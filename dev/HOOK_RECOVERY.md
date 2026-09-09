@@ -14,9 +14,9 @@ alias postcmd 'echo running'
 - [scripts.py](D:/Programs/ish/src/ish/shell/scripts.py)의 `ish_watch_hooks.tcsh`는 사용자 `periodic`을 실행할 시점을 판단하고, `ish_bind_hooks.tcsh`는 새 훅을 저장하고 연동을 다시 연결합니다.
 - 기본 프롬프트의 `precmd`에서도 다시 확인하므로 사용자 훅 자체가 다른 훅을 변경한 결과를 반영합니다. 반복해서 확인해도 기존 래퍼를 사용자 훅으로 중복 저장하지 않습니다.
 - 내부 확인용 스크립트를 읽을 때는 `postcmd`를 해제하고, 사용자 훅을 실행하는 동안에는 다시 연결합니다. 사용자 훅의 호출 횟수와 종료 상태를 보존합니다.
-- [base.py](D:/Programs/ish/src/ish/shell/base.py)의 csh/tcsh 분기에서는 여전히 프로세스 대기 상태만으로 PTY에 복구 명령을 보내지 않습니다. BSD csh는 `precmd`·`postcmd`가 없으므로 이번 tcsh 훅 감시를 설치하지 않습니다.
+- [base.py](D:/Programs/ish/src/ish/shell/base.py)는 이제 모든 셸에서 프로세스 대기 상태를 조회하는 `_recover` 루프를 제거했습니다. 세션의 기본 프롬프트가 확인된 경계에서만 복구합니다. BSD csh는 `precmd`·`postcmd`가 없으므로 tcsh 훅 감시를 설치하지 않습니다.
 
-이 감시는 `periodic`과 `tperiod=0`을 연동용으로 사용합니다. 시작 시 사용자가 설정한 `periodic` 본문과 주기는 별도로 저장하여 유지합니다. 사용자 콜백이 없으면 매 프롬프트마다 시계 조회 프로세스를 실행하지 않습니다. ish 실행 중 `tperiod`의 표시 값은 감시용인 `0`이며, `precmd`·`postcmd`·`periodic` 등 모든 연동 훅을 한꺼번에 제거하는 상황까지 자동 복구하는 장치는 아닙니다. 이 경우에는 ish를 재시작해야 합니다.
+이 감시는 `periodic`과 `tperiod=0`을 연동용으로 사용합니다. 시작 시 사용자가 설정한 `periodic` 본문과 주기는 별도로 저장하여 유지합니다. 사용자 콜백이 없으면 매 프롬프트마다 시계 조회 프로세스를 실행하지 않습니다. ish 실행 중 `tperiod`의 표시 값은 감시용인 `0`이며, `precmd`·`postcmd`·`periodic`과 프롬프트 마커를 모두 제거하는 상황까지 자동 복구하는 장치는 아닙니다. 이 경우 원시 입력을 유지하므로, 셸이 명령을 기다리는 프롬프트에서 `ish_recover`를 실행하여 설치된 래퍼를 다시 연결할 수 있습니다. 복구 alias나 ish 내부 변수·함수까지 지웠다면 ish를 재시작해야 합니다.
 
 tcsh의 [실행 루프](https://github.com/tcsh-org/tcsh/blob/master/sh.c)와 [periodic 구현](https://github.com/tcsh-org/tcsh/blob/master/tc.func.c)을 확인했습니다. `periodic`은 기본 프롬프트 앞에서 실행되며 반복문 입력 대기에는 실행되지 않습니다. 따라서 화면의 프롬프트 문자열이나 유휴 시간으로 입력 상태를 추정할 필요가 없습니다.
 

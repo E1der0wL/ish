@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing import Final
+from dataclasses import dataclass
+import secrets
 
 BUILTIN: Final = "builtin"
 ENVIRON: Final = "environ"
@@ -38,6 +40,23 @@ FORWARD_BINARY: Final = 'ish_forward'
 FORWARD_SOURCE: Final = 'ish_forward.c'
 SHELL_FIFO: Final = 'shell.fifo'
 TTY_FIFO: Final = 'tty.fifo'
+
+
+@dataclass(frozen=True)
+class SessionSignals:
+    """Scope integration markers to one PTY; empty tokens support old fixtures."""
+    token: str = ''
+
+    @classmethod
+    def create(cls):
+        return cls(secrets.token_hex(16))
+
+    def scope(self, sequence: bytes) -> bytes:
+        if not self.token:
+            return sequence
+        prefix = ISH_OSC_PREFIX + self.token.encode('ascii') + b';'
+        return sequence.replace(ISH_OSC_PREFIX, prefix, 1).replace(
+            ISH_OSC_PREFIX.replace(b'\x1b', b'^['), prefix.replace(b'\x1b', b'^['), 1)
 
 
 def bytes_to_shell_escape(value: bytes) -> str:

@@ -10,6 +10,7 @@ from .constants import (
     BASH_INTEGRATION_SCRIPT, ZSH_INTEGRATION_SCRIPT, CSH_INTEGRATION_SCRIPT,
     TCSH_INTEGRATION_SCRIPT, POSIX_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT, POSIX_UPDATE_SCRIPT,
+    SessionSignals,
 )
 
 
@@ -38,17 +39,24 @@ class ShellSyntax:
     source_command: str
     parse_aliases: Callable[[str], dict[str, str]]
     lexer: str
+    restore_status: str = '_ish_status {value}'
 
     def assign(self, name: str, expression: str) -> str:
         """Assign an already quoted value or a shell expression."""
         return self.assignment.format(name=name, value=expression)
+
+    def preserve_status(self, command: str) -> str:
+        saved = '_ish_recovery_exit_code'
+        return (self.assign(saved, self.exit_status) + '; ' + command.rstrip('\n') + '; '
+                + self.restore_status.format(value='"$' + saved + '"') + '\n')
 
 
 # These are the syntax features ish uses, not strict standards compliance
 # claims (notably, zsh shares this POSIX-style quoting/assignment profile).
 SYNTAXES = {
     'posix': ShellSyntax(shlex.quote, '{name}={value}', '$?', '.', posix_aliases, 'bash'),
-    'csh': ShellSyntax(csh_quote, 'set {name} = {value}', '$status', 'source', csh_aliases, 'tcsh'),
+    'csh': ShellSyntax(csh_quote, 'set {name} = {value}', '$status', 'source', csh_aliases, 'tcsh',
+                       restore_status='set status = {value}'),
 }
 
 
@@ -57,7 +65,6 @@ class ShellBehavior:
     native_continuation: bool = False
     preserve_output_line: bool = False
     batch_input: bool = False
-    idle_recovery: bool = True
 
     def split_commands(self, command: str) -> list[str]:
         if self.batch_input:
@@ -65,12 +72,12 @@ class ShellBehavior:
         return command.splitlines() if command.strip() else ['']
 
 
-POSIX_BEHAVIOR = ShellBehavior()
+POSIX_BEHAVIOR = ShellBehavior(native_continuation=True, batch_input=True)
 # Sleeping csh/tcsh may be reading foreach or $<. Recovery commands must not
 # be injected into that input; keep secondary editing and typeahead native.
 CSH_BEHAVIOR = ShellBehavior(
     native_continuation=True, preserve_output_line=True,
-    batch_input=True, idle_recovery=False,
+    batch_input=True,
 )
 INTEGRATION_ARGUMENTS = ('_ish_pipe', '_tty_pipe')
 
@@ -119,12 +126,14 @@ class ShellAdapter:
             command = self.syntax.assign('_ish_shell_exit_code', self.syntax.exit_status) + '; ' + command
         return command
 
-    def configure_sequencer(self, sequencer, *, prompt_id, prompt, continuation, unhooked_prompt):
-        sequencer.on_prefix(PROMPT_ID_PREFIX, prompt_id)
-        sequencer.between_sequence(BEFORE_PROMPT, AFTER_PROMPT, prompt)
-        sequencer.between_sequence(BEFORE_CONTINUATION, AFTER_CONTINUATION, continuation)
+    def configure_sequencer(self, sequencer, *, prompt_id, prompt, continuation, unhooked_prompt,
+                            signals=SessionSignals()):
+        scope = signals.scope
+        sequencer.on_prefix(scope(PROMPT_ID_PREFIX), prompt_id)
+        sequencer.between_sequence(scope(BEFORE_PROMPT), scope(AFTER_PROMPT), prompt)
+        sequencer.between_sequence(scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation)
         if self.unhooked_prompt:
-            sequencer.between_sequence(*self.unhooked_prompt, unhooked_prompt)
+            sequencer.between_sequence(*(scope(marker) for marker in self.unhooked_prompt), unhooked_prompt)
 
 
 ADAPTERS = {

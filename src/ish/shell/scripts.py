@@ -4,7 +4,7 @@ from .adapters import csh_quote
 from .protocol import VERSION, SOH, EOT, RS, US
 from .constants import (
     BEFORE_PROMPT, AFTER_PROMPT, BEFORE_CONTINUATION, AFTER_CONTINUATION,
-    PROMPT_ID_PREFIX, OSC_TERMINATOR, bytes_to_shell_escape,
+    PROMPT_ID_PREFIX, OSC_TERMINATOR, bytes_to_shell_escape, SessionSignals,
     BASH_INTEGRATION_SCRIPT, ZSH_INTEGRATION_SCRIPT, CSH_INTEGRATION_SCRIPT,
     TCSH_INTEGRATION_SCRIPT, POSIX_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT, POSIX_UPDATE_SCRIPT, TCSH_PRECMD_SCRIPT,
@@ -12,25 +12,31 @@ from .constants import (
 )
 
 
-def make_scripts(directory):
+def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
+    scope = signals.scope
+    forward_path = forward_path or directory / FORWARD_BINARY
     tokens = {
         '@VERSION@': VERSION.decode('ascii'),
-        '@FORWARD@': shlex.quote(str(directory / FORWARD_BINARY)),
-        '@CSH_FORWARD@': csh_quote(str(directory / FORWARD_BINARY)),
+        '@FORWARD@': shlex.quote(str(forward_path)),
+        '@CSH_FORWARD@': csh_quote(str(forward_path)),
         '@CSH_UPDATE@': csh_quote(str(directory / CSH_UPDATE_SCRIPT)),
         '@CSH_HOOK@': csh_quote(str(directory / TCSH_PRECMD_SCRIPT)),
         '@CSH_BIND@': csh_quote(str(directory / TCSH_BIND_HOOKS_SCRIPT)),
         '@CSH_WATCH@': csh_quote(str(directory / TCSH_WATCH_HOOKS_SCRIPT)),
         '@POSIX_UPDATE@': shlex.quote(str(directory / POSIX_UPDATE_SCRIPT)),
+        '@BASH_SELF@': shlex.quote(str(directory / BASH_INTEGRATION_SCRIPT)),
+        '@ZSH_SELF@': shlex.quote(str(directory / ZSH_INTEGRATION_SCRIPT)),
+        '@POSIX_SELF@': shlex.quote(str(directory / POSIX_INTEGRATION_SCRIPT)),
+        '@CSH_SELF@': csh_quote(str(directory / CSH_INTEGRATION_SCRIPT)),
         '@SOH@': bytes_to_shell_escape(SOH), '@EOT@': bytes_to_shell_escape(EOT),
         '@RS@': bytes_to_shell_escape(RS), '@US@': bytes_to_shell_escape(US),
-        '@START@': bytes_to_shell_escape(BEFORE_PROMPT),
-        '@END@': bytes_to_shell_escape(AFTER_PROMPT),
-        '@CONT_START@': bytes_to_shell_escape(BEFORE_CONTINUATION),
-        '@CONT_END@': bytes_to_shell_escape(AFTER_CONTINUATION),
-        '@PROMPT_ID@': bytes_to_shell_escape(PROMPT_ID_PREFIX + b'%s' + OSC_TERMINATOR),
+        '@START@': bytes_to_shell_escape(scope(BEFORE_PROMPT)),
+        '@END@': bytes_to_shell_escape(scope(AFTER_PROMPT)),
+        '@CONT_START@': bytes_to_shell_escape(scope(BEFORE_CONTINUATION)),
+        '@CONT_END@': bytes_to_shell_escape(scope(AFTER_CONTINUATION)),
+        '@PROMPT_ID@': bytes_to_shell_escape(scope(PROMPT_ID_PREFIX) + b'%s' + OSC_TERMINATOR),
         # csh checks only the OSC body so both raw and caret prompts match.
-        '@CSH_START_PATTERN@': csh_quote(BEFORE_PROMPT[2:-len(OSC_TERMINATOR)].decode('ascii')),
+        '@CSH_START_PATTERN@': csh_quote(scope(BEFORE_PROMPT)[2:-len(OSC_TERMINATOR)].decode('ascii')),
     }
 
     def render(template):
@@ -63,6 +69,7 @@ _tty_pipe=$2
 _ish_prompt_id=${_ish_prompt_id:-0}
 '''
     bash = init + update + r'''
+ish_recover() { source @BASH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 set +o notify
 _ish_capture_status() {
     _ish_shell_exit_code=$?
@@ -86,6 +93,7 @@ if [[ "${PROMPT_COMMAND[0]:-}" != _ish_capture_status ]]; then
 fi
 '''
     zsh = init + update + r'''
+ish_recover() { source @ZSH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 unsetopt zle notify promptcr promptsp
 _ish_precmd() {
     if [[ "$PS1" != *$'@START@'* ]]; then
@@ -118,6 +126,7 @@ if [[ ${functions[precmd]-} != *'_ish_precmd '* ]]; then
 fi
 '''
     posix = '_ish_prompt_id=${_ish_prompt_id:-0}\n' + update + r'''
+ish_recover() { . @POSIX_SELF@; }
 _ish_posix_prompt() {
     case "$PS1" in *"$(command printf '@START@')"*) ;;
         *) PS1="$(command printf '@START@')${PS1}$(command printf '@END@')";;
@@ -175,6 +184,8 @@ printf '@PROMPT_ID@' "$_ish_prompt_id"
 set status = $_ish_shell_exit_code
 '''
     csh = csh_init + r'''
+set _ish_recover_path = @CSH_SELF@
+alias ish_recover 'source "$_ish_recover_path"'
 set _ish_shell_exit_code = 0
 source @CSH_UPDATE@
 '''
@@ -213,6 +224,8 @@ _ish_periodic_dispatch
 source @CSH_BIND@
 '''
     tcsh = 'set _ish_pipe = "$1"\nset _tty_pipe = "$2"\n' + csh_init + r'''
+# Rebind installed wrappers without resetting saved editor/periodic state.
+alias ish_recover 'alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; alias postcmd _ish_postcmd'
 unset notify
 set _ish_hook_path = @CSH_HOOK@
 set _ish_bind_path = @CSH_BIND@

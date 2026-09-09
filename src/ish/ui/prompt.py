@@ -17,6 +17,8 @@ from typing import (
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.application import in_terminal
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import ThreadedCompleter, merge_completers
 from prompt_toolkit.filters import (
@@ -179,6 +181,9 @@ class Prompt(PromptSession):
 		}
 		self._completion_words = []
 		self._cwd = ""
+		self._path_scan_key = None
+		self._path_scan_task = None
+		self._path_generation = 0
 		self.default_completer = PromptCompleter(
 			words=lambda: self._completion_words,
 			cwd=lambda: [self._cwd],
@@ -471,7 +476,7 @@ class Prompt(PromptSession):
 			text = buffer.text
 			lines = text.split('\n')
 			cursor_position = buffer.document.cursor_position
-			if text.strip().endswith('\\'):
+			if (len(text) - len(text.rstrip('\\'))) % 2:
 				if cursor_position > 0:
 					left_char = buffer.document.text[cursor_position - 1]
 					if left_char == ":":
@@ -610,15 +615,24 @@ class Prompt(PromptSession):
 
 	async def _update_context(self, category: str, data: Any) -> None:
 		if ENVIRON == category:
-			os_path: Set[str] = set(os.get_exec_path(data))
-			execs = await asyncio.to_thread(self._scan_path, os_path)
-			self._completions[category][:] = execs
 			self._cwd = data.get(PWD)
-			await asyncio.to_thread(self._rebuild_completer)
+			self._path_generation += 1
+			generation = self._path_generation
+			paths = tuple(os.path.normpath(os.path.join(self._cwd or os.getcwd(), path))
+				for path in os.get_exec_path(data))
+			if self._path_scan_key != paths or self._path_scan_task.done():
+				self._path_scan_key = paths
+				self._path_scan_task = asyncio.create_task(asyncio.to_thread(self._scan_path, paths))
+			execs = await asyncio.shield(self._path_scan_task)
+			if generation == self._path_generation and set(self._completions[category]) != execs:
+				self._completions[category][:] = execs
+				self._rebuild_completer()
 
 		elif ALIAS == category:
-			self._completions[category][:] = list(data.keys())
-			await asyncio.to_thread(self._rebuild_completer)
+			aliases = list(data.keys())
+			if self._completions[category] != aliases:
+				self._completions[category][:] = aliases
+				self._rebuild_completer()
 
 	def cmd(self, cmd: str) -> None:
 		self.app.exit(result=cmd)
@@ -702,6 +716,13 @@ class Prompt(PromptSession):
 		cleaned_prompt = prompt.replace(b'\r\n', b'\n')
 		self.message = ShellANSI(cleaned_prompt.decode(encoder or self.encoder, errors='replace'))
 
+	async def write_output(self, write) -> None:
+		# Reader callbacks run outside prompt_async's context. Select this app
+		# explicitly so the renderer suspends and redraws around background output.
+		with set_app(self.app):
+			async with in_terminal():
+				await write()
+
 	def update_context(self, category: str, data: Any) -> None:
 		self.context.update(category, data)
 
@@ -764,7 +785,7 @@ class Prompt(PromptSession):
 			await self.process_handler.run(self.internal_tools[argv[0]], *argv[1:])
 			return ''
 
-		return command.rstrip()
+		return command
 
 	def run(self) -> None:
 		self.interactive_shell.run()

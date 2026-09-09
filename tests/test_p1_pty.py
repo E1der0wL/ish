@@ -85,9 +85,15 @@ class ShellPTYTests(unittest.TestCase):
                 self.assertTrue(until(lambda: received.find(b'\x1b[?2004h', received.find(b'P1_OK\r\n')) >= 0))
                 os.write(fd, b'ish_exit\r')
                 until(lambda: False, 2)
-                waited, status = os.waitpid(pid, os.WNOHANG)
-                reaped = bool(waited)
-                self.assertTrue(reaped, 'ish did not exit')
+                # PTY EOF may precede waitpid readiness, and the engine allows
+                # two seconds for shell hangup before forceful shutdown.
+                deadline = time.monotonic() + 3
+                while not reaped and time.monotonic() < deadline:
+                    waited, status = os.waitpid(pid, os.WNOHANG)
+                    reaped = bool(waited)
+                    if not reaped:
+                        time.sleep(.01)
+                self.assertTrue(reaped, 'ish did not exit: ' + repr(bytes(received[-1000:])))
                 self.assertEqual(os.waitstatus_to_exitcode(status), 0)
                 self.assertEqual(list((scratch / 'tmp').iterdir()), [])
             finally:

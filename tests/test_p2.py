@@ -111,9 +111,10 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(sequencer.interpret(AFTER_PROMPT + b'OK'), b'OK')
         self.assertIn(b'[prompt truncated]', prompts[0])
         for prefix, suffix in [(b'\x1b]0;', b'\x07'), (b'\x1b[', b'm')]:
-            sequencer.interpret(prefix + b'1' * 10000)
+            output = sequencer.interpret(prefix + b'1' * 10000)
             self.assertLessEqual(len(sequencer.buffer), 128)
-            self.assertEqual(sequencer.interpret(suffix + b'OK'), b'OK')
+            output += sequencer.interpret(suffix + b'OK')
+            self.assertEqual(output, prefix + b'1' * 10000 + suffix + b'OK')
 
     def test_unicode_fragmentation_and_between_passthrough(self):
         data = '가나다🙂'.encode()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Dict, Tuple, Set, Callable
+from typing import Optional, Dict, Tuple, Callable
 
 __all__ = ['Sequencer']
 
@@ -13,43 +13,14 @@ class Sequencer:
 	OSC: int = 4
 	BETWEEN: int = 5
 	MASKING: int = 6
-
-	ESC_SINGLE_STARTS: Set = {
-		0x50,
-		0x52,
-		0x53,
-		0x56,
-		0x57,
-		0x58,
-		0x5D,
-		0x5E,
-		0x5F,
-	}
-	ESC_SINGLE_INTERS: Set = {
-		0x28,
-		0x29,
-		0x2A,
-		0x2B,
-		0x2C,
-		0x2D,
-		0x2E,
-		0x2F,
-		0x5B,
-	}
-	ESC_SINGLE_FINALS: Set = {
-		0x37, 0x38,
-		0x3C, 0x3D, 0x3E,
-		0x40, 0x41, 0x42, 0x43, 0x44, 0x45,
-		0x4C, 0x4D, 0x4E, 0x4F,
-		0x5A,
-		0x5C,
-	}
+	ESC_INTERMEDIATE: int = 7
 
 	__slots__ = (
 		'buffer', 'between_buffer', 'masking_buffer', 'state',
 		'masking_index', 'masking_disabled', 'masking_bytes',
 		'encoder', 'callbacks', 'between_callbacks', 'active_between',
-		'max_sequence_bytes', '_between_tail', 'between_truncated', '_discard_control', 'prefix_callbacks', 'literal_starts'
+		'max_sequence_bytes', '_between_tail', 'between_truncated', '_passthrough',
+		'_string_bel', '_string_escape', 'prefix_callbacks', 'literal_starts'
 	)
 
 	def __init__(self, encoder: str = 'utf-8', errors: str = 'replace', max_sequence_bytes: int = 65536):
@@ -58,7 +29,9 @@ class Sequencer:
 		self.max_sequence_bytes = max_sequence_bytes
 		self._between_tail = bytearray()
 		self.between_truncated = False
-		self._discard_control = False
+		self._passthrough = False
+		self._string_bel = False
+		self._string_escape = False
 		self.encoder = encoder
 		self.buffer: bytearray = bytearray()
 		self.between_buffer: bytearray = bytearray()
@@ -111,7 +84,9 @@ class Sequencer:
 		data = bytes(self.buffer)
 		for prefix, callback in self.prefix_callbacks.items():
 			if data.startswith(prefix):
-				callback(data[len(prefix):-2] if data.endswith(b'\x1b\\') else data[len(prefix):-1])
+				accepted = callback(data[len(prefix):-2] if data.endswith(b'\x1b\\') else data[len(prefix):-1])
+				if accepted is False:
+					buffer.extend(data)
 				self.buffer.clear()
 				self.state = self.GROUND
 				return
@@ -155,6 +130,8 @@ class Sequencer:
 			if self.between_truncated:
 				payload += b' [prompt truncated] '
 			replacement = callback(payload)
+			if remove_seq and replacement is False:
+				buffer.extend(start_seq + payload + end_seq)
 			if remove_seq and isinstance(replacement, bytes):
 				buffer.extend(replacement)
 			self.between_buffer.clear()
@@ -184,25 +161,59 @@ class Sequencer:
 		self.masking_disabled = True
 		self.state = self.GROUND
 
+	def _control_byte(self, byte, output):
+		# Long OSC/DCS/APC payloads belong to the terminal, not our buffer.
+		if self._passthrough:
+			output.append(byte)
+		else:
+			self.buffer.append(byte)
+			if len(self.buffer) >= self.max_sequence_bytes:
+				self._flush_text(output)
+				self._passthrough = True
+
+	def _end_control(self, output):
+		if self._passthrough:
+			self.buffer.clear()
+			self.state = self.GROUND
+		else:
+			self._union(output)
+		self._passthrough = False
+		self._string_escape = False
+
+	def finish(self) -> bytes:
+		"""Release an incomplete sequence/echo when the PTY stream ends."""
+		output = bytearray(self.buffer)
+		if self.state == self.OSC and self._string_escape:
+			output.append(0x1b)
+		if self.state == self.BETWEEN and self.active_between:
+			start, _, _, remove = self.active_between
+			if remove:
+				output.extend(start)
+				output.extend(self.between_buffer)
+				output.extend(self._between_tail)
+		output.extend(self.masking_buffer)
+		self.buffer.clear()
+		self.between_buffer.clear()
+		self._between_tail.clear()
+		self.masking_buffer.clear()
+		self.masking_bytes = b''
+		self.active_between = None
+		self._passthrough = False
+		self._string_escape = False
+		self.state = self.GROUND
+		return bytes(output)
+
 	def interpret(self, data: bytes):
 		output = bytearray()
 		for byte in data:
-			if not self._discard_control and len(self.buffer) >= self.max_sequence_bytes:
-				if self.state in (self.OSC, self.CSI):
-					self.buffer[:] = self.buffer[-1:]
-					self._discard_control = True
-				else:
-					self._flush_text(output)
-					self.state = self.GROUND
-			if self._discard_control:
-				previous = self.buffer[-1:] == b'\x1b'
-				self.buffer[:] = bytes([byte])
-				if ((self.state == self.CSI and 0x40 <= byte <= 0x7e) or
-					(self.state == self.OSC and (byte == 7 or previous and byte == 92))):
-					self.buffer.clear()
-					self._discard_control = False
-					self.state = self.GROUND
-				continue
+			if self.state == self.OSC and self._string_escape and byte != 0x5c:
+				# A fresh ESC cancels an unterminated control string. Hold it
+				# until we know whether it belongs to ST or a new sequence.
+				self._flush_text(output)
+				self._passthrough = False
+				self._string_escape = False
+				self.buffer.append(0x1b)
+				self.state = self.ESC
 			if self.state == self.GROUND:
 				if byte in self.literal_starts:
 					self._flush_text(output)
@@ -223,7 +234,7 @@ class Sequencer:
 							self.masking_index += 1
 							self.state = self.MASKING
 					else:
-						self.buffer.append(byte)
+						output.append(byte)
 
 			elif self.state == self.CARET:
 				self.buffer.append(byte)
@@ -231,7 +242,6 @@ class Sequencer:
 				if bytes(self.buffer) in candidates:
 					self._union(output)
 				elif not any(seq.startswith(self.buffer) for seq in candidates):
-					# Keep a new introducer at the tail when a prefix mismatches.
 					if byte in self.literal_starts or byte == 0x1b:
 						output.extend(self.buffer[:-1])
 						self.buffer[:] = bytes([byte])
@@ -240,28 +250,54 @@ class Sequencer:
 						self._flush_text(output)
 						self.state = self.GROUND
 
-			elif self.state == self.ESC:
-				self.buffer.append(byte)
-				if byte in self.ESC_SINGLE_INTERS:
-					self.state = self.CSI
-				elif byte in self.ESC_SINGLE_STARTS:
-					self.state = self.OSC
-				elif byte in self.ESC_SINGLE_FINALS:
-					self._union(output)
-				elif 0x40 <= byte <= 0x5F:
-					self._union(output)
-
-			elif self.state == self.CSI:
-				self.buffer.append(byte)
-				if 0x40 <= byte <= 0x7E:
-					self._union(output)
+			elif self.state in (self.ESC, self.ESC_INTERMEDIATE, self.CSI):
+				if byte == 0x1b:
+					self._flush_text(output)
+					self._passthrough = False
+					self.buffer.append(byte)
+					self.state = self.ESC
+					continue
+				self._control_byte(byte, output)
+				if byte in (0x18, 0x1a):  # CAN/SUB cancel the current control.
+					self._flush_text(output)
+					self._passthrough = False
+					self.state = self.GROUND
+				elif byte < 0x20 or byte == 0x7f:
+					continue  # C0/DEL do not terminate an escape or CSI.
+				elif self.state == self.ESC:
+					if byte == 0x5b:
+						self.state = self.CSI
+					elif byte in (0x50, 0x58, 0x5d, 0x5e, 0x5f):
+						self._string_bel = byte == 0x5d
+						self._string_escape = False
+						self.state = self.OSC
+					elif 0x20 <= byte <= 0x2f:
+						self.state = self.ESC_INTERMEDIATE
+					else:
+						# Includes RIS (ESC c) and other valid 0x30..0x7e finals.
+						self._end_control(output)
+				elif self.state == self.ESC_INTERMEDIATE:
+					if not 0x20 <= byte <= 0x2f:
+						self._end_control(output)
+				elif not 0x20 <= byte <= 0x3f:
+					self._end_control(output)
 
 			elif self.state == self.OSC:
-				self.buffer.append(byte)
-				if byte == 0x07:
-					self._union(output)
-				elif len(self.buffer) >= 2 and self.buffer[-2:] == b'\x1b\\':
-					self._union(output)
+				if byte == 0x1b:
+					self._string_escape = True
+					continue
+				if self._string_escape:
+					self._control_byte(0x1b, output)
+				self._control_byte(byte, output)
+				if byte in (0x18, 0x1a):
+					self._flush_text(output)
+					self._passthrough = False
+					self._string_escape = False
+					self.state = self.GROUND
+				elif (self._string_bel and byte == 0x07) or (self._string_escape and byte == 0x5c):
+					self._end_control(output)
+				else:
+					self._string_escape = byte == 0x1b
 
 			elif self.state == self.BETWEEN:
 				self._between(byte, output)
@@ -280,8 +316,8 @@ class Sequencer:
 							self._complete_masking()
 					else:
 						self._cancel_masking()
+						self._flush_text(output)
 
 		if self.state == self.GROUND:
 			self._flush_text(output)
-
 		return bytes(output)

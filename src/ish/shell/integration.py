@@ -83,7 +83,6 @@ int main(int argc, char *argv[]) {
     if (argc < 2) return 1;
     struct termios saved, raw;
     if (tcgetattr(STDIN_FILENO, &saved) != 0) return 1;
-    if (!(saved.c_lflag & ECHO)) return 0;
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     if (flags < 0) return 1;
     int pipe_fd = open(argv[1], O_WRONLY | O_NONBLOCK);
@@ -117,10 +116,12 @@ cleanup:
 """)
 
 
-def install_scripts() -> Path:
-	ish_xdg_home: Path = config.XDG_DATA_HOME
+def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
+	from .constants import SessionSignals
+	ish_xdg_home: Path = directory or config.XDG_DATA_HOME
 	ish_xdg_home.mkdir(parents=True, exist_ok=True)
-	for name, content in make_scripts(ish_xdg_home).items():
+	for name, content in make_scripts(ish_xdg_home, signals=signals or SessionSignals(),
+		forward_path=forward_path or Path(ISH_FORWARD)).items():
 		script_path = ish_xdg_home / name
 		with open(script_path, "w", encoding="utf-8", newline="\n") as file:
 			file.write(content)
@@ -128,12 +129,12 @@ def install_scripts() -> Path:
 	return ish_xdg_home
 
 
-def build_binary() -> bool:
+def build_binary(*, directory=None) -> bool:
 	logger = get_logger()
-	ish_xdg_home: Path = config.XDG_DATA_HOME
+	ish_xdg_home: Path = directory or config.XDG_DATA_HOME
 	ish_xdg_home.mkdir(parents=True, exist_ok=True)
 	src_path = ish_xdg_home / FORWARD_SOURCE
-	bin_path = Path(ISH_FORWARD)
+	bin_path = ish_xdg_home / FORWARD_BINARY if directory is not None else Path(ISH_FORWARD)
 	import subprocess
 	try:
 		src_path.write_text(TTY_FORWARD, encoding='utf-8')
