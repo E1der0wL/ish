@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ish"
+version = "1.0.0"
+description = "A prompt-toolkit command editor for interactive Linux shells"
+readme = "README.md"
+requires-python = ">=3.12.14,<3.13"
+dependencies = [
+    "packaging==26.3",
+    # PluginManager invokes `python -m pip` for explicit plugin dependencies.
+    "pip>=25.3,<27",
+    "prompt-toolkit==3.0.53",
+    "pygments==2.21.0",
+]
+
+[project.scripts]
+ish = "ish.main:main"
+
+[dependency-groups]
+dev = ["psutil==7.2.2", "ruff==0.16.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ish"]
+
+[tool.uv]
+# CLI subprocesses should not repeatedly compile dependencies on WSL mounts.
+compile-bytecode = true
+
+[tool.ruff]
+target-version = "py312"
+indent-width = 4
+src = ["src", "tests"]
+# Existing Git ignores include tests/; lint those files as well.
+respect-gitignore = false
+# This legacy generator runs on import and was explicitly excluded from work.
+extend-exclude = ["tests/test.py"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+ignore = ["E501", "B008", "UP006", "UP007", "UP035", "UP045"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+# Imports are intentional: the generated module preloads optional stdlib modules.
+"src/ish/stdlib.py" = ["F401", "E722"]
+"src/ish/main.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

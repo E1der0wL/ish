@@ -1,3 +1,9 @@
+"""Run Python tools in separate processes with controlling PTYs.
+
+The parent event loop relays I/O, transfers file descriptors, and drains output after
+process exit.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,18 +11,18 @@ import contextlib
 import errno
 import fcntl
 import multiprocessing as mp
-from multiprocessing.reduction import recv_handle, send_handle
 import os
 import pickle
 import pty
 import sys
 import termios
 import traceback
+from multiprocessing.reduction import recv_handle, send_handle
 from typing import Any, Callable
 
 from ish.fdio import FDWriter
 
-__all__ = ['ProcessHandler']
+__all__ = ["ProcessHandler"]
 
 
 def _run_worker(func, args, kwargs, connection, encoder):
@@ -31,16 +37,20 @@ def _run_worker(func, args, kwargs, connection, encoder):
         os.dup2(slave_fd, fd)
     if slave_fd > 2:
         os.close(slave_fd)
-    sys.stdin = os.fdopen(0, 'r', encoding=encoder, errors='replace', closefd=False)
-    sys.stdout = os.fdopen(1, 'w', encoding=encoder, errors='replace', buffering=1, closefd=False)
-    sys.stderr = os.fdopen(2, 'w', encoding=encoder, errors='replace', buffering=1, closefd=False)
+    sys.stdin = os.fdopen(0, "r", encoding=encoder, errors="replace", closefd=False)
+    sys.stdout = os.fdopen(
+        1, "w", encoding=encoder, errors="replace", buffering=1, closefd=False
+    )
+    sys.stderr = os.fdopen(
+        2, "w", encoding=encoder, errors="replace", buffering=1, closefd=False
+    )
     try:
         func(*args, **kwargs)
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None
     except Exception:
         traceback.print_exc()
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -54,18 +64,33 @@ class ProcessHandler:
     No global multiprocessing start method is modified.
     """
 
-    def __init__(self, encoder: str = 'utf-8', *, stdin: int | None = None, stdout: int | None = None):
+    def __init__(
+        self,
+        encoder: str = "utf-8",
+        *,
+        stdin: int | None = None,
+        stdout: int | None = None,
+    ):
+        """Store caller-owned I/O descriptors and the worker stream encoding."""
         self.encoder = encoder
         self.stdin_fd = sys.stdin.fileno() if stdin is None else stdin
         self.stdout_fd = sys.stdout.fileno() if stdout is None else stdout
 
     async def run(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
+        """Run a tool and return its exit code after draining output.
+
+        The callable and arguments must be pickleable. Reject local functions before
+        acquiring resources. On cancellation, stop the worker and restore the parent's
+        descriptor flags.
+        """
         if not callable(func):
-            raise TypeError('Python tool must be callable')
+            raise TypeError("Python tool must be callable")
         try:
             pickle.dumps((func, args, kwargs))
         except (pickle.PickleError, TypeError, AttributeError) as exc:
-            raise TypeError('Python tools and arguments must be pickleable; define the tool in an importable module') from exc
+            raise TypeError(
+                "Python tools and arguments must be pickleable; define the tool in an importable module"
+            ) from exc
 
         loop = asyncio.get_running_loop()
         failed = loop.create_future()
@@ -76,6 +101,7 @@ class ProcessHandler:
         sentinel = None
 
         def fail(exc):
+            """Report the first I/O error to the main waiting task."""
             if not failed.done():
                 failed.set_result(exc)
 
@@ -88,18 +114,23 @@ class ProcessHandler:
                 master_fd, slave_fd = pty.openpty()
                 resources.callback(os.close, master_fd)
                 # File.close() is idempotent, including on the failure path.
-                slave_owner = resources.enter_context(os.fdopen(slave_fd, 'rb', buffering=0))
+                slave_owner = resources.enter_context(
+                    os.fdopen(slave_fd, "rb", buffering=0)
+                )
                 os.set_blocking(master_fd, False)
                 input_writer = FDWriter(loop, master_fd, fail)
                 output_writer = FDWriter(loop, self.stdout_fd, fail)
                 resources.callback(input_writer.close)
                 resources.callback(output_writer.close)
 
-                context = mp.get_context('spawn')
+                context = mp.get_context("spawn")
                 parent_connection, child_connection = context.Pipe(duplex=True)
                 resources.callback(parent_connection.close)
                 resources.callback(child_connection.close)
-                process = context.Process(target=_run_worker, args=(func, args, kwargs, child_connection, self.encoder))
+                process = context.Process(
+                    target=_run_worker,
+                    args=(func, args, kwargs, child_connection, self.encoder),
+                )
                 process.start()
                 started = True
                 child_connection.close()
@@ -109,16 +140,18 @@ class ProcessHandler:
                 sentinel = process.sentinel
 
                 def on_exit():
+                    """Stop watching the process sentinel and wake the exit waiter."""
                     loop.remove_reader(sentinel)
                     if not exited.done():
                         exited.set_result(None)
 
                 def on_input():
+                    """Forward user input to the worker PTY and translate EOF to EOT."""
                     try:
                         data = os.read(self.stdin_fd, 4096)
                         if not data:
                             loop.remove_reader(self.stdin_fd)
-                            data = b'\x04'
+                            data = b"\x04"
                         input_writer.write(data)
                     except (BlockingIOError, InterruptedError):
                         pass
@@ -126,13 +159,14 @@ class ProcessHandler:
                         fail(exc)
 
                 def on_output():
+                    """Queue worker output and record PTY EOF."""
                     try:
                         try:
                             data = os.read(master_fd, 65536)
                         except OSError as exc:
                             if exc.errno != errno.EIO:
                                 raise
-                            data = b''
+                            data = b""
                         if data:
                             output_writer.write(data)
                         else:
@@ -145,6 +179,9 @@ class ProcessHandler:
                         fail(exc)
 
                 def output_flow(paused):
+                    """Pause PTY reads when the output queue fills and resume when space is
+                    available.
+                    """
                     if paused:
                         loop.remove_reader(master_fd)
                     elif not eof.done():
@@ -152,17 +189,25 @@ class ProcessHandler:
 
                 output_writer.on_flow = output_flow
 
-                for fd, callback in [(master_fd, on_output), (self.stdin_fd, on_input), (sentinel, on_exit)]:
+                for fd, callback in [
+                    (master_fd, on_output),
+                    (self.stdin_fd, on_input),
+                    (sentinel, on_exit),
+                ]:
                     loop.add_reader(fd, callback)
                     resources.callback(loop.remove_reader, fd)
-                done, _ = await asyncio.wait([exited, failed], return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    [exited, failed], return_when=asyncio.FIRST_COMPLETED
+                )
                 if failed in done:
                     raise failed.result()
                 # A slow consumer may have paused the PTY reader. Resume it
                 # before starting the EOF timeout, so queued output is not lost.
                 await output_writer.drain()
                 # Process death can precede the final readable PTY bytes.
-                done, _ = await asyncio.wait([eof, failed], timeout=1, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    [eof, failed], timeout=1, return_when=asyncio.FIRST_COMPLETED
+                )
                 if failed in done:
                     raise failed.result()
                 await output_writer.drain()

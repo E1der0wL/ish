@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import errno
 import os
 import stat
@@ -17,8 +16,18 @@ class FDWriter:
     A bounded amount of work per callback also makes repeated EINTR yield.
     """
 
-    def __init__(self, loop, fd: int, on_error: Callable[[Exception], None] | None = None,
-                 *, max_pending_bytes: int = 4 * 1024 * 1024, on_flow=None):
+    def __init__(
+        self,
+        loop,
+        fd: int,
+        on_error: Callable[[Exception], None] | None = None,
+        *,
+        max_pending_bytes: int = 4 * 1024 * 1024,
+        on_flow=None,
+    ):
+        """Prepare the write queue and error and backpressure callbacks without owning the
+        FD.
+        """
         self.loop = loop
         self.fd = fd
         self.on_error = on_error
@@ -34,13 +43,18 @@ class FDWriter:
         self._paused = False
 
     def write(self, data: bytes | bytearray) -> None:
+        """Queue bytes in order and write as much as possible immediately.
+
+        Report queue overflow and permanent I/O errors to the caller. Retain the
+        remainder of partial writes.
+        """
         if self.closed:
             raise RuntimeError("Writer is closed")
         if self.error:
             raise self.error
         if data:
             if self.pending_bytes + len(data) > self.max_pending_bytes:
-                raise BufferError('Pending terminal writes exceed the byte limit')
+                raise BufferError("Pending terminal writes exceed the byte limit")
             self.pending.append(memoryview(bytes(data)))
             self.pending_bytes += len(data)
             self._flush()
@@ -48,6 +62,7 @@ class FDWriter:
             raise self.error
 
     def _unwatch(self) -> None:
+        """Remove write-readiness monitoring and cancel scheduled retries."""
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
@@ -56,10 +71,12 @@ class FDWriter:
             self._watching = False
 
     def _resume(self) -> None:
+        """Clear the scheduled callback and retry pending writes."""
         self._scheduled = None
         self._flush()
 
     def _finish_waiters(self) -> None:
+        """Wake drain waiters without setting an exception on their Futures."""
         for waiter in self._waiters:
             if not waiter.done():
                 # Errors are raised by drain(), avoiding unobserved exceptions.
@@ -67,6 +84,7 @@ class FDWriter:
         self._waiters.clear()
 
     def _flush(self) -> None:
+        """Drain the queue within a callback work budget and wait for readiness as needed."""
         if self.closed or self.error:
             return
         budget = 65536
@@ -103,7 +121,10 @@ class FDWriter:
                 self._unwatch()
                 self._finish_waiters()
             if self.on_flow:
-                if not self._paused and self.pending_bytes >= self.max_pending_bytes // 2:
+                if (
+                    not self._paused
+                    and self.pending_bytes >= self.max_pending_bytes // 2
+                ):
                     self._paused = True
                     self.on_flow(True)
                 elif self._paused and self.pending_bytes <= self.max_pending_bytes // 4:
@@ -119,6 +140,7 @@ class FDWriter:
                 self.on_error(exc)
 
     async def drain(self) -> None:
+        """Wait for the current queue to drain and raise any stored error."""
         if self.pending and not self.error and not self.closed:
             waiter = self.loop.create_future()
             self._waiters.add(waiter)
@@ -132,6 +154,7 @@ class FDWriter:
             raise RuntimeError("Writer is closed")
 
     def close(self) -> None:
+        """Cancel waiters and monitoring and discard the queue without closing the FD."""
         self.closed = True
         self._unwatch()
         self.pending.clear()

@@ -1,3 +1,5 @@
+"""Module and console entry points that parse CLI options and start ish sessions."""
+
 from __future__ import annotations
 
 import ish.stdlib
@@ -5,9 +7,10 @@ from ish.parser.cli import ArgumentParser
 
 
 def main():
-	option = ArgumentParser()
-	option.parse()
+    """Parse command-line arguments and run the selected interactive shell UI."""
+    option = ArgumentParser()
+    option.parse()
 
 
-if __name__ == '__main__':
-	main()
+if __name__ == "__main__":
+    main()

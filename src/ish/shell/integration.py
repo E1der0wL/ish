@@ -1,30 +1,49 @@
+"""Write session-specific shell scripts and build the C typeahead forwarding tool.
+
+Runtime files live in a caller-supplied directory; script templates are defined in
+scripts.
+"""
+
 from __future__ import annotations
 
 import os
 import textwrap
 import traceback
 from pathlib import Path
-from typing import Dict
 
 from ish.config import config
-from ish.log import get_logger
 from ish.lang import i18n
+from ish.log import get_logger
 
+from .adapters import ADAPTERS
 from .constants import (
-	ALIAS, ENVIRON, EXITCODE, BEFORE_PROMPT, AFTER_PROMPT,
-	BEFORE_CONTINUATION, AFTER_CONTINUATION, COMMAND_START, COMMAND_DONE,
-	FORWARD_BINARY, FORWARD_SOURCE, bytes_to_shell_escape,
+    AFTER_CONTINUATION,
+    AFTER_PROMPT,
+    BEFORE_CONTINUATION,
+    BEFORE_PROMPT,
+    COMMAND_DONE,
+    COMMAND_START,
+    FORWARD_BINARY,
+    FORWARD_SOURCE,
+    bytes_to_shell_escape,
 )
-from .protocol import SOH, RS, US, EOT, VERSION
+from .protocol import EOT, RS, SOH, US, VERSION
+from .scripts import make_scripts
 
 __all__ = [
-	'BEFORE_PROMPT', 'AFTER_PROMPT',
-	'BEFORE_CONTINUATION',
-	'AFTER_CONTINUATION',
-	'COMMAND_START', 'COMMAND_DONE',
-	'SOH', 'RS', 'US', 'EOT',
-	'SHELL_INTEGRATION_MAP',
-	'install_scripts', 'build_binary'
+    "BEFORE_PROMPT",
+    "AFTER_PROMPT",
+    "BEFORE_CONTINUATION",
+    "AFTER_CONTINUATION",
+    "COMMAND_START",
+    "COMMAND_DONE",
+    "SOH",
+    "RS",
+    "US",
+    "EOT",
+    "SHELL_INTEGRATION_MAP",
+    "install_scripts",
+    "build_binary",
 ]
 
 
@@ -47,9 +66,6 @@ BIN_EOT = bytes_to_shell_escape(EOT)
 
 ISH_FORWARD = str(config.XDG_DATA_HOME / FORWARD_BINARY)
 
-
-from .adapters import ADAPTERS
-from .scripts import make_scripts
 
 SHELL_INTEGRATION = make_scripts(config.XDG_DATA_HOME)
 SHELL_INTEGRATION_MAP = {name: adapter.script for name, adapter in ADAPTERS.items()}
@@ -117,40 +133,59 @@ cleanup:
 
 
 def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
-	from .constants import SessionSignals
-	ish_xdg_home: Path = directory or config.XDG_DATA_HOME
-	ish_xdg_home.mkdir(parents=True, exist_ok=True)
-	for name, content in make_scripts(ish_xdg_home, signals=signals or SessionSignals(),
-		forward_path=forward_path or Path(ISH_FORWARD)).items():
-		script_path = ish_xdg_home / name
-		with open(script_path, "w", encoding="utf-8", newline="\n") as file:
-			file.write(content)
-		os.chmod(script_path, 0o644)
-	return ish_xdg_home
+    """Write integration scripts with session identifiers and forwarding paths.
+
+    Use UTF-8, LF line endings, and mode 0644. The caller owns directory cleanup.
+    """
+    from .constants import SessionSignals
+
+    ish_xdg_home: Path = directory or config.XDG_DATA_HOME
+    ish_xdg_home.mkdir(parents=True, exist_ok=True)
+    for name, content in make_scripts(
+        ish_xdg_home,
+        signals=signals or SessionSignals(),
+        forward_path=forward_path or Path(ISH_FORWARD),
+    ).items():
+        script_path = ish_xdg_home / name
+        with open(script_path, "w", encoding="utf-8", newline="\n") as file:
+            file.write(content)
+        os.chmod(script_path, 0o644)
+    return ish_xdg_home
 
 
 def build_binary(*, directory=None) -> bool:
-	logger = get_logger()
-	ish_xdg_home: Path = directory or config.XDG_DATA_HOME
-	ish_xdg_home.mkdir(parents=True, exist_ok=True)
-	src_path = ish_xdg_home / FORWARD_SOURCE
-	bin_path = ish_xdg_home / FORWARD_BINARY if directory is not None else Path(ISH_FORWARD)
-	import subprocess
-	try:
-		src_path.write_text(TTY_FORWARD, encoding='utf-8')
-		cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path)]
-		result = subprocess.run(cmd, capture_output=True)
-		if result.returncode != 0:
-			logger.error("gcc failed (exit %s): %s", result.returncode,
-				result.stderr.decode('utf-8', errors='replace').strip())
-			return False
-		os.chmod(bin_path, 0o755)
-		return True
-	except FileNotFoundError as exc:
-		logger.error("Could not build ish_forward: %s. Ensure gcc is installed.", exc)
-		return False
-	except Exception:
-		logger.error(i18n.get("error", error=traceback.format_exc()))
-		return False
-	finally:
-		src_path.unlink(missing_ok=True)
+    """Build the forwarding tool with GCC and report success.
+
+    Log build diagnostics and remove temporary C source. The host must permit execution
+    through both file permissions and the directory's mount policy, including noexec.
+    """
+    logger = get_logger()
+    ish_xdg_home: Path = directory or config.XDG_DATA_HOME
+    ish_xdg_home.mkdir(parents=True, exist_ok=True)
+    src_path = ish_xdg_home / FORWARD_SOURCE
+    bin_path = (
+        ish_xdg_home / FORWARD_BINARY if directory is not None else Path(ISH_FORWARD)
+    )
+    import subprocess
+
+    try:
+        src_path.write_text(TTY_FORWARD, encoding="utf-8")
+        cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path)]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            logger.error(
+                "gcc failed (exit %s): %s",
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return False
+        os.chmod(bin_path, 0o755)
+        return True
+    except FileNotFoundError as exc:
+        logger.error("Could not build ish_forward: %s. Ensure gcc is installed.", exc)
+        return False
+    except Exception:
+        logger.error(i18n.get("error", error=traceback.format_exc()))
+        return False
+    finally:
+        src_path.unlink(missing_ok=True)

@@ -12,11 +12,20 @@ VERSION = b"ISH2"
 
 
 class FrameDecoder:
+    """Decode multiple FIFO frames and partial tails within a byte limit."""
+
     def __init__(self, max_frame_bytes=16 * 1024 * 1024):
+        """Initialize the receive buffer and maximum frame size."""
         self.buffer = bytearray()
         self.max_frame_bytes = max_frame_bytes
 
     def feed(self, chunk: bytes):
+        """Return complete category-payload pairs from a chunk and retain the remaining
+        tail.
+
+        Decode ISH2 payloads as strict base64 and reject invalid encodings or oversized
+        frames.
+        """
         self.buffer.extend(chunk)
         records = []
         consumed = 0
@@ -35,11 +44,11 @@ class FrameDecoder:
             if end - start > self.max_frame_bytes:
                 self.buffer.clear()
                 raise ValueError("Shell context frame exceeds size limit")
-            payload = bytes(self.buffer[start + 1:end])
+            payload = bytes(self.buffer[start + 1 : end])
             consumed = end + 1
             encoded = payload.startswith(VERSION + RS)
             if encoded:
-                payload = payload[len(VERSION) + 1:]
+                payload = payload[len(VERSION) + 1 :]
             for record in payload.split(RS):
                 if US not in record:
                     continue

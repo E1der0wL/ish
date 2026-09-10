@@ -24,10 +24,17 @@ class ShellANSI(ANSI):
     """
 
     _STRING_STARTS = {"P": "DCS", "X": "SOS", "]": "OSC", "^": "PM", "_": "APC"}
-    _C1_STARTS = {"\x90": "DCS", "\x98": "SOS", "\x9d": "OSC", "\x9e": "PM", "\x9f": "APC"}
+    _C1_STARTS = {
+        "\x90": "DCS",
+        "\x98": "SOS",
+        "\x9d": "OSC",
+        "\x9e": "PM",
+        "\x9f": "APC",
+    }
     _MAX_CONTROL = 65536
 
     def __init__(self, value: str) -> None:
+        """Prepare title metadata and parse content through the parent ANSI formatter."""
         self.title: str | None = None
         self.icon_title: str | None = None
         super().__init__(value)
@@ -43,6 +50,9 @@ class ShellANSI(ANSI):
                     self.icon_title = text
 
     def _parse_corot(self) -> Generator[None, str, None]:
+        """Separate control sequences from text and pass only supported styles to the
+        parent.
+        """
         parent = super()._parse_corot()
         next(parent)
         state = "text"
@@ -51,6 +61,7 @@ class ShellANSI(ANSI):
         overflow = False
 
         def append(char: str) -> None:
+            """Retain control payload within the limit and record overflow."""
             nonlocal overflow
             if len(buffer) < self._MAX_CONTROL:
                 buffer.append(char)
@@ -58,6 +69,7 @@ class ShellANSI(ANSI):
                 overflow = True
 
         def finish() -> None:
+            """Handle a complete control sequence and return to ordinary text parsing."""
             nonlocal state
             if not overflow:
                 self.handle_control(kind, "".join(buffer))
@@ -121,9 +133,12 @@ class ShellANSI(ANSI):
                     if "@" <= char <= "~":
                         # Delegate only the grammar and operations ANSI supports.
                         # Otherwise e.g. CSI ?25l leaks '25l' through its parser.
-                        if (not overflow and char in ("m", "C")
-                                and all(c in "0123456789;" for c in buffer)
-                                and all(len(p) <= 4 for p in "".join(buffer).split(";"))):
+                        if (
+                            not overflow
+                            and char in ("m", "C")
+                            and all(c in "0123456789;" for c in buffer)
+                            and all(len(p) <= 4 for p in "".join(buffer).split(";"))
+                        ):
                             for part in ("\x1b", "[", *buffer, char):
                                 parent.send(part)
                             buffer.clear()
@@ -154,7 +169,9 @@ class ShellANSI(ANSI):
             parent.close()
 
     def format(self, *args: str, **kwargs: str) -> ShellANSI:
+        """Preserve ShellANSI parsing and metadata handling after string formatting."""
         return type(self)(super().format(*args, **kwargs).value)
 
     def __mod__(self, value: object) -> ShellANSI:
+        """Return a ShellANSI instance after percent formatting."""
         return type(self)(super().__mod__(value).value)

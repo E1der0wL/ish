@@ -9,7 +9,11 @@
 
 현재 `posix`에는 bash·zsh·sh, `csh`에는 csh·tcsh가 속합니다. 여기서 `posix`는 ish가 사용하는 공통 문법을 뜻하며 zsh 전체가 POSIX 표준을 준수한다는 의미는 아닙니다.
 
+zsh는 `-i`로 실행해 시스템·사용자 시작 설정을 읽습니다. 전역 설정을 생략하는 `-d`는 사용하지 않으며, 기본 ZLE는 연동 스크립트에서 끕니다. Bash의 `PROMPT_COMMAND`는 5.1 이상에서 배열을 사용하고, 이전 버전에서는 기존 문자열 훅과 종료 상태를 보존하는 함수 하나를 등록합니다. 버전별 처리는 `scripts.py`의 Bash 템플릿에 모았습니다. EL8의 Bash 4.4.20·zsh 5.5.1 재현 결과는 [EL8_COMPATIBILITY.md](D:/Programs/ish/dev/EL8_COMPATIBILITY.md)에 있습니다.
+
 `ShellBehavior`는 문법과 별도로 선택합니다. 현재 지원하는 모든 셸은 보조 입력을 셸에 맡기고 여러 줄을 한 번에 보냅니다. C shell 계열은 보조 프롬프트와 같은 줄에 남은 선입력 표시도 유지합니다. 기본 입력 편집·자동완성은 prompt-toolkit이 담당합니다. 같은 문법을 쓰는 셸이라도 필요한 정책을 개별적으로 설정할 수 있습니다. 새 정책에서도 셸에 넘긴 입력을 `tcflush()`로 지우거나 복사본으로 재생하지 않아야 합니다.
+
+`preserve_output_line`은 `OutputLine`으로 일반 텍스트·SGR 색상 코드만 프롬프트 접두부에 보존합니다. 화면 전환·커서 이동·삭제·단독 CR 등으로 화면을 조작한 명령의 출력은 접두부로 복사하지 않습니다. 원본 PTY 출력은 그대로 전달합니다. `Sequencer.output_callback`은 프롬프트 콜백보다 앞선 출력부터 순서대로 알려주므로, 같은 읽기에 섞인 프롬프트 뒤의 출력이 접두부로 들어가지 않습니다. [TUI_RETURN.md](D:/Programs/ish/dev/TUI_RETURN.md)에 재현과 검증을 기록했습니다.
 
 `idle_recovery` 설정과 프로세스 유휴 상태를 조회하는 `_recover` 루프는 제거했습니다. 기본 프롬프트를 확인한 시점에만 context 동기화·복구를 수행합니다. `ShellSyntax.preserve_status()`는 자동 재연결 명령 앞뒤로 셸의 종료 상태를 보존합니다. 다른 문법을 추가할 때 `restore_status` 표현식도 지정해야 합니다. 모든 마커·훅이 사라지면 원시 입력을 유지하며 사용자가 셸 프롬프트에서 `ish_recover`로 재연결할 수 있습니다. 자세한 경계와 제약은 [STREAMING_REVIEW.md](D:/Programs/ish/dev/STREAMING_REVIEW.md)의 개선 결과에 정리했습니다.
 
@@ -30,9 +34,11 @@
 from dataclasses import replace
 
 # ADAPTERS 선언 뒤, SHELL_CATEGORIES 생성 전에 추가
-ADAPTERS['new-shell'] = replace(
-    ADAPTERS['tcsh'], name='new-shell',
-    args=('-i',), script=NEW_SHELL_INTEGRATION_SCRIPT,
+ADAPTERS["new-shell"] = replace(
+    ADAPTERS["tcsh"],
+    name="new-shell",
+    args=("-i",),
+    script=NEW_SHELL_INTEGRATION_SCRIPT,
 )
 ```
 
