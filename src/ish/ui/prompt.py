@@ -222,8 +222,12 @@ class Prompt(PromptSession):
         self.shell = self.interactive_shell.shell
 
         self.process_handler: ProcessHandler = ProcessHandler(
-            encoder=self.encoder, stdin=input_fd, stdout=output_fd
+            encoder=self.encoder,
+            stdin=input_fd,
+            stdout=output_fd,
+            get_terminal_fd=lambda: self.interactive_shell.master_fd,
         )
+        self.interactive_shell.resize_callback = self.process_handler.resize
 
         self.pre_hook: Optional[Callable[..., Any]] = None
         self.post_hook: Optional[Callable[..., Any]] = None

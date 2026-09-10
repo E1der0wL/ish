@@ -1,7 +1,7 @@
 """Run Python tools in separate processes with controlling PTYs.
 
-The parent event loop relays I/O, transfers file descriptors, and drains output after
-process exit.
+The parent event loop relays I/O, transfers file descriptors and terminal sizes, and
+drains output after process exit.
 """
 
 from __future__ import annotations
@@ -70,11 +70,38 @@ class ProcessHandler:
         *,
         stdin: int | None = None,
         stdout: int | None = None,
+        get_terminal_fd: Callable[[], int | None] | None = None,
     ):
-        """Store caller-owned I/O descriptors and the worker stream encoding."""
+        """Store I/O descriptors and a lazy getter for the shell's current PTY.
+
+        Without a shell PTY, use stdin's size, falling back to 24 rows and 80 columns
+        for non-terminal input. The caller forwards size changes through resize().
+        """
         self.encoder = encoder
         self.stdin_fd = sys.stdin.fileno() if stdin is None else stdin
         self.stdout_fd = sys.stdout.fileno() if stdout is None else stdout
+        self.get_terminal_fd = get_terminal_fd
+        self._master_fds: set[int] = set()
+
+    def _terminal_size(self) -> tuple[int, int]:
+        """Read the current source PTY size as rows and columns at the time of use."""
+        fd = self.get_terminal_fd() if self.get_terminal_fd is not None else None
+        try:
+            rows, columns = termios.tcgetwinsize(self.stdin_fd if fd is None else fd)
+        except (OSError, termios.error):
+            rows, columns = 0, 0
+        return rows or 24, columns or 80
+
+    def resize(self) -> None:
+        """Copy the shell's size to active workers without changing signal handlers.
+
+        Updating a controlling PTY also notifies its foreground process group of
+        SIGWINCH. Completed workers are removed before their descriptors are closed.
+        """
+        if self._master_fds:
+            size = self._terminal_size()
+            for fd in self._master_fds:
+                termios.tcsetwinsize(fd, size)
 
     async def run(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
         """Run a tool and return its exit code after draining output.
@@ -117,6 +144,10 @@ class ProcessHandler:
                 slave_owner = resources.enter_context(
                     os.fdopen(slave_fd, "rb", buffering=0)
                 )
+                self._master_fds.add(master_fd)
+                resources.callback(self._master_fds.discard, master_fd)
+                # Set dimensions before the child can initialize a terminal UI.
+                termios.tcsetwinsize(master_fd, self._terminal_size())
                 os.set_blocking(master_fd, False)
                 input_writer = FDWriter(loop, master_fd, fail)
                 output_writer = FDWriter(loop, self.stdout_fd, fail)

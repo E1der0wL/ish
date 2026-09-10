@@ -227,6 +227,7 @@ class InteractiveShell:
         "_output_task",
         "_output_paused",
         "_closing_output",
+        "resize_callback",
     )
 
     def __init__(
@@ -280,6 +281,7 @@ class InteractiveShell:
         self._output_task = None
         self._output_paused = False
         self._closing_output = False
+        self.resize_callback: Optional[Callable[[], None]] = None
         self._context_id = self._prompt_id = 0
         self._context_event = asyncio.Event()
         self._native_output_line = OutputLine()
@@ -339,7 +341,22 @@ class InteractiveShell:
     def _signal_handler(self, signum: int, frame: Optional[types.FrameType]) -> None:
         """Handle SIGWINCH by matching the internal PTY size to the current terminal."""
         if signum == signal.SIGWINCH:
-            self._sigwinch(self.master_fd, *shutil.get_terminal_size())
+            self._resize()
+
+    def _resize(self) -> None:
+        """Resize the shell first, then notify any active Python tool of its new size."""
+        if self.master_fd is None:
+            return
+        try:
+            rows, columns = termios.tcgetwinsize(self.stdin_fd)
+        except (OSError, termios.error):
+            rows, columns = 0, 0
+        if not rows or not columns:
+            fallback = shutil.get_terminal_size()
+            rows, columns = rows or fallback.lines, columns or fallback.columns
+        self._sigwinch(self.master_fd, columns, rows)
+        if self.resize_callback is not None:
+            self.resize_callback()
 
     def _set_prompt(self, prompt: bytes) -> None:
         # Stop forwarding as soon as the primary boundary is parsed, before
@@ -945,7 +962,7 @@ class InteractiveShell:
 
                 def on_resize():
                     """Resize the PTY, then call prompt-toolkit's original resize callback."""
-                    self._sigwinch(self.master_fd, *shutil.get_terminal_size())
+                    self._resize()
                     previous_resize()
 
                 self.session.app._on_resize = on_resize
@@ -974,7 +991,7 @@ class InteractiveShell:
                     signal.SIGWINCH, self._signal_handler, signal.SIGWINCH, None
                 )
                 resources.callback(self.loop.remove_signal_handler, signal.SIGWINCH)
-                self._sigwinch(self.master_fd, *shutil.get_terminal_size())
+                self._resize()
 
                 self._initializing = True
                 await self._spawn()
