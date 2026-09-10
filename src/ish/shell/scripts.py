@@ -7,6 +7,7 @@ from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
     BASH_INTEGRATION_SCRIPT,
+    BEFORE_BUFFERED_CONTINUATION,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
     CSH_INTEGRATION_SCRIPT,
@@ -55,6 +56,9 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
         "@START@": bytes_to_shell_escape(scope(BEFORE_PROMPT)),
         "@END@": bytes_to_shell_escape(scope(AFTER_PROMPT)),
         "@CONT_START@": bytes_to_shell_escape(scope(BEFORE_CONTINUATION)),
+        "@BUFFERED_CONT_START@": bytes_to_shell_escape(
+            scope(BEFORE_BUFFERED_CONTINUATION)
+        ),
         "@CONT_END@": bytes_to_shell_escape(scope(AFTER_CONTINUATION)),
         "@PROMPT_ID@": bytes_to_shell_escape(
             scope(PROMPT_ID_PREFIX) + b"%s" + OSC_TERMINATOR
@@ -105,13 +109,35 @@ _ish_capture_status() {
     _ish_shell_exit_code=$?
     return "$_ish_shell_exit_code"
 }
+_ish_continuation_start() {
+    # A zero timeout checks readiness without consuming or assigning input.
+    # Probe here, before Bash reads the next line, rather than after its output
+    # reaches Python and the shell may already have consumed the queued block.
+    if builtin read -t 0; then
+        builtin printf '@BUFFERED_CONT_START@'
+    else
+        builtin printf '@CONT_START@'
+    fi
+}
 _ish_precmd() {
     if [[ "$PS1" != *$'@START@'* ]]; then
         PS1="$(command printf '@START@')${PS1}$(command printf '@END@')"
     fi
-    if [[ "$PS2" != *$'@CONT_START@'* ]]; then
-        PS2="$(command printf '@CONT_START@')${PS2}$(command printf '@CONT_END@')"
+    if [[ ${PS2-} != "${_ish_wrapped_ps2-}" ]]; then
+        _ish_original_ps2=${PS2-}
+        # Users may prepend or append text to the already wrapped PS2. Remove
+        # only our own markers before wrapping the edited prompt once again.
+        _ish_original_ps2=${_ish_original_ps2//'$(_ish_continuation_start)'/}
+        _ish_original_ps2=${_ish_original_ps2//$'@CONT_START@'/}
+        _ish_original_ps2=${_ish_original_ps2//$'@CONT_END@'/}
     fi
+    if builtin shopt -q promptvars; then
+        PS2='$(_ish_continuation_start)'"${_ish_original_ps2-}"$'@CONT_END@'
+    else
+        # Keep literal prompts literal when the user disables prompt expansion.
+        PS2=$'@CONT_START@'"${_ish_original_ps2-}"$'@CONT_END@'
+    fi
+    _ish_wrapped_ps2=$PS2
     _ish_update "$_ish_shell_exit_code"
     _ish_forward
     _ish_mark_prompt

@@ -9,6 +9,7 @@ from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
     BASH_INTEGRATION_SCRIPT,
+    BEFORE_BUFFERED_CONTINUATION,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
     CARET_AFTER_PROMPT,
@@ -144,6 +145,7 @@ class ShellAdapter:
     refresh_script: str | None = None
     capture_refresh_status: bool = False
     unhooked_prompt: tuple[bytes, bytes] | None = None
+    buffered_continuation: tuple[bytes, bytes] | None = None
     builtins_command: str = ""
     builtins: tuple[str, ...] = ()
 
@@ -221,6 +223,11 @@ class ShellAdapter:
         sequencer.between_sequence(
             scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation
         )
+        if self.buffered_continuation:
+            sequencer.between_sequence(
+                *(scope(marker) for marker in self.buffered_continuation),
+                lambda prompt: continuation(prompt, buffered=True),
+            )
         if self.unhooked_prompt:
             sequencer.between_sequence(
                 *(scope(marker) for marker in self.unhooked_prompt), unhooked_prompt
@@ -234,6 +241,7 @@ ADAPTERS = {
         ("--noediting", "-i"),
         BASH_INTEGRATION_SCRIPT,
         source_command="source",
+        buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
     ),
     "zsh": ShellAdapter(

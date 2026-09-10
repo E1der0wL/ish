@@ -406,11 +406,17 @@ class InteractiveShell:
                     "Shell context was not received after a confirmed prompt"
                 ) from None
 
-    def _set_continuation(self, prompt: bytes) -> Optional[bytes]:
+    def _set_continuation(
+        self, prompt: bytes, *, buffered: bool = False
+    ) -> Optional[bytes]:
         """Keep continuation input with the shell or pass it to the editor per adapter
         policy.
         """
         self.continuation_active.set()
+        if buffered:
+            # The shell checked readiness before reading its next line. The
+            # editor already displayed that submitted input; omit only this PS2.
+            return None
         if self.adapter.behavior.native_continuation:
             # The shell may already have read the complete foreach body into
             # its own buffer. Keep one input owner until the primary prompt.

@@ -113,6 +113,12 @@ confirming that the underlying shell is waiting for a command.
 At the primary prompt, Ctrl+C cancels editing without changing the shell's exit
 status. Native Readline and ZLE editing are intentionally disabled there.
 
+With Bash's default `promptvars` option enabled, secondary prompts for already
+available input are omitted from command output. Incomplete blocks still show a
+secondary prompt when more input is needed. The readiness check does not consume
+input and runs only when Bash expands PS2. If `promptvars` is disabled, ish preserves
+literal PS2 behavior, including its secondary prompt display.
+
 ## Prompt extension API
 
 Use `set_tool`, `set_key`, and `set_float` in `.ishrc.py` to register, replace,
