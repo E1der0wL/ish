@@ -26,6 +26,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
+from ish.config import config
 from ish.fdio import FDWriter
 
 from .adapters import get_adapter
@@ -39,6 +40,7 @@ from .signal import ShellExitRequest, ShellPassRequest
 if TYPE_CHECKING:
     import types
     from asyncio import AbstractEventLoop
+
     from ish.ui.prompt import Prompt
 
 __all__ = ["InteractiveShell"]
@@ -883,13 +885,17 @@ class InteractiveShell:
 
         with contextlib.ExitStack() as resources:
             try:
+                # Each session owns its files; another session must never replace or
+                # clean up live FIFOs. Resolve rc overrides before the shell can cd.
+                cache_dir = config.CACHE_DIR.expanduser().resolve()
+                cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 pipe_dir = resources.enter_context(
-                    tempfile.TemporaryDirectory(prefix="ish-")
+                    tempfile.TemporaryDirectory(prefix="session-", dir=cache_dir)
                 )
                 runtime = Path(pipe_dir) / "integration"
                 if not build_binary(directory=runtime):
                     raise RuntimeError(
-                        "Failed to build ish_forward. Check the compiler error above."
+                        "Failed to prepare ish_forward. Check the error above."
                     )
 
                 self.exec_attrs = termios.tcgetattr(self.stdin_fd)

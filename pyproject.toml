@@ -20,6 +20,11 @@ dependencies = [
 ish = "ish.main:main"
 
 [dependency-groups]
+build = [
+    "nuitka==4.2.1",
+    "patchelf==0.19.1.0",
+    "zstandard==0.25.0",
+]
 dev = ["psutil==7.2.2", "ruff==0.16.6"]
 
 [tool.hatch.build.targets.wheel]

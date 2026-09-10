@@ -23,9 +23,36 @@ uv는 `.python-version`에 지정한 Python을 선택하고 `uv.lock`의 의존�
 CLI 시작 비용을 줄이기 위해 uv 동기화 시 의존성 바이트코드를 사전 컴파일합니다.
 WSL의 `/mnt/d`에 가상환경을 두면 파일 접근 때문에 첫 실행이 수 초 걸릴 수 있습니다.
 
-실행 호스트에는 사용할 셸, GCC, GNU coreutils(`base64 -w0`, `env -0`)가 필요합니다.
-ish는 실행할 때 보조 C 프로그램을 임시 디렉터리에서 빌드·실행하므로,
-해당 디렉터리에서 실행이 허용되어야 합니다.
+실행 호스트에는 사용할 셸과 GNU coreutils(`base64 -w0`, `env -0`)가 필요합니다.
+소스 실행에는 GCC도 필요합니다. Nuitka 배포본은 미리 빌드한 보조 프로그램을 포함합니다.
+셸 통합 스크립트, 보조 프로그램, FIFO는 `config.CACHE_DIR/session-...`에 생성하며,
+이 경로에서 실행이 허용되어야 합니다. 기본 위치는 `~/ish/.cache`입니다.
+
+## Linux distribution
+
+Build with Python 3.12.14 on the oldest Linux/glibc release you intend to support:
+
+```sh
+uv sync --locked --group build
+uv run --locked --group build python tools/build_nuitka.py --mode standalone
+uv run --locked --group build python tools/build_nuitka.py --mode onefile
+```
+
+The builder prints the release directory under `dist/nuitka/`. Test the executable
+in a real terminal, or run the automated PTY checks against it:
+
+```sh
+uv run --locked python tools/smoke_distribution.py /absolute/path/to/ish
+```
+
+Onefile extracts into a private directory under
+`~/ish/.cache/nuitka/<build-id>/launch-...` instead of `/tmp`, and cleans up on exit.
+Its files stay available for the full process lifetime. Shell sessions use separate
+`config.CACHE_DIR/session-...` directories and remove only their own files on exit.
+See [distribution details](docs/DISTRIBUTION.md) for cache lifetime, plugin dependency
+installation, target compatibility, and the scope of automated verification.
+The [local validation report](docs/DISTRIBUTION_VALIDATION.md) records the final
+artifact, checksums, actual test results, and the RHEL 8 compatibility limitation.
 
 ## 코드 검사
 
@@ -57,6 +84,47 @@ ISH_TEST_CSH=/usr/bin/bsd-csh uv run python -B -m unittest discover -s tests -p 
 기본 프롬프트에서는 ish가 편집을 담당하고, 명령 실행 중과 보조 프롬프트에서는
 셸이 입력을 읽습니다. 프롬프트 신호와 상태 FIFO가 모두 동기화된 뒤 UI로 돌아옵니다.
 셸 훅과 프롬프트 마커를 모두 제거한 경우 원시 셸 프롬프트에서 `ish_recover`로 복구합니다.
+
+## Prompt extension API
+
+Use `set_tool`, `set_key`, and `set_float` in `.ishrc.py` to register, replace,
+or remove extensions. These replace the former `add_*` and `delete_*` methods;
+update existing rc files and plugins to use the new names.
+
+```python
+from prompt_toolkit.widgets import Label
+
+prompt.set_tool("say", function=print)
+prompt.set_tool("say", function=None)
+prompt.set_tool("report", plugin_name="reports", function_name="run")
+
+
+def insert_example(event):
+    """Insert example text at the current cursor position."""
+    event.current_buffer.insert_text("example")
+
+
+prompt.set_key("c-x", handler=insert_example, eager=True)
+prompt.set_key("c-x", handler=None)
+prompt.set_key(insert_example)  # Remove all bindings using this handler.
+
+panel = prompt.set_float(Label("Status"), top=0, right=0)
+panel = prompt.set_float(Label("Updated"), target_float=panel, top=0, right=0)
+prompt.set_float(target_float=panel)
+prompt.set_float()  # Clear all custom floats.
+```
+
+Setting a tool replaces the callable for its command name. Tool functions run in
+a spawned worker and must be pickleable; use an importable function such as `print`.
+Setting a key replaces every binding for that exact sequence, including conditional
+variants, and accepts the options supported by `KeyBindings.add`. A positional
+handler removes all bindings using that function. Removing an absent entry is a no-op.
+
+`set_float` returns a new `Float` handle. To replace a float, pass its current handle
+as `target_float` and retain the returned handle. Replacement preserves list order
+and uses default values for omitted `Float` options. Omitting content removes the
+target, or clears all custom floats when the target is also omitted. Invalid tool
+sources, key options, or float replacements raise errors before changing existing entries.
 
 ## Ruff 정책
 

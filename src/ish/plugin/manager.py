@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import importlib.metadata
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -233,6 +234,8 @@ class PluginManager:
             self.logger.warning(i18n.get("pip_install_fail", library=library))
             return False
 
+        if self.python_exe is None and "__compiled__" in globals():
+            self.python_exe = self._find_dependency_python()
         if not self.python_exe:
             self.logger.warning(i18n.get("pip_install_fail", library=library))
             return False
@@ -257,6 +260,45 @@ class PluginManager:
         except Exception:
             self.logger.warning(i18n.get("pip_install_fail", library=library))
             return False
+
+    def _find_dependency_python(self) -> Optional[str]:
+        """Find an ABI-compatible external Python for optional compiled plugin installs.
+
+        A Nuitka executable cannot act as Python's -m pip or -c command. Probe only
+        when an installation is requested; ordinary sessions need no host Python.
+        """
+        executable = os.environ.get("ISH_PLUGIN_PYTHON") or shutil.which(
+            f"python{sys.version_info.major}.{sys.version_info.minor}"
+        )
+        if executable:
+            try:
+                if Path(executable).resolve() == Path(sys.executable).resolve():
+                    raise ValueError("ISH_PLUGIN_PYTHON points to ish itself")
+                result = subprocess.run(
+                    [
+                        executable,
+                        "-c",
+                        "import sys; print('%d.%d' % sys.version_info[:2])",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+                if (
+                    result.stdout.strip()
+                    == f"{sys.version_info.major}.{sys.version_info.minor}"
+                ):
+                    return executable
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        self.logger.warning(
+            "Installing plugin dependencies requires an external Python %s.%s with pip. "
+            "Set ISH_PLUGIN_PYTHON to its executable path.",
+            sys.version_info.major,
+            sys.version_info.minor,
+        )
+        return None
 
     def _load_plugin(
         self, plugin_file: Path, plugin_name: str, meta: Optional[Dict]
@@ -408,7 +450,9 @@ class PluginManager:
             sys.path.insert(0, str(config.PLUGIN_SCRIPT_DIR))
 
         # Use the interpreter that owns ish's environment, including under uv.
-        self.python_exe = sys.executable
+        self.python_exe = None if "__compiled__" in globals() else sys.executable
+        if self.python_exe is None:
+            return self._load_plugins()
         try:
             ver_res = subprocess.run(
                 [
@@ -434,6 +478,10 @@ class PluginManager:
         if self.python_exe is None:
             self.logger.warning(i18n.get("pm_python_not_found"))
 
+        return self._load_plugins()
+
+    def _load_plugins(self) -> List[Any]:
+        """Load plugin directories after configuring dependency installation and imports."""
         loaded_infos = []
         plugin_dirs = [
             d

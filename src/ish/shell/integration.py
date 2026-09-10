@@ -7,6 +7,7 @@ scripts.
 from __future__ import annotations
 
 import os
+import shutil
 import textwrap
 import traceback
 from pathlib import Path
@@ -21,6 +22,7 @@ from .constants import (
     AFTER_PROMPT,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
+    BUNDLED_FORWARD_DIRECTORY,
     COMMAND_DONE,
     COMMAND_START,
     FORWARD_BINARY,
@@ -154,7 +156,7 @@ def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
 
 
 def build_binary(*, directory=None) -> bool:
-    """Build the forwarding tool with GCC and report success.
+    """Copy the bundled forwarding tool, or build it with GCC in a source checkout.
 
     Log build diagnostics and remove temporary C source. The host must permit execution
     through both file permissions and the directory's mount policy, including noexec.
@@ -169,6 +171,15 @@ def build_binary(*, directory=None) -> bool:
     import subprocess
 
     try:
+        if "__compiled__" in globals():
+            # Keep data outside the package name: the executable itself is "ish".
+            # __file__ retains the synthetic ish/shell/integration.py module path.
+            bundled = (
+                Path(__file__).parents[2] / BUNDLED_FORWARD_DIRECTORY / FORWARD_BINARY
+            )
+            shutil.copyfile(bundled, bin_path)
+            os.chmod(bin_path, 0o700)
+            return True
         src_path.write_text(TTY_FORWARD, encoding="utf-8")
         cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path)]
         result = subprocess.run(cmd, capture_output=True)
@@ -182,7 +193,7 @@ def build_binary(*, directory=None) -> bool:
         os.chmod(bin_path, 0o755)
         return True
     except FileNotFoundError as exc:
-        logger.error("Could not build ish_forward: %s. Ensure gcc is installed.", exc)
+        logger.error("Could not prepare ish_forward: %s", exc)
         return False
     except Exception:
         logger.error(i18n.get("error", error=traceback.format_exc()))

@@ -784,55 +784,119 @@ class Prompt(PromptSession):
             self.logger.exception("fallback hook failed")
             return
 
-    def add_tool(
+    def set_tool(
         self,
         cmd: str,
         plugin_name: Optional[str] = None,
         function_name: Optional[str] = None,
         function: Optional[Callable[..., Any]] = None,
     ) -> None:
-        """Bind a supplied callable or plugin function to an internal command name."""
-        if plugin_name and function_name:
+        """Set an internal tool, or remove it when no function source is supplied.
+
+        Supply either function or both plugin_name and function_name. Setting an
+        existing command replaces its callable. Invalid sources raise an error
+        without replacing the current tool; removing an unknown command is a no-op.
+        """
+        if plugin_name is not None or function_name is not None:
+            if not plugin_name or not function_name or function is not None:
+                raise ValueError(
+                    "Supply either function or both plugin_name and function_name"
+                )
+            if self.plugin_manager is None:
+                raise ValueError("No plugin manager is configured")
             plugin = self.plugin_manager.get(plugin_name)
-            if plugin and hasattr(plugin, function_name):
-                self.internal_tools[cmd] = getattr(plugin, function_name)
-        elif function:
-            self.internal_tools[cmd] = function
+            if plugin is None:
+                raise ValueError(f"Plugin is not loaded: {plugin_name}")
+            function = getattr(plugin, function_name, None)
+        elif function is None:
+            self.internal_tools.pop(cmd, None)
+            return
 
-    def delete_tool(self, cmd: str) -> None:
-        """Unregister an internal tool name."""
-        if cmd in self.internal_tools:
-            del self.internal_tools[cmd]
+        if not callable(function):
+            raise TypeError("The internal tool must be callable")
+        self.internal_tools[cmd] = function
 
-    def add_key(
+    def set_key(
         self,
-        *keys: Union[Keys, str],
-        handler: Callable[[KeyPressEvent], None],
+        *keys: Union[Keys, str, KeyHandlerCallable],
+        handler: Optional[KeyHandlerCallable] = None,
         **kwargs,
     ) -> None:
-        """Register a user handler for the given key and options."""
-        self.key_bindings.add(*keys, **kwargs)(handler)
+        """Replace bindings for an exact key sequence, or remove them with handler=None.
 
-    def delete_key(self, *args: Union[Keys, str, KeyHandlerCallable]) -> None:
-        """Remove a registered user handler from the key bindings."""
-        self.key_bindings.remove(*args)
-
-    def add_float(self, content: AnyContainer, **kwargs) -> None:
-        """Register an additional UI float and rebuild the layout."""
-        new_float = Float(content=content, **kwargs)
-        self.floats.append(new_float)
-        self._update_layout()
-
-    def delete_float(self, target_float: Optional[Float] = None) -> None:
-        """Remove the specified float, or all floats if omitted, and update the layout."""
-        if target_float is None:
-            if self.floats:
-                self.floats.clear()
-                self._update_layout()
+        Forward registration options to KeyBindings.add. Replacement removes all
+        bindings for that sequence, including conditional variants. Pass a single
+        callable positionally to remove every binding using that handler. Removing
+        an absent binding is a no-op; invalid replacements preserve existing bindings.
+        """
+        if not keys:
+            raise ValueError("Supply a key sequence or a handler to remove")
+        if handler is None and kwargs:
+            raise ValueError("Binding options require a handler")
+        by_handler = callable(keys[0])
+        if by_handler:
+            if len(keys) != 1 or handler is not None:
+                raise TypeError("A positional handler can only be used for removal")
         else:
-            if target_float in self.floats:
+            if not all(isinstance(key, (Keys, str)) for key in keys):
+                raise TypeError("Keys must be strings or Keys values")
+            # Normalize aliases through the public API, even for disabled bindings.
+            candidate = KeyBindings()
+            candidate.add(*keys)(lambda event: None)
+            keys = candidate.bindings[0].keys
+            # Validate replacement options before removing the current binding.
+            if handler is not None:
+                if not callable(handler):
+                    raise TypeError("The key handler must be callable")
+                candidate.add(*keys, **kwargs)(handler)
+
+        # In 3.0.53, remove can skip adjacent matches and raises UnboundLocalError
+        # for absent key sequences. Remove only known matches through its public API.
+        while any(
+            binding.handler == keys[0] if by_handler else binding.keys == keys
+            for binding in self.key_bindings.bindings
+        ):
+            self.key_bindings.remove(*keys)
+        if handler is not None:
+            self.key_bindings.add(*keys, **kwargs)(handler)
+
+    def set_float(
+        self,
+        content: Optional[AnyContainer] = None,
+        *,
+        target_float: Optional[Float] = None,
+        **kwargs,
+    ) -> Optional[Float]:
+        """Create or replace a float, or remove floats when content is None.
+
+        Return the new Float handle for later replacement or removal. Supplying
+        target_float replaces its list position with a newly configured Float;
+        omitted options use Float defaults. A missing replacement target raises
+        ValueError. With content=None, remove the target (missing targets are no-ops),
+        or clear all custom floats when no target is supplied. Removal returns None.
+        """
+        if content is None:
+            if kwargs:
+                raise ValueError("Float options require content")
+            if target_float is None:
+                if not self.floats:
+                    return None
+                self.floats.clear()
+            elif target_float in self.floats:
                 self.floats.remove(target_float)
-                self._update_layout()
+            else:
+                return None
+            self._update_layout()
+            return None
+
+        index = self.floats.index(target_float) if target_float is not None else None
+        new_float = Float(content=content, **kwargs)
+        if index is None:
+            self.floats.append(new_float)
+        else:
+            self.floats[index] = new_float
+        self._update_layout()
+        return new_float
 
     def set_completer(self, completer) -> None:
         """Deduplicate default and user completions and wrap them in a threaded completer."""
