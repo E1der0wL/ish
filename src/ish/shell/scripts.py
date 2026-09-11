@@ -316,7 +316,7 @@ source @CSH_BIND@
         + csh_init
         + r"""
 # Rebind installed wrappers without resetting saved editor/periodic state.
-alias ish_recover 'alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; alias postcmd _ish_postcmd'
+alias ish_recover 'if (1) glob; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; alias postcmd _ish_postcmd'
 unset notify
 set _ish_hook_path = @CSH_HOOK@
 set _ish_bind_path = @CSH_BIND@
@@ -336,11 +336,16 @@ if (! $?_ish_tcsh_installed) then
     # A sourced file also invokes postcmd for each line. Suspend that hook
     # only around our bookkeeping so it neither restores edit too early nor
     # calls the user's postcmd for integration commands.
-    alias _ish_precmd 'set _ish_shell_exit_code = $status; set status = $_ish_shell_exit_code; _ish_original_precmd; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; source "$_ish_hook_path"; alias postcmd _ish_postcmd'
+    # Ctrl+C in the secondary editor can leave redraw bytes in tcsh's output
+    # buffer. Backticks inherit that buffer and can capture it as alias text.
+    # The argument-free glob builtin flushes it to the terminal without adding
+    # output or forking. A one-line if bypasses aliases but still allows builtin
+    # lookup. Save status first so flushing does not change user hook status.
+    alias _ish_precmd 'set _ish_shell_exit_code = $status; if (1) glob; set status = $_ish_shell_exit_code; _ish_original_precmd; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; source "$_ish_hook_path"; alias postcmd _ish_postcmd'
     # postcmd runs after the user's input has been recorded in history and
     # before execution, even with edit unset. Keep setup out of the input line.
-    alias _ish_postcmd 'set _ish_exec_status = $status; if ($_ish_editor_suspended && $_ish_edit_enabled) set edit; set _ish_editor_suspended = 0; set status = $_ish_exec_status; _ish_original_postcmd; set status = $_ish_exec_status'
-    alias _ish_periodic 'set _ish_guard_status = $status; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_watch_path"; alias postcmd _ish_postcmd; set status = $_ish_guard_status'
+    alias _ish_postcmd 'set _ish_exec_status = $status; if (1) glob; if ($_ish_editor_suspended && $_ish_edit_enabled) set edit; set _ish_editor_suspended = 0; set status = $_ish_exec_status; _ish_original_postcmd; set status = $_ish_exec_status'
+    alias _ish_periodic 'set _ish_guard_status = $status; if (1) glob; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_watch_path"; alias postcmd _ish_postcmd; set status = $_ish_guard_status'
     alias precmd _ish_precmd
     alias periodic _ish_periodic
     set tperiod = 0
