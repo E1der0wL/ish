@@ -1,6 +1,6 @@
 """Build Linux distributions with a bundled helper and private extraction in user cache.
 
-Run with `uv run --group build python tools/build_nuitka.py`. Build on the oldest
+Run with `./tools/build.sh`. Build on the oldest
 Linux/glibc target you support; Nuitka does not make newer glibc backward compatible.
 """
 
@@ -27,7 +27,12 @@ from ish.shell.integration import build_binary
 def main() -> None:
     """Compile into a Linux build cache and copy only distributable files to dist."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("standalone", "onefile"), default="onefile")
+    parser.add_argument(
+        "--mode",
+        choices=("standalone", "onefile"),
+        default="standalone",
+        help="Distribution layout (default: standalone)",
+    )
     parser.add_argument(
         "--build-id", help="Unique release ID; never reuse for different binaries"
     )

@@ -1,277 +1,287 @@
 # ish
 
-ish is a command-line UI that communicates with Linux shells through a PTY and
-provides editing and completion through prompt-toolkit.
-It supports Bash, zsh, BSD csh, tcsh, and dash. On Windows, run it inside WSL.
+ish is an interactive command editor for Linux shells. It adds multiline editing,
+syntax highlighting, completion, paired-character input, and Python extensions
+through prompt-toolkit while your selected shell executes commands.
 
-## Command-line options
+Use ish on Linux or inside WSL on Windows. Native Windows and macOS execution are
+not supported. Run `ish --help` for command-line options and `ish --diagnose tcsh`
+for an environment report without starting an interactive session.
 
-```sh
-uv run ish --help
-uv run ish --version
-uv run ish --home "$HOME/ish-testing" --no-rc --no-plugins bash
-uv run ish --home "$HOME/ish-testing" --diagnose tcsh
-```
+## Supported shells
 
-The optional shell argument accepts a supported shell name or executable path.
-Without it, ish selects the login shell by name.
+The selected shell must be installed on the host; the distribution does not bundle
+shell executables. Specify a shell name or its executable path. If omitted, ish
+selects the login shell by name.
 
-| Option | Behavior |
-| --- | --- |
-| `--version` | Print the ish version and exit. |
-| `--no-rc` | Skip loading ish's `.ishrc.py` at startup. |
-| `--no-plugins` | Skip automatic plugin loading and its dependency installation. |
-| `--home DIR` | Select ish's settings, plugin, log, and cache base directory; defaults to `~/ish`. |
-| `--diagnose` | Print a read-only environment snapshot and exit. |
-| `-l LANG`, `--lang LANG` | Select the interface language, including help. |
-| `-h`, `--help` | Print help and exit. |
+| Shell | Argument | Support notes |
+| --- | --- | --- |
+| Bash | `bash` | Uses ish editing at the primary prompt with native Readline disabled. |
+| zsh | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
+| tcsh | `tcsh` | Supports prompt hooks and return to the ish editor. |
+| BSD csh | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
+| dash / sh | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
-`--home` expands `~` and resolves relative paths against the launch directory.
-It does not change the shell's `HOME`. Settings are selected before translations,
-plugins, and the user rc are loaded. The rc can still explicitly change configuration.
-The two loading flags operate independently; native shell startup files such as
-`.bashrc` and `.zshrc` are still read. Explicit plugin loading by user rc code is
-outside the automatic loading controlled by `--no-plugins`.
+A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
+named `sh` are not automatically covered by dash support.
 
-Help, version, and diagnostics do not create ish directories or translation files,
-load rc/plugins, or start an interactive session. Diagnostics report the selected
-shell path and adapter, runtime, terminal, cache permissions/mount flags, and helper
-availability before the rc runs. They execute no shell, compiler, or helper and
-are not an interactive health check. Exit status zero means the report completed;
-missing or unsupported resources are printed in the report.
+## Building with build.sh
 
-CLI descriptions, option help, and diagnostic labels are defined in `I18N` in
-`src/ish/lang/i18n.py`. Partial JSON translations under `<ish home>/lang/` fall
-back to built-in messages. For example, `--home DIR --lang ko --help` reads
-`DIR/lang/ko.json` without creating missing files.
+Build on Linux or inside WSL. Install **uv**, **GCC**, and the usual C development
+tools and headers first, and make `uv` available on `PATH`. The project selects
+Python **3.12.14** through `.python-version`. uv prepares the project environment
+and installs the locked application and build dependencies, including Nuitka.
+Downloads require network access unless the required Python and packages are
+already installed or cached.
 
-These options are available in the current source. The frozen release dated
-2026-09-12 predates them; rebuild the distribution to use the new CLI in a binary.
-
-## Development environment
-
-Use Python **3.12.14** and uv. Create `.venv` with Linux Python, including when
-working in WSL; do not share it with Windows Python.
-From the project directory (for example, `/mnt/d/Programs/ish` in WSL), run:
+From the repository root:
 
 ```sh
-cd /mnt/d/Programs/ish
-export PATH="$HOME/.local/bin:$PATH"
-uv sync --locked
-uv run ish tcsh
+chmod +x tools/build.sh
+./tools/build.sh
 ```
 
-The PATH example assumes uv is installed in `~/.local/bin`. Adjust it if your
-installation uses a different location.
-uv selects the Python version in `.python-version` and installs the dependencies
-recorded in `uv.lock`. The default sync also includes Ruff and psutil for development
-and testing. `uv run` does not require manually activating the virtual environment.
-Dependency bytecode is compiled during synchronization to reduce CLI startup work.
-Keeping the virtual environment on a WSL mount such as `/mnt/d` can add several
-seconds to the first launch because of filesystem access overhead.
-
-The host needs the selected shell. The bundled helper encodes state and collects
-the exported environment without depending on the shell's current `PATH`.
-C shell integration also uses the system `printf` resolved at startup.
-Interrupting queued submissions uses Linux's `TIOCGPTPEER` ioctl (Linux 4.13+).
-Running from source also requires GCC; Nuitka distributions include a precompiled
-helper. Integration scripts, the helper, and FIFOs are created under
-`config.CACHE_DIR/session-...`. The cache filesystem must allow executable files.
-The default cache location is `~/ish/.cache`.
-
-## Linux distribution
-
-Build with Python 3.12.14 on the oldest Linux/glibc release you intend to support:
+The default is a **standalone** build. Build options are forwarded to the Python
+driver:
 
 ```sh
-uv sync --locked --group build
-uv run --locked --group build python tools/build_nuitka.py --mode standalone
+./tools/build.sh --help
+./tools/build.sh --jobs 4
+./tools/build.sh --output-dir "$HOME/ish-release"
 ```
 
-The builder prints the release directory under `dist/nuitka/`. Test the executable
-in a real terminal, or run the automated PTY checks against it:
+The script also works when invoked by an absolute path from another directory.
+Relative `--output-dir` values are resolved against the repository root. Existing
+release directories are not overwritten.
+
+By default, the result is written under
+`dist/nuitka/<build-id>/standalone/`. The builder prints the actual path. Distribute
+the **entire `ish.dist` directory**, then run its executable:
 
 ```sh
-uv run --locked python tools/smoke_distribution.py /absolute/path/to/ish
+cd /path/to/release
+./ish.dist/ish bash
+./ish.dist/ish tcsh
+./ish.dist/ish --home "$HOME/ish-profile" zsh
 ```
 
-Deploy the entire `ish.dist` directory and run its `ish` executable. The current
-validated archive is `dist/ish-1.0.0-20260912-linux-x86_64.tar.gz`; within this
-checkout, `./dist/ish tcsh` launches the tested standalone bundle.
+The standalone application includes Python and the compiled state helper; normal
+use does not require host Python or GCC. Installing additional Python plugin
+dependencies can require a compatible external Python with pip. The selected
+shell and external commands must still be installed on the host.
 
-Nuitka 4.2.1 Onefile passed normal interactive checks but failed targeted TERM/HUP
-cleanup at its bootstrap boundary. Use standalone for the current release.
-Shell sessions use separate
-`config.CACHE_DIR/session-...` directories and remove only their own files on exit.
-See [distribution details](docs/DISTRIBUTION.md) for cache lifetime, plugin dependency
-installation, target compatibility, and the scope of automated verification.
-The [local validation report](docs/RELEASE_VALIDATION_20260912.md) records the final
-artifact, checksums, actual test results, and the RHEL 8 compatibility limitation.
+Onefile remains available through `--mode onefile`, but is not recommended with
+the pinned Nuitka 4.2.1: its bootstrap can bypass ish's TERM/HUP cleanup. Use
+standalone for the current release. Build on the oldest Linux/glibc environment
+you intend to support; a newer Ubuntu build is not automatically compatible with
+RHEL 8.10.
 
-## Stability and support scope
+## Customizing ish
 
-Normal interactive workflows have regression coverage across the five supported
-shells, including continuation input, history, hook recovery, and return from Vim
-and man. This supports controlled evaluation, but does not establish unattended
-or multi-day reliability on every target host.
+Create `~/ish/.ishrc.py` for your settings. With `--home DIR`, use
+`DIR/.ishrc.py` instead. This file receives `prompt`, `config`, `logger`, `option`,
+and `plugin` objects. Enter `ish_reload` to reload the rc file in a running session;
+restart ish after changing plugin source files.
 
-The [stability review](docs/STABILITY_REVIEW.md) records the remaining limitations
-and subsequent fixes. Internal Python tools now inherit the shell PTY's dimensions
-and receive live size changes. Catchable termination now restores terminal settings
-and releases session files; see [termination behavior](docs/TERMINATION.md).
-The latest standalone build includes these fixes and passed the compiled WSL
-checks, but requires a newer glibc than RHEL 8 provides. Rebuild and validate the actual deployment
-environment before treating the release as production-ready.
+`--no-rc` skips this startup file. `--no-plugins` skips automatic plugin loading.
+Neither option skips the selected shell's own startup files. `--home` changes
+ish's settings location without changing the shell's `HOME`.
 
-## Code checks
+### pre_hook, post_hook, and fallback_hook
 
-```sh
-uv run ruff check .
-uv run ruff format --check .
-uv run python -B -m unittest discover -s tests -p 'test_*.py' -v
+Hooks run for shell submissions made through the ish editor. The normal order is
+`pre_hook`, shell execution, `post_hook`, and then `fallback_hook` when a nonempty
+submission reports a nonzero shell exit status. Post/fallback hooks run after
+control returns from the shell; they are not shutdown callbacks. Internal Python
+tools do not trigger these shell hooks.
+
+Each hook is a synchronous function called **without arguments** in a separate
+Python worker. Hooks do not receive `prompt`, command text, or exit status, and
+their return values are ignored. Changing worker globals does not update the UI
+or the parent shell. Keep hooks short, since ish waits for them to finish.
+
+Define hooks and tools in an importable module. For example, create
+`~/ish/plugin/script/my_tools/__init__.py` with:
+
+```python
+PLUGIN_META = {"name": "my_tools", "version": "1.0.0"}
+
+
+def before_command():
+    """Announce a shell submission."""
+    print("Starting command...", flush=True)
+
+
+def after_command():
+    """Announce return from a shell submission."""
+    print("Command finished.", flush=True)
+
+
+def on_failure():
+    """Report a nonzero shell exit status."""
+    print("The command reported a failure.", flush=True)
+
+
+def greet(name="world"):
+    """Print a greeting from an internal Python tool."""
+    print(f"Hello, {name}!", flush=True)
 ```
 
-The local test suite is excluded from Git under the repository's current policy.
-The test commands require a separately retained copy of `tests/`; a fresh checkout
-after the tracking removal is committed will not contain it.
+For a custom home, place the module under `DIR/plugin/script/my_tools/`.
+Then connect the hooks in `.ishrc.py`:
 
-`tests/test.py` is a legacy generator that creates files when imported. It is
-excluded from linting and test discovery. CLI PTY tests allow up to 30 seconds for
-the first prompt to accommodate initial imports and helper compilation. Command
-responses and returns from TUIs use the deadlines defined by each test.
-Tests may skip shells that are not installed. If Ubuntu's `csh` is a symlink to
-tcsh, set `ISH_TEST_CSH` to an actual BSD csh executable to test that implementation:
+```python
+from my_tools import after_command, before_command, on_failure
 
-```sh
-ISH_TEST_CSH=/usr/bin/bsd-csh uv run python -B -m unittest discover -s tests -p 'test_*.py' -v
+prompt.pre_hook = before_command
+prompt.post_hook = after_command
+prompt.fallback_hook = on_failure
+
+# Set any hook to None to disable it.
+# prompt.pre_hook = None
 ```
 
-## Architecture
+Functions used as hooks or tools must be importable and pickleable. Avoid lambdas,
+nested functions, or functions defined only in `.ishrc.py` for these workers.
+Key handlers and completers can be defined directly in `.ishrc.py`.
 
-- `src/ish/shell`: shell adapters, integration scripts, FIFO framing, PTY I/O,
-  and prompt boundaries.
-- `src/ish/ui`: the prompt-toolkit editor, ANSI prompt rendering, and completion.
-- `src/ish/parser`: CLI options, shell output, command arguments, and completion context.
-- `src/ish/app`: Python tools running in separate processes with PTY connections.
-- `src/ish/plugin`: plugin registration, dependency checks, and loading.
-- `src/ish/lang`: translations and default messages.
+### set_tool
 
-ish owns editing at the primary prompt. During command execution and continuation
-prompts, input remains with the shell. The editor resumes after both the prompt
-signals and the state FIFO have synchronized on a fresh generation. Reprinting
-`PS1` cannot authorize a recovery command or transfer input to the editor.
-If reporting hooks are removed, input remains with the shell even when its
-prompt markers survive. Run `ish_recover` after confirming that the underlying
-shell is waiting for a command. No recovery commands are sent automatically.
-Dash reports state during PS1 expansion. BSD csh has no equivalent prompt hook:
-after a command it keeps native input until the user explicitly runs
-`ish_recover` to resume the ish editor. This limitation does not apply to a
-`csh` executable that resolves to tcsh.
-At the primary prompt, Ctrl+C cancels editing without changing the shell's exit
-status. Native Readline and ZLE editing are intentionally disabled there.
+Register a Python callable under an internal command name in `.ishrc.py`:
 
-Oversized input is gated by shell capability and input context. Bash, zsh, tcsh, and
-BSD csh may use a temporary TTY mode for a long first physical line at a confirmed
-primary prompt. The saved settings are restored before its newline is sent.
-Zsh additionally requires ish's verified SIGINT handler; existing custom or
-ignored SIGINT traps are preserved and disable long input. Dash/sh rejects lines
-over 4,095 encoded bytes; every shell rejects an
-oversized later line in a pasted block. Rejection keeps the entire block in the
-editor and displays a warning before running any part of it. Internal Python
-tools do not use this shell transport. See [long-input handling](docs/LONG_INPUT.md)
-for validation conditions, test results, and native-shell limits.
+```python
+from my_tools import greet
 
-With Bash's default `promptvars` option enabled, secondary prompts for already
-available input are omitted from command output. Incomplete blocks still show a
-secondary prompt when more input is needed. The readiness check does not consume
-input and runs only when Bash expands PS2. If `promptvars` is disabled, ish preserves
-literal PS2 behavior, including its secondary prompt display.
+prompt.set_tool("greet", function=greet)
+prompt.set_tool("say", function=print)
 
-During a large submission, Ctrl+C cancels unsent bytes and clears queued PTY
-input before forwarding the interrupt. A program that disables terminal signal
-processing continues to receive Ctrl+C as input, according to its terminal mode.
-See [input-boundary validation](docs/INPUT_BOUNDARIES.md) for the behavior changes,
-maintenance-cost measurements, and remaining limits.
+# Alternatively, resolve a function from an already loaded plugin.
+prompt.set_tool("greet", plugin_name="my_tools", function_name="greet")
 
-Input observation is available through `prompt.input_observer`. It is disabled
-by default and keeps a bounded metadata trace in memory when enabled. It does
-not block consumers or change input queues. See
-[input observation results](docs/INPUT_OBSERVATION.md) for setup, real-PTY
-comparisons, and the input-boundary limitations found during those checks.
-Those four input-transfer defects have since been addressed; see
-[input transfer fixes](docs/INPUT_TRANSFER.md) for the current behavior and validation.
+# Remove a registration by omitting the function source.
+# prompt.set_tool("greet")
+```
 
-Once a fresh shell state frame announces prompt return, newer keyboard input is
-held for the editor behind older forwarded input. Python tools receive already-read
-editor typeahead, and unread terminal input is returned when a tool exits. A tool
-that has already consumed bytes into its own memory cannot return them this way.
-BSD csh receives pending user keystrokes even while it remains in native input;
-its explicit `ish_recover` requirement for resuming the editor still applies.
+Enter `greet Alice` or `greet "Ada Lovelace"` at the ish prompt. Arguments are
+passed as positional strings. A repeated registration replaces the existing
+callable. Supply either `function` or the pair `plugin_name` and `function_name`.
 
-Submission generations and cached process-exit checks guard against stale sends
-and callbacks. Optional terminal snapshots observe mode, foreground group, and
-size at transitions without changing them. See [session guards](docs/SESSION_GUARDS.md)
-for cross-shell regressions, measured costs, and the cancellation policy deliberately
-excluded because it interfered with programs that handle SIGINT and keep reading.
+Tools run in Python workers. Shell operators, substitutions, and redirections
+such as `greet Alice | cat` are handed to the shell, which needs an actual external
+command or shell function of that name.
 
-SIGTERM and SIGHUP request one awaited shutdown from shell-session initialization
-onward, restoring terminal settings and removing the owning session directory.
-Repeated signals do not interrupt cleanup. See [termination behavior](docs/TERMINATION.md)
-for startup handling, TUI mode restoration, output deadlines, and limitations.
+### set_key
 
-## Prompt extension API
+Key handlers run in the UI process and receive a prompt-toolkit key event:
 
-Use `set_tool`, `set_key`, and `set_float` in `.ishrc.py` to register, replace,
-or remove extensions. These replace the former `add_*` and `delete_*` methods;
-update existing rc files and plugins to use the new names.
+```python
+def insert_pwd(event):
+    """Insert a command without submitting it."""
+    event.current_buffer.insert_text("pwd")
+
+
+prompt.set_key("f2", handler=insert_pwd)
+prompt.set_key("c-x", "c-e", handler=insert_pwd)
+
+# Remove one sequence or every custom binding using this handler.
+# prompt.set_key("f2")
+# prompt.set_key(insert_pwd)
+```
+
+Use key names or `prompt_toolkit.keys.Keys` values. Multiple positional keys form
+a sequence. Setting a sequence replaces its existing ish bindings, including
+conditional variants. Keyword options such as `filter` and `eager` are forwarded
+to prompt-toolkit's `KeyBindings.add`. Keep handlers short to avoid blocking input.
+
+### set_float
+
+Add a floating UI element and keep the returned handle for replacement or removal:
 
 ```python
 from prompt_toolkit.widgets import Label
 
-prompt.set_tool("say", function=print)
-prompt.set_tool("say", function=None)
-prompt.set_tool("report", plugin_name="reports", function_name="run")
+panel = prompt.set_float(Label("Ready"), top=0, right=0)
+panel = prompt.set_float(
+    Label("Updated"), target_float=panel, top=0, right=0
+)
 
-
-def insert_example(event):
-    """Insert example text at the current cursor position."""
-    event.current_buffer.insert_text("example")
-
-
-prompt.set_key("c-x", handler=insert_example, eager=True)
-prompt.set_key("c-x", handler=None)
-prompt.set_key(insert_example)  # Remove all bindings using this handler.
-
-panel = prompt.set_float(Label("Status"), top=0, right=0)
-panel = prompt.set_float(Label("Updated"), target_float=panel, top=0, right=0)
-prompt.set_float(target_float=panel)
-prompt.set_float()  # Clear all custom floats.
+# Remove the selected float, or clear all custom floats.
+# prompt.set_float(target_float=panel)
+# prompt.set_float()
 ```
 
-Setting a tool replaces the callable for its command name. Tool functions run in
-a spawned worker and must be pickleable; use an importable function such as `print`.
-Setting a key replaces every binding for that exact sequence, including conditional
-variants, and accepts the options supported by `KeyBindings.add`. A positional
-handler removes all bindings using that function. Removing an absent entry is a no-op.
+`content` accepts a prompt-toolkit container or widget. Additional keyword
+arguments configure the `Float`. Replacement preserves its position in the float
+list but returns a new handle; omitted options use their defaults.
 
-`set_float` returns a new `Float` handle. To replace a float, pass its current handle
-as `target_float` and retain the returned handle. Replacement preserves list order
-and uses default values for omitted `Float` options. Omitting content removes the
-target, or clears all custom floats when the target is also omitted. Invalid tool
-sources, key options, or float replacements raise errors before changing existing entries.
+### set_completer
 
-## Ruff policy
+Pass an **iterable of completers**, even when adding only one:
 
-The project enables E/W/F/I/B/C4/UP with the type-annotation exceptions listed in
-`pyproject.toml`. D100–D107 check for missing docstrings without enforcing the full
-pydocstyle rule set. The E722 exception applies only to the optional imports in
-`stdlib.py`; ordinary code avoids bare `except` clauses that also swallow
-`KeyboardInterrupt` and `SystemExit`. No S101 exception is needed because the S
-rule family is not enabled.
+```python
+from prompt_toolkit.completion import WordCompleter
 
-Ruff also checks locally available tests ignored by Git. The root-level `tests/`
-and `dev/` directories remain excluded from version control.
+prompt.set_completer([
+    WordCompleter(["greet", "say"], ignore_case=True)
+])
 
-Configuration references: [uv Python version selection](https://docs.astral.sh/uv/concepts/python-versions/),
-[uv bytecode compilation](https://docs.astral.sh/uv/reference/settings/#compile-bytecode),
-and [Ruff configuration](https://docs.astral.sh/ruff/configuration/).
+# Remove additional completers while retaining ish's default completion.
+# prompt.set_completer([])
+```
+
+ish merges these with its default completer, removes duplicate suggestions, and
+runs completion in a worker thread. Each call replaces the previous additional
+completers. A custom `Completer` implementation can also be supplied; its completion
+code should not mutate UI state from the worker thread.
+
+## Development environment
+
+The current development environment is Windows with WSL 2 running Ubuntu 26.04
+on x86-64 Linux 6.6.87.2. The project uses:
+
+| Component | Version |
+| --- | --- |
+| Python | 3.12.14 |
+| uv | 0.12.12 |
+| prompt-toolkit | 3.0.53 |
+| Pygments | 2.21.0 |
+| Nuitka | 4.2.1 |
+| GCC / glibc in the WSL build environment | 15 / 2.43 |
+
+For source execution, use a Linux virtual environment, including inside WSL:
+
+```sh
+uv sync --locked
+uv run ish bash
+```
+
+Do not share a virtual environment between Windows Python and Linux Python.
+GCC is needed for the helper when running from source. The lockfile records the
+application and build dependencies.
+
+## Support scope
+
+ish is intended for interactive Linux terminal use, including multiline commands,
+input-waiting programs, typeahead, paste, Ctrl+C, Python tools, and return from
+programs such as Vim and man. Linux kernel 4.13 or newer is required for the PTY
+input handling used by ish.
+
+- The primary prompt uses prompt-toolkit editing. Native Readline/ZLE bindings,
+  native editor widgets, and every aspect of shell prompt rendering are not
+  reproduced. At this prompt, Ctrl+C cancels editing without changing shell status.
+- If integration hooks are replaced or removed, confirm the shell is waiting for
+  a command and enter `ish_recover`. BSD csh requires this explicit return after
+  commands as described above.
+- Long input support depends on the shell and current input state. Bash, zsh,
+  tcsh, and BSD csh can accept a long first line at an eligible primary prompt.
+  A long later line in a pasted block is rejected, and dash/sh retains its
+  4,095-byte limit. Custom zsh SIGINT handling can disable long input support.
+- Session files are stored under `~/ish/.cache` by default. This location must be
+  writable and permit executable files. Regular shutdown and handled TERM/HUP
+  perform terminal and session cleanup; SIGKILL and OOM termination cannot do so.
+  Cleanup of a pipeline whose leading process exits before its remaining
+  processes is a known remaining limitation.
+- Support is bounded by the host, shell version, startup configuration, and
+  terminal. Indefinite unattended operation and compatibility with every Linux
+  distribution are not guaranteed. RHEL 8.10 deployment requires a compatible
+  build environment and confirmation on the actual host.
