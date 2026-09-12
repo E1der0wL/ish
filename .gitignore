@@ -23,6 +23,7 @@ wheels/
 share/python-wheels/
 /tests/
 /dev/
+/docs/
 *.egg-info/
 .installed.cfg
 *.egg
