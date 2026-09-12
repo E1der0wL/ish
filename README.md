@@ -42,7 +42,6 @@ Build with Python 3.12.14 on the oldest Linux/glibc release you intend to suppor
 ```sh
 uv sync --locked --group build
 uv run --locked --group build python tools/build_nuitka.py --mode standalone
-uv run --locked --group build python tools/build_nuitka.py --mode onefile
 ```
 
 The builder prints the release directory under `dist/nuitka/`. Test the executable
@@ -52,13 +51,17 @@ in a real terminal, or run the automated PTY checks against it:
 uv run --locked python tools/smoke_distribution.py /absolute/path/to/ish
 ```
 
-Onefile extracts into a private directory under
-`~/ish/.cache/nuitka/<build-id>/launch-...` instead of `/tmp`, and cleans up on exit.
-Its files stay available for the full process lifetime. Shell sessions use separate
+Deploy the entire `ish.dist` directory and run its `ish` executable. The current
+validated archive is `dist/ish-1.0.0-20260912-linux-x86_64.tar.gz`; within this
+checkout, `./dist/ish tcsh` launches the tested standalone bundle.
+
+Nuitka 4.2.1 Onefile passed normal interactive checks but failed targeted TERM/HUP
+cleanup at its bootstrap boundary. Use standalone for the current release.
+Shell sessions use separate
 `config.CACHE_DIR/session-...` directories and remove only their own files on exit.
 See [distribution details](docs/DISTRIBUTION.md) for cache lifetime, plugin dependency
 installation, target compatibility, and the scope of automated verification.
-The [local validation report](docs/DISTRIBUTION_VALIDATION.md) records the final
+The [local validation report](docs/RELEASE_VALIDATION_20260912.md) records the final
 artifact, checksums, actual test results, and the RHEL 8 compatibility limitation.
 
 ## Stability and support scope
@@ -72,8 +75,8 @@ The [stability review](docs/STABILITY_REVIEW.md) records the remaining limitatio
 and subsequent fixes. Internal Python tools now inherit the shell PTY's dimensions
 and receive live size changes. Catchable termination now restores terminal settings
 and releases session files; see [termination behavior](docs/TERMINATION.md).
-The existing WSL-built binary predates these source fixes and
-requires a newer glibc than RHEL 8 provides. Rebuild and validate the actual deployment
+The latest standalone build includes these fixes and passed the compiled WSL
+checks, but requires a newer glibc than RHEL 8 provides. Rebuild and validate the actual deployment
 environment before treating the release as production-ready.
 
 ## Code checks

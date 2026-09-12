@@ -1,6 +1,9 @@
 # Interactive shell engine reliability review
 
-Review date: 2026-09-12. This review does not change production code.
+Review date: 2026-09-12. The original review did not change production code.
+The subsequent prompt-capture and exit-status repairs are described in the
+follow-ups below. The foreground-pipeline finding remains open and is deferred
+at the user's request.
 
 ## Assessment
 
@@ -18,6 +21,9 @@ does not mean ordinary command execution, editing, or TUI return fails generally
 ## Newly reproduced findings
 
 ### P2: A truncated replay can swallow the next real prompt and hold input
+
+Status: addressed by the subsequent prompt-capture repair. The reproduction
+and evidence below describe the original behavior.
 
 In an otherwise normal Bash ish session, run:
 
@@ -56,6 +62,9 @@ Evidence: `dist/engine-reliability-unit-probes.jsonl`,
 
 ### P2: Native shell exit status is lost at the ish process boundary
 
+Status: addressed by the exit-status follow-up below. The reproduction here
+describes the original behavior.
+
 `exit 7` ended the inner shell but returned status **0** from ish on Bash, zsh,
 sh/dash, tcsh, and BSD csh. `_shell()` reads the child's status for observation,
 but `_run_session()` and `ShellSignalController.run()` do not return it through
@@ -76,6 +85,8 @@ Relevant paths: [base.py](../src/ish/shell/base.py) and
 `dist/engine-reliability-cli-probes.jsonl`.
 
 ### P2: A foreground pipeline can outlive shutdown after its leader exits
+
+Status: open; remediation is explicitly deferred at the user's request.
 
 The probe ran `true | python3 stubborn.py`, where the second process stayed in
 the foreground pipeline and ignored TERM/HUP. The first process, which was the
@@ -294,3 +305,73 @@ Diagnostic JSON is evidence, not an assertion suite: inspect `error`,
 `exact_order`, and each finding's observed result rather than treating a zero
 diagnostic process exit as a product pass. The pipeline probe cleans only its
 own captured descendant processes after recording the shutdown defect.
+
+## Follow-up: prompt capture repair
+
+The parser now retains the active prompt capture independently of the ANSI
+lexer's state. An ESC inside a capture enters the existing lexer. Registered
+session controls are dispatched normally, while ordinary text and unrelated
+controls stay in the capture. This includes zsh reader-readiness and interrupt
+acknowledgements, so resynchronizing a prompt does not lose those replies.
+
+Adapters mark only the prompt-ID prefix as a capture restart. Its existing
+callback must accept a valid increasing ID before the old capture is released.
+Stale, malformed, or foreign IDs cannot release it; a repeated prompt-start
+marker by itself is not sufficient. On release, the retained contents are
+emitted once in stream order, without their old opening marker and without
+calling the abandoned prompt callback. Previously emitted passthrough contents
+are not duplicated. Capture and control buffers retain their existing size
+limits; a truncated capture includes the existing truncation notice.
+
+The existing engine remains responsible for input ownership. A fresh ID alone
+does not return the editor. A complete new prompt and the matching FIFO
+generation are still required by `_accept_prompt()`. The older typeahead FIFO
+is still drained before newer deferred input. No recovery command, synthetic
+input, new timeout, or periodic check was added by this repair. If the shell
+never sends a complete fresh prompt, this change cannot reconstruct one.
+
+Controls inside an intact prompt are rendered by the prompt UI and do not
+claim to have changed native terminal modes. When a stale capture is released
+as terminal output, a bounded observer-only parse records its controls without
+replaying any shell-integration callback. This exceptional path preserves mode
+cleanup for the bytes that now actually reach the terminal.
+
+`tests/test_prompt_resync.py` adds split-boundary coverage for primary,
+continuation, buffered, and caret captures; malformed/foreign IDs; zsh replies;
+bounded oversized captures; EOF; passthrough output; terminal observation; both
+FIFO arrival orders; and real-shell queued input after a partial replay.
+
+The alternating before/after parser benchmark is recorded in
+`dist/prompt-resync-benchmark.jsonl` and can be repeated with
+`PYTHONPATH=src .venv/bin/python -B dev/benchmark_prompt_resync.py` while HEAD
+still contains the original parser. Plain and colored output showed no
+observed median slowdown in this run. The synthetic 5,000-prompt stream took
+0.419 seconds before and 0.490 seconds after: about 17% extra parser time, or
+0.014 milliseconds per prompt. This is not a measurement of interactive input
+latency; it reflects the additional parsing of controls inside prompt text.
+
+Final follow-up validation: **282 tests passed in 1,219.453 seconds**, with no
+failures or skips (273 existing tests plus nine new tests). Evidence:
+`dist/prompt-resync-full-suite.log`. This full run used the verified zsh 5.5.1
+fixture, tcsh 6.20.00, actual BSD csh, Bash 5.3.9, and sh/dash on WSL. It includes
+long input, interruption, native input waits, Python tools, TERM/HUP cleanup,
+runtime hook replacement, history, and Vim/man return. The previously failing
+zsh long-input/native-read assertion also passed in this full run; this does
+not retrospectively establish the cause of the earlier failure.
+
+This is source-execution validation on the local WSL host, not a new test on
+the corporate RHEL 8.10 system or a rebuilt Nuitka executable. The other two
+P2 findings remain outside this repair.
+
+## Follow-up: exit status propagation
+
+The native child wait result now passes through `_shell()`, `_run_session()`,
+the signal controller, and `main()` to `run()`. Final output and resource cleanup
+still finish first. Async callers receive the raw child status; the CLI maps a
+negative signal result to 128 plus the signal number. A requested TERM/HUP exit
+still takes precedence, and the explicit `ish_exit` editor command returns zero
+without adopting its cleanup-induced child HUP status.
+
+The deferred foreground-pipeline cleanup logic is unchanged. See
+[Exit status and Linux syscall validation](EXIT_STATUS_SYSCALL_VALIDATION.md)
+for the exact contract, test scenarios, results, and environment limits.

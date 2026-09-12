@@ -24,6 +24,8 @@ from pathlib import Path
 
 import psutil
 
+from ish.shell.adapters import get_adapter
+
 
 class Terminal:
     """Manage a PTY child with bounded waits and cleanup on failed assertions."""
@@ -82,16 +84,28 @@ class Terminal:
     def finish(self) -> None:
         """Exit normally and verify terminal restoration before closing the test PTY."""
         self.submit("ish_exit")
+        self.wait_exit(0)
+
+    def wait_exit(self, expected: int) -> None:
+        """Observe a requested exit without confusing PTY closure with process exit."""
         # A PTY may signal EIO before waitpid observes the exit.
         deadline = time.monotonic() + 15
         while not self.exited() and time.monotonic() < deadline:
             with contextlib.suppress(AssertionError):
                 self.until(self.exited, timeout=0.1)
             time.sleep(0.02)
-        assert self.status == 0, (self.status, bytes(self.output[-3500:]))
+        assert self.status == expected, (self.status, bytes(self.output[-3500:]))
         assert termios.tcgetattr(self.fd) == self.attrs, (
             "terminal settings not restored"
         )
+
+    def resume(self, reconnect: bool, timeout: float = 3) -> None:
+        """Explicitly reconnect BSD csh only after its real native prompt returns."""
+        if reconnect:
+            self.until(lambda: self.output.endswith(b"READY> "), timeout)
+            self.output.clear()
+            self.send(b"ish_recover\r")
+        self.until(self.ready, timeout)
 
     def close(self) -> None:
         """Kill only this test process and its descendants if normal exit did not complete."""
@@ -165,6 +179,8 @@ def exercise(
     executable = os.environ.get("ISH_TEST_" + shell.upper()) or shutil.which(shell)
     if not executable:
         raise RuntimeError(f"Shell not installed: {shell}")
+    reconnect = get_adapter(shell, executable).refresh
+    suffix = "; ish_recover" if reconnect else ""
     terminals = []
     started = time.monotonic()
     try:
@@ -213,8 +229,8 @@ def exercise(
             terminal.until(lambda t=terminal: b"INTERRUPT_READY\r\n" in t.output)
             terminal.output.clear()
             terminal.send(b"\x03")
-            terminal.until(terminal.ready, 3)
-            terminal.submit(f"echo CACHE_OK > shell-{index}")
+            terminal.resume(reconnect)
+            terminal.submit(f"echo CACHE_OK > shell-{index}" + suffix)
             terminal.until(
                 lambda t=terminal, i=index: (root / f"shell-{i}").exists() and t.ready()
             )
@@ -234,7 +250,34 @@ def exercise(
                 root / "ish" / ".cache" / "nuitka"
             ), worker_exe
             assert b"WORKER_OK\r\n" in terminal.output
-        if shell == "tcsh":
+        # The reader must receive only its value, even after an input wait.
+        read_command = (
+            'set answer = "$<"; printf "%s" "$answer" > read-result'
+            if get_adapter(shell, executable).family == "csh"
+            else 'read -r answer; printf "%s" "$answer" > read-result'
+        )
+        first.submit('printf "INPUT_WAIT> "; ' + read_command + suffix)
+        first.until(lambda: first.output.endswith(b"INPUT_WAIT> "))
+        time.sleep(0.2)
+        assert not (root / "read-result").exists()
+        first.send(b"reader-value\r")
+        first.until(lambda: (root / "read-result").exists() and first.ready())
+        assert (root / "read-result").read_text() == "reader-value"
+
+        first.submit("sleep 0.2; echo FIRST >> ordered" + suffix)
+        first.send(("echo SECOND >> ordered" + suffix + "\r").encode())
+        first.until(
+            lambda: (
+                (root / "ordered").exists()
+                and (root / "ordered").read_text() == "FIRST\nSECOND\n"
+                and first.ready()
+            )
+        )
+        first.submit("echo BOUNDARY > boundary" + suffix)
+        first.until(lambda: (root / "boundary").exists() and first.ready())
+        assert (root / "ordered").read_text() == "FIRST\nSECOND\n"
+
+        if all(shutil.which(tool) for tool in ("vim", "man", "less")):
             for command, quit_keys, marker in (
                 (
                     "vim -Nu NONE -n -i NONE "
@@ -254,9 +297,9 @@ def exercise(
                 )
                 first.output.clear()
                 first.send(quit_keys)
-                first.until(first.ready, 3)
+                first.resume(reconnect)
                 assert b"^M" not in first.output and b"Manual page" not in first.output
-                first.submit("echo TUI_OK > tui-result")
+                first.submit("echo TUI_OK > tui-result" + suffix)
                 first.until(lambda: (root / "tui-result").exists() and first.ready(), 3)
                 (root / "tui-result").unlink()
         first.finish()
@@ -279,6 +322,8 @@ def exercise(
         terminals.append(reused)
         reused.until(reused.ready, 60)
         reused.finish()
+        assert not list(cache.glob("session-*"))
+        assert not list((root / "ish" / ".cache" / "nuitka").glob("*/launch-*"))
         if not onefile:
             assert bundle_helper.stat().st_mtime_ns == bundle_mtime, (
                 "installed helper was rewritten"
@@ -287,6 +332,12 @@ def exercise(
             "shell": shell,
             "startup_seconds": round(startup, 3),
             "idle_seconds": idle_seconds,
+            "explicit_reconnect": reconnect,
+            "native_read": "passed",
+            "ordered_typeahead": "passed",
+            "vim_man": "passed"
+            if all(shutil.which(tool) for tool in ("vim", "man", "less"))
+            else "not installed",
             "active_extractions_after_exit": len(extractions),
             "result": "passed",
         }

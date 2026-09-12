@@ -1094,10 +1094,8 @@ class InteractiveShell:
         await self._wait_context()
         self._accept_prompt()
 
-    async def _shell(self) -> None:
-        """Wait for shell exit, then drain final PTY output and incomplete control
-        sequences.
-        """
+    async def _shell(self) -> int:
+        """Return the child status after draining final output and control sequences."""
         status = await self.proc.wait()
         self._native_input_active = False
         if self.dupin_fd is not None:
@@ -1131,6 +1129,7 @@ class InteractiveShell:
                 budget = STREAM_CHUNK_BYTES
         self._write(self.stdout_fd, self.sequencer.finish())
         await self._drain_output()
+        return status
 
     async def _prompt(self) -> None:
         """Inject typeahead into the editor and process submissions in pre-hook, execution,
@@ -1292,12 +1291,14 @@ class InteractiveShell:
         self.loop = asyncio.get_running_loop()
         return await self.signal_controller.run(self._run_session)
 
-    async def _run_session(self):
+    async def _run_session(self) -> int:
         """Acquire temporary integration files, FDs, and terminal settings for the session
         lifetime.
 
         ExitStack restores resources after normal exit, exceptions, and the
         cancellation requested by main's catchable termination handlers.
+        Return the natural child status, or zero for an editor-only exit. The
+        cleanup-induced child termination is not the editor's exit result.
         """
         self.loop = asyncio.get_running_loop()
         self._fatal_error = self.loop.create_future()
@@ -1411,11 +1412,13 @@ class InteractiveShell:
                     raise self._fatal_error.result()
                 for task in done:
                     task.result()
+                status = 0
                 if self._has_exited():
                     # A queued editor completion can win the wait in the same
                     # turn as process exit. Let the shell task drain its tail.
-                    await self.tasks[1]
+                    status = await self.tasks[1]
                 await self._drain_output()
+                return status
             finally:
                 self._stopping = True
                 await self._stop()
@@ -1443,4 +1446,5 @@ class InteractiveShell:
                         # open() may reuse the broken standard descriptor itself.
                         if sink != target:
                             os.close(sink)
-        sys.exit(status)
+        # asyncio reports a child signal death as -N; CLI callers expect 128+N.
+        sys.exit(128 - status if status is not None and status < 0 else status)

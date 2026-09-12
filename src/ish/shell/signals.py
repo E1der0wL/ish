@@ -353,13 +353,13 @@ class ShellSignalController:
                 return
 
     async def run(self, session_factory):
-        """Protect acquisition and cleanup, retaining caller cancellation semantics."""
+        """Return the session result unless a requested shutdown takes precedence."""
         self.shutdown_signal = None
         self.shell._stopping = False
         with self.install(SignalScope.STARTUP):
             self._session_task = self.shell.loop.create_task(session_factory())
             try:
-                await self._session_task
+                status = await self._session_task
             except asyncio.CancelledError:
                 if self.shutdown_signal is None:
                     raise
@@ -367,6 +367,7 @@ class ShellSignalController:
                 self._session_task = None
             if self.shutdown_signal is not None:
                 return 128 + self.shutdown_signal
+            return status
 
     @staticmethod
     def _control(attrs, index: int) -> bytes | None:

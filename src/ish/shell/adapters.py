@@ -223,7 +223,7 @@ class ShellAdapter:
         the sequencer.
         """
         scope = signals.scope
-        sequencer.on_prefix(scope(PROMPT_ID_PREFIX), prompt_id)
+        sequencer.on_prefix(scope(PROMPT_ID_PREFIX), prompt_id, restart_capture=True)
         sequencer.between_sequence(scope(BEFORE_PROMPT), scope(AFTER_PROMPT), prompt)
         sequencer.between_sequence(
             scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation

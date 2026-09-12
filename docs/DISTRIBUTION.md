@@ -22,6 +22,14 @@ is no longer running. Do not clear live session directories or extraction caches
 
 ## Onefile choice
 
+The latest [frozen-release validation](RELEASE_VALIDATION_20260912.md) found
+that Nuitka 4.2.1 Onefile converts targeted SIGTERM to SIGINT, which can lead to
+forced child termination, an unrestored terminal and a leftover session.
+Targeted SIGHUP can leave the extraction directory behind. **Use standalone
+mode for the current release.** The private extraction design below still
+protects normal operation and concurrent launches, but does not solve these
+bootstrap signal-handling failures.
+
 The build script uses `--onefile-cache-mode=temporary` and a private path under
 `{HOME}/ish/.cache/nuitka/<build-id>/launch-{PID}-{TIME_US}-{RANDOM}`. Here, temporary
 is a cleanup policy: the directory is removed when the owning instance exits.
@@ -127,8 +135,8 @@ The driver relocates the binary away from the checkout, omits `PYTHONPATH`, and
 uses isolated homes. It checks real shell commands, rc loading, a source plugin
 function in a spawned worker, a built-in Python tool, concurrent sessions, custom
 cache paths containing spaces, deletion of a private TMPDIR, normal-exit cleanup,
-terminal restoration, independent extraction cleanup, restart, and tcsh return from
-Vim and man. Sentinel
+terminal restoration, independent extraction cleanup, restart, native input
+waits, ordered typeahead, and return from Vim and man on every shell. Sentinel
 executables detect attempted host Python or GCC use. The driver itself runs in
 the development environment and uses psutil to clean up failed test processes.
 For onefile it also pauses a cold extraction during the executable write and

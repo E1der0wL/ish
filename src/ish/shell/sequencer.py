@@ -45,6 +45,7 @@ class Sequencer:
         "_string_bel",
         "_string_escape",
         "prefix_callbacks",
+        "_capture_restarts",
         "literal_starts",
         "output_callback",
         "_notified_output",
@@ -81,6 +82,7 @@ class Sequencer:
 
         self.callbacks: Dict[bytes, Tuple[Callable, bool]] = {}
         self.prefix_callbacks = {}
+        self._capture_restarts = set()
         self.literal_starts = {}
         self.between_callbacks: Dict[bytes, Tuple[bytes, Callable, bool]] = {}
         self.active_between: Optional[Tuple[bytes, bytes, Callable, bool]] = None
@@ -96,9 +98,19 @@ class Sequencer:
         """
         self.callbacks[seq] = (callback, remove_seq)
 
-    def on_prefix(self, prefix: bytes, callback: Callable) -> None:
-        """Register a payload callback for control sequences with a given prefix."""
+    def on_prefix(
+        self, prefix: bytes, callback: Callable, *, restart_capture: bool = False
+    ) -> None:
+        """Handle a control even inside a capture; optionally release a stale capture.
+
+        A restarting callback must validate the payload and return False when
+        rejected. Accepting a control does not itself authorize input ownership.
+        """
         self.prefix_callbacks[prefix] = callback
+        if restart_capture:
+            self._capture_restarts.add(prefix)
+        else:
+            self._capture_restarts.discard(prefix)
 
     def between_sequence(
         self,
@@ -126,9 +138,49 @@ class Sequencer:
         self.masking_disabled = False
 
     def _flush_text(self, buffer: bytearray):
-        """Move classified temporary bytes into the output buffer."""
-        buffer.extend(self.buffer)
+        """Move classified temporary bytes into the active capture or output."""
+        self._text(self.buffer, buffer)
         self.buffer.clear()
+
+    def _text(self, data, buffer: bytearray) -> None:
+        """Retain prompt bytes or emit ordinary text without reparsing controls."""
+        if self.active_between is None:
+            buffer.extend(data)
+            return
+        for index, byte in enumerate(data):
+            self._between(byte, buffer)
+            if self.active_between is None:
+                buffer.extend(data[index + 1 :])
+                break
+
+    def _resume_text(self) -> None:
+        """Resume the current capture after a complete or cancelled control."""
+        self.state = self.BETWEEN if self.active_between is not None else self.GROUND
+
+    def _release_capture(self, buffer: bytearray) -> None:
+        """Display an abandoned capture once, without invoking its prompt callback."""
+        if self.active_between is None:
+            return
+        if self.active_between[3]:
+            offset = len(buffer)
+            buffer.extend(self.between_buffer)
+            if self.between_truncated:
+                buffer.extend(b" [prompt truncated] ")
+            buffer.extend(self._between_tail)
+            # These bytes now reach the real terminal instead of the prompt
+            # renderer. Observe their controls without replaying session hooks.
+            released = bytes(buffer[offset:])
+            if self.control_callback is not None and b"\x1b" in released:
+                observer = Sequencer(
+                    max_sequence_bytes=self.max_sequence_bytes,
+                    control_callback=self.control_callback,
+                )
+                observer.interpret(released)
+        self.between_buffer.clear()
+        self._between_tail.clear()
+        self.between_truncated = False
+        self.active_between = None
+        self._notify_output(buffer)
 
     def _notify_output(self, buffer: bytearray) -> None:
         """Observe emitted bytes before protocol callbacks, in stream order."""
@@ -141,7 +193,11 @@ class Sequencer:
         output.
         """
         data = bytes(self.buffer)
-        if self.control_callback is not None:
+        # Controls retained as prompt text are rendered by the prompt UI, not
+        # sent to the terminal. Preserve that observation boundary.
+        if self.control_callback is not None and (
+            self.active_between is None or not self.active_between[3]
+        ):
             self.control_callback(data)
         for prefix, callback in self.prefix_callbacks.items():
             if data.startswith(prefix):
@@ -152,12 +208,21 @@ class Sequencer:
                     else data[len(prefix) : -1]
                 )
                 if accepted is False:
-                    buffer.extend(data)
+                    self._text(data, buffer)
+                elif prefix in self._capture_restarts:
+                    self._release_capture(buffer)
                 self.buffer.clear()
-                self.state = self.GROUND
+                self._resume_text()
                 return
 
         if data in self.between_callbacks:
+            if self.active_between is not None:
+                # Only an accepted generation control may supersede an open
+                # capture. A repeated start marker alone is still its content.
+                self._text(data, buffer)
+                self.buffer.clear()
+                self._resume_text()
+                return
             end_seq, callback, remove_seq = self.between_callbacks[data]
             self.active_between = (data, end_seq, callback, remove_seq)
             self.between_buffer.clear()
@@ -174,12 +239,12 @@ class Sequencer:
             self._notify_output(buffer)
             callback()
             if not remove_seq:
-                buffer.extend(self.buffer)
+                self._text(data, buffer)
         else:
-            buffer.extend(self.buffer)
+            self._text(data, buffer)
 
         self.buffer.clear()
-        self.state = self.GROUND
+        self._resume_text()
 
     def _between(self, byte, buffer: bytearray) -> None:
         """Collect payload until its end marker and emit callback replacement bytes in
@@ -245,7 +310,10 @@ class Sequencer:
         # Long OSC/DCS/APC payloads belong to the terminal, not our buffer.
         """Buffer a control sequence up to its limit and stream excess payload directly."""
         if self._passthrough:
-            output.append(byte)
+            if self.active_between is not None:
+                self._between(byte, output)
+            else:
+                output.append(byte)
         else:
             self.buffer.append(byte)
             if len(self.buffer) >= self.max_sequence_bytes:
@@ -258,7 +326,7 @@ class Sequencer:
         """
         if self._passthrough:
             self.buffer.clear()
-            self.state = self.GROUND
+            self._resume_text()
         else:
             self._union(output)
         self._passthrough = False
@@ -266,15 +334,16 @@ class Sequencer:
 
     def finish(self) -> bytes:
         """Release an incomplete sequence/echo when the PTY stream ends."""
-        output = bytearray(self.buffer)
-        if self.state == self.OSC and self._string_escape:
-            output.append(0x1B)
-        if self.state == self.BETWEEN and self.active_between:
+        output = bytearray()
+        if self.active_between:
             start, _, _, remove = self.active_between
             if remove:
                 output.extend(start)
                 output.extend(self.between_buffer)
                 output.extend(self._between_tail)
+        output.extend(self.buffer)
+        if self.state == self.OSC and self._string_escape:
+            output.append(0x1B)
         output.extend(self.masking_buffer)
         self.buffer.clear()
         self.between_buffer.clear()
@@ -353,7 +422,7 @@ class Sequencer:
                 if byte in (0x18, 0x1A):  # CAN/SUB cancel the current control.
                     self._flush_text(output)
                     self._passthrough = False
-                    self.state = self.GROUND
+                    self._resume_text()
                 elif byte < 0x20 or byte == 0x7F:
                     continue  # C0/DEL do not terminate an escape or CSI.
                 elif self.state == self.ESC:
@@ -385,7 +454,7 @@ class Sequencer:
                     self._flush_text(output)
                     self._passthrough = False
                     self._string_escape = False
-                    self.state = self.GROUND
+                    self._resume_text()
                 elif (self._string_bel and byte == 0x07) or (
                     self._string_escape and byte == 0x5C
                 ):
@@ -394,7 +463,13 @@ class Sequencer:
                     self._string_escape = byte == 0x1B
 
             elif self.state == self.BETWEEN:
-                self._between(byte, output)
+                if byte == 0x1B:
+                    # Reuse the normal ANSI lexer so session controls remain
+                    # visible while prompt text is being collected.
+                    self.buffer.append(byte)
+                    self.state = self.ESC
+                else:
+                    self._between(byte, output)
 
             elif self.state == self.MASKING:
                 if byte == 0x1B:

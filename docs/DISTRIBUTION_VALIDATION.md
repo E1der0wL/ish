@@ -1,5 +1,10 @@
 # Distribution validation: 2026-09-11
 
+This is a historical validation record. The [2026-09-12 release
+validation](RELEASE_VALIDATION_20260912.md) found that Nuitka 4.2.1 Onefile
+bootstrap signal handling bypasses orderly TERM/HUP cleanup. Follow that newer
+report for the current artifact and packaging decision.
+
 The final Linux onefile executable is `dist/ish` (16.87 MiB). It is a copy of
 `dist/nuitka/1.0.0-20260911-cache04/onefile/ish` with the same SHA-256:
 
