@@ -4,6 +4,50 @@ ish is a command-line UI that communicates with Linux shells through a PTY and
 provides editing and completion through prompt-toolkit.
 It supports Bash, zsh, BSD csh, tcsh, and dash. On Windows, run it inside WSL.
 
+## Command-line options
+
+```sh
+uv run ish --help
+uv run ish --version
+uv run ish --home "$HOME/ish-testing" --no-rc --no-plugins bash
+uv run ish --home "$HOME/ish-testing" --diagnose tcsh
+```
+
+The optional shell argument accepts a supported shell name or executable path.
+Without it, ish selects the login shell by name.
+
+| Option | Behavior |
+| --- | --- |
+| `--version` | Print the ish version and exit. |
+| `--no-rc` | Skip loading ish's `.ishrc.py` at startup. |
+| `--no-plugins` | Skip automatic plugin loading and its dependency installation. |
+| `--home DIR` | Select ish's settings, plugin, log, and cache base directory; defaults to `~/ish`. |
+| `--diagnose` | Print a read-only environment snapshot and exit. |
+| `-l LANG`, `--lang LANG` | Select the interface language, including help. |
+| `-h`, `--help` | Print help and exit. |
+
+`--home` expands `~` and resolves relative paths against the launch directory.
+It does not change the shell's `HOME`. Settings are selected before translations,
+plugins, and the user rc are loaded. The rc can still explicitly change configuration.
+The two loading flags operate independently; native shell startup files such as
+`.bashrc` and `.zshrc` are still read. Explicit plugin loading by user rc code is
+outside the automatic loading controlled by `--no-plugins`.
+
+Help, version, and diagnostics do not create ish directories or translation files,
+load rc/plugins, or start an interactive session. Diagnostics report the selected
+shell path and adapter, runtime, terminal, cache permissions/mount flags, and helper
+availability before the rc runs. They execute no shell, compiler, or helper and
+are not an interactive health check. Exit status zero means the report completed;
+missing or unsupported resources are printed in the report.
+
+CLI descriptions, option help, and diagnostic labels are defined in `I18N` in
+`src/ish/lang/i18n.py`. Partial JSON translations under `<ish home>/lang/` fall
+back to built-in messages. For example, `--home DIR --lang ko --help` reads
+`DIR/lang/ko.json` without creating missing files.
+
+These options are available in the current source. The frozen release dated
+2026-09-12 predates them; rebuild the distribution to use the new CLI in a binary.
+
 ## Development environment
 
 Use Python **3.12.14** and uv. Create `.venv` with Linux Python, including when
