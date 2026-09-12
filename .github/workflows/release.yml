@@ -88,7 +88,17 @@ jobs:
             --env PYTHON_VERSION --env UV_VERSION --env UV_SHA256 \
             --env RELEASE_TAG --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT \
             --env SOURCE_COMMIT --env BUILD_IMAGE \
+            --env "BUILD_UID=$(id -u)" --env "BUILD_GID=$(id -g)" \
             "$BUILD_IMAGE" bash -euo pipefail <<'BUILD'
+          # Bind-mounted outputs must remain writable by the host runner.
+          # Keep ownership consistent even when compilation or validation fails.
+          restore_output_owner() {
+            if [[ -d /work/dist ]]; then
+              chown -hR "$BUILD_UID:$BUILD_GID" /work/dist
+            fi
+          }
+          trap restore_output_owner EXIT
+
           test "$(uname -m)" = x86_64
           test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.28'
           curl --fail --location --retry 3 \
