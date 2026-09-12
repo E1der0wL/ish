@@ -288,56 +288,6 @@ class Prompt(PromptSession):
         self.completer = ThreadedCompleter(self.default_completer)
         self.parser = Vt100Parser(feed_key_callback=self.app.key_processor.feed)
 
-    def _create_default_buffer(self) -> Buffer:
-        """Check transport admission on acceptance, including cached user validation.
-
-        Keep the user's dynamic validator and validate-while-typing behavior.
-        The transport check runs on explicit validate/accept calls only, so it
-        performs no per-keystroke terminal queries and cannot be bypassed by a
-        cached VALID state from the asynchronous user validator.
-        """
-        buffer = super()._create_default_buffer()
-        original_validate = buffer.validate
-        rejection = None
-
-        def validate(set_cursor: bool = False) -> bool:
-            """Leave rejected input, cursor, history, and the active editor untouched."""
-            nonlocal rejection
-            if rejection is not None and buffer.validation_error is rejection:
-                buffer.validation_state = ValidationState.UNKNOWN
-                buffer.validation_error = None
-            try:
-                self._validate_editor_submission(buffer.text)
-            except InputRejected as exc:
-                rejection = ValidationError(
-                    message=str(exc), cursor_position=buffer.cursor_position
-                )
-                buffer.validation_error = rejection
-                buffer.validation_state = ValidationState.INVALID
-                self.input_observer.record("input_rejected", "EDITOR")
-                return False
-            return original_validate(set_cursor=set_cursor)
-
-        buffer.validate = validate
-        return buffer
-
-    def _validate_editor_submission(self, command: str) -> None:
-        """Apply shell transport limits without restricting directly dispatched tools."""
-        try:
-            data = (command + "\n").encode(self.encoder)
-        except UnicodeEncodeError as exc:
-            raise InputRejected(
-                "Not sent: input cannot be encoded for this shell."
-            ) from exc
-        if len(data) > CANONICAL_LINE_BYTES:
-            key = command.strip()
-            if key == self.exit_command or key in self.internal_commands:
-                return
-            argv = simple_command(command) if self.internal_tools else None
-            if argv and argv[0] in self.internal_tools:
-                return
-        self.interactive_shell.validate_submission(data)
-
     @property
     def key_list(self) -> List[Dict[str, Any]]:
         """Build a user-facing list of registered keys, handlers, and filters."""
@@ -560,6 +510,39 @@ class Prompt(PromptSession):
 
         return Layout(layout, default_buffer_window)
 
+    def _create_default_buffer(self) -> Buffer:
+        """Check transport admission on acceptance, including cached user validation.
+
+        Keep the user's dynamic validator and validate-while-typing behavior.
+        The transport check runs on explicit validate/accept calls only, so it
+        performs no per-keystroke terminal queries and cannot be bypassed by a
+        cached VALID state from the asynchronous user validator.
+        """
+        buffer = super()._create_default_buffer()
+        original_validate = buffer.validate
+        rejection = None
+
+        def validate(set_cursor: bool = False) -> bool:
+            """Leave rejected input, cursor, history, and the active editor untouched."""
+            nonlocal rejection
+            if rejection is not None and buffer.validation_error is rejection:
+                buffer.validation_state = ValidationState.UNKNOWN
+                buffer.validation_error = None
+            try:
+                self._validate_editor_submission(buffer.text)
+            except InputRejected as exc:
+                rejection = ValidationError(
+                    message=str(exc), cursor_position=buffer.cursor_position
+                )
+                buffer.validation_error = rejection
+                buffer.validation_state = ValidationState.INVALID
+                self.input_observer.record("input_rejected", "EDITOR")
+                return False
+            return original_validate(set_cursor=set_cursor)
+
+        buffer.validate = validate
+        return buffer
+
     def _create_key_binding(self) -> KeyBindings:
         """Register editing keys for submission, indentation, paired characters, and
         completion.
@@ -576,39 +559,25 @@ class Prompt(PromptSession):
             return len(line) - len(line.lstrip(" "))
 
         def input_pair(event, key: str, insert: str) -> None:
-            """Skip an existing quote at the cursor or insert a quote pair."""
-            try:
-                buffer = event.current_buffer
-                cursor_position = buffer.document.cursor_position
-                if buffer.text and buffer.text[cursor_position] == key:
-                    buffer.delete(count=1)
-                    buffer.insert_text(key, move_cursor=True)
-                else:
-                    event.current_buffer.insert_text(insert, move_cursor=True)
-                    event.current_buffer.cursor_left()
-            except Exception:
-                if is_balanced(event.current_buffer.text, key):
-                    event.current_buffer.insert_text(insert, move_cursor=True)
-                    event.current_buffer.cursor_left()
-                else:
-                    event.current_buffer.insert_text(key, move_cursor=True)
+            """Skip a matching quote or open a pair at buffer end; close unmatched quotes."""
+            buffer = event.current_buffer
+            document = buffer.document
+            if document.current_char == key:
+                buffer.cursor_right()
+            elif document.is_cursor_at_the_end and is_balanced(buffer.text, key):
+                buffer.insert_text(insert)
+                buffer.cursor_left()
+            else:
+                buffer.insert_text(key)
 
-        def input_set(event, key: str, set_key: str, insert: str) -> None:
-            """Adjust bracket pairs and cursor position based on an existing closing
-            bracket.
-            """
-            try:
-                buffer = event.current_buffer
-                cursor_position = buffer.document.cursor_position
-                after_cursor = buffer.text[cursor_position]
-                if after_cursor != set_key:
-                    event.current_buffer.insert_text(insert, move_cursor=True)
-                    event.current_buffer.cursor_left()
-                else:
-                    event.current_buffer.insert_text(insert, move_cursor=True)
-            except Exception:
-                event.current_buffer.insert_text(insert, move_cursor=True)
-                event.current_buffer.cursor_left()
+        def input_set(event, key: str, insert: str) -> None:
+            """Open a bracket pair at buffer end, or insert only the typed character."""
+            buffer = event.current_buffer
+            if buffer.document.is_cursor_at_the_end:
+                buffer.insert_text(insert)
+                buffer.cursor_left()
+            else:
+                buffer.insert_text(key)
 
         def get_common_prefix(completions):
             """Compute the common prefix of completion display strings."""
@@ -733,13 +702,33 @@ class Prompt(PromptSession):
 
         @kb.add("(")
         def _(event: KeyPressEvent):
-            """Insert a matching bracket pair when an opening parenthesis is typed."""
-            input_set(event, "(", ")", "()")
+            """Insert an opening parenthesis, pairing it only at the end of the input."""
+            input_set(event, "(", "()")
+
+        @kb.add("{")
+        def _(event: KeyPressEvent):
+            """Insert an opening brace, pairing it only at the end of the input."""
+            input_set(event, "{", "{}")
+
+        @kb.add("[")
+        def _(event: KeyPressEvent):
+            """Insert an opening bracket, pairing it only at the end of the input."""
+            input_set(event, "[", "[]")
 
         @kb.add('"')
         def _(event: KeyPressEvent):
             """Apply paired-quote editing when a double quote is typed."""
             input_pair(event, '"', '""')
+
+        @kb.add("'")
+        def _(event: KeyPressEvent):
+            """Apply paired-quote editing when a single quote is typed."""
+            input_pair(event, "'", "''")
+
+        @kb.add('`')
+        def _(event: KeyPressEvent):
+            """Apply paired-quote editing when a backtick is typed."""
+            input_pair(event, "`", "``")
 
         return kb
 
@@ -758,6 +747,23 @@ class Prompt(PromptSession):
             except (FileNotFoundError, PermissionError):
                 continue
         return all_cmd
+
+    def _validate_editor_submission(self, command: str) -> None:
+        """Apply shell transport limits without restricting directly dispatched tools."""
+        try:
+            data = (command + "\n").encode(self.encoder)
+        except UnicodeEncodeError as exc:
+            raise InputRejected(
+                "Not sent: input cannot be encoded for this shell."
+            ) from exc
+        if len(data) > CANONICAL_LINE_BYTES:
+            key = command.strip()
+            if key == self.exit_command or key in self.internal_commands:
+                return
+            argv = simple_command(command) if self.internal_tools else None
+            if argv and argv[0] in self.internal_tools:
+                return
+        self.interactive_shell.validate_submission(data)
 
     def _update_layout(self) -> None:
         """Rebuild the layout after float or tool changes and request a redraw."""
