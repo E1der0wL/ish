@@ -1,4 +1,4 @@
-"""Retain a prompt prefix only while output is a simple, sequential line.
+"""Track a safe prompt prefix while output is a simple, sequential line.
 
 This is deliberately not a terminal emulator. Cursor movement, erasing, screen
 switches and other unsupported controls invalidate the prefix for the current

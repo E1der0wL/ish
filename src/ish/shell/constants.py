@@ -11,6 +11,8 @@ ENVIRON: Final = "environ"
 ALIAS: Final = "alias"
 EXITCODE: Final = "exitcode"
 PROMPT_ID: Final = "prompt_id"
+PROMPT_ID_LIMIT: Final = 2**63
+PROMPT_ID_MAX_DIGITS: Final = len(str(PROMPT_ID_LIMIT - 1))
 PWD: Final = "PWD"
 
 # The shell templates and the Python receiver share these exact wire signals.
@@ -24,6 +26,8 @@ AFTER_CONTINUATION: Final = ISH_OSC_PREFIX + b"e" + OSC_TERMINATOR
 COMMAND_START: Final = ISH_OSC_PREFIX + b"C" + OSC_TERMINATOR
 COMMAND_DONE: Final = ISH_OSC_PREFIX + b"D" + OSC_TERMINATOR
 PROMPT_ID_PREFIX: Final = ISH_OSC_PREFIX + b"P;"
+LINE_READER_READY_PREFIX: Final = ISH_OSC_PREFIX + b"LR;"
+LINE_INTERRUPT_ACK_PREFIX: Final = ISH_OSC_PREFIX + b"LI;"
 
 # tcsh's native editor can render control bytes in caret notation.
 CARET_BEFORE_PROMPT: Final = BEFORE_PROMPT.replace(b"\x1b", b"^[").replace(b"\a", b"^G")
@@ -32,6 +36,7 @@ CARET_AFTER_PROMPT: Final = AFTER_PROMPT.replace(b"\x1b", b"^[").replace(b"\a", 
 # Keep the existing on-disk names for compatibility.
 BASH_INTEGRATION_SCRIPT: Final = "shellIntegraion.sh"
 ZSH_INTEGRATION_SCRIPT: Final = "shellIntegraion.zsh"
+ZSH_TRAP_SNAPSHOT: Final = "zsh-traps"
 CSH_INTEGRATION_SCRIPT: Final = "shellIntegraion.csh"
 TCSH_INTEGRATION_SCRIPT: Final = "shellIntegraion.tcsh"
 POSIX_INTEGRATION_SCRIPT: Final = "shellIntegraion.posix"
@@ -45,6 +50,8 @@ BUNDLED_FORWARD_DIRECTORY: Final = "libexec"
 FORWARD_SOURCE: Final = "ish_forward.c"
 SHELL_FIFO: Final = "shell.fifo"
 TTY_FIFO: Final = "tty.fifo"
+# Linux since 4.13; Python's termios module does not expose this on every build.
+TIOCGPTPEER: Final = 0x5441
 
 
 @dataclass(frozen=True)

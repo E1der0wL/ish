@@ -5,24 +5,29 @@ Review date: 2026-09-11.
 ## Assessment
 
 ish is suitable for controlled evaluation of its normal interactive workflows.
-Its streaming design includes bounded buffers, output backpressure, incremental
+Its streaming design includes bounded transport buffers, output backpressure, incremental
 control parsing, separate session files, and explicit prompt/context synchronization.
 Keeping prompt-toolkit as the primary editor is compatible with this design.
 Native primary-prompt editing and Ctrl+C exit-status behavior are intentionally
 different from the underlying shell and are not defects in this assessment.
 
 An unconditional production-ready claim would be premature. Termination cleanup
-has a reproducible defect, and the existing Linux artifact cannot run directly on
-the stated RHEL 8 target. The worker-size defect described below has since been
-fixed in source. Long-running operation also needs more evidence than the existing
-short functional checks.
+and worker sizing have since been fixed in source; the existing Linux artifact
+still cannot run directly on the stated RHEL 8 target. Long-running operation also
+needs more evidence than the existing short functional checks.
 
 The original review changed documentation only. The follow-up implementation and
 its validation are recorded alongside the corresponding finding below.
 
 ## Reproduced findings
 
-### P1: SIGTERM bypasses terminal and session cleanup
+### P2, fixed in source: SIGTERM bypasses terminal and session cleanup
+
+Priority was changed to P2 and implementation was initially deferred at the user's
+request. The later source fix routes SIGTERM/SIGHUP through one awaited shutdown,
+including session initialization. See [termination behavior](TERMINATION.md) for
+the implementation, validation, and remaining limits. The reproduction below
+describes the earlier implementation and previously built executable.
 
 Relevant code: `InteractiveShell.main` in [base.py](../src/ish/shell/base.py).
 The session switches the outer terminal to raw mode and registers resource cleanup
@@ -36,8 +41,8 @@ remained in each isolated cache. The onefile extraction directory was removed,
 which did not restore the terminal or remove the shell session files.
 
 This can leave the caller's terminal with altered echo/input behavior when ish is
-terminated by a process manager or `kill`. Before a stable release, route catchable
-termination signals through task cancellation and awaited cleanup, preserve prior
+terminated by a process manager or `kill`. When this deferred item is addressed,
+route catchable termination signals through task cancellation and awaited cleanup, preserve prior
 signal handlers, and check behavior both at the prompt and while a child TUI runs.
 SIGKILL and power loss require a separate abandoned-file policy; they cannot use
 an in-process cleanup handler.
@@ -120,8 +125,8 @@ compiled matrix or rebuild the executable.
 - Exercise prolonged sessions on the target host with repeated commands, large
   output, continuation input, TUI transitions, workers, and concurrent instances.
   Track memory, open descriptors, child processes, response latency, and cache use.
-- Check catchable termination, SSH disconnection, and terminal resizing during
-  active tools. The normal-exit tests do not cover all of these transitions.
+- Confirm the later [termination fix](TERMINATION.md) and worker resizing on
+  the target RHEL host, including its actual SSH client and terminal settings.
 - Validate the intended plugins and their dependency installation in the offline
   environment. Plugin loading can synchronously invoke pip before the UI starts;
   `_load_library` has no overall subprocess timeout. This is a code-observed

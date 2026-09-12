@@ -1,6 +1,7 @@
 """Templates use @tokens@ so shell quoting and braces remain readable."""
 
 import shlex
+import shutil
 
 from .adapters import csh_quote
 from .constants import (
@@ -13,6 +14,8 @@ from .constants import (
     CSH_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT,
     FORWARD_BINARY,
+    LINE_INTERRUPT_ACK_PREFIX,
+    LINE_READER_READY_PREFIX,
     OSC_TERMINATOR,
     POSIX_INTEGRATION_SCRIPT,
     POSIX_UPDATE_SCRIPT,
@@ -22,6 +25,7 @@ from .constants import (
     TCSH_PRECMD_SCRIPT,
     TCSH_WATCH_HOOKS_SCRIPT,
     ZSH_INTEGRATION_SCRIPT,
+    ZSH_TRAP_SNAPSHOT,
     SessionSignals,
     bytes_to_shell_escape,
 )
@@ -36,10 +40,14 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
     """
     scope = signals.scope
     forward_path = forward_path or directory / FORWARD_BINARY
+    # Resolve the few remaining external utilities once, before user commands
+    # can change PATH. The context helper handles encoding and environments.
+    printf_path = shutil.which("printf", path="/usr/bin:/bin") or "/usr/bin/printf"
     tokens = {
         "@VERSION@": VERSION.decode("ascii"),
         "@FORWARD@": shlex.quote(str(forward_path)),
         "@CSH_FORWARD@": csh_quote(str(forward_path)),
+        "@CSH_PRINTF@": csh_quote(printf_path),
         "@CSH_UPDATE@": csh_quote(str(directory / CSH_UPDATE_SCRIPT)),
         "@CSH_HOOK@": csh_quote(str(directory / TCSH_PRECMD_SCRIPT)),
         "@CSH_BIND@": csh_quote(str(directory / TCSH_BIND_HOOKS_SCRIPT)),
@@ -47,6 +55,7 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
         "@POSIX_UPDATE@": shlex.quote(str(directory / POSIX_UPDATE_SCRIPT)),
         "@BASH_SELF@": shlex.quote(str(directory / BASH_INTEGRATION_SCRIPT)),
         "@ZSH_SELF@": shlex.quote(str(directory / ZSH_INTEGRATION_SCRIPT)),
+        "@ZSH_TRAPS@": shlex.quote(str(directory / ZSH_TRAP_SNAPSHOT)),
         "@POSIX_SELF@": shlex.quote(str(directory / POSIX_INTEGRATION_SCRIPT)),
         "@CSH_SELF@": csh_quote(str(directory / CSH_INTEGRATION_SCRIPT)),
         "@SOH@": bytes_to_shell_escape(SOH),
@@ -63,6 +72,12 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
         "@PROMPT_ID@": bytes_to_shell_escape(
             scope(PROMPT_ID_PREFIX) + b"%s" + OSC_TERMINATOR
         ),
+        "@LINE_READY@": bytes_to_shell_escape(
+            scope(LINE_READER_READY_PREFIX) + b"%s;%s" + OSC_TERMINATOR
+        ),
+        "@LINE_INTERRUPT@": bytes_to_shell_escape(
+            scope(LINE_INTERRUPT_ACK_PREFIX) + b"%s" + OSC_TERMINATOR
+        ),
         # csh checks only the OSC body so both raw and caret prompts match.
         "@CSH_START_PATTERN@": csh_quote(
             scope(BEFORE_PROMPT)[2 : -len(OSC_TERMINATOR)].decode("ascii")
@@ -78,17 +93,7 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
     update = r"""
 _ish_update() {
     _ish_prompt_id=$((_ish_prompt_id + 1))
-    {
-        command printf '@SOH@@VERSION@@RS@exitcode@US@'
-        command printf '%s' "$1" | command base64 -w0
-        command printf '@RS@alias@US@'
-        alias | command base64 -w0
-        command printf '@RS@environ@US@'
-        command env -0 | command base64 -w0
-        command printf '@RS@prompt_id@US@'
-        command printf '%s' "$_ish_prompt_id" | command base64 -w0
-        command printf '@EOT@'
-    } > "$_ish_pipe"
+    alias | @FORWARD@ --context "$_ish_pipe" "$1" "$_ish_prompt_id"
 }
 _ish_forward() { @FORWARD@ "$_tty_pipe"; }
 _ish_status() { return "$1"; }
@@ -103,7 +108,11 @@ _ish_prompt_id=${_ish_prompt_id:-0}
         init
         + update
         + r"""
-ish_recover() { source @BASH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
+ish_recover() {
+    local _ish_recover_status=$?
+    source @BASH_SELF@ "$_ish_pipe" "$_tty_pipe"
+    return "$_ish_recover_status"
+}
 set +o notify
 _ish_capture_status() {
     _ish_shell_exit_code=$?
@@ -168,31 +177,68 @@ fi
     )
     zsh = (
         init
-        + update
+        + update.replace("command printf", "builtin printf").replace(
+            "alias |", "builtin alias |"
+        )
         + r"""
 ish_recover() { source @ZSH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 unsetopt zle notify promptcr promptsp
+# Install only over the default SIGINT behavior, never over a user's trap.
+# Capture in this shell: command substitution resets string traps. This private
+# session file is overwritten only when sourcing and removed by session cleanup.
+# Later readiness checks only compare the function body, without file I/O.
+if (( ! ${+functions[TRAPINT]} )) && builtin trap >| @ZSH_TRAPS@; then
+    _ish_int_traps=$(<@ZSH_TRAPS@)
+    if [[ "$_ish_int_traps"$'\n' != *' INT'$'\n'* ]]; then
+        TRAPINT() {
+            if (( ZSH_SUBSHELL == 0 )); then
+                _ish_interrupt_pending=1
+                builtin printf '@LINE_INTERRUPT@' "$_ish_prompt_id"
+            fi
+            return 130
+        }
+        _ish_line_interrupt_body=${functions[TRAPINT]}
+    fi
+    unset _ish_int_traps
+fi
 _ish_precmd() {
+    _ish_interrupt_pending=0
     if [[ "$PS1" != *$'@START@'* ]]; then
-        PS1="$(command printf '@START@')${PS1}$(command printf '@END@')"
+        PS1=$'@START@'"${PS1}"$'@END@'
     fi
     if [[ "$PS2" != *$'@CONT_START@'* ]]; then
-        PS2="$(command printf '@CONT_START@')${PS2}$(command printf '@CONT_END@')"
+        PS2=$'@CONT_START@'"${PS2}"$'@CONT_END@'
     fi
     _ish_update "$1"
     _ish_forward
+    local _ish_line_ready=0
+    if [[ -n ${_ish_line_interrupt_body-} && ${functions[TRAPINT]-} == "$_ish_line_interrupt_body" ]]; then
+        _ish_line_ready=1
+    fi
+    builtin printf '@LINE_READY@' "$_ish_prompt_id" "$_ish_line_ready"
     _ish_mark_prompt
+}
+# A nonzero TRAPINT return leaves zsh's return flag set when its non-ZLE
+# line reader aborts. The next precmd function can be skipped while clearing
+# that flag. Its hook array still runs; retry our wrapper exactly once there.
+_ish_after_interrupt() {
+    local _ish_saved_status=$?
+    if (( ${_ish_interrupt_pending:-0} )); then
+        _ish_status "$_ish_saved_status"
+        precmd
+    fi
+    return "$_ish_saved_status"
 }
 if [[ ${functions[precmd]-} != *'_ish_precmd '* ]]; then
     functions[_ish_original_precmd]=${functions[precmd]-:}
-    _ish_original_precmd_functions=("${precmd_functions[@]}")
-    precmd_functions=()
+    _ish_original_precmd_functions=("${precmd_functions[@]:#_ish_after_interrupt}")
+    precmd_functions=(_ish_after_interrupt)
     precmd() {
         local _ish_saved_status=$?
         local _ish_hook
         # Include hooks registered after initialization; integration always runs.
-        _ish_original_precmd_functions+=("${precmd_functions[@]}")
-        precmd_functions=()
+        _ish_original_precmd_functions+=("${precmd_functions[@]:#_ish_after_interrupt}")
+        precmd_functions=(_ish_after_interrupt)
         for _ish_hook in _ish_original_precmd "${_ish_original_precmd_functions[@]}"; do
             # Quoting an unset hook array can produce one empty element.
             # Native zsh silently skips absent functions, never runs executables.
@@ -210,10 +256,23 @@ fi
         "_ish_prompt_id=${_ish_prompt_id:-0}\n"
         + update
         + r"""
-ish_recover() { . @POSIX_SELF@; }
+ish_recover() {
+    _ish_recover_status=$?
+    . @POSIX_SELF@
+    return "$_ish_recover_status"
+}
+_ish_posix_before() {
+    _ish_shell_exit_code=$?
+    # PS1 expansion runs in a subshell, so a parent-shell counter cannot
+    # advance here. A monotonic generation stays fresh across expansions.
+    _ish_prompt_id=$(@FORWARD@ --clock)
+    _ish_update "$_ish_shell_exit_code"
+    _ish_forward
+    _ish_mark_prompt
+}
 _ish_posix_prompt() {
-    case "$PS1" in *"$(command printf '@START@')"*) ;;
-        *) PS1="$(command printf '@START@')${PS1}$(command printf '@END@')";;
+    case "$PS1" in *'$(_ish_posix_before)'*) ;;
+        *) PS1='$(_ish_posix_before)'"$(command printf '@START@')${PS1}$(command printf '@END@')";;
     esac
     case "$PS2" in *"$(command printf '@CONT_START@')"*) ;;
         *) PS2="$(command printf '@CONT_START@')${PS2}$(command printf '@CONT_END@')";;
@@ -223,22 +282,17 @@ _ish_posix_prompt() {
 """
     )
     posix_refresh = r"""
-_ish_shell_exit_code=$?
 _ish_posix_prompt
-_ish_update "$_ish_shell_exit_code"
-_ish_forward
-_ish_mark_prompt
-_ish_status "$_ish_shell_exit_code"
 """
 
     csh_init = r"""
 if (! $?_ish_prompt_id) set _ish_prompt_id = 0
-set _ish_before = "`printf '@START@'`"
-set _ish_after = "`printf '@END@'`"
-set _ish_cont_before = "`printf '@CONT_START@'`"
-set _ish_cont_after = "`printf '@CONT_END@'`"
+set _ish_before = "`@CSH_PRINTF@ '@START@'`"
+set _ish_after = "`@CSH_PRINTF@ '@END@'`"
+set _ish_cont_before = "`@CSH_PRINTF@ '@CONT_START@'`"
+set _ish_cont_after = "`@CSH_PRINTF@ '@CONT_END@'`"
 """
-    # BSD csh has no precmd. Its adapter explicitly sources this after a prompt.
+    # BSD csh has no precmd. Only explicit ish_recover sources this update.
     csh_refresh = r"""
 source @CSH_HOOK@
 """
@@ -255,25 +309,17 @@ if ($?tcsh) then
 endif
 @ _ish_prompt_id ++
 setenv PWD "$cwd"
-printf '@SOH@@VERSION@@RS@exitcode@US@' > "$_ish_pipe"
-printf '%s' "$_ish_shell_exit_code" | base64 -w0 >> "$_ish_pipe"
-printf '@RS@alias@US@' >> "$_ish_pipe"
-alias | base64 -w0 >> "$_ish_pipe"
-printf '@RS@environ@US@' >> "$_ish_pipe"
-env -0 | base64 -w0 >> "$_ish_pipe"
-printf '@RS@prompt_id@US@' >> "$_ish_pipe"
-printf '%s' "$_ish_prompt_id" | base64 -w0 >> "$_ish_pipe"
-printf '@EOT@' >> "$_ish_pipe"
+alias | @CSH_FORWARD@ --context "$_ish_pipe" "$_ish_shell_exit_code" "$_ish_prompt_id"
 @CSH_FORWARD@ "$_tty_pipe"
-printf '@PROMPT_ID@' "$_ish_prompt_id"
+@CSH_PRINTF@ '@PROMPT_ID@' "$_ish_prompt_id"
 set status = $_ish_shell_exit_code
 """
     csh = (
         csh_init
         + r"""
 set _ish_recover_path = @CSH_SELF@
-alias ish_recover 'source "$_ish_recover_path"'
-set _ish_shell_exit_code = 0
+alias ish_recover 'set _ish_shell_exit_code = $status; source "$_ish_recover_path"'
+if (! $?_ish_shell_exit_code) set _ish_shell_exit_code = 0
 source @CSH_UPDATE@
 """
     )
@@ -283,7 +329,7 @@ if ("`alias precmd`" != "_ish_precmd") alias _ish_original_precmd "`alias precmd
 if ("`alias _ish_current_postcmd`" != "_ish_postcmd") alias _ish_original_postcmd "`alias _ish_current_postcmd`"
 if ("`alias periodic`" != "_ish_periodic") then
     alias _ish_original_periodic "`alias periodic`"
-    set _ish_periodic_last = "`date +%s`"
+    set _ish_periodic_last = "`@CSH_FORWARD@ --time`"
 endif
 if ($?tperiod) then
     if ("$tperiod" != "0") set _ish_user_tperiod = "$tperiod"
@@ -300,7 +346,7 @@ set tperiod = 0
 # every primary prompt. Only consult the clock when there is a user callback.
 alias _ish_periodic_dispatch ''
 if ("`alias _ish_original_periodic`" != "") then
-    set _ish_periodic_now = "`date +%s`"
+    set _ish_periodic_now = "`@CSH_FORWARD@ --time`"
     @ _ish_periodic_elapsed = $_ish_periodic_now - $_ish_periodic_last
     @ _ish_periodic_interval = $_ish_user_tperiod * 60
     if ($_ish_periodic_elapsed >= $_ish_periodic_interval) then
@@ -332,7 +378,7 @@ if (! $?_ish_tcsh_installed) then
     if ($?tperiod) then
         set _ish_user_tperiod = "$tperiod"
     endif
-    set _ish_periodic_last = "`date +%s`"
+    set _ish_periodic_last = "`@CSH_FORWARD@ --time`"
     # A sourced file also invokes postcmd for each line. Suspend that hook
     # only around our bookkeeping so it neither restores edit too early nor
     # calls the user's postcmd for integration commands.

@@ -16,7 +16,6 @@ import os
 import platform
 import pty
 import shutil
-import signal
 import struct
 import sys
 import tempfile
@@ -27,18 +26,48 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 from ish.config import config
-from ish.fdio import FDWriter
+from ish.runtime.fdio import FDWriter
+from ish.runtime.observer import InputObserver
 
 from .adapters import get_adapter
-from .constants import FORWARD_BINARY, PROMPT_ID, SHELL_FIFO, TTY_FIFO, SessionSignals
-from .integration import build_binary, install_scripts
-from .output_line import OutputLine
+from .constants import (
+    FORWARD_BINARY,
+    PROMPT_ID,
+    PROMPT_ID_LIMIT,
+    PROMPT_ID_MAX_DIGITS,
+    SHELL_FIFO,
+    TIOCGPTPEER,
+    TTY_FIFO,
+    SessionSignals,
+)
+from .input import (
+    InputModeLease,
+    InputRejected,
+    check_terminal,
+    staged_prefix,
+)
+from .integration import build_binary_async, install_scripts
+from .limits import (
+    BYTES_PER_MIB,
+    DEFAULT_READ_CHUNK_BYTES,
+    DIAGNOSTIC_TAIL_BYTES,
+    FIFO_READ_CHUNK_BYTES,
+    OUTPUT_QUEUE_HIGH_BYTES,
+    OUTPUT_QUEUE_LIMIT_BYTES,
+    OUTPUT_QUEUE_LOW_BYTES,
+    SCROLLBACK_MAX_BYTES,
+    SCROLLBACK_MAX_LINES,
+    STREAM_CHUNK_BYTES,
+    TYPEAHEAD_LIMIT_BYTES,
+)
+from .prefix import OutputLine
 from .protocol import FrameDecoder
+from .request import ShellExitRequest, ShellPassRequest
 from .sequencer import Sequencer
-from .signal import ShellExitRequest, ShellPassRequest
+from .signals import ShellSignalController, SignalScope
+from .state import TerminalState
 
 if TYPE_CHECKING:
-    import types
     from asyncio import AbstractEventLoop
 
     from ish.ui.prompt import Prompt
@@ -53,7 +82,12 @@ class ScrollBack:
     truncation flags let consumers distinguish a retained tail from full output.
     """
 
-    def __init__(self, max_lines=10000, max_bytes=10 * 1024 * 1024, encoder="utf-8"):
+    def __init__(
+        self,
+        max_lines=SCROLLBACK_MAX_LINES,
+        max_bytes=SCROLLBACK_MAX_BYTES,
+        encoder="utf-8",
+    ):
         """Validate line and byte budgets and prepare history and last-output buffers."""
         if max_lines < 0 or max_bytes < 0:
             raise ValueError("Scrollback limits must be nonnegative")
@@ -164,7 +198,8 @@ class InteractiveShell:
     """Asynchronous session coordinating a real shell process, PTY, FIFOs, and editor.
 
     Adapters define shell policies. Forward raw output to the terminal and transfer
-    input ownership or repair integration only at a confirmed primary prompt boundary.
+    input ownership only after confirming a fresh prompt and its state frame.
+    Signal policies request transport operations; buffers stay owned by this engine.
     """
 
     __slots__ = (
@@ -217,10 +252,8 @@ class InteractiveShell:
         "_context_id",
         "_prompt_id",
         "_context_event",
-        "refresh_command",
         "_native_output_line",
         "_prompt_prefix",
-        "_unhooked_prompt",
         "signals",
         "context_timeout",
         "_output_buffer",
@@ -228,6 +261,21 @@ class InteractiveShell:
         "_output_paused",
         "_closing_output",
         "resize_callback",
+        "_accepted_prompt_id",
+        "_pending_prompt_id",
+        "_send_task",
+        "_send_interrupted",
+        "_deferred_input",
+        "input_observer",
+        "_input_observation",
+        "_handoff_pending",
+        "_native_input_active",
+        "_input_epoch",
+        "_send_generation",
+        "terminal_state",
+        "_stopping",
+        "_input_mode_lease",
+        "signal_controller",
     )
 
     def __init__(
@@ -238,7 +286,8 @@ class InteractiveShell:
         stdout: int = sys.stdout.fileno(),
         stderr: int = sys.stderr.fileno(),
         prompt: Prompt = None,
-        chunk: int = 1024 * 1024,
+        chunk: int = DEFAULT_READ_CHUNK_BYTES,
+        input_observer: InputObserver | None = None,
     ):
         """Prepare the shell adapter and buffers; main opens descriptors and starts
         processes.
@@ -274,7 +323,6 @@ class InteractiveShell:
         self.adapter = get_adapter(shell_name or shell, self.shell_path)
         self.shell = self.adapter.name
         self.shell_args = self.adapter.args
-        self.refresh_command = b""
         self.signals = SessionSignals.create()
         self.context_timeout = 5.0
         self._output_buffer = bytearray()
@@ -283,10 +331,22 @@ class InteractiveShell:
         self._closing_output = False
         self.resize_callback: Optional[Callable[[], None]] = None
         self._context_id = self._prompt_id = 0
+        self._accepted_prompt_id = self._pending_prompt_id = 0
+        self._send_task = None
+        self._send_interrupted = False
+        self._deferred_input = bytearray()
+        self.input_observer = input_observer or InputObserver()
+        self._input_observation = None
+        self._handoff_pending = False
+        self._native_input_active = False
+        self._input_epoch = 0
+        self._send_generation = 0
+        self.terminal_state = TerminalState()
+        self._stopping = False
+        self._input_mode_lease = None
         self._context_event = asyncio.Event()
         self._native_output_line = OutputLine()
         self._prompt_prefix = b""
-        self._unhooked_prompt = False
 
         self.shell_pid: int = -1
 
@@ -317,7 +377,9 @@ class InteractiveShell:
         self.dupin_buffer: bytearray = bytearray()
 
         self.scroll_back: ScrollBack = ScrollBack(
-            max_lines=10000, max_bytes=10 * 1024 * 1024, encoder=self.encoder
+            max_lines=SCROLLBACK_MAX_LINES,
+            max_bytes=SCROLLBACK_MAX_BYTES,
+            encoder=self.encoder,
         )
 
         self.sequencer: Optional[Sequencer] = None
@@ -328,20 +390,16 @@ class InteractiveShell:
         self._initializing = False
         self._init_output = bytearray()
         self._init_event = None
+        self.signal_controller = ShellSignalController(self, self.adapter.signal_policy)
 
     @staticmethod
-    def _sigwinch(fd, col, row, xpix=0, ypix=0) -> None:
+    def _set_window_size(fd, col, row, xpix=0, ypix=0) -> None:
         """Set the PTY window size in rows and columns."""
         try:
             win_size = struct.pack("HHHH", row, col, xpix, ypix)
             fcntl.ioctl(fd, termios.TIOCSWINSZ, win_size)
         except OSError:
             return
-
-    def _signal_handler(self, signum: int, frame: Optional[types.FrameType]) -> None:
-        """Handle SIGWINCH by matching the internal PTY size to the current terminal."""
-        if signum == signal.SIGWINCH:
-            self._resize()
 
     def _resize(self) -> None:
         """Resize the shell first, then notify any active Python tool of its new size."""
@@ -354,50 +412,81 @@ class InteractiveShell:
         if not rows or not columns:
             fallback = shutil.get_terminal_size()
             rows, columns = rows or fallback.lines, columns or fallback.columns
-        self._sigwinch(self.master_fd, columns, rows)
+        self._set_window_size(self.master_fd, columns, rows)
         if self.resize_callback is not None:
             self.resize_callback()
 
-    def _set_prompt(self, prompt: bytes) -> None:
-        # Stop forwarding as soon as the primary boundary is parsed, before
-        # awaiting context or running any integration maintenance commands.
-        """Store the primary prompt and stop forwarding raw input.
+    def _set_prompt(self, prompt: bytes) -> Optional[bytes]:
+        """Stage a fresh prompt candidate; replayed PS1 is ordinary program output.
 
-        Freeze the output prefix at this boundary; state FIFO synchronization uses a
-        separate wait.
+        Only the matching state frame can transfer input back to the editor. A
+        surviving marker without a hook must never authorize a maintenance write.
         """
-        if self.loop is not None and self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
-        self.command_done_event.set()
-        self.continuation_active.clear()
+        if self._prompt_id <= self._accepted_prompt_id:
+            return prompt
+        self._pending_prompt_id = self._prompt_id
+        self.input_observer.record(
+            "prompt_candidate", prompt_id=self._prompt_id, context_id=self._context_id
+        )
         self.message = prompt
         if not self._initializing:
             self._prompt_prefix = self._native_output_line.prefix
-        self.session.set_prompt(self._prompt_prefix + prompt, self.encoder)
         self.prompt_event.set()
+        self._context_event.set()
         if self._initializing:
             self._init_event.set()
 
+    def _accept_prompt(self) -> None:
+        """Transfer input ownership only after a fresh prompt and its state agree."""
+        if self._closing_output or self._has_exited():
+            return
+        if not self._accepted_prompt_id < self._pending_prompt_id == self._context_id:
+            raise RuntimeError("Cannot accept an unconfirmed shell prompt")
+        self.signal_controller.reset()
+        if self.loop is not None and self.dupin_fd is not None:
+            self.loop.remove_reader(self.dupin_fd)
+            self._native_input_active = False
+            self.input_observer.end(self._input_observation)
+            self._input_observation = None
+        if self._send_interrupted:
+            # A previous primary hook may have moved submitted suffix bytes
+            # into the typeahead FIFO before VINTR arrived. The new prompt is
+            # emitted after its forwarder exits, so drain those bytes now.
+            while self._pre_input(self.tty_pipe):
+                pass
+            self._send_interrupted = False
+        self._accepted_prompt_id = self._pending_prompt_id
+        # The helper forwarded older PTY input before emitting this prompt.
+        # Read that FIFO before appending newer input held during the handoff.
+        while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+            pass
+        self.return_typeahead(bytes(self._deferred_input))
+        self._deferred_input.clear()
+        self.input_observer.record(
+            "prompt_accepted", prompt_id=self._accepted_prompt_id
+        )
+        self.command_done_event.set()
+        self.continuation_active.clear()
+        self.session.set_prompt(self._prompt_prefix + self.message, self.encoder)
+        self.input_observer.terminal("SHELL", self.master_fd, "prompt_accepted")
+
     def _set_prompt_id(self, data: bytes) -> bool:
         """Accept only valid, increasing session IDs and pass invalid signals through."""
-        if not data or len(data) > 19 or not data.isdigit():
+        if not data or len(data) > PROMPT_ID_MAX_DIGITS or not data.isdigit():
             return False
         value = int(data)
-        if not self._prompt_id < value < 2**63:
+        if not self._prompt_id < value < PROMPT_ID_LIMIT:
             return False
         self._prompt_id = value
         return True
 
-    def _set_unhooked_prompt(self, prompt: bytes) -> None:
-        # After an interrupt tcsh can skip precmd and show the primary
-        # markers as caret notation with its secondary editor still enabled.
-        """Record a caret-form primary prompt and schedule recovery at that boundary."""
-        self._unhooked_prompt = True
-        self._set_prompt(prompt)
+    def _set_unhooked_prompt(self, prompt: bytes) -> Optional[bytes]:
+        """Keep an unconfirmed caret prompt with native input, without sending a newline."""
+        return self._set_prompt(prompt)
 
     async def _wait_context(self) -> None:
         """Wait within a deadline for the state FIFO to reach the current prompt ID."""
-        while self._context_id < self._prompt_id:
+        while self._context_id != (self._pending_prompt_id or self._prompt_id):
             self._context_event.clear()
             try:
                 await asyncio.wait_for(self._context_event.wait(), self.context_timeout)
@@ -431,13 +520,23 @@ class InteractiveShell:
         read.
         """
         try:
-            chunk = os.read(fd, 4096)
+            chunk = os.read(fd, FIFO_READ_CHUNK_BYTES)
             if not chunk:
                 return
-            if len(self.dupin_buffer) + len(chunk) > 1024 * 1024:
-                self._io_failed(BufferError("Pending typeahead exceeds 1 MiB"))
+            if self._send_interrupted:
+                self.input_observer.record("typeahead_discard", bytes=len(chunk))
+                return True
+            if len(self.dupin_buffer) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
+                self._io_failed(
+                    BufferError(
+                        f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+                    )
+                )
                 return
             self.dupin_buffer.extend(chunk)
+            self.input_observer.record(
+                "typeahead_received", bytes=len(chunk), pending=len(self.dupin_buffer)
+            )
             return True
         except (BlockingIOError, OSError):
             return
@@ -451,6 +550,18 @@ class InteractiveShell:
         except (BlockingIOError, OSError):
             data = b""
         return data
+
+    def return_typeahead(self, data: bytes) -> None:
+        """Append unread input returned by the previous consumer within the byte limit."""
+        if len(self.dupin_buffer) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+            raise BufferError(
+                f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+            )
+        self.dupin_buffer.extend(data)
+        if data:
+            self.input_observer.record(
+                "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
+            )
 
     def _io_failed(self, exc: Exception) -> None:
         """Wake the main session waiter with the first I/O error."""
@@ -468,7 +579,7 @@ class InteractiveShell:
         if (
             self._output_paused
             and not self._closing_output
-            and len(self._output_buffer) <= 1024 * 1024
+            and len(self._output_buffer) <= OUTPUT_QUEUE_LOW_BYTES
         ):
             self._output_paused = False
             self.loop.add_reader(self.master_fd, self._display, self.master_fd)
@@ -479,7 +590,7 @@ class InteractiveShell:
         """
         try:
             while self._output_buffer:
-                data = bytes(self._output_buffer[:65536])
+                data = bytes(self._output_buffer[:STREAM_CHUNK_BYTES])
                 del self._output_buffer[: len(data)]
 
                 async def write(data=data):
@@ -514,24 +625,128 @@ class InteractiveShell:
             return
         if not data:
             return
-        if len(self._output_buffer) + len(data) > 4 * 1024 * 1024:
-            raise BufferError("Pending terminal output exceeds 4 MiB")
+        if len(self._output_buffer) + len(data) > OUTPUT_QUEUE_LIMIT_BYTES:
+            raise BufferError(
+                f"Pending terminal output exceeds {OUTPUT_QUEUE_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+            )
         self._output_buffer.extend(data)
-        if len(self._output_buffer) >= 2 * 1024 * 1024 and not self._output_paused:
+        if (
+            len(self._output_buffer) >= OUTPUT_QUEUE_HIGH_BYTES
+            and not self._output_paused
+        ):
             self._output_paused = True
             self.loop.remove_reader(self.master_fd)
         if self._output_task is None or self._output_task.done():
             self._output_task = self.loop.create_task(self._flush_output())
 
-    def _input(self, fd: int) -> None:
+    def _has_exited(self) -> bool:
+        """Consult the child watcher's cached status without probing the process."""
+        return self.proc is not None and self.proc.returncode is not None
+
+    def _input(self, fd: int, epoch: int | None = None) -> None:
         """Forward input to the internal PTY during execution and retain a diagnostic tail."""
+        if (
+            not self._native_input_active
+            or (epoch is not None and epoch != self._input_epoch)
+            or self._closing_output
+            or self._has_exited()
+        ):
+            return
         data = self._read(fd)
+        self.input_observer.read("SHELL", self._input_observation, len(data))
         self.shell_temp_buffer.extend(data)
-        del self.shell_temp_buffer[:-65536]
+        del self.shell_temp_buffer[:-DIAGNOSTIC_TAIL_BYTES]
         try:
+            if self.signal_controller.consume_input(data):
+                return
+            if self._handoff_pending and (
+                self._send_task is None or self._send_task.done()
+            ):
+                if len(self._deferred_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+                    raise BufferError(
+                        f"Input during handoff exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+                    )
+                self._deferred_input.extend(data)
+                self.input_observer.record("handoff_input_deferred", bytes=len(data))
+                return
+            if self._send_task is not None and not self._send_task.done():
+                if len(self._deferred_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+                    raise BufferError(
+                        f"Input during submission exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+                    )
+                self._deferred_input.extend(data)
+                self.input_observer.record(
+                    "input_deferred",
+                    "SHELL",
+                    bytes=len(data),
+                    pending=len(self._deferred_input),
+                )
+                return
             self._write(self.master_fd, data)
+            self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
         except Exception as exc:
             self._io_failed(exc)
+
+    def _cancel_handoff(self, control: bytes, remaining: bytes) -> None:
+        """Cancel an input handoff and retain only post-control typeahead."""
+        self._deferred_input.clear()
+        self.dupin_buffer.clear()
+        self._handoff_pending = False
+        self._write(self.master_fd, control)
+        self.return_typeahead(remaining)
+
+    def _cancel_submission(self, control: bytes, remaining: bytes) -> None:
+        """Discard cancelled transport data before a policy-selected control byte.
+
+        The signal policy has already restored any TTY lease. Queue ownership,
+        cancellation generations, and post-control byte ordering remain here.
+        """
+        self._send_generation += 1
+        self._send_interrupted = True
+        self._handoff_pending = False
+        self.input_observer.record(
+            "submission_interrupt", "SHELL", generation=self._send_generation
+        )
+        if self._send_task is not None:
+            self._send_task.cancel()
+        self._deferred_input.clear()
+        self.dupin_buffer.clear()
+        self._accepted_prompt_id = self._prompt_id
+        self._pending_prompt_id = 0
+        if self.prompt_event is not None:
+            self.prompt_event.clear()
+        self._writer(self.master_fd).discard()
+        self._discard_terminal_input()
+        if self.sequencer is not None:
+            self.sequencer.at_masking(b"")
+        self._write(self.master_fd, control)
+        if self.adapter.refresh:
+            # This adapter has no automatic prompt acknowledgement. Its old
+            # FIFO is idle until explicit reconnect, so discard it now and keep
+            # following user bytes with native input, including recovery.
+            while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+                pass
+            self._send_interrupted = False
+            self._write(self.master_fd, remaining)
+        else:
+            self.return_typeahead(remaining)
+        self.input_observer.terminal("SHELL", self.master_fd, "interrupt")
+
+    def _discard_terminal_input(self) -> None:
+        """Flush submitted bytes on both sides of the PTY input path, preserving output.
+
+        TCIFLUSH on the master would discard command output, not shell input.
+        Open the slave only for this ioctl so it cannot keep an exited shell alive.
+        TIOCGPTPEER avoids reopening a possibly renamed or permission-changed path.
+        """
+        peer = fcntl.ioctl(
+            self.master_fd, TIOCGPTPEER, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC
+        )
+        try:
+            termios.tcflush(self.master_fd, termios.TCOFLUSH)
+            termios.tcflush(peer, termios.TCIFLUSH)
+        finally:
+            os.close(peer)
 
     def _update(self, fd: int) -> None:
         """Consume FIFO frames to update shell state and the received prompt ID."""
@@ -543,11 +758,13 @@ class InteractiveShell:
                 if category == PROMPT_ID:
                     if (
                         body
-                        and len(body) <= 19
+                        and len(body) <= PROMPT_ID_MAX_DIGITS
                         and body.isdigit()
-                        and int(body) < 2**63
+                        and int(body) < PROMPT_ID_LIMIT
                     ):
                         self._context_id = max(self._context_id, int(body))
+                        if self._context_id > self._accepted_prompt_id:
+                            self._handoff_pending = True
                         self._context_event.set()
                 else:
                     self.session.update_context(category, body)
@@ -568,7 +785,7 @@ class InteractiveShell:
         data = self.sequencer.interpret(raw_data)
         if self._initializing:
             self._init_output.extend(raw_data)
-            del self._init_output[:-65536]
+            del self._init_output[:-DIAGNOSTIC_TAIL_BYTES]
             return
         self.scroll_back.append(raw_data)
         self.scroll_back.append_ld(data)
@@ -580,7 +797,7 @@ class InteractiveShell:
         """Read the PTY within a work budget and handle EOF, backpressure, and I/O
         failures.
         """
-        budget = 65536
+        budget = STREAM_CHUNK_BYTES
         try:
             for _ in range(64):
                 try:
@@ -591,6 +808,7 @@ class InteractiveShell:
                     raw_data = b""  # A closed PTY slave reports EIO on Linux.
                 if not raw_data:
                     self._closing_output = True
+                    self.input_observer.record("pty_eof", "SHELL")
                     self.loop.remove_reader(fd)
                     self._write(self.stdout_fd, self.sequencer.finish())
                     return
@@ -603,14 +821,98 @@ class InteractiveShell:
         except Exception as exc:
             self._io_failed(exc)
 
-    async def _send(self, data: Union[str, bytes]) -> int:
+    def validate_submission(self, data: bytes) -> int:
+        """Validate editor input without changing terminal settings or writing bytes."""
+        prefix = staged_prefix(data, self.adapter.long_input, self.shell)
+        if not prefix:
+            return 0
+        self.signal_controller.validate_submission()
+        if (
+            self._has_exited()
+            or self._closing_output
+            or self._accepted_prompt_id <= 0
+            or self._accepted_prompt_id != self._context_id
+            or self._accepted_prompt_id != self._prompt_id
+            or self.command_done_event is None
+            or not self.command_done_event.is_set()
+            or self.continuation_active is None
+            or self.continuation_active.is_set()
+        ):
+            raise InputRejected(
+                "Not sent: long input requires a confirmed primary shell prompt."
+            )
+        try:
+            attrs = termios.tcgetattr(self.master_fd)
+            if os.tcgetpgrp(self.master_fd) != self.shell_pid:
+                raise InputRejected(
+                    "Not sent: the shell does not own the terminal for long input."
+                )
+            check_terminal(attrs, data[:prefix])
+        except (OSError, termios.error) as exc:
+            raise InputRejected(
+                "Not sent: the shell terminal is unavailable for long input."
+            ) from exc
+        return prefix
+
+    async def _send_staged(self, data: bytes, prefix: int, generation: int) -> int:
+        """Transmit a verified first-line prefix before committing its newline."""
+        lease = InputModeLease(self.master_fd, data[:prefix])
+        self._input_mode_lease = lease
+        try:
+            suffix = data[prefix:]
+            echo = suffix if lease.saved[3] & termios.ECHO else b""
+            if lease.saved[1] & termios.OPOST and lease.saved[1] & termios.ONLCR:
+                echo = echo.replace(b"\n", b"\r\n")
+            # The prefix has echo disabled; only arm suffix masking when LF
+            # is about to be sent, so intervening background output stays intact.
+            self.sequencer.at_masking(b"")
+            lease.start()
+            self.input_observer.record("long_input_started", "SHELL", bytes=prefix)
+            sent = await self._send(data[:prefix], generation)
+            if generation != self._send_generation or sent != prefix:
+                return sent
+            async with asyncio.timeout(5):
+                while lease.pending():
+                    if self._has_exited() or self._closing_output:
+                        raise OSError("Shell exited during long input")
+                    await asyncio.sleep(0.001)
+            if self._prompt_id != self._accepted_prompt_id:
+                raise RuntimeError("Shell abandoned a long input before its newline")
+        finally:
+            try:
+                lease.close()
+            finally:
+                self._input_mode_lease = None
+                self.input_observer.record("long_input_restored", "SHELL")
+        self.sequencer.at_masking(echo)
+        return sent + await self._send(data[prefix:], generation)
+
+    async def _send(
+        self, data: Union[str, bytes], generation: int | None = None
+    ) -> int:
         """Send an encoded command in ordered chunks and return the byte count."""
         text_bytes = data.encode(self.encoder) if isinstance(data, str) else data
+        if generation is None:
+            generation = self._send_generation
+        self.input_observer.record(
+            "submission", "SHELL", bytes=len(text_bytes), generation=generation
+        )
         writer = self._writer(self.master_fd)
-        for start in range(0, len(text_bytes), 65536):
-            writer.write(text_bytes[start : start + 65536])
+        sent = 0
+        for start in range(0, len(text_bytes), STREAM_CHUNK_BYTES):
+            if (
+                generation != self._send_generation
+                or self._has_exited()
+                or self._closing_output
+            ):
+                break
+            writer.write(text_bytes[start : start + STREAM_CHUNK_BYTES])
             await writer.drain()
-        return len(text_bytes)
+            sent += min(STREAM_CHUNK_BYTES, len(text_bytes) - start)
+            # drain() can finish synchronously; even an immediately writable
+            # PTY must allow the input callback to observe an interrupt.
+            await asyncio.sleep(0)
+        return sent
 
     async def _exec(self, data: Union[str, bytes]) -> None:
         """Pass input to the shell and wait for the next prompt, state, and output drain.
@@ -624,26 +926,73 @@ class InteractiveShell:
         self._prompt_prefix = b""
         if isinstance(data, str):
             data = data.encode(self.encoder)
-        previous_prompt_id = self._prompt_id
+        prefix = self.validate_submission(data)
         self.prompt_event.clear()
         self.command_start_event.set()
         self.command_done_event.clear()
+        self._send_interrupted = False
+        self._handoff_pending = False
+        self._deferred_input.clear()
+        self._send_generation += 1
+        self._input_epoch += 1
+        if self.adapter.refresh and hasattr(self.session, "take_typeahead"):
+            data += self.session.take_typeahead()
         try:
             # The PTY echoes every newline as CRLF, including pasted lines.
             attrs = termios.tcgetattr(self.master_fd)
+            self.input_observer.terminal("SHELL", self.master_fd, "submission")
             echo = data if attrs[3] & termios.ECHO else b""
             if attrs[1] & termios.OPOST and attrs[1] & termios.ONLCR:
                 echo = echo.replace(b"\n", b"\r\n")
             self.sequencer.at_masking(echo)
-            await self._send(data)
-            if not self.prompt_event.is_set():
-                self.loop.add_reader(self.dupin_fd, self._input, self.dupin_fd)
+            self.loop.add_reader(
+                self.dupin_fd, self._input, self.dupin_fd, self._input_epoch
+            )
+            self._native_input_active = True
+            self._input_observation = self.input_observer.begin("SHELL")
+            generation = self._send_generation
+            self._send_task = asyncio.create_task(
+                self._send_staged(data, prefix, generation)
+                if prefix
+                else self._send(data, generation)
+            )
+            try:
+                await self._send_task
+            except InputRejected:
+                # A final lease check can reject changed settings before any
+                # bytes are sent. The acknowledged prompt still belongs to us.
+                self.command_start_event.clear()
+                self.command_done_event.set()
+                self.prompt_event.set()
+                self.return_typeahead(bytes(self._deferred_input))
+                raise
+            except asyncio.CancelledError:
+                if (
+                    generation == self._send_generation
+                    or asyncio.current_task().cancelling()
+                ):
+                    raise
+            finally:
+                self._send_task = None
+            if (
+                self._deferred_input
+                and not self._handoff_pending
+                and not self._has_exited()
+            ):
+                self._write(self.master_fd, self._deferred_input)
+                self.input_observer.record(
+                    "deferred_forwarded", "SHELL", bytes=len(self._deferred_input)
+                )
+                self._deferred_input.clear()
             await self.prompt_event.wait()
-            if not self.continuation_active.is_set():
-                await self._synchronize_prompt(previous_prompt_id)
+            await self._synchronize_prompt()
             await self._drain_output()
         finally:
             self.loop.remove_reader(self.dupin_fd)
+            self._native_input_active = False
+            self.input_observer.end(self._input_observation)
+            self._input_observation = None
+            self._deferred_input.clear()
 
     async def _spawn(self) -> None:
         """Start an interactive shell with a controlling PTY and close the parent's slave
@@ -660,16 +1009,25 @@ class InteractiveShell:
         if not self.shell_path or not os.path.isfile(self.shell_path):
             raise FileNotFoundError(f"Shell not found: {self.shell}")
 
-        self.proc = await asyncio.create_subprocess_exec(
-            self.shell_path,
-            *self.shell_args,
-            stdin=self.slave_fd,
-            stdout=self.slave_fd,
-            stderr=self.slave_fd,
-            env=self._environ,
-            cwd=os.getcwd(),
-            preexec_fn=setup_pty,
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                self.shell_path,
+                *self.shell_args,
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                env=self._environ,
+                cwd=os.getcwd(),
+                preexec_fn=setup_pty,
+            )
         )
+        try:
+            self.proc = await asyncio.shield(spawn)
+        finally:
+            if self.proc is None:
+                # Cancellation during transport setup must not orphan the child.
+                with contextlib.suppress(Exception):
+                    self.proc = await spawn
 
         self.shell_pid = self.proc.pid
         # The parent must not keep the slave alive after the child inherits it.
@@ -699,6 +1057,7 @@ class InteractiveShell:
             await self._send(init_command)
             await self._init_event.wait()
             await self._wait_context()
+            self._accept_prompt()
 
         ready = asyncio.create_task(handshake())
         exited = asyncio.create_task(self.proc.wait())
@@ -710,7 +1069,7 @@ class InteractiveShell:
             )
             if self._fatal_error in done:
                 raise self._fatal_error.result()
-            if ready in done:
+            if ready in done and exited not in done and not self._has_exited():
                 ready.result()
                 if show_newline:
                     self._write(self.stdout_fd, b"\r\n")
@@ -718,7 +1077,7 @@ class InteractiveShell:
                 return
             reason = (
                 "Shell exited during initialization"
-                if exited in done
+                if exited in done or self._has_exited()
                 else "Shell initialization timed out"
             )
             raise RuntimeError(
@@ -730,39 +1089,30 @@ class InteractiveShell:
             exited.cancel()
             await asyncio.gather(ready, exited, return_exceptions=True)
 
-    async def _synchronize_prompt(self, previous_prompt_id):
-        """Recovery is permitted only after this session's primary prompt."""
-        if self._unhooked_prompt:
-            self._unhooked_prompt = False
-            await self._init(b"\n", timeout=self.context_timeout, show_newline=False)
-        elif self.adapter.refresh:
-            await self._init(
-                self.refresh_command, timeout=self.context_timeout, show_newline=False
-            )
-        elif self._prompt_id <= previous_prompt_id:
-            # The PS1 marker survived but the prompt hook stopped reporting.
-            command = self.adapter.syntax.preserve_status(
-                self.init_command.decode(self.encoder)
-            )
-            await self._init(
-                command.encode(self.encoder),
-                timeout=self.context_timeout,
-                show_newline=False,
-            )
-        else:
-            await self._wait_context()
+    async def _synchronize_prompt(self):
+        """Confirm context without ever injecting recovery commands into shell stdin."""
+        await self._wait_context()
+        self._accept_prompt()
 
     async def _shell(self) -> None:
         """Wait for shell exit, then drain final PTY output and incomplete control
         sequences.
         """
-        await self.proc.wait()
+        status = await self.proc.wait()
+        self._native_input_active = False
+        if self.dupin_fd is not None:
+            self.loop.remove_reader(self.dupin_fd)
+        self._send_generation += 1
+        writer = self._writers.get(self.master_fd)
+        if writer is not None:
+            writer.discard()
+        self.input_observer.record("process_exit", "SHELL", status=status)
         # Process exit does not mean the PTY has been drained. Stop the reader
         # before draining, including when a descendant holds the slave open.
         self._closing_output = True
         self.loop.remove_reader(self.master_fd)
         await self._drain_output()
-        budget = 65536
+        budget = STREAM_CHUNK_BYTES
         while True:
             try:
                 data = os.read(self.master_fd, self.chunk_size)
@@ -778,7 +1128,7 @@ class InteractiveShell:
             budget -= len(data)
             if budget <= 0:
                 await self._drain_output()
-                budget = 65536
+                budget = STREAM_CHUNK_BYTES
         self._write(self.stdout_fd, self.sequencer.finish())
         await self._drain_output()
 
@@ -792,13 +1142,24 @@ class InteractiveShell:
             rendering.
             """
             if typehead:
-                self.session.parser.feed(typehead)
-                self.session.parser.flush()
+                self.input_observer.record(
+                    "typeahead_injected", "EDITOR", bytes=len(typehead)
+                )
+                if hasattr(self.session, "feed_typeahead"):
+                    self.session.feed_typeahead(typehead)
+                else:
+                    self.session.parser.feed(
+                        typehead.decode(self.encoder, errors="replace")
+                    )
+                    self.session.parser.flush()
                 self.session.app.key_processor.process_keys()
                 self.session.app.invalidate()
 
+        retry_command = None
         while True:
-            typehead = ""
+            if self._has_exited():
+                return
+            typehead = b""
             if self.shell_temp_buffer:
                 del self.shell_temp_buffer[:]
             while self._pre_input(self.tty_pipe):
@@ -807,19 +1168,27 @@ class InteractiveShell:
                 idx = self.dupin_buffer.find(b"\n")
                 if idx != -1:
                     typehead_bytes = self.dupin_buffer[: idx + 1]
-                    typehead = typehead_bytes.decode(self.encoder, errors="ignore")
+                    typehead = bytes(typehead_bytes)
                     del self.dupin_buffer[: idx + 1]
                 else:
-                    typehead = self.dupin_buffer.decode(self.encoder, errors="ignore")
+                    typehead = bytes(self.dupin_buffer)
                     self.dupin_buffer.clear()
 
             try:
                 self._write(self.stdout_fd, b"\x1b[2K\r")
                 await self._drain_output()
-                command = await self.session.get(pre_run=inject_typehead)
+                options = {"pre_run": inject_typehead}
+                if retry_command is not None:
+                    options["default"] = retry_command
+                    retry_command = None
+                command = await self.session.get(**options)
                 await self._drain_output()
+                if self._has_exited():
+                    return
                 if command is None:
-                    command = typehead
+                    # Internal tools already completed without running a shell
+                    # command. Their unread input belongs to the next editor.
+                    continue
             except KeyboardInterrupt:
                 self.dupin_buffer.clear()
                 if self.continuation_active.is_set():
@@ -837,6 +1206,7 @@ class InteractiveShell:
                 lines = self.adapter.behavior.split_commands(command)
                 for cmd in lines:
                     self.last_command = cmd
+                    self.validate_submission((cmd + "\n").encode(self.encoder))
                     await self.session.pre_exec()
 
                     await self._exec((cmd + "\n").encode(self.encoder))
@@ -844,6 +1214,11 @@ class InteractiveShell:
                     await self.session.post_exec()
                     await self.session.fallback()
 
+            except InputRejected as exc:
+                # The UI normally rejects before accepting Enter. Revalidate
+                # here for custom sessions or hooks that changed terminal modes.
+                retry_command = command
+                self._write(self.stdout_fd, (str(exc) + "\r\n").encode(self.encoder))
             except ShellExitRequest:
                 if command.strip():
                     return
@@ -855,32 +1230,48 @@ class InteractiveShell:
         if fd is not None:
             os.close(fd)
 
+    def _restore_terminal(self) -> None:
+        """Restore saved termios, tolerating a terminal destroyed during hangup."""
+        try:
+            termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self.exec_attrs)
+        except termios.error as exc:
+            if self.signal_controller.shutdown_signal is None or exc.args[0] not in (
+                errno.EIO,
+                errno.ENOTTY,
+                errno.EBADF,
+            ):
+                raise
+
     async def _stop(self) -> None:
         """Cancel session tasks, wait for shell exit, and close output-monitoring
         resources.
         """
+        self._native_input_active = False
+        self._send_generation += 1
+        self.signal_controller.reset()
+        if self.dupin_fd is not None:
+            self.loop.remove_reader(self.dupin_fd)
         for task in self.tasks or []:
             task.cancel()
         await asyncio.gather(*(self.tasks or []), return_exceptions=True)
         try:
-            if self.proc is not None:
-                if self.proc.returncode is None:
-                    try:
-                        # Interactive Bash ignores SIGTERM; hangup also informs its jobs.
-                        self.proc.send_signal(signal.SIGHUP)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(self.proc.wait(), 2)
-                    except TimeoutError:
-                        try:
-                            self.proc.kill()
-                        except ProcessLookupError:
-                            pass
-                        await self.proc.wait()
-                else:
-                    await self.proc.wait()
+            await self.signal_controller.stop_child()
         finally:
+            if self.signal_controller.shutdown_signal is not None:
+                # Drain only within a shutdown deadline. A disconnected terminal
+                # or blocked output consumer must not prevent termios/FD cleanup.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    async with asyncio.timeout(0.5):
+                        if self.master_fd is not None:
+                            self.loop.remove_reader(self.master_fd)
+                            self._closing_output = True
+                            for _ in range(16):
+                                data = self._read(self.master_fd)
+                                if not data:
+                                    break
+                                self._consume_output(data)
+                                await self._drain_output()
+                        await self._drain_output()
             if self._output_task is not None:
                 self._output_task.cancel()
                 await asyncio.gather(self._output_task, return_exceptions=True)
@@ -888,14 +1279,25 @@ class InteractiveShell:
             for writer in self._writers.values():
                 writer.close()
             self._writers.clear()
+            if self.signal_controller.shutdown_signal is not None and os.isatty(
+                self.stdout_fd
+            ):
+                # The output FD is still nonblocking. Failure here is harmless:
+                # ExitStack must still restore termios and release session files.
+                with contextlib.suppress(OSError):
+                    os.write(self.stdout_fd, self.terminal_state.restore())
 
     async def main(self):
+        """Run acquisition and cleanup inside the adapter's signal-handler lifetime."""
+        self.loop = asyncio.get_running_loop()
+        return await self.signal_controller.run(self._run_session)
+
+    async def _run_session(self):
         """Acquire temporary integration files, FDs, and terminal settings for the session
         lifetime.
 
-        ExitStack restores resources on normal exit and Python exceptions. External
-        SIGTERM currently has no cleanup handler and does not guarantee the same
-        restoration.
+        ExitStack restores resources after normal exit, exceptions, and the
+        cancellation requested by main's catchable termination handlers.
         """
         self.loop = asyncio.get_running_loop()
         self._fatal_error = self.loop.create_future()
@@ -916,15 +1318,13 @@ class InteractiveShell:
                     tempfile.TemporaryDirectory(prefix="session-", dir=cache_dir)
                 )
                 runtime = Path(pipe_dir) / "integration"
-                if not build_binary(directory=runtime):
+                if not await build_binary_async(directory=runtime):
                     raise RuntimeError(
                         "Failed to prepare ish_forward. Check the error above."
                     )
 
                 self.exec_attrs = termios.tcgetattr(self.stdin_fd)
-                resources.callback(
-                    termios.tcsetattr, self.stdin_fd, termios.TCSANOW, self.exec_attrs
-                )
+                resources.callback(self._restore_terminal)
                 for fd in dict.fromkeys([self.stdin_fd, self.stdout_fd]):
                     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
                     resources.callback(fcntl.fcntl, fd, fcntl.F_SETFL, flags)
@@ -956,9 +1356,6 @@ class InteractiveShell:
                 self.init_command = self.adapter.source(
                     self.shell_integration, self.shell_pipe_path, self.tty_pipe_path
                 ).encode(self.encoder)
-                self.refresh_command = self.adapter.refresh_command(
-                    self.xdg_home
-                ).encode(self.encoder)
 
                 tty.setraw(self.stdin_fd)
                 previous_resize = self.session.app._on_resize
@@ -967,14 +1364,16 @@ class InteractiveShell:
                 )
 
                 def on_resize():
-                    """Resize the PTY, then call prompt-toolkit's original resize callback."""
-                    self._resize()
+                    """Dispatch the resize policy before prompt-toolkit updates its UI."""
+                    self.signal_controller.notify_resize()
                     previous_resize()
 
                 self.session.app._on_resize = on_resize
 
                 self.sequencer = Sequencer(
-                    encoder=self.encoder, output_callback=self._track_output_line
+                    encoder=self.encoder,
+                    output_callback=self._track_output_line,
+                    control_callback=self.terminal_state.observe,
                 )
                 self.adapter.configure_sequencer(
                     self.sequencer,
@@ -984,6 +1383,7 @@ class InteractiveShell:
                     unhooked_prompt=self._set_unhooked_prompt,
                     signals=self.signals,
                 )
+                self.signal_controller.configure_sequencer(self.sequencer, self.signals)
                 for fd, callback in [
                     (self.master_fd, self._display),
                     (self.shell_pipe, self._update),
@@ -991,12 +1391,9 @@ class InteractiveShell:
                 ]:
                     self.loop.add_reader(fd, callback, fd)
                     resources.callback(self.loop.remove_reader, fd)
-                previous_signal = signal.getsignal(signal.SIGWINCH)
-                resources.callback(signal.signal, signal.SIGWINCH, previous_signal)
-                self.loop.add_signal_handler(
-                    signal.SIGWINCH, self._signal_handler, signal.SIGWINCH, None
+                resources.enter_context(
+                    self.signal_controller.install(SignalScope.RUNTIME)
                 )
-                resources.callback(self.loop.remove_signal_handler, signal.SIGWINCH)
                 self._resize()
 
                 self._initializing = True
@@ -1014,12 +1411,36 @@ class InteractiveShell:
                     raise self._fatal_error.result()
                 for task in done:
                     task.result()
+                if self._has_exited():
+                    # A queued editor completion can win the wait in the same
+                    # turn as process exit. Let the shell task drain its tail.
+                    await self.tasks[1]
                 await self._drain_output()
             finally:
+                self._stopping = True
                 await self._stop()
 
     def run(self):
         """Check Linux support and run the asynchronous session from a synchronous call."""
         if platform.system() != "Linux":
             raise OSError(f"Unsupported operating system: {platform.system()}")
-        sys.exit(asyncio.run(self.main()))
+        status = asyncio.run(self.main())
+        if self.signal_controller.shutdown_signal is not None:
+            # Python changes the exit status to 120 if its final stdio flush
+            # fails. Only redirect a broken stream after cleanup, immediately
+            # before this CLI process exits; embedded main() never changes it.
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except OSError as exc:
+                    if exc.errno not in (errno.EIO, errno.EPIPE, errno.EBADF):
+                        raise
+                    target = stream.fileno()
+                    sink = os.open(os.devnull, os.O_WRONLY)
+                    try:
+                        os.dup2(sink, target)
+                    finally:
+                        # open() may reuse the broken standard descriptor itself.
+                        if sink != target:
+                            os.close(sink)
+        sys.exit(status)

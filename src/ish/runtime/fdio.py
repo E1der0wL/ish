@@ -156,7 +156,21 @@ class FDWriter:
     def close(self) -> None:
         """Cancel waiters and monitoring and discard the queue without closing the FD."""
         self.closed = True
+        self.discard()
+
+    def discard(self) -> None:
+        """Cancel queued bytes without closing the writer, for an interrupted submission."""
         self._unwatch()
         self.pending.clear()
         self.pending_bytes = 0
         self._finish_waiters()
+        if self._paused:
+            self._paused = False
+            if self.on_flow and not self.closed:
+                self.on_flow(False)
+
+    def take_pending(self) -> bytes:
+        """Detach unsent bytes in order before transferring input to another consumer."""
+        data = b"".join(self.pending)
+        self.discard()
+        return data

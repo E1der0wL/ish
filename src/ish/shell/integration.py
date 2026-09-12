@@ -1,4 +1,4 @@
-"""Write session-specific shell scripts and build the C typeahead forwarding tool.
+"""Write session scripts and build the C helper for state framing and typeahead.
 
 Runtime files live in a caller-supplied directory; script templates are defined in
 scripts.
@@ -6,8 +6,11 @@ scripts.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import shutil
+import signal
 import textwrap
 import traceback
 from pathlib import Path
@@ -46,6 +49,7 @@ __all__ = [
     "SHELL_INTEGRATION_MAP",
     "install_scripts",
     "build_binary",
+    "build_binary_async",
 ]
 
 
@@ -80,6 +84,68 @@ TTY_FORWARD: str = textwrap.dedent(r"""
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+extern char **environ;
+
+/* Stream base64 without retaining a second copy of the shell environment. */
+struct encoder { FILE *out; unsigned char tail[3]; size_t count; };
+static void encode(struct encoder *e, const unsigned char *data, size_t size) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    while (size--) {
+        e->tail[e->count++] = *data++;
+        if (e->count == 3) {
+            fputc(alphabet[e->tail[0] >> 2], e->out);
+            fputc(alphabet[((e->tail[0] & 3) << 4) | (e->tail[1] >> 4)], e->out);
+            fputc(alphabet[((e->tail[1] & 15) << 2) | (e->tail[2] >> 6)], e->out);
+            fputc(alphabet[e->tail[2] & 63], e->out);
+            e->count = 0;
+        }
+    }
+}
+static void encode_end(struct encoder *e) {
+    size_t count = e->count;
+    if (!count) return;
+    unsigned char zero[2] = {0, 0};
+    /* Encode the incomplete group directly, with padding instead of zeros. */
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    memcpy(e->tail + count, zero, 3 - count);
+    fputc(alphabet[e->tail[0] >> 2], e->out);
+    fputc(alphabet[((e->tail[0] & 3) << 4) | (e->tail[1] >> 4)], e->out);
+    fputc(count == 2 ? alphabet[(e->tail[1] & 15) << 2] : '=', e->out);
+    fputc('=', e->out);
+    e->count = 0;
+}
+static void encode_string(struct encoder *e, const char *s) {
+    encode(e, (const unsigned char *)s, strlen(s));
+    encode_end(e);
+}
+static int context(const char *path, const char *status, const char *id) {
+    FILE *out = fopen(path, "w");
+    if (!out) return 1;
+    struct encoder e = { .out = out, .count = 0 };
+    fputs("@SOH@@VERSION@@RS@exitcode@US@", out);
+    encode_string(&e, status);
+    fputs("@RS@alias@US@", out);
+    unsigned char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) encode(&e, buf, n);
+    if (ferror(stdin)) { fclose(out); return 1; }
+    encode_end(&e);
+    fputs("@RS@environ@US@", out);
+    for (char **entry = environ; *entry; ++entry)
+        encode(&e, (const unsigned char *)*entry, strlen(*entry) + 1);
+    encode_end(&e);
+    fputs("@RS@prompt_id@US@", out);
+    encode_string(&e, id);
+    fputc('@EOT@', out);
+    int failed = ferror(out);
+    return fclose(out) != 0 || failed;
+}
 
 static int write_all(int fd, const unsigned char *buf, size_t size) {
     while (size > 0) {
@@ -98,6 +164,18 @@ static int write_all(int fd, const unsigned char *buf, size_t size) {
 }
 
 int main(int argc, char *argv[]) {
+    if (argc == 5 && !strcmp(argv[1], "--context"))
+        return context(argv[2], argv[3], argv[4]);
+    if (argc == 2 && !strcmp(argv[1], "--time")) {
+        printf("%lld\n", (long long)time(NULL));
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--clock")) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 1;
+        printf("%lld\n", (long long)now.tv_sec * 1000000000LL + now.tv_nsec);
+        return 0;
+    }
     if (argc < 2) return 1;
     struct termios saved, raw;
     if (tcgetattr(STDIN_FILENO, &saved) != 0) return 1;
@@ -132,6 +210,15 @@ cleanup:
     return result;
 }
 """)
+
+for _token, _value in {
+    "@VERSION@": WIRE_VERSION,
+    "@SOH@": BIN_SOH,
+    "@RS@": BIN_RS,
+    "@US@": BIN_US,
+    "@EOT@": BIN_EOT,
+}.items():
+    TTY_FORWARD = TTY_FORWARD.replace(_token, _value)
 
 
 def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
@@ -200,3 +287,65 @@ def build_binary(*, directory=None) -> bool:
         return False
     finally:
         src_path.unlink(missing_ok=True)
+
+
+async def build_binary_async(*, directory: Path) -> bool:
+    """Prepare a session helper without blocking termination during compilation.
+
+    A source build owns a separate compiler process group, including compiler
+    subprocesses. Cancellation stops the group and reaps the compiler before the
+    session directory can be removed. Frozen builds copy their compiled helper.
+    """
+    if "__compiled__" in globals():
+        return build_binary(directory=directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / FORWARD_SOURCE
+    binary = directory / FORWARD_BINARY
+    process = None
+    spawn = None
+    completed = False
+    try:
+        source.write_text(TTY_FORWARD, encoding="utf-8")
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                "gcc",
+                "-O3",
+                "-o",
+                str(binary),
+                str(source),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        )
+        # Do not lose ownership if termination arrives during subprocess setup.
+        process = await asyncio.shield(spawn)
+        _, error = await process.communicate()
+        completed = True
+        if process.returncode:
+            get_logger().error(
+                "gcc failed (exit %s): %s",
+                process.returncode,
+                error.decode("utf-8", errors="replace").strip(),
+            )
+            return False
+        binary.chmod(0o755)
+        return True
+    except FileNotFoundError as exc:
+        get_logger().error("Could not prepare ish_forward: %s", exc)
+        return False
+    finally:
+        if process is None and spawn is not None:
+            # Shielded creation can still be completing when cancellation lands.
+            with contextlib.suppress(Exception):
+                process = await spawn
+        if process is not None and not completed:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(process.communicate(), 1)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                await process.communicate()
+        source.unlink(missing_ok=True)

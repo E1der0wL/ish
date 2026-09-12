@@ -48,6 +48,7 @@ class Sequencer:
         "literal_starts",
         "output_callback",
         "_notified_output",
+        "control_callback",
     )
 
     def __init__(
@@ -57,6 +58,7 @@ class Sequencer:
         max_sequence_bytes: int = 65536,
         *,
         output_callback: Optional[Callable[[bytes], None]] = None,
+        control_callback: Optional[Callable[[bytes], None]] = None,
     ):
         """Prepare control-sequence limits, callback stores, and partial receive state."""
         if max_sequence_bytes < 64:
@@ -69,6 +71,7 @@ class Sequencer:
         self._string_escape = False
         self.encoder = encoder
         self.output_callback = output_callback
+        self.control_callback = control_callback
         self._notified_output = 0
         self.buffer: bytearray = bytearray()
         self.between_buffer: bytearray = bytearray()
@@ -138,6 +141,8 @@ class Sequencer:
         output.
         """
         data = bytes(self.buffer)
+        if self.control_callback is not None:
+            self.control_callback(data)
         for prefix, callback in self.prefix_callbacks.items():
             if data.startswith(prefix):
                 self._notify_output(buffer)

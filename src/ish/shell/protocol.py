@@ -1,7 +1,7 @@
 """FIFO framing: SOH ISH2 RS (category US base64(body) RS ... ) EOT.
 
 Version 2 bodies cannot contain frame/record delimiters. Environments use
-NUL-separated `env -0` records to preserve embedded newlines in values.
+NUL-separated NAME=value records to preserve embedded newlines in values.
 Legacy unversioned frames remain readable during integration script updates.
 """
 
@@ -35,6 +35,16 @@ class FrameDecoder:
                 consumed = len(self.buffer)
                 break
             end = self.buffer.find(EOT, start + 1)
+            # SIGINT can stop a context writer halfway through a frame. A
+            # fresh versioned header cannot occur inside a base64 body; resume
+            # there instead of decoding two generations as one damaged frame.
+            restart = self.buffer.rfind(
+                SOH + VERSION + RS,
+                start + 1,
+                end if end >= 0 else len(self.buffer),
+            )
+            if restart >= 0:
+                start = restart
             if end < 0:
                 consumed = start
                 if len(self.buffer) - start > self.max_frame_bytes:

@@ -26,7 +26,10 @@ Dependency bytecode is compiled during synchronization to reduce CLI startup wor
 Keeping the virtual environment on a WSL mount such as `/mnt/d` can add several
 seconds to the first launch because of filesystem access overhead.
 
-The host needs the selected shell and GNU coreutils (`base64 -w0`, `env -0`).
+The host needs the selected shell. The bundled helper encodes state and collects
+the exported environment without depending on the shell's current `PATH`.
+C shell integration also uses the system `printf` resolved at startup.
+Interrupting queued submissions uses Linux's `TIOCGPTPEER` ioctl (Linux 4.13+).
 Running from source also requires GCC; Nuitka distributions include a precompiled
 helper. Integration scripts, the helper, and FIFOs are created under
 `config.CACHE_DIR/session-...`. The cache filesystem must allow executable files.
@@ -67,8 +70,9 @@ or multi-day reliability on every target host.
 
 The [stability review](docs/STABILITY_REVIEW.md) records the remaining limitations
 and subsequent fixes. Internal Python tools now inherit the shell PTY's dimensions
-and receive live size changes. SIGTERM can still leave terminal settings and session
-files unrestored. The existing WSL-built binary predates the worker-size fix and
+and receive live size changes. Catchable termination now restores terminal settings
+and releases session files; see [termination behavior](docs/TERMINATION.md).
+The existing WSL-built binary predates these source fixes and
 requires a newer glibc than RHEL 8 provides. Rebuild and validate the actual deployment
 environment before treating the release as production-ready.
 
@@ -107,17 +111,66 @@ ISH_TEST_CSH=/usr/bin/bsd-csh uv run python -B -m unittest discover -s tests -p 
 
 ish owns editing at the primary prompt. During command execution and continuation
 prompts, input remains with the shell. The editor resumes after both the prompt
-signals and the state FIFO have synchronized.
-If both shell hooks and prompt markers are removed, run `ish_recover` after
-confirming that the underlying shell is waiting for a command.
+signals and the state FIFO have synchronized on a fresh generation. Reprinting
+`PS1` cannot authorize a recovery command or transfer input to the editor.
+If reporting hooks are removed, input remains with the shell even when its
+prompt markers survive. Run `ish_recover` after confirming that the underlying
+shell is waiting for a command. No recovery commands are sent automatically.
+Dash reports state during PS1 expansion. BSD csh has no equivalent prompt hook:
+after a command it keeps native input until the user explicitly runs
+`ish_recover` to resume the ish editor. This limitation does not apply to a
+`csh` executable that resolves to tcsh.
 At the primary prompt, Ctrl+C cancels editing without changing the shell's exit
 status. Native Readline and ZLE editing are intentionally disabled there.
+
+Oversized input is gated by shell capability and input context. Bash, zsh, tcsh, and
+BSD csh may use a temporary TTY mode for a long first physical line at a confirmed
+primary prompt. The saved settings are restored before its newline is sent.
+Zsh additionally requires ish's verified SIGINT handler; existing custom or
+ignored SIGINT traps are preserved and disable long input. Dash/sh rejects lines
+over 4,095 encoded bytes; every shell rejects an
+oversized later line in a pasted block. Rejection keeps the entire block in the
+editor and displays a warning before running any part of it. Internal Python
+tools do not use this shell transport. See [long-input handling](docs/LONG_INPUT.md)
+for validation conditions, test results, and native-shell limits.
 
 With Bash's default `promptvars` option enabled, secondary prompts for already
 available input are omitted from command output. Incomplete blocks still show a
 secondary prompt when more input is needed. The readiness check does not consume
 input and runs only when Bash expands PS2. If `promptvars` is disabled, ish preserves
 literal PS2 behavior, including its secondary prompt display.
+
+During a large submission, Ctrl+C cancels unsent bytes and clears queued PTY
+input before forwarding the interrupt. A program that disables terminal signal
+processing continues to receive Ctrl+C as input, according to its terminal mode.
+See [input-boundary validation](docs/INPUT_BOUNDARIES.md) for the behavior changes,
+maintenance-cost measurements, and remaining limits.
+
+Input observation is available through `prompt.input_observer`. It is disabled
+by default and keeps a bounded metadata trace in memory when enabled. It does
+not block consumers or change input queues. See
+[input observation results](docs/INPUT_OBSERVATION.md) for setup, real-PTY
+comparisons, and the input-boundary limitations found during those checks.
+Those four input-transfer defects have since been addressed; see
+[input transfer fixes](docs/INPUT_TRANSFER.md) for the current behavior and validation.
+
+Once a fresh shell state frame announces prompt return, newer keyboard input is
+held for the editor behind older forwarded input. Python tools receive already-read
+editor typeahead, and unread terminal input is returned when a tool exits. A tool
+that has already consumed bytes into its own memory cannot return them this way.
+BSD csh receives pending user keystrokes even while it remains in native input;
+its explicit `ish_recover` requirement for resuming the editor still applies.
+
+Submission generations and cached process-exit checks guard against stale sends
+and callbacks. Optional terminal snapshots observe mode, foreground group, and
+size at transitions without changing them. See [session guards](docs/SESSION_GUARDS.md)
+for cross-shell regressions, measured costs, and the cancellation policy deliberately
+excluded because it interfered with programs that handle SIGINT and keep reading.
+
+SIGTERM and SIGHUP request one awaited shutdown from shell-session initialization
+onward, restoring terminal settings and removing the owning session directory.
+Repeated signals do not interrupt cleanup. See [termination behavior](docs/TERMINATION.md)
+for startup handling, TUI mode restoration, output deadlines, and limitations.
 
 ## Prompt extension API
 

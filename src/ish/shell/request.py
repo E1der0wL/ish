@@ -1,5 +1,6 @@
-"""Control-flow exceptions requesting session exit or internal tool execution from the
-editor.
+"""Editor requests for session exit or internal tool execution.
+
+OS signal and terminal-key policies live in the separate signals module.
 """
 
 from __future__ import annotations

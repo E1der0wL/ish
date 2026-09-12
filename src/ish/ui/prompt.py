@@ -33,6 +33,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import in_terminal
 from prompt_toolkit.application.current import get_app, set_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.buffer import Buffer, ValidationState
 from prompt_toolkit.completion import ThreadedCompleter, merge_completers
 from prompt_toolkit.filters import (
     Condition,
@@ -42,6 +43,7 @@ from prompt_toolkit.filters import (
     is_true,
     renderer_height_is_known,
 )
+from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -75,6 +77,7 @@ from prompt_toolkit.shortcuts.prompt import (
     _RPrompt,
     _split_multiline_prompt,
 )
+from prompt_toolkit.validation import ValidationError
 from prompt_toolkit.widgets import Frame
 from prompt_toolkit.widgets.toolbars import (
     SearchToolbar,
@@ -88,14 +91,17 @@ from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
 from ish.parser.shell import alias_parser, dict_parser, simple_command, str_parser
+from ish.runtime.observer import InputObserver
 from ish.shell.adapters import get_adapter
 from ish.shell.base import InteractiveShell
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE, PWD
 from ish.shell.context import ShellContext
-from ish.shell.signal import ShellExitRequest, ShellPassRequest
+from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
+from ish.shell.request import ShellExitRequest, ShellPassRequest
 
 from .ansi import ShellANSI
 from .completer import PromptCompleter
+from .input import ObservedInput
 
 if TYPE_CHECKING:
     from argparse import Namespace
@@ -151,6 +157,7 @@ class Prompt(PromptSession):
         bindings.
         """
         self.logger = get_logger()
+        self.input_observer = InputObserver()
 
         self.shell: Optional[str] = kwargs.pop("shell", shell)
         self.encoder: Optional[str] = kwargs.pop("encoder", encoder)
@@ -218,6 +225,7 @@ class Prompt(PromptSession):
             encoder=self.encoder,
             stdin=sys.stdin.fileno() if input_fd is None else input_fd,
             stdout=sys.stdout.fileno() if output_fd is None else output_fd,
+            input_observer=self.input_observer,
         )
         self.shell = self.interactive_shell.shell
 
@@ -226,6 +234,10 @@ class Prompt(PromptSession):
             stdin=input_fd,
             stdout=output_fd,
             get_terminal_fd=lambda: self.interactive_shell.master_fd,
+            input_observer=self.input_observer,
+            take_input=self.take_typeahead,
+            return_input=self.interactive_shell.return_typeahead,
+            observe_output=self.interactive_shell.terminal_state.feed,
         )
         self.interactive_shell.resize_callback = self.process_handler.resize
 
@@ -265,6 +277,7 @@ class Prompt(PromptSession):
         self.internal_tools: Dict[str, Callable[..., Any]] = {}
 
         super().__init__(*args, **kwargs)
+        self.app.input = ObservedInput(self.app.input, self.input_observer)
         self.multiline = True
         self.color_depth = ColorDepth.TRUE_COLOR
         self.key_bindings = self._create_key_binding()
@@ -274,6 +287,56 @@ class Prompt(PromptSession):
         )
         self.completer = ThreadedCompleter(self.default_completer)
         self.parser = Vt100Parser(feed_key_callback=self.app.key_processor.feed)
+
+    def _create_default_buffer(self) -> Buffer:
+        """Check transport admission on acceptance, including cached user validation.
+
+        Keep the user's dynamic validator and validate-while-typing behavior.
+        The transport check runs on explicit validate/accept calls only, so it
+        performs no per-keystroke terminal queries and cannot be bypassed by a
+        cached VALID state from the asynchronous user validator.
+        """
+        buffer = super()._create_default_buffer()
+        original_validate = buffer.validate
+        rejection = None
+
+        def validate(set_cursor: bool = False) -> bool:
+            """Leave rejected input, cursor, history, and the active editor untouched."""
+            nonlocal rejection
+            if rejection is not None and buffer.validation_error is rejection:
+                buffer.validation_state = ValidationState.UNKNOWN
+                buffer.validation_error = None
+            try:
+                self._validate_editor_submission(buffer.text)
+            except InputRejected as exc:
+                rejection = ValidationError(
+                    message=str(exc), cursor_position=buffer.cursor_position
+                )
+                buffer.validation_error = rejection
+                buffer.validation_state = ValidationState.INVALID
+                self.input_observer.record("input_rejected", "EDITOR")
+                return False
+            return original_validate(set_cursor=set_cursor)
+
+        buffer.validate = validate
+        return buffer
+
+    def _validate_editor_submission(self, command: str) -> None:
+        """Apply shell transport limits without restricting directly dispatched tools."""
+        try:
+            data = (command + "\n").encode(self.encoder)
+        except UnicodeEncodeError as exc:
+            raise InputRejected(
+                "Not sent: input cannot be encoded for this shell."
+            ) from exc
+        if len(data) > CANONICAL_LINE_BYTES:
+            key = command.strip()
+            if key == self.exit_command or key in self.internal_commands:
+                return
+            argv = simple_command(command) if self.internal_tools else None
+            if argv and argv[0] in self.internal_tools:
+                return
+        self.interactive_shell.validate_submission(data)
 
     @property
     def key_list(self) -> List[Dict[str, Any]]:
@@ -998,9 +1061,60 @@ class Prompt(PromptSession):
         argv = simple_command(command)
         if argv and argv[0] in self.internal_tools:
             await self.process_handler.run(self.internal_tools[argv[0]], *argv[1:])
-            return ""
+            return None
 
         return command
+
+    def take_typeahead(self) -> bytes:
+        """Transfer unconsumed editor input to a native consumer exactly once.
+
+        Prompt-toolkit stores keys after the accepted Enter for its next run.
+        A tool or a shell without prompt hooks must receive those keys instead.
+        Cursor-position replies are terminal protocol, not user input.
+        """
+        pending = self.interactive_shell.dupin_buffer
+        data = bytes(pending)
+        pending.clear()
+        keys = get_typeahead(self.input)
+        keys.extend(self.input.flush_keys())
+        data += "".join(key.data for key in keys if key.key != Keys.CPRResponse).encode(
+            self.encoder, errors="surrogateescape"
+        )
+        if isinstance(self.input, ObservedInput):
+            data += self.input.take_decoder_prefix()
+        source = getattr(self.input, "source", self.input)
+        reader = getattr(source, "stdin_reader", None)
+        if reader is not None:
+            # The pinned VT100 input keeps incomplete encoded characters in
+            # its incremental decoder, outside the public typeahead store.
+            decoder = reader._stdin_decoder
+            partial, state = decoder.getstate()
+            data += partial
+            decoder.setstate((b"", state))
+        self.input_observer.record("editor_input_transferred", bytes=len(data))
+        return data
+
+    def feed_typeahead(self, data: bytes) -> None:
+        """Feed returned bytes through the editor's existing decoder and VT100 parser.
+
+        Sharing these objects keeps a UTF-8 character or escape sequence split
+        across the handoff joined to its later bytes from the terminal.
+        """
+        source = getattr(self.input, "source", self.input)
+        reader = getattr(source, "stdin_reader", None)
+        parser = getattr(source, "vt100_parser", None)
+        if reader is None or parser is None:
+            self.parser.feed(data.decode(self.encoder, errors="replace"))
+            self.parser.flush()
+            return
+        original_callback = parser.feed_key_callback
+        parser.feed_key_callback = self.app.key_processor.feed
+        try:
+            parser.feed(reader._stdin_decoder.decode(data))
+            if isinstance(self.input, ObservedInput):
+                self.input.hold_decoder_prefix(self.encoder)
+        finally:
+            parser.feed_key_callback = original_callback
 
     def run(self) -> None:
         """Call the connected shell runner's synchronous entry point."""

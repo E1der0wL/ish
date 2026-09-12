@@ -2,6 +2,8 @@
 
 import os
 import shlex
+import signal
+import termios
 from dataclasses import dataclass
 from typing import Callable
 
@@ -17,12 +19,13 @@ from .constants import (
     CSH_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT,
     POSIX_INTEGRATION_SCRIPT,
-    POSIX_UPDATE_SCRIPT,
     PROMPT_ID_PREFIX,
     TCSH_INTEGRATION_SCRIPT,
     ZSH_INTEGRATION_SCRIPT,
     SessionSignals,
 )
+from .input import LongInputMode
+from .signals import SignalPolicy, TerminalSignal, ZshInterrupt
 
 
 def csh_quote(value: str) -> str:
@@ -148,6 +151,8 @@ class ShellAdapter:
     buffered_continuation: tuple[bytes, bytes] | None = None
     builtins_command: str = ""
     builtins: tuple[str, ...] = ()
+    long_input: LongInputMode = LongInputMode.REJECT
+    signal_policy: SignalPolicy = SignalPolicy()
 
     @property
     def syntax(self) -> ShellSyntax:
@@ -156,7 +161,7 @@ class ShellAdapter:
 
     @property
     def refresh(self) -> bool:
-        """Report whether a separate state refresh script is required after the prompt."""
+        """Report whether state refresh requires an explicit user reconnect."""
         return self.refresh_script is not None
 
     def source(self, path, *args) -> str:
@@ -243,6 +248,7 @@ ADAPTERS = {
         source_command="source",
         buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
+        long_input=LongInputMode.STAGED_FIRST_LINE,
     ),
     "zsh": ShellAdapter(
         "zsh",
@@ -251,6 +257,11 @@ ADAPTERS = {
         ZSH_INTEGRATION_SCRIPT,
         source_command="source",
         builtins_command='printf "%s\\n" ${(k)builtins}',
+        # Releasing a cancelled no-ZLE line requires a matching SIGINT response.
+        long_input=LongInputMode.STAGED_FIRST_LINE,
+        signal_policy=SignalPolicy(
+            terminal=(TerminalSignal(signal.SIGINT, termios.VINTR, ZshInterrupt),)
+        ),
     ),
     "tcsh": ShellAdapter(
         "tcsh",
@@ -260,6 +271,7 @@ ADAPTERS = {
         behavior=CSH_BEHAVIOR,
         unhooked_prompt=(CARET_BEFORE_PROMPT, CARET_AFTER_PROMPT),
         builtins_command="builtins",
+        long_input=LongInputMode.STAGED_FIRST_LINE,
     ),
     "csh": ShellAdapter(
         "csh",
@@ -270,6 +282,7 @@ ADAPTERS = {
         source_args=INTEGRATION_ARGUMENTS,
         refresh_script=CSH_UPDATE_SCRIPT,
         capture_refresh_status=True,
+        long_input=LongInputMode.STAGED_FIRST_LINE,
         builtins=tuple(
             "alias bg break breaksw case cd chdir continue default dirs echo else end endif endsw "
             "eval exec exit fg foreach glob goto hashstat history if jobs kill limit login logout "
@@ -283,7 +296,8 @@ ADAPTERS = {
         ("-i",),
         POSIX_INTEGRATION_SCRIPT,
         source_args=INTEGRATION_ARGUMENTS,
-        refresh_script=POSIX_UPDATE_SCRIPT,
+        # dash can execute a suffix after rejecting an earlier long fragment.
+        long_input=LongInputMode.REJECT,
         builtins=tuple(
             "alias bg break cd command continue eval exec exit export false fc fg getopts hash jobs "
             "kill printf pwd read readonly return set shift test times trap true type ulimit umask "
