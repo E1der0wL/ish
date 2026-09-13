@@ -87,6 +87,48 @@ restart ish after changing plugin source files.
 Neither option skips the selected shell's own startup files. `--home` changes
 ish's settings location without changing the shell's `HOME`.
 
+The following objects are available directly in `.ishrc.py`, without importing them:
+
+| Object | Purpose |
+| --- | --- |
+| `prompt` | The active ish `Prompt` instance. Configure hooks, tools, key bindings, completion, toolbar, right prompt, and styles. |
+| `config` | The current configuration and resolved paths, such as `config.ISH_HOME`, `config.RC_FILE`, and `config.CACHE_DIR`. |
+| `logger` | The session logger. Use methods such as `logger.info(...)` and `logger.warning(...)` for configuration diagnostics. |
+| `option` | Parsed command-line options, including `option.shell`, `option.lang`, `option.home`, and `option.no_plugins`. |
+| `plugin` | The plugin manager. `plugin.get("my_tools")` retrieves an already loaded plugin module, or returns `None` if it is unavailable. |
+
+### Plugin metadata: PLUGIN_META
+
+Place each plugin in its own directory under `~/ish/plugin/script/`. For example,
+`my_tools` can use `my_tools/__init__.py` or `my_tools/my_tools.py` as its entry
+point. If both exist, `my_tools.py` takes precedence. With `--home DIR`, the base
+directory is `DIR/plugin/script/`.
+
+Define `PLUGIN_META` as a top-level dictionary literal in the entry point.
+Metadata is read before importing the plugin, so use literal strings and lists;
+do not construct the dictionary with function calls, variables, or imports.
+
+| Key | Definition and current behavior |
+| --- | --- |
+| `name` | A string identifying the plugin in its metadata. Keep it equal to the directory name. The loader currently registers plugins by directory name, regardless of this value. |
+| `version` | The plugin version as a string, such as `"1.0.0"`. Defaults to `"0.0.0"`; other plugins can require a compatible version. |
+| `description` | A short description string. Defaults to `""`. The spelling is `description`, not `descrption`. |
+| `author` | The author's name or attribution as a string. Defaults to `""`. |
+| `module` | The loaded Python module, populated by the loader in `PluginInfo.module`. Omit it from `PLUGIN_META`: a supplied value does not select an entry point or replace the loaded module. Use `plugin.get(...)` to access the module. |
+| `requirements` | A list of other **ish plugin** names, optionally with version constraints, such as `["shared_tools>=1.0,<2"]`. These plugins must exist under the plugin source directory; this does not download them. Defaults to `[]`. |
+| `dependencies` | A list of **Python package** requirements, such as `["requests>=2.31,<3"]`. Missing or incompatible packages are installed with pip into `config.PLUGIN_LIB_DIR`. Defaults to `[]`. |
+
+For Python packages whose distribution and import names differ, use
+`"distribution>=version|import_name"`, for example `"PyYAML>=6|yaml"` in
+`dependencies`. This separates the name passed to pip from the module checked
+for import availability. Package installation requires access to the packages
+and a compatible Python with pip, as described in the build section.
+
+Plugins normally load before `.ishrc.py` runs. `plugin.get("my_tools")` looks up
+the registered module; it does not import an arbitrary file or trigger loading.
+Check for `None`, particularly when starting with `--no-plugins` or after a plugin
+fails to load.
+
 ### pre_hook, post_hook, and fallback_hook
 
 Hooks run for shell submissions made through the ish editor. The normal order is
@@ -104,7 +146,14 @@ Define hooks and tools in an importable module. For example, create
 `~/ish/plugin/script/my_tools/__init__.py` with:
 
 ```python
-PLUGIN_META = {"name": "my_tools", "version": "1.0.0"}
+PLUGIN_META = {
+    "name": "my_tools",
+    "version": "1.0.0",
+    "description": "Shell hooks and greeting commands for ish.",
+    "author": "Your Name",
+    "requirements": [],
+    "dependencies": [],
+}
 
 
 def before_command():
@@ -183,6 +232,14 @@ def insert_pwd(event):
 prompt.set_key("f2", handler=insert_pwd)
 prompt.set_key("c-x", "c-e", handler=insert_pwd)
 
+
+def run_pwd(event):
+    """Submit a command immediately."""
+    event.app.exit("pwd")
+
+
+prompt.set_key("f3", handler=run_pwd)
+
 # Remove one sequence or every custom binding using this handler.
 # prompt.set_key("f2")
 # prompt.set_key(insert_pwd)
@@ -192,6 +249,11 @@ Use key names or `prompt_toolkit.keys.Keys` values. Multiple positional keys for
 a sequence. Setting a sequence replaces its existing ish bindings, including
 conditional variants. Keyword options such as `filter` and `eager` are forwarded
 to prompt-toolkit's `KeyBindings.add`. Keep handlers short to avoid blocking input.
+
+`event.app.exit("pwd")` ends the current prompt-toolkit input operation and returns
+`"pwd"` to ish for command dispatch. It does not itself close ish. The supplied
+string is submitted immediately instead of the current editor text. It can also
+name a registered internal tool, for example `event.app.exit("greet Alice")`.
 
 ### set_float
 
@@ -233,6 +295,80 @@ ish merges these with its default completer, removes duplicate suggestions, and
 runs completion in a worker thread. Each call replaces the previous additional
 completers. A custom `Completer` implementation can also be supplied; its completion
 code should not mutate UI state from the worker thread.
+
+### Bottom toolbar, right prompt, and styles
+
+Assign `prompt.bottom_toolbar` to show a bottom toolbar and `prompt.rprompt` to
+show a right prompt. Each accepts plain text, prompt-toolkit formatted text
+(such as `HTML` or style/text tuples), or a callable returning either. A callable
+is evaluated during rendering, so keep it fast. Set either attribute to `None`
+to hide it.
+
+Assign a prompt-toolkit `Style` object to `prompt.style`. `Style.from_dict(...)`
+maps style class names to color and formatting rules. Use `bottom-toolbar` for
+the toolbar background, `bottom-toolbar.text` for its text, `rprompt` for the right
+prompt, and `completion-menu.*` for completion candidates and their descriptions.
+The example below uses `noreverse` to override the toolbar's default reverse style.
+For additional formatting options, see the
+[prompt-toolkit documentation](https://python-prompt-toolkit.readthedocs.io/en/stable/pages/asking_for_input.html#adding-a-bottom-toolbar).
+
+### Complete .ishrc.py example
+
+After creating the `my_tools` plugin shown above, save the following as
+`~/ish/.ishrc.py` (or `DIR/.ishrc.py` with `--home DIR`). It configures the UI,
+retrieves the plugin module, registers its hooks and tool, and binds commands
+to function keys.
+
+```python
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.styles import Style
+
+# prompt, config, logger, option, and plugin are supplied by ish.
+logger.info("Loading ish settings from %s", config.RC_FILE)
+
+prompt.bottom_toolbar = " F2: pwd "
+prompt.rprompt = f" {option.shell} "
+prompt.style = Style.from_dict({
+    "bottom-toolbar": "bg:#263238 #eeeeee noreverse",
+    "bottom-toolbar.text": "#eeeeee",
+    "rprompt": "bg:#263238 #80cbc4",
+    "completion-menu.completion": "bg:#263238 #eeeeee",
+    "completion-menu.completion.current": "bg:#80cbc4 #102027",
+    "completion-menu.meta.completion": "bg:#37474f #cfd8dc",
+    "completion-menu.meta.completion.current": "bg:#80cbc4 #102027",
+    "completion-menu.multi-column-meta": "bg:#37474f #cfd8dc",
+})
+
+
+def run_pwd(event):
+    """Submit pwd through ish's command dispatcher."""
+    event.app.exit("pwd")
+
+
+prompt.set_key("f2", handler=run_pwd)
+
+# The lookup name is the plugin directory name, without a .py suffix.
+my_tools = plugin.get("my_tools")
+if my_tools is not None:
+    prompt.pre_hook = my_tools.before_command
+    prompt.post_hook = my_tools.after_command
+    prompt.fallback_hook = my_tools.on_failure
+    prompt.set_tool("greet", function=my_tools.greet)
+    prompt.set_completer([WordCompleter(["greet"], ignore_case=True)])
+
+    def run_greeting(event):
+        """Run the registered Python tool with a fixed argument."""
+        event.app.exit("greet Alice")
+
+    prompt.set_key("f3", handler=run_greeting)
+    prompt.bottom_toolbar += "| F3: greet "
+else:
+    logger.warning("my_tools is unavailable; check plugin loading or --no-plugins.")
+```
+
+F2 immediately submits `pwd` to the selected shell. When `my_tools` is loaded,
+F3 dispatches `greet Alice` to its Python worker. The rc file's key handlers stay
+in the UI process, while the plugin's importable hooks and tool run in workers.
 
 ## Development environment
 
