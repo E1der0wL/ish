@@ -36,6 +36,8 @@ env:
 jobs:
   build:
     name: Build Linux x86_64 (glibc 2.28)
+    # Limit both initial runs and reruns to the owner of this personal repository.
+    if: ${{ github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
@@ -326,6 +328,8 @@ jobs:
 
   release:
     name: Attach verified files to a draft release
+    # Recheck here because this job can be rerun after an earlier successful build.
+    if: ${{ github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     needs: [build, smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
