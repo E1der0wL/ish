@@ -278,6 +278,10 @@ class InteractiveShell:
         "signal_controller",
     )
 
+    # =============================================
+    # [Initialization] Configure the adapter and prepare per-session state.
+    # =============================================
+
     def __init__(
         self,
         shell: str = "bash",
@@ -392,6 +396,14 @@ class InteractiveShell:
         self._init_event = None
         self.signal_controller = ShellSignalController(self, self.adapter.signal_policy)
 
+    # =============================================
+    # [Utility] Shared process, terminal, descriptor, and I/O helpers.
+    # =============================================
+
+    def _has_exited(self) -> bool:
+        """Consult the child watcher's cached status without probing the process."""
+        return self.proc is not None and self.proc.returncode is not None
+
     @staticmethod
     def _set_window_size(fd, col, row, xpix=0, ypix=0) -> None:
         """Set the PTY window size in rows and columns."""
@@ -416,104 +428,49 @@ class InteractiveShell:
         if self.resize_callback is not None:
             self.resize_callback()
 
-    def _set_prompt(self, prompt: bytes) -> Optional[bytes]:
-        """Stage a fresh prompt candidate; replayed PS1 is ordinary program output.
-
-        Only the matching state frame can transfer input back to the editor. A
-        surviving marker without a hook must never authorize a maintenance write.
+    def _read(self, fd: int) -> bytes:
+        """Read one chunk from an FD, returning empty bytes if nothing is currently
+        readable.
         """
-        if self._prompt_id <= self._accepted_prompt_id:
-            return prompt
-        self._pending_prompt_id = self._prompt_id
-        self.input_observer.record(
-            "prompt_candidate", prompt_id=self._prompt_id, context_id=self._context_id
-        )
-        self.message = prompt
-        if not self._initializing:
-            self._prompt_prefix = self._native_output_line.prefix
-        self.prompt_event.set()
-        self._context_event.set()
-        if self._initializing:
-            self._init_event.set()
+        try:
+            data = os.read(fd, self.chunk_size)
+        except (BlockingIOError, OSError):
+            data = b""
+        return data
 
-    def _accept_prompt(self) -> None:
-        """Transfer input ownership only after a fresh prompt and its state agree."""
-        if self._closing_output or self._has_exited():
-            return
-        if not self._accepted_prompt_id < self._pending_prompt_id == self._context_id:
-            raise RuntimeError("Cannot accept an unconfirmed shell prompt")
-        self.signal_controller.reset()
-        if self.loop is not None and self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
-            self._native_input_active = False
-            self.input_observer.end(self._input_observation)
-            self._input_observation = None
-        if self._send_interrupted:
-            # A previous primary hook may have moved submitted suffix bytes
-            # into the typeahead FIFO before VINTR arrived. The new prompt is
-            # emitted after its forwarder exits, so drain those bytes now.
-            while self._pre_input(self.tty_pipe):
-                pass
-            self._send_interrupted = False
-        self._accepted_prompt_id = self._pending_prompt_id
-        # The helper forwarded older PTY input before emitting this prompt.
-        # Read that FIFO before appending newer input held during the handoff.
-        while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
-            pass
-        self.return_typeahead(bytes(self._deferred_input))
-        self._deferred_input.clear()
-        self.input_observer.record(
-            "prompt_accepted", prompt_id=self._accepted_prompt_id
-        )
-        self.command_done_event.set()
-        self.continuation_active.clear()
-        self.session.set_prompt(self._prompt_prefix + self.message, self.encoder)
-        self.input_observer.terminal("SHELL", self.master_fd, "prompt_accepted")
+    def _io_failed(self, exc: Exception) -> None:
+        """Wake the main session waiter with the first I/O error."""
+        if self._fatal_error is not None and not self._fatal_error.done():
+            self._fatal_error.set_result(exc)
 
-    def _set_prompt_id(self, data: bytes) -> bool:
-        """Accept only valid, increasing session IDs and pass invalid signals through."""
-        if not data or len(data) > PROMPT_ID_MAX_DIGITS or not data.isdigit():
-            return False
-        value = int(data)
-        if not self._prompt_id < value < PROMPT_ID_LIMIT:
-            return False
-        self._prompt_id = value
-        return True
+    def _writer(self, fd: int) -> FDWriter:
+        """Create or reuse a writer that preserves output order for each FD."""
+        if fd not in self._writers:
+            self._writers[fd] = FDWriter(self.loop, fd, self._io_failed)
+        return self._writers[fd]
 
-    def _set_unhooked_prompt(self, prompt: bytes) -> Optional[bytes]:
-        """Keep an unconfirmed caret prompt with native input, without sending a newline."""
-        return self._set_prompt(prompt)
+    def _close_fd(self, name: str) -> None:
+        """Close an owned FD once and clear its attribute to None."""
+        fd = getattr(self, name)
+        setattr(self, name, None)
+        if fd is not None:
+            os.close(fd)
 
-    async def _wait_context(self) -> None:
-        """Wait within a deadline for the state FIFO to reach the current prompt ID."""
-        while self._context_id != (self._pending_prompt_id or self._prompt_id):
-            self._context_event.clear()
-            try:
-                await asyncio.wait_for(self._context_event.wait(), self.context_timeout)
-            except TimeoutError:
-                raise RuntimeError(
-                    "Shell context was not received after a confirmed prompt"
-                ) from None
+    def _restore_terminal(self) -> None:
+        """Restore saved termios, tolerating a terminal destroyed during hangup."""
+        try:
+            termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self.exec_attrs)
+        except termios.error as exc:
+            if self.signal_controller.shutdown_signal is None or exc.args[0] not in (
+                errno.EIO,
+                errno.ENOTTY,
+                errno.EBADF,
+            ):
+                raise
 
-    def _set_continuation(
-        self, prompt: bytes, *, buffered: bool = False
-    ) -> Optional[bytes]:
-        """Keep continuation input with the shell or pass it to the editor per adapter
-        policy.
-        """
-        self.continuation_active.set()
-        if buffered:
-            # The shell checked readiness before reading its next line. The
-            # editor already displayed that submitted input; omit only this PS2.
-            return None
-        if self.adapter.behavior.native_continuation:
-            # The shell may already have read the complete foreach body into
-            # its own buffer. Keep one input owner until the primary prompt.
-            # Returning bytes preserves the prompt's position in the PTY output.
-            return prompt
-        self.session.set_prompt(prompt, self.encoder)
-        # A custom UI continuation policy must not flush or replay shell input.
-        self.prompt_event.set()
+    # =============================================
+    # [Internal API: Input] Collect typeahead, cancel submissions, and transmit input.
+    # =============================================
 
     def _pre_input(self, fd: int) -> Optional[bool]:
         """Collect forwarded typeahead in a bounded buffer and report whether data was
@@ -540,108 +497,6 @@ class InteractiveShell:
             return True
         except (BlockingIOError, OSError):
             return
-
-    def _read(self, fd: int) -> bytes:
-        """Read one chunk from an FD, returning empty bytes if nothing is currently
-        readable.
-        """
-        try:
-            data = os.read(fd, self.chunk_size)
-        except (BlockingIOError, OSError):
-            data = b""
-        return data
-
-    def return_typeahead(self, data: bytes) -> None:
-        """Append unread input returned by the previous consumer within the byte limit."""
-        if len(self.dupin_buffer) + len(data) > TYPEAHEAD_LIMIT_BYTES:
-            raise BufferError(
-                f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
-            )
-        self.dupin_buffer.extend(data)
-        if data:
-            self.input_observer.record(
-                "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
-            )
-
-    def _io_failed(self, exc: Exception) -> None:
-        """Wake the main session waiter with the first I/O error."""
-        if self._fatal_error is not None and not self._fatal_error.done():
-            self._fatal_error.set_result(exc)
-
-    def _writer(self, fd: int) -> FDWriter:
-        """Create or reuse a writer that preserves output order for each FD."""
-        if fd not in self._writers:
-            self._writers[fd] = FDWriter(self.loop, fd, self._io_failed)
-        return self._writers[fd]
-
-    def _resume_output(self):
-        """Register PTY reads again when the output queue reaches its low watermark."""
-        if (
-            self._output_paused
-            and not self._closing_output
-            and len(self._output_buffer) <= OUTPUT_QUEUE_LOW_BYTES
-        ):
-            self._output_paused = False
-            self.loop.add_reader(self.master_fd, self._display, self.master_fd)
-
-    async def _flush_output(self):
-        """Drain queued output in order and coordinate writes with the active editor
-        renderer.
-        """
-        try:
-            while self._output_buffer:
-                data = bytes(self._output_buffer[:STREAM_CHUNK_BYTES])
-                del self._output_buffer[: len(data)]
-
-                async def write(data=data):
-                    """Write the chunk captured for this iteration and wait for partial
-                    writes to finish.
-                    """
-                    writer = self._writer(self.stdout_fd)
-                    writer.write(data)
-                    await writer.drain()
-
-                app = getattr(self.session, "app", None)
-                if getattr(app, "is_running", False) is True:
-                    await self.session.write_output(write)
-                else:
-                    await write()
-                self._resume_output()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._io_failed(exc)
-
-    async def _drain_output(self):
-        """Wait until both output tasks and FD writer queues are empty."""
-        if self._output_task is not None:
-            await self._output_task
-        await self._writer(self.stdout_fd).drain()
-
-    def _write(self, fd: int, data: Union[bytes, bytearray]) -> None:
-        """Send output to an FD writer or enqueue it for the UI and apply backpressure."""
-        if fd != self.stdout_fd:
-            self._writer(fd).write(data)
-            return
-        if not data:
-            return
-        if len(self._output_buffer) + len(data) > OUTPUT_QUEUE_LIMIT_BYTES:
-            raise BufferError(
-                f"Pending terminal output exceeds {OUTPUT_QUEUE_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
-            )
-        self._output_buffer.extend(data)
-        if (
-            len(self._output_buffer) >= OUTPUT_QUEUE_HIGH_BYTES
-            and not self._output_paused
-        ):
-            self._output_paused = True
-            self.loop.remove_reader(self.master_fd)
-        if self._output_task is None or self._output_task.done():
-            self._output_task = self.loop.create_task(self._flush_output())
-
-    def _has_exited(self) -> bool:
-        """Consult the child watcher's cached status without probing the process."""
-        return self.proc is not None and self.proc.returncode is not None
 
     def _input(self, fd: int, epoch: int | None = None) -> None:
         """Forward input to the internal PTY during execution and retain a diagnostic tail."""
@@ -686,6 +541,22 @@ class InteractiveShell:
             self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
         except Exception as exc:
             self._io_failed(exc)
+
+    def _discard_terminal_input(self) -> None:
+        """Flush submitted bytes on both sides of the PTY input path, preserving output.
+
+        TCIFLUSH on the master would discard command output, not shell input.
+        Open the slave only for this ioctl so it cannot keep an exited shell alive.
+        TIOCGPTPEER avoids reopening a possibly renamed or permission-changed path.
+        """
+        peer = fcntl.ioctl(
+            self.master_fd, TIOCGPTPEER, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC
+        )
+        try:
+            termios.tcflush(self.master_fd, termios.TCOFLUSH)
+            termios.tcflush(peer, termios.TCIFLUSH)
+        finally:
+            os.close(peer)
 
     def _cancel_handoff(self, control: bytes, remaining: bytes) -> None:
         """Cancel an input handoff and retain only post-control typeahead."""
@@ -732,46 +603,134 @@ class InteractiveShell:
             self.return_typeahead(remaining)
         self.input_observer.terminal("SHELL", self.master_fd, "interrupt")
 
-    def _discard_terminal_input(self) -> None:
-        """Flush submitted bytes on both sides of the PTY input path, preserving output.
-
-        TCIFLUSH on the master would discard command output, not shell input.
-        Open the slave only for this ioctl so it cannot keep an exited shell alive.
-        TIOCGPTPEER avoids reopening a possibly renamed or permission-changed path.
-        """
-        peer = fcntl.ioctl(
-            self.master_fd, TIOCGPTPEER, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC
+    async def _send(
+        self, data: Union[str, bytes], generation: int | None = None
+    ) -> int:
+        """Send an encoded command in ordered chunks and return the byte count."""
+        text_bytes = data.encode(self.encoder) if isinstance(data, str) else data
+        if generation is None:
+            generation = self._send_generation
+        self.input_observer.record(
+            "submission", "SHELL", bytes=len(text_bytes), generation=generation
         )
-        try:
-            termios.tcflush(self.master_fd, termios.TCOFLUSH)
-            termios.tcflush(peer, termios.TCIFLUSH)
-        finally:
-            os.close(peer)
+        writer = self._writer(self.master_fd)
+        sent = 0
+        for start in range(0, len(text_bytes), STREAM_CHUNK_BYTES):
+            if (
+                generation != self._send_generation
+                or self._has_exited()
+                or self._closing_output
+            ):
+                break
+            writer.write(text_bytes[start : start + STREAM_CHUNK_BYTES])
+            await writer.drain()
+            sent += min(STREAM_CHUNK_BYTES, len(text_bytes) - start)
+            # drain() can finish synchronously; even an immediately writable
+            # PTY must allow the input callback to observe an interrupt.
+            await asyncio.sleep(0)
+        return sent
 
-    def _update(self, fd: int) -> None:
-        """Consume FIFO frames to update shell state and the received prompt ID."""
+    async def _send_staged(self, data: bytes, prefix: int, generation: int) -> int:
+        """Transmit a verified first-line prefix before committing its newline."""
+        lease = InputModeLease(self.master_fd, data[:prefix])
+        self._input_mode_lease = lease
         try:
-            chunk = os.read(fd, self.chunk_size)
-            if not chunk:
-                return
-            for category, body in self._frame_decoder.feed(chunk):
-                if category == PROMPT_ID:
-                    if (
-                        body
-                        and len(body) <= PROMPT_ID_MAX_DIGITS
-                        and body.isdigit()
-                        and int(body) < PROMPT_ID_LIMIT
-                    ):
-                        self._context_id = max(self._context_id, int(body))
-                        if self._context_id > self._accepted_prompt_id:
-                            self._handoff_pending = True
-                        self._context_event.set()
-                else:
-                    self.session.update_context(category, body)
-        except (BlockingIOError, InterruptedError):
+            suffix = data[prefix:]
+            echo = suffix if lease.saved[3] & termios.ECHO else b""
+            if lease.saved[1] & termios.OPOST and lease.saved[1] & termios.ONLCR:
+                echo = echo.replace(b"\n", b"\r\n")
+            # The prefix has echo disabled; only arm suffix masking when LF
+            # is about to be sent, so intervening background output stays intact.
+            self.sequencer.at_masking(b"")
+            lease.start()
+            self.input_observer.record("long_input_started", "SHELL", bytes=prefix)
+            sent = await self._send(data[:prefix], generation)
+            if generation != self._send_generation or sent != prefix:
+                return sent
+            async with asyncio.timeout(5):
+                while lease.pending():
+                    if self._has_exited() or self._closing_output:
+                        raise OSError("Shell exited during long input")
+                    await asyncio.sleep(0.001)
+            if self._prompt_id != self._accepted_prompt_id:
+                raise RuntimeError("Shell abandoned a long input before its newline")
+        finally:
+            try:
+                lease.close()
+            finally:
+                self._input_mode_lease = None
+                self.input_observer.record("long_input_restored", "SHELL")
+        self.sequencer.at_masking(echo)
+        return sent + await self._send(data[prefix:], generation)
+
+    # =============================================
+    # [Internal API: Output] Queue, parse, and display PTY output with backpressure.
+    # =============================================
+
+    def _write(self, fd: int, data: Union[bytes, bytearray]) -> None:
+        """Send output to an FD writer or enqueue it for the UI and apply backpressure."""
+        if fd != self.stdout_fd:
+            self._writer(fd).write(data)
             return
+        if not data:
+            return
+        if len(self._output_buffer) + len(data) > OUTPUT_QUEUE_LIMIT_BYTES:
+            raise BufferError(
+                f"Pending terminal output exceeds {OUTPUT_QUEUE_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+            )
+        self._output_buffer.extend(data)
+        if (
+            len(self._output_buffer) >= OUTPUT_QUEUE_HIGH_BYTES
+            and not self._output_paused
+        ):
+            self._output_paused = True
+            self.loop.remove_reader(self.master_fd)
+        if self._output_task is None or self._output_task.done():
+            self._output_task = self.loop.create_task(self._flush_output())
+
+    def _resume_output(self):
+        """Register PTY reads again when the output queue reaches its low watermark."""
+        if (
+            self._output_paused
+            and not self._closing_output
+            and len(self._output_buffer) <= OUTPUT_QUEUE_LOW_BYTES
+        ):
+            self._output_paused = False
+            self.loop.add_reader(self.master_fd, self._display, self.master_fd)
+
+    async def _flush_output(self):
+        """Drain queued output in order and coordinate writes with the active editor
+        renderer.
+        """
+        try:
+            while self._output_buffer:
+                data = bytes(self._output_buffer[:STREAM_CHUNK_BYTES])
+                del self._output_buffer[: len(data)]
+
+                async def write(data=data):
+                    """Write the chunk captured for this iteration and wait for partial
+                    writes to finish.
+                    """
+                    writer = self._writer(self.stdout_fd)
+                    writer.write(data)
+                    await writer.drain()
+
+                app = getattr(self.session, "app", None)
+                if getattr(app, "is_running", False) is True:
+                    await self.session.write_output(write)
+                else:
+                    await write()
+                self._resume_output()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._io_failed(exc)
+
+    async def _drain_output(self):
+        """Wait until both output tasks and FD writer queues are empty."""
+        if self._output_task is not None:
+            await self._output_task
+        await self._writer(self.stdout_fd).drain()
 
     def _track_output_line(self, data: bytes) -> None:
         """Track only linear output outside initialization as a candidate prompt prefix."""
@@ -821,178 +780,142 @@ class InteractiveShell:
         except Exception as exc:
             self._io_failed(exc)
 
-    def validate_submission(self, data: bytes) -> int:
-        """Validate editor input without changing terminal settings or writing bytes."""
-        prefix = staged_prefix(data, self.adapter.long_input, self.shell)
-        if not prefix:
-            return 0
-        self.signal_controller.validate_submission()
-        if (
-            self._has_exited()
-            or self._closing_output
-            or self._accepted_prompt_id <= 0
-            or self._accepted_prompt_id != self._context_id
-            or self._accepted_prompt_id != self._prompt_id
-            or self.command_done_event is None
-            or not self.command_done_event.is_set()
-            or self.continuation_active is None
-            or self.continuation_active.is_set()
-        ):
-            raise InputRejected(
-                "Not sent: long input requires a confirmed primary shell prompt."
-            )
+    # =============================================
+    # [Internal API: Integration] Validate prompt signals and synchronize shell context.
+    # =============================================
+
+    def _update(self, fd: int) -> None:
+        """Consume FIFO frames to update shell state and the received prompt ID."""
         try:
-            attrs = termios.tcgetattr(self.master_fd)
-            if os.tcgetpgrp(self.master_fd) != self.shell_pid:
-                raise InputRejected(
-                    "Not sent: the shell does not own the terminal for long input."
-                )
-            check_terminal(attrs, data[:prefix])
-        except (OSError, termios.error) as exc:
-            raise InputRejected(
-                "Not sent: the shell terminal is unavailable for long input."
-            ) from exc
-        return prefix
+            chunk = os.read(fd, self.chunk_size)
+            if not chunk:
+                return
+            for category, body in self._frame_decoder.feed(chunk):
+                if category == PROMPT_ID:
+                    if (
+                        body
+                        and len(body) <= PROMPT_ID_MAX_DIGITS
+                        and body.isdigit()
+                        and int(body) < PROMPT_ID_LIMIT
+                    ):
+                        self._context_id = max(self._context_id, int(body))
+                        if self._context_id > self._accepted_prompt_id:
+                            self._handoff_pending = True
+                        self._context_event.set()
+                else:
+                    self.session.update_context(category, body)
+        except (BlockingIOError, InterruptedError):
+            return
+        except Exception as exc:
+            self._io_failed(exc)
 
-    async def _send_staged(self, data: bytes, prefix: int, generation: int) -> int:
-        """Transmit a verified first-line prefix before committing its newline."""
-        lease = InputModeLease(self.master_fd, data[:prefix])
-        self._input_mode_lease = lease
-        try:
-            suffix = data[prefix:]
-            echo = suffix if lease.saved[3] & termios.ECHO else b""
-            if lease.saved[1] & termios.OPOST and lease.saved[1] & termios.ONLCR:
-                echo = echo.replace(b"\n", b"\r\n")
-            # The prefix has echo disabled; only arm suffix masking when LF
-            # is about to be sent, so intervening background output stays intact.
-            self.sequencer.at_masking(b"")
-            lease.start()
-            self.input_observer.record("long_input_started", "SHELL", bytes=prefix)
-            sent = await self._send(data[:prefix], generation)
-            if generation != self._send_generation or sent != prefix:
-                return sent
-            async with asyncio.timeout(5):
-                while lease.pending():
-                    if self._has_exited() or self._closing_output:
-                        raise OSError("Shell exited during long input")
-                    await asyncio.sleep(0.001)
-            if self._prompt_id != self._accepted_prompt_id:
-                raise RuntimeError("Shell abandoned a long input before its newline")
-        finally:
-            try:
-                lease.close()
-            finally:
-                self._input_mode_lease = None
-                self.input_observer.record("long_input_restored", "SHELL")
-        self.sequencer.at_masking(echo)
-        return sent + await self._send(data[prefix:], generation)
+    def _set_prompt_id(self, data: bytes) -> bool:
+        """Accept only valid, increasing session IDs and pass invalid signals through."""
+        if not data or len(data) > PROMPT_ID_MAX_DIGITS or not data.isdigit():
+            return False
+        value = int(data)
+        if not self._prompt_id < value < PROMPT_ID_LIMIT:
+            return False
+        self._prompt_id = value
+        return True
 
-    async def _send(
-        self, data: Union[str, bytes], generation: int | None = None
-    ) -> int:
-        """Send an encoded command in ordered chunks and return the byte count."""
-        text_bytes = data.encode(self.encoder) if isinstance(data, str) else data
-        if generation is None:
-            generation = self._send_generation
-        self.input_observer.record(
-            "submission", "SHELL", bytes=len(text_bytes), generation=generation
-        )
-        writer = self._writer(self.master_fd)
-        sent = 0
-        for start in range(0, len(text_bytes), STREAM_CHUNK_BYTES):
-            if (
-                generation != self._send_generation
-                or self._has_exited()
-                or self._closing_output
-            ):
-                break
-            writer.write(text_bytes[start : start + STREAM_CHUNK_BYTES])
-            await writer.drain()
-            sent += min(STREAM_CHUNK_BYTES, len(text_bytes) - start)
-            # drain() can finish synchronously; even an immediately writable
-            # PTY must allow the input callback to observe an interrupt.
-            await asyncio.sleep(0)
-        return sent
+    def _set_prompt(self, prompt: bytes) -> Optional[bytes]:
+        """Stage a fresh prompt candidate; replayed PS1 is ordinary program output.
 
-    async def _exec(self, data: Union[str, bytes]) -> None:
-        """Pass input to the shell and wait for the next prompt, state, and output drain.
-
-        Remove one matching echo using the current termios settings. Forward keystrokes
-        to the shell while waiting, then detach the raw input reader after the
-        completion boundary.
+        Only the matching state frame can transfer input back to the editor. A
+        surviving marker without a hook must never authorize a maintenance write.
         """
-        self.scroll_back.last_output = None
-        self._native_output_line.clear()
-        self._prompt_prefix = b""
-        if isinstance(data, str):
-            data = data.encode(self.encoder)
-        prefix = self.validate_submission(data)
-        self.prompt_event.clear()
-        self.command_start_event.set()
-        self.command_done_event.clear()
-        self._send_interrupted = False
-        self._handoff_pending = False
-        self._deferred_input.clear()
-        self._send_generation += 1
-        self._input_epoch += 1
-        if self.adapter.refresh and hasattr(self.session, "take_typeahead"):
-            data += self.session.take_typeahead()
-        try:
-            # The PTY echoes every newline as CRLF, including pasted lines.
-            attrs = termios.tcgetattr(self.master_fd)
-            self.input_observer.terminal("SHELL", self.master_fd, "submission")
-            echo = data if attrs[3] & termios.ECHO else b""
-            if attrs[1] & termios.OPOST and attrs[1] & termios.ONLCR:
-                echo = echo.replace(b"\n", b"\r\n")
-            self.sequencer.at_masking(echo)
-            self.loop.add_reader(
-                self.dupin_fd, self._input, self.dupin_fd, self._input_epoch
-            )
-            self._native_input_active = True
-            self._input_observation = self.input_observer.begin("SHELL")
-            generation = self._send_generation
-            self._send_task = asyncio.create_task(
-                self._send_staged(data, prefix, generation)
-                if prefix
-                else self._send(data, generation)
-            )
+        if self._prompt_id <= self._accepted_prompt_id:
+            return prompt
+        self._pending_prompt_id = self._prompt_id
+        self.input_observer.record(
+            "prompt_candidate", prompt_id=self._prompt_id, context_id=self._context_id
+        )
+        self.message = prompt
+        if not self._initializing:
+            self._prompt_prefix = self._native_output_line.prefix
+        self.prompt_event.set()
+        self._context_event.set()
+        if self._initializing:
+            self._init_event.set()
+
+    def _set_unhooked_prompt(self, prompt: bytes) -> Optional[bytes]:
+        """Keep an unconfirmed caret prompt with native input, without sending a newline."""
+        return self._set_prompt(prompt)
+
+    def _set_continuation(
+        self, prompt: bytes, *, buffered: bool = False
+    ) -> Optional[bytes]:
+        """Keep continuation input with the shell or pass it to the editor per adapter
+        policy.
+        """
+        self.continuation_active.set()
+        if buffered:
+            # The shell checked readiness before reading its next line. The
+            # editor already displayed that submitted input; omit only this PS2.
+            return None
+        if self.adapter.behavior.native_continuation:
+            # The shell may already have read the complete foreach body into
+            # its own buffer. Keep one input owner until the primary prompt.
+            # Returning bytes preserves the prompt's position in the PTY output.
+            return prompt
+        self.session.set_prompt(prompt, self.encoder)
+        # A custom UI continuation policy must not flush or replay shell input.
+        self.prompt_event.set()
+
+    async def _wait_context(self) -> None:
+        """Wait within a deadline for the state FIFO to reach the current prompt ID."""
+        while self._context_id != (self._pending_prompt_id or self._prompt_id):
+            self._context_event.clear()
             try:
-                await self._send_task
-            except InputRejected:
-                # A final lease check can reject changed settings before any
-                # bytes are sent. The acknowledged prompt still belongs to us.
-                self.command_start_event.clear()
-                self.command_done_event.set()
-                self.prompt_event.set()
-                self.return_typeahead(bytes(self._deferred_input))
-                raise
-            except asyncio.CancelledError:
-                if (
-                    generation == self._send_generation
-                    or asyncio.current_task().cancelling()
-                ):
-                    raise
-            finally:
-                self._send_task = None
-            if (
-                self._deferred_input
-                and not self._handoff_pending
-                and not self._has_exited()
-            ):
-                self._write(self.master_fd, self._deferred_input)
-                self.input_observer.record(
-                    "deferred_forwarded", "SHELL", bytes=len(self._deferred_input)
-                )
-                self._deferred_input.clear()
-            await self.prompt_event.wait()
-            await self._synchronize_prompt()
-            await self._drain_output()
-        finally:
+                await asyncio.wait_for(self._context_event.wait(), self.context_timeout)
+            except TimeoutError:
+                raise RuntimeError(
+                    "Shell context was not received after a confirmed prompt"
+                ) from None
+
+    def _accept_prompt(self) -> None:
+        """Transfer input ownership only after a fresh prompt and its state agree."""
+        if self._closing_output or self._has_exited():
+            return
+        if not self._accepted_prompt_id < self._pending_prompt_id == self._context_id:
+            raise RuntimeError("Cannot accept an unconfirmed shell prompt")
+        self.signal_controller.reset()
+        if self.loop is not None and self.dupin_fd is not None:
             self.loop.remove_reader(self.dupin_fd)
             self._native_input_active = False
             self.input_observer.end(self._input_observation)
             self._input_observation = None
-            self._deferred_input.clear()
+        if self._send_interrupted:
+            # A previous primary hook may have moved submitted suffix bytes
+            # into the typeahead FIFO before VINTR arrived. The new prompt is
+            # emitted after its forwarder exits, so drain those bytes now.
+            while self._pre_input(self.tty_pipe):
+                pass
+            self._send_interrupted = False
+        self._accepted_prompt_id = self._pending_prompt_id
+        # The helper forwarded older PTY input before emitting this prompt.
+        # Read that FIFO before appending newer input held during the handoff.
+        while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+            pass
+        self.return_typeahead(bytes(self._deferred_input))
+        self._deferred_input.clear()
+        self.input_observer.record(
+            "prompt_accepted", prompt_id=self._accepted_prompt_id
+        )
+        self.command_done_event.set()
+        self.continuation_active.clear()
+        self.session.set_prompt(self._prompt_prefix + self.message, self.encoder)
+        self.input_observer.terminal("SHELL", self.master_fd, "prompt_accepted")
+
+    async def _synchronize_prompt(self):
+        """Confirm context without ever injecting recovery commands into shell stdin."""
+        await self._wait_context()
+        self._accept_prompt()
+
+    # =============================================
+    # [Core API] Coordinate shell startup, command execution, and session cleanup.
+    # =============================================
 
     async def _spawn(self) -> None:
         """Start an interactive shell with a controlling PTY and close the parent's slave
@@ -1089,47 +1012,85 @@ class InteractiveShell:
             exited.cancel()
             await asyncio.gather(ready, exited, return_exceptions=True)
 
-    async def _synchronize_prompt(self):
-        """Confirm context without ever injecting recovery commands into shell stdin."""
-        await self._wait_context()
-        self._accept_prompt()
+    async def _exec(self, data: Union[str, bytes]) -> None:
+        """Pass input to the shell and wait for the next prompt, state, and output drain.
 
-    async def _shell(self) -> int:
-        """Return the child status after draining final output and control sequences."""
-        status = await self.proc.wait()
-        self._native_input_active = False
-        if self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
+        Remove one matching echo using the current termios settings. Forward keystrokes
+        to the shell while waiting, then detach the raw input reader after the
+        completion boundary.
+        """
+        self.scroll_back.last_output = None
+        self._native_output_line.clear()
+        self._prompt_prefix = b""
+        if isinstance(data, str):
+            data = data.encode(self.encoder)
+        prefix = self.validate_submission(data)
+        self.prompt_event.clear()
+        self.command_start_event.set()
+        self.command_done_event.clear()
+        self._send_interrupted = False
+        self._handoff_pending = False
+        self._deferred_input.clear()
         self._send_generation += 1
-        writer = self._writers.get(self.master_fd)
-        if writer is not None:
-            writer.discard()
-        self.input_observer.record("process_exit", "SHELL", status=status)
-        # Process exit does not mean the PTY has been drained. Stop the reader
-        # before draining, including when a descendant holds the slave open.
-        self._closing_output = True
-        self.loop.remove_reader(self.master_fd)
-        await self._drain_output()
-        budget = STREAM_CHUNK_BYTES
-        while True:
+        self._input_epoch += 1
+        if self.adapter.refresh and hasattr(self.session, "take_typeahead"):
+            data += self.session.take_typeahead()
+        try:
+            # The PTY echoes every newline as CRLF, including pasted lines.
+            attrs = termios.tcgetattr(self.master_fd)
+            self.input_observer.terminal("SHELL", self.master_fd, "submission")
+            echo = data if attrs[3] & termios.ECHO else b""
+            if attrs[1] & termios.OPOST and attrs[1] & termios.ONLCR:
+                echo = echo.replace(b"\n", b"\r\n")
+            self.sequencer.at_masking(echo)
+            self.loop.add_reader(
+                self.dupin_fd, self._input, self.dupin_fd, self._input_epoch
+            )
+            self._native_input_active = True
+            self._input_observation = self.input_observer.begin("SHELL")
+            generation = self._send_generation
+            self._send_task = asyncio.create_task(
+                self._send_staged(data, prefix, generation)
+                if prefix
+                else self._send(data, generation)
+            )
             try:
-                data = os.read(self.master_fd, self.chunk_size)
-            except BlockingIOError:
-                break
-            except OSError as exc:
-                if exc.errno != errno.EIO:
+                await self._send_task
+            except InputRejected:
+                # A final lease check can reject changed settings before any
+                # bytes are sent. The acknowledged prompt still belongs to us.
+                self.command_start_event.clear()
+                self.command_done_event.set()
+                self.prompt_event.set()
+                self.return_typeahead(bytes(self._deferred_input))
+                raise
+            except asyncio.CancelledError:
+                if (
+                    generation == self._send_generation
+                    or asyncio.current_task().cancelling()
+                ):
                     raise
-                break
-            if not data:
-                break
-            self._consume_output(data)
-            budget -= len(data)
-            if budget <= 0:
-                await self._drain_output()
-                budget = STREAM_CHUNK_BYTES
-        self._write(self.stdout_fd, self.sequencer.finish())
-        await self._drain_output()
-        return status
+            finally:
+                self._send_task = None
+            if (
+                self._deferred_input
+                and not self._handoff_pending
+                and not self._has_exited()
+            ):
+                self._write(self.master_fd, self._deferred_input)
+                self.input_observer.record(
+                    "deferred_forwarded", "SHELL", bytes=len(self._deferred_input)
+                )
+                self._deferred_input.clear()
+            await self.prompt_event.wait()
+            await self._synchronize_prompt()
+            await self._drain_output()
+        finally:
+            self.loop.remove_reader(self.dupin_fd)
+            self._native_input_active = False
+            self.input_observer.end(self._input_observation)
+            self._input_observation = None
+            self._deferred_input.clear()
 
     async def _prompt(self) -> None:
         """Inject typeahead into the editor and process submissions in pre-hook, execution,
@@ -1222,24 +1183,42 @@ class InteractiveShell:
                 if command.strip():
                     return
 
-    def _close_fd(self, name: str) -> None:
-        """Close an owned FD once and clear its attribute to None."""
-        fd = getattr(self, name)
-        setattr(self, name, None)
-        if fd is not None:
-            os.close(fd)
-
-    def _restore_terminal(self) -> None:
-        """Restore saved termios, tolerating a terminal destroyed during hangup."""
-        try:
-            termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self.exec_attrs)
-        except termios.error as exc:
-            if self.signal_controller.shutdown_signal is None or exc.args[0] not in (
-                errno.EIO,
-                errno.ENOTTY,
-                errno.EBADF,
-            ):
-                raise
+    async def _shell(self) -> int:
+        """Return the child status after draining final output and control sequences."""
+        status = await self.proc.wait()
+        self._native_input_active = False
+        if self.dupin_fd is not None:
+            self.loop.remove_reader(self.dupin_fd)
+        self._send_generation += 1
+        writer = self._writers.get(self.master_fd)
+        if writer is not None:
+            writer.discard()
+        self.input_observer.record("process_exit", "SHELL", status=status)
+        # Process exit does not mean the PTY has been drained. Stop the reader
+        # before draining, including when a descendant holds the slave open.
+        self._closing_output = True
+        self.loop.remove_reader(self.master_fd)
+        await self._drain_output()
+        budget = STREAM_CHUNK_BYTES
+        while True:
+            try:
+                data = os.read(self.master_fd, self.chunk_size)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                break
+            if not data:
+                break
+            self._consume_output(data)
+            budget -= len(data)
+            if budget <= 0:
+                await self._drain_output()
+                budget = STREAM_CHUNK_BYTES
+        self._write(self.stdout_fd, self.sequencer.finish())
+        await self._drain_output()
+        return status
 
     async def _stop(self) -> None:
         """Cancel session tasks, wait for shell exit, and close output-monitoring
@@ -1285,11 +1264,6 @@ class InteractiveShell:
                 # ExitStack must still restore termios and release session files.
                 with contextlib.suppress(OSError):
                     os.write(self.stdout_fd, self.terminal_state.restore())
-
-    async def main(self):
-        """Run acquisition and cleanup inside the adapter's signal-handler lifetime."""
-        self.loop = asyncio.get_running_loop()
-        return await self.signal_controller.run(self._run_session)
 
     async def _run_session(self) -> int:
         """Acquire temporary integration files, FDs, and terminal settings for the session
@@ -1422,6 +1396,60 @@ class InteractiveShell:
             finally:
                 self._stopping = True
                 await self._stop()
+
+    # =============================================
+    # [External API] Expose input handoff, validation, and session entry points.
+    # =============================================
+
+    def return_typeahead(self, data: bytes) -> None:
+        """Append unread input returned by the previous consumer within the byte limit."""
+        if len(self.dupin_buffer) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+            raise BufferError(
+                f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+            )
+        self.dupin_buffer.extend(data)
+        if data:
+            self.input_observer.record(
+                "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
+            )
+
+    def validate_submission(self, data: bytes) -> int:
+        """Validate editor input without changing terminal settings or writing bytes."""
+        prefix = staged_prefix(data, self.adapter.long_input, self.shell)
+        if not prefix:
+            return 0
+        self.signal_controller.validate_submission()
+        if (
+            self._has_exited()
+            or self._closing_output
+            or self._accepted_prompt_id <= 0
+            or self._accepted_prompt_id != self._context_id
+            or self._accepted_prompt_id != self._prompt_id
+            or self.command_done_event is None
+            or not self.command_done_event.is_set()
+            or self.continuation_active is None
+            or self.continuation_active.is_set()
+        ):
+            raise InputRejected(
+                "Not sent: long input requires a confirmed primary shell prompt."
+            )
+        try:
+            attrs = termios.tcgetattr(self.master_fd)
+            if os.tcgetpgrp(self.master_fd) != self.shell_pid:
+                raise InputRejected(
+                    "Not sent: the shell does not own the terminal for long input."
+                )
+            check_terminal(attrs, data[:prefix])
+        except (OSError, termios.error) as exc:
+            raise InputRejected(
+                "Not sent: the shell terminal is unavailable for long input."
+            ) from exc
+        return prefix
+
+    async def main(self):
+        """Run acquisition and cleanup inside the adapter's signal-handler lifetime."""
+        self.loop = asyncio.get_running_loop()
+        return await self.signal_controller.run(self._run_session)
 
     def run(self):
         """Check Linux support and run the asynchronous session from a synchronous call."""
