@@ -104,6 +104,15 @@ class Config:
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
 
+    def ensure_rc_file(self) -> None:
+        """Create an empty initialization script without modifying an existing file."""
+        self.ISH_HOME.mkdir(parents=True, exist_ok=True)
+        try:
+            # Exclusive creation also preserves a file created by another session.
+            self.RC_FILE.touch(exist_ok=False)
+        except FileExistsError:
+            pass
+
     def reset(self) -> None:
         """Clear the home override and restore default path resolution."""
         self._ish_home = None

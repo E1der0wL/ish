@@ -78,12 +78,13 @@ RHEL 8.10.
 
 ## Customizing ish
 
-Create `~/ish/.ishrc.py` for your settings. With `--home DIR`, use
-`DIR/.ishrc.py` instead. This file receives `prompt`, `config`, `logger`, `option`,
+Edit `~/ish/.ishrc.py` for your settings. With `--home DIR`, use
+`DIR/.ishrc.py` instead. Interactive startup creates an empty file if it is missing
+and preserves existing files. This file receives `prompt`, `config`, `logger`, `option`,
 and `plugin` objects. Enter `ish_reload` to reload the rc file in a running session;
 restart ish after changing plugin source files.
 
-`--no-rc` skips this startup file. `--no-plugins` skips automatic plugin loading.
+`--no-rc` skips creating and loading this startup file. `--no-plugins` skips automatic plugin loading.
 Neither option skips the selected shell's own startup files. `--home` changes
 ish's settings location without changing the shell's `HOME`.
 
@@ -278,22 +279,24 @@ list but returns a new handle; omitted options use their defaults.
 
 ### set_completer
 
-Pass an **iterable of completers**, even when adding only one:
+Pass a single `Completer` instance or an iterable of instances:
 
 ```python
 from prompt_toolkit.completion import WordCompleter
 
-prompt.set_completer([
-    WordCompleter(["greet", "say"], ignore_case=True)
-])
+prompt.set_completer(WordCompleter(["greet", "say"], ignore_case=True))
+
+# Multiple sources can be supplied as a list, tuple, or generator.
+# prompt.set_completer([first_completer, second_completer])
 
 # Remove additional completers while retaining ish's default completion.
-# prompt.set_completer([])
+# prompt.set_completer()  # None or [] also clears additional sources.
 ```
 
 ish merges these with its default completer, removes duplicate suggestions, and
 runs completion in a worker thread. Each call replaces the previous additional
-completers. A custom `Completer` implementation can also be supplied; its completion
+completers; invalid sources raise `TypeError` without replacing the current setup.
+A custom `Completer` subclass instance can also be supplied directly; its completion
 code should not mutate UI state from the worker thread.
 
 ### Bottom toolbar, right prompt, and styles
@@ -354,7 +357,7 @@ if my_tools is not None:
     prompt.post_hook = my_tools.after_command
     prompt.fallback_hook = my_tools.on_failure
     prompt.set_tool("greet", function=my_tools.greet)
-    prompt.set_completer([WordCompleter(["greet"], ignore_case=True)])
+    prompt.set_completer(WordCompleter(["greet"], ignore_case=True))
 
     def run_greeting(event):
         """Run the registered Python tool with a fixed argument."""

@@ -171,7 +171,8 @@ class ArgumentParser:
                 option=option,
                 plugin_manager=plugin_manager,
             )
-            if not option.no_rc and config.RC_FILE.exists():
+            if not option.no_rc:
+                config.ensure_rc_file()
                 prompt.load_rc()
             prompt.run()
 

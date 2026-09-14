@@ -34,7 +34,7 @@ from prompt_toolkit.application import in_terminal
 from prompt_toolkit.application.current import get_app, set_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer, ValidationState
-from prompt_toolkit.completion import ThreadedCompleter, merge_completers
+from prompt_toolkit.completion import Completer, ThreadedCompleter, merge_completers
 from prompt_toolkit.filters import (
     Condition,
     has_arg,
@@ -725,7 +725,7 @@ class Prompt(PromptSession):
             """Apply paired-quote editing when a single quote is typed."""
             input_pair(event, "'", "''")
 
-        @kb.add('`')
+        @kb.add("`")
         def _(event: KeyPressEvent):
             """Apply paired-quote editing when a backtick is typed."""
             input_pair(event, "`", "``")
@@ -971,10 +971,31 @@ class Prompt(PromptSession):
         self._update_layout()
         return new_float
 
-    def set_completer(self, completer) -> None:
-        """Deduplicate default and user completions and wrap them in a threaded completer."""
+    def set_completer(
+        self, completer: Optional[Union[Completer, Iterable[Completer]]] = None
+    ) -> None:
+        """Replace additional completion sources with one completer or an iterable.
+
+        None or an empty iterable restores default completion. Validate all sources
+        before replacing the current completer, then deduplicate suggestions and
+        run completion in a worker thread.
+        """
+        if completer is None:
+            additional = []
+        elif isinstance(completer, Completer):
+            additional = [completer]
+        else:
+            try:
+                additional = list(completer)
+            except TypeError as exc:
+                raise TypeError(
+                    "Supply a Completer instance, an iterable of Completer instances, or None"
+                ) from exc
+            if not all(isinstance(item, Completer) for item in additional):
+                raise TypeError("Each completion source must be a Completer instance")
+
         comps = merge_completers(
-            [self.default_completer] + list(completer), deduplicate=True
+            [self.default_completer, *additional], deduplicate=True
         )
         self.completer = ThreadedCompleter(comps)
 
