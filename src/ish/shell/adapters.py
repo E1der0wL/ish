@@ -282,7 +282,7 @@ ADAPTERS = {
         builtins_command="builtins",
         builtins_args=("-f", "-c"),
         long_input=LongInputMode.STAGED_FIRST_LINE,
-        version=VersionPolicy((6, 24, 16), "tcsh "),
+        version=VersionPolicy((6, 21, 0), "tcsh "),
     ),
     "csh": ShellAdapter(
         "csh",

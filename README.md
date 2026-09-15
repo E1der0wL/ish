@@ -18,7 +18,7 @@ selects the login shell by name.
 | --- | --- | --- | --- |
 | Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
 | zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
-| tcsh | 6.24.16 | `tcsh` | Supports prompt hooks and return to the ish editor. |
+| tcsh | 6.21.00 | `tcsh` | Supports prompt hooks and return to the ish editor. |
 | BSD csh | No numeric check | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
 | dash / sh | No numeric check | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
