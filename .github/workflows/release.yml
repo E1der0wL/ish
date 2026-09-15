@@ -32,6 +32,7 @@ env:
   PYTHON_VERSION: "3.12.14"
   UV_VERSION: "0.12.12"
   UV_SHA256: ab9b309d4586403f024e100abaceb396616e178a553e2500c36087d180f09509
+  TEST_BASH_VERSION: "5.3.9"
 
 jobs:
   build:
@@ -87,7 +88,7 @@ jobs:
           docker run --rm -i --platform linux/amd64 \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work" \
             --workdir /work \
-            --env PYTHON_VERSION --env UV_VERSION --env UV_SHA256 \
+            --env PYTHON_VERSION --env UV_VERSION --env UV_SHA256 --env TEST_BASH_VERSION \
             --env RELEASE_TAG --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT \
             --env SOURCE_COMMIT --env BUILD_IMAGE \
             --env "BUILD_UID=$(id -u)" --env "BUILD_GID=$(id -g)" \
@@ -113,6 +114,51 @@ jobs:
           export UV_PROJECT_ENVIRONMENT=/tmp/ish-build-venv
           export CFLAGS='-march=x86-64 -mtune=generic'
           export CXXFLAGS="$CFLAGS"
+
+          # The target images' system Bash versions predate ish's minimum.
+          # Build a separate test shell against the same glibc baseline.
+          mkdir -p /tmp/ish-smoke-bash /work/dist/smoke-bash
+          cd /tmp/ish-smoke-bash
+          cat > SOURCES.sha256 <<'BASH_SOURCES'
+          0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba  bash-5.3.tar.gz
+          1f608434364af86b9b45c8b0ea3fb3b165fb830d27697e6cdfc7ac17dee3287f  bash53-001
+          e385548a00130765ec7938a56fbdca52447ab41fabc95a25f19ade527e282001  bash53-002
+          f245d9c7dc3f5a20d84b53d249334747940936f09dc97e1dcb89fc3ab37d60ed  bash53-003
+          9591d245045529f32f0812f94180b9d9ce9023f5a765c039b852e5dfc99747d0  bash53-004
+          cca1ef52dbbf433bc98e33269b64b2c814028efe2538be1e2c9a377da90bc99d  bash53-005
+          29119addefed8eff91ae37fd51822c31780ee30d4a28376e96002706c995ff10  bash53-006
+          c0976bbfffa1453c7cfdd62058f206a318568ff2d690f5d4fa048793fa3eb299  bash53-007
+          097cd723cbfb8907674ac32214063a3fd85282657ec5b4e544d2c0f719653fb4  bash53-008
+          eee30fe78a4b0cb2fe20e010e00308899cfc613e0774ebb3c8557a1552f24f8c  bash53-009
+          BASH_SOURCES
+          while read -r checksum filename; do
+            case "$filename" in
+              bash-5.3.tar.gz) source_url="https://ftp.gnu.org/gnu/bash/$filename" ;;
+              *) source_url="https://ftp.gnu.org/gnu/bash/bash-5.3-patches/$filename" ;;
+            esac
+            curl --fail --location --retry 3 "$source_url" --output "$filename"
+          done < SOURCES.sha256
+          sha256sum --check --strict SOURCES.sha256
+          tar -xzf bash-5.3.tar.gz
+          for patch_file in bash53-*; do
+            patch --batch --forward -d bash-5.3 -p0 < "$patch_file"
+          done
+          cd bash-5.3
+          # ish disables Readline. Omitting it here avoids a test-only libtinfo
+          # dependency that differs between the older and newer target images.
+          ./configure --prefix=/opt/ish-test-shell --disable-readline --disable-nls
+          make -j4
+          install -m 0755 bash /work/dist/smoke-bash/bash
+          cp COPYING ../SOURCES.sha256 /work/dist/smoke-bash/
+          # Keep the corresponding sources with the CI-only binary artifact.
+          mkdir -p /work/dist/smoke-bash/source
+          cp ../bash-5.3.tar.gz ../bash53-* /work/dist/smoke-bash/source/
+          /work/dist/smoke-bash/bash --version
+          /work/dist/smoke-bash/bash --noprofile --norc --noediting -c \
+            'test "${BASH_VERSION%%(*}" = "$1" && test "${ printf ready; }" = ready' \
+            bash "$TEST_BASH_VERSION"
+          cd /work
+
           uv python install "$PYTHON_VERSION"
           sh tools/build.sh --mode standalone --jobs 4 \
             --build-id "$RELEASE_TAG-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
@@ -132,14 +178,11 @@ jobs:
               path = bundle / name
               if not path.is_file() or not os.access(path, os.X_OK):
                   raise SystemExit(f"Missing executable: {path}")
-          requirements = {}
-          for path in sorted(bundle.rglob("*")):
-              if not path.is_file():
-                  continue
+          def elf_requirements(path):
               with path.open("rb") as stream:
                   header = stream.read(20)
               if not header.startswith(b"\x7fELF"):
-                  continue
+                  return None
               if len(header) < 20 or header[4:6] != b"\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 62:
                   raise SystemExit(f"Not a little-endian x86_64 ELF: {path}")
               info = subprocess.check_output(["readelf", "--version-info", "--wide", str(path)], text=True)
@@ -151,9 +194,20 @@ jobs:
                       raise SystemExit(f"Unsupported glibc ABI requirement: {path}: {version}")
                   if tuple(map(int, version[6:].split("."))) > (2, 28):
                       raise SystemExit(f"glibc requirement exceeds 2.28: {path}: {version}")
-              requirements[str(path.relative_to(bundle))] = sorted(versions)
+              return sorted(versions)
+
+          requirements = {}
+          for path in sorted(bundle.rglob("*")):
+              if path.is_file():
+                  versions = elf_requirements(path)
+                  if versions is not None:
+                      requirements[str(path.relative_to(bundle))] = versions
           if not requirements:
               raise SystemExit("No ELF files were checked.")
+          test_shell = Path("dist/smoke-bash/bash")
+          test_requirements = elf_requirements(test_shell)
+          if test_requirements is None:
+              raise SystemExit("The test Bash is not an ELF executable.")
           manifest = json.loads((root / "build.json").read_text())
           manifest.update(
               source_commit=os.environ["SOURCE_COMMIT"],
@@ -161,10 +215,16 @@ jobs:
               build_image=os.environ["BUILD_IMAGE"],
               target="linux-x86_64-glibc2.28",
               glibc_requirements=requirements,
+              test_bash_version=os.environ["TEST_BASH_VERSION"],
+              test_bash_glibc_requirements=test_requirements,
           )
           (root / "build.json").write_text(json.dumps(manifest, indent=2) + "\n")
           print(f"Checked {len(requirements)} ELF files: x86_64, glibc <= 2.28")
           PY
+          mkdir -p dist/smoke-bash-artifact
+          tar -czf "dist/smoke-bash-artifact/bash-$TEST_BASH_VERSION.tar.gz" -C dist/smoke-bash .
+          cd dist/smoke-bash-artifact
+          sha256sum "bash-$TEST_BASH_VERSION.tar.gz" > SHA256SUMS
           BUILD
 
       - name: Package the complete standalone distribution
@@ -192,6 +252,15 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+      - name: Save the CI test shell
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-bash
+          path: dist/smoke-bash-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   smoke:
     name: Check archive on ${{ matrix.image }}
     needs: build
@@ -208,6 +277,12 @@ jobs:
           name: linux-x86_64
           path: release
 
+      - name: Download the CI test shell
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: smoke-bash
+          path: test-shell
+
       - name: Check checksum and extract
         env:
           ASSET: ${{ needs.build.outputs.asset }}
@@ -215,6 +290,9 @@ jobs:
           cd release
           sha256sum --check SHA256SUMS
           tar -xzf "$ASSET.tar.gz"
+          cd "$GITHUB_WORKSPACE/test-shell"
+          sha256sum --check SHA256SUMS
+          tar -xzf "bash-$TEST_BASH_VERSION.tar.gz"
 
       - name: Prepare a terminal smoke check
         run: |
@@ -234,7 +312,7 @@ jobs:
           import time
           from pathlib import Path
 
-          binary, version = sys.argv[1:]
+          binary, version, shell = sys.argv[1:]
           with tempfile.TemporaryDirectory(prefix="ish-smoke-") as temporary:
               home = Path(temporary)
               (home / ".bashrc").write_text("PS1='ISH_CI> '\nPROMPT_COMMAND=\n")
@@ -248,17 +326,35 @@ jobs:
                   tool.chmod(0o755)
               env["PATH"] = str(blocked) + ":" + env["PATH"]
               args = [binary, "--lang", "en", "--no-rc", "--no-plugins", "--home", str(home / "state")]
+              print(subprocess.check_output([shell, "--version"], env=env, timeout=30).decode(), flush=True)
               result = subprocess.check_output(args + ["--version"], env=env, cwd=temporary, timeout=30)
               if result.decode().strip() != "ish " + version:
                   raise RuntimeError("Unexpected binary version: " + repr(result))
               for option in ("--help", "--diagnose"):
-                  subprocess.run(args + [option, "/bin/bash"], env=env, cwd=temporary, check=True, timeout=30)
+                  subprocess.run(args + [option, shell], env=env, cwd=temporary, check=True, timeout=30)
+
+              # Keep the old system shell as a negative version-admission check.
+              system_version = subprocess.check_output(
+                  ["/bin/bash", "--noprofile", "--norc", "-c",
+                   'printf "%s.%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"'],
+                  env=env, timeout=30,
+              ).decode()
+              required = os.environ["TEST_BASH_VERSION"]
+              if tuple(map(int, system_version.split("."))) < tuple(map(int, required.split("."))):
+                  rejected = subprocess.run(
+                      args + ["/bin/bash"], env=env, cwd=temporary,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                  )
+                  if rejected.returncode != 2 or any(
+                      text.encode() not in rejected.stderr for text in (system_version, required, "/bin/bash")
+                  ):
+                      raise RuntimeError("Old system Bash was not rejected clearly: " + repr(rejected.stderr))
 
               pid, master = pty.fork()
               if pid == 0:
                   fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
                   os.chdir(temporary)
-                  os.execve(binary, args + ["/bin/bash"], env)
+                  os.execve(binary, args + [shell], env)
               reaped = False
               output = bytearray()
               try:
@@ -313,8 +409,9 @@ jobs:
         run: |
           docker run --rm --platform linux/amd64 \
             --mount "type=bind,source=$GITHUB_WORKSPACE/release/$ASSET,target=/opt/ish,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/test-shell,target=/opt/ish-test-shell,readonly" \
             --mount "type=bind,source=$RUNNER_TEMP/smoke.py,target=/smoke.py,readonly" \
-            --env VERSION "$IMAGE" bash -euo pipefail -c '
+            --env VERSION --env TEST_BASH_VERSION "$IMAGE" bash -euo pipefail -c '
               if [[ -x /usr/libexec/platform-python ]]; then
                 driver=/usr/libexec/platform-python
               else
@@ -323,7 +420,7 @@ jobs:
                 driver=/usr/bin/python3
               fi
               cd /tmp
-              "$driver" /smoke.py /opt/ish/ish.dist/ish "$VERSION"
+              "$driver" /smoke.py /opt/ish/ish.dist/ish "$VERSION" /opt/ish-test-shell/bash
             '
 
   release:
@@ -368,10 +465,13 @@ jobs:
 
           Extract the archive and keep the entire `ish.dist` directory together.
           Run `./ish.dist/ish bash` from the extracted directory. The selected shell
-          must be installed on the host. Native Windows and musl/Alpine are not covered.
+          must be installed on the host: Bash 5.3.9+, zsh 5.5.1+, or tcsh 6.24.16+.
+          See README for BSD csh and dash support. Native Windows and musl/Alpine
+          are not covered. The test Bash is not included in this release archive.
 
           The same archive passed CLI and Bash session smoke checks on AlmaLinux 8.10,
-          Ubuntu 22.04, and Ubuntu 24.04 containers. These checks use the GitHub runner's
+          Ubuntu 22.04, and Ubuntu 24.04 containers using a separately built Bash 5.3.9.
+          Older system Bash versions are checked for clear rejection. These checks use the GitHub runner's
           kernel and do not replace validation on the actual RHEL 8.10 host or of other shells.
           NOTES
             gh release create "$RELEASE_TAG" --verify-tag --draft \
