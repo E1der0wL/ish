@@ -25,6 +25,8 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
+import psutil
+
 from ish.config import config
 from ish.runtime.fdio import FDWriter
 from ish.runtime.observer import InputObserver
@@ -43,6 +45,7 @@ from .constants import (
 from .input import (
     InputModeLease,
     InputRejected,
+    SubmittedInput,
     check_terminal,
     staged_prefix,
 )
@@ -66,6 +69,7 @@ from .request import ShellExitRequest, ShellPassRequest
 from .sequencer import Sequencer
 from .signals import ShellSignalController, SignalScope
 from .state import TerminalState
+from .version import ShellVersionError, check_version
 
 if TYPE_CHECKING:
     from asyncio import AbstractEventLoop
@@ -249,6 +253,7 @@ class InteractiveShell:
         "_init_event",
         "_frame_decoder",
         "adapter",
+        "shell_version",
         "_context_id",
         "_prompt_id",
         "_context_event",
@@ -276,6 +281,8 @@ class InteractiveShell:
         "_stopping",
         "_input_mode_lease",
         "signal_controller",
+        "_submitted_input",
+        "_literal_input",
     )
 
     # =============================================
@@ -322,11 +329,13 @@ class InteractiveShell:
             self.shell_path = shutil.which(shell)
         shell_name: str = ""
         if self.shell_path:
+            self.shell_path = os.path.abspath(self.shell_path)
             shell_name = os.path.basename(self.shell_path)
 
         self.adapter = get_adapter(shell_name or shell, self.shell_path)
         self.shell = self.adapter.name
         self.shell_args = self.adapter.args
+        self.shell_version: str | None = None
         self.signals = SessionSignals.create()
         self.context_timeout = 5.0
         self._output_buffer = bytearray()
@@ -345,6 +354,8 @@ class InteractiveShell:
         self._native_input_active = False
         self._input_epoch = 0
         self._send_generation = 0
+        self._submitted_input = SubmittedInput()
+        self._literal_input = bytearray()
         self.terminal_state = TerminalState()
         self._stopping = False
         self._input_mode_lease = None
@@ -483,6 +494,10 @@ class InteractiveShell:
             if self._send_interrupted:
                 self.input_observer.record("typeahead_discard", bytes=len(chunk))
                 return True
+            if self._submitted_input.active:
+                self._submitted_input.append(chunk)
+                self.input_observer.record("submission_returned", bytes=len(chunk))
+                return True
             if len(self.dupin_buffer) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
                 self._io_failed(
                     BufferError(
@@ -495,6 +510,9 @@ class InteractiveShell:
                 "typeahead_received", bytes=len(chunk), pending=len(self.dupin_buffer)
             )
             return True
+        except BufferError as exc:
+            self._io_failed(exc)
+            return
         except (BlockingIOError, OSError):
             return
 
@@ -560,11 +578,33 @@ class InteractiveShell:
 
     def _cancel_handoff(self, control: bytes, remaining: bytes) -> None:
         """Cancel an input handoff and retain only post-control typeahead."""
+        discard_submitted = self._handoff_pending and self._submitted_input.active
         self._deferred_input.clear()
         self.dupin_buffer.clear()
-        self._handoff_pending = False
-        self._write(self.master_fd, control)
+        self._submitted_input.clear()
+        self._literal_input.clear()
+        # A helper may already have written cancelled bytes to the FIFO before
+        # its read callback runs. Discard them through the confirmed boundary,
+        # keeping later keys outside that FIFO until ownership is transferred.
+        self._send_interrupted |= discard_submitted
+        self._handoff_pending = discard_submitted
+        confirmed_prompt = (
+            self._accepted_prompt_id < self._pending_prompt_id == self._context_id
+        )
+        if not (discard_submitted and confirmed_prompt):
+            # At an already confirmed primary prompt only the queued block is
+            # being cancelled. Signalling that idle reader can consume the next
+            # command as interrupt recovery (notably with zsh's disabled ZLE).
+            self._write(self.master_fd, control)
         self.return_typeahead(remaining)
+
+    def _resume_native_typeahead(self) -> None:
+        """Return held keys to a native command that won a continuation cancel race."""
+        data = bytes(self.dupin_buffer)
+        self.dupin_buffer.clear()
+        if data and not (self._closing_output or self._stopping or self._has_exited()):
+            self._write(self.master_fd, data)
+            self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
 
     def _cancel_submission(self, control: bytes, remaining: bytes) -> None:
         """Discard cancelled transport data before a policy-selected control byte.
@@ -582,6 +622,8 @@ class InteractiveShell:
             self._send_task.cancel()
         self._deferred_input.clear()
         self.dupin_buffer.clear()
+        self._submitted_input.clear()
+        self._literal_input.clear()
         self._accepted_prompt_id = self._prompt_id
         self._pending_prompt_id = 0
         if self.prompt_event is not None:
@@ -1013,6 +1055,34 @@ class InteractiveShell:
             await asyncio.gather(ready, exited, return_exceptions=True)
 
     async def _exec(self, data: Union[str, bytes]) -> None:
+        """Execute one accepted block, resuming unread native suffixes unchanged.
+
+        An intermediate primary prompt is a transport boundary, not another
+        editor submission. Preserve native reads and continuation syntax by
+        resending the whole returned stream, including an incomplete final line.
+        Only a suffix with no submitted newline returns to the editor as literal
+        text. Fresh keys held outside the PTY remain in their existing queue.
+        """
+        if isinstance(data, str):
+            data = data.encode(self.encoder)
+        self._submitted_input.begin(data, enabled=not self.adapter.refresh)
+        try:
+            while True:
+                await self._exec_once(data)
+                if not self._submitted_input.active or self._has_exited():
+                    return
+                returned = self._submitted_input.take()
+                if not returned:
+                    return
+                if b"\n" not in returned:
+                    self._literal_input.extend(returned)
+                    return
+                self.input_observer.record("submission_resumed", bytes=len(returned))
+                data = returned
+        finally:
+            self._submitted_input.clear()
+
+    async def _exec_once(self, data: Union[str, bytes]) -> None:
         """Pass input to the shell and wait for the next prompt, state, and output drain.
 
         Remove one matching echo using the current termios settings. Forward keystrokes
@@ -1033,8 +1103,14 @@ class InteractiveShell:
         self._deferred_input.clear()
         self._send_generation += 1
         self._input_epoch += 1
-        if self.adapter.refresh and hasattr(self.session, "take_typeahead"):
-            data += self.session.take_typeahead()
+        if hasattr(self.session, "take_typeahead"):
+            if self.adapter.refresh:
+                data += self.session.take_typeahead()
+            elif self._submitted_input.active:
+                # Keys already retained by the editor or an earlier handoff
+                # precede future native reads, but follow the submitted block.
+                # Keep them separate from command echo and transport validation.
+                self._deferred_input.extend(self.session.take_typeahead())
         try:
             # The PTY echoes every newline as CRLF, including pasted lines.
             attrs = termios.tcgetattr(self.master_fd)
@@ -1101,6 +1177,9 @@ class InteractiveShell:
             """Feed typeahead through the real key parser and update editor state and
             rendering.
             """
+            if self._literal_input:
+                self.session.feed_literal_input(bytes(self._literal_input))
+                self._literal_input.clear()
             if typehead:
                 self.input_observer.record(
                     "typeahead_injected", "EDITOR", bytes=len(typehead)
@@ -1151,6 +1230,7 @@ class InteractiveShell:
                     continue
             except KeyboardInterrupt:
                 self.dupin_buffer.clear()
+                self._literal_input.clear()
                 if self.continuation_active.is_set():
                     await self._exec(bytes(self.exec_attrs[6][termios.VINTR]))
                 continue
@@ -1283,6 +1363,12 @@ class InteractiveShell:
         self.command_done_event = asyncio.Event()
         self.tasks = []
 
+        # Run once per session while startup signal handling is already active,
+        # before creating session files, opening a PTY, or touching terminal modes.
+        self.shell_version = await check_version(
+            self.shell_path or self.shell, self.shell, self.adapter.version
+        )
+
         with contextlib.ExitStack() as resources:
             try:
                 # Each session owns its files; another session must never replace or
@@ -1401,6 +1487,37 @@ class InteractiveShell:
     # [External API] Expose input handoff, validation, and session entry points.
     # =============================================
 
+    def tool_context(self) -> tuple[str, dict[str, str]]:
+        """Snapshot exported state at a confirmed primary prompt for a Python tool.
+
+        FIFO updates populate session.context synchronously, independently of
+        completion scans. Read the actual shell cwd once per tool because PWD may
+        be unset or modified. Never fall back to the ish parent's startup state.
+        """
+        if (
+            self._has_exited()
+            or self._stopping
+            or self._closing_output
+            or self._initializing
+            or self._accepted_prompt_id <= 0
+            or self._accepted_prompt_id != self._context_id
+            or self._accepted_prompt_id != self._prompt_id
+            or self.command_done_event is None
+            or not self.command_done_event.is_set()
+            or self.continuation_active is None
+            or self.continuation_active.is_set()
+        ):
+            raise RuntimeError("Python tools require a confirmed primary shell prompt")
+        environ = self.session.context.environ
+        if environ is None:
+            raise RuntimeError("Shell environment is unavailable for the Python tool")
+        cwd = psutil.Process(self.shell_pid).cwd()
+        if not cwd or not os.path.isabs(cwd):
+            raise RuntimeError(
+                "Shell working directory is unavailable for the Python tool"
+            )
+        return cwd, dict(environ)
+
     def return_typeahead(self, data: bytes) -> None:
         """Append unread input returned by the previous consumer within the byte limit."""
         if len(self.dupin_buffer) + len(data) > TYPEAHEAD_LIMIT_BYTES:
@@ -1455,7 +1572,11 @@ class InteractiveShell:
         """Check Linux support and run the asynchronous session from a synchronous call."""
         if platform.system() != "Linux":
             raise OSError(f"Unsupported operating system: {platform.system()}")
-        status = asyncio.run(self.main())
+        try:
+            status = asyncio.run(self.main())
+        except ShellVersionError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from None
         if self.signal_controller.shutdown_signal is not None:
             # Python changes the exit status to 120 if its final stdio flush
             # fails. Only redirect a broken stream after cleanup, immediately

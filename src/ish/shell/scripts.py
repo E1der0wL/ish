@@ -76,7 +76,7 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
             scope(LINE_READER_READY_PREFIX) + b"%s;%s" + OSC_TERMINATOR
         ),
         "@LINE_INTERRUPT@": bytes_to_shell_escape(
-            scope(LINE_INTERRUPT_ACK_PREFIX) + b"%s" + OSC_TERMINATOR
+            scope(LINE_INTERRUPT_ACK_PREFIX) + b"%s;%s" + OSC_TERMINATOR
         ),
         # csh checks only the OSC body so both raw and caret prompts match.
         "@CSH_START_PATTERN@": csh_quote(
@@ -136,12 +136,14 @@ _ish_precmd() {
         _ish_original_ps2=${PS2-}
         # Users may prepend or append text to the already wrapped PS2. Remove
         # only our own markers before wrapping the edited prompt once again.
-        _ish_original_ps2=${_ish_original_ps2//'$(_ish_continuation_start)'/}
+        _ish_original_ps2=${_ish_original_ps2//'${ _ish_continuation_start; }'/}
         _ish_original_ps2=${_ish_original_ps2//$'@CONT_START@'/}
         _ish_original_ps2=${_ish_original_ps2//$'@CONT_END@'/}
     fi
     if builtin shopt -q promptvars; then
-        PS2='$(_ish_continuation_start)'"${_ish_original_ps2-}"$'@CONT_END@'
+        # Bash 5.3 runs this check in the current shell without a subshell per
+        # continuation line. The startup version gate enforces a patched release.
+        PS2='${ _ish_continuation_start; }'"${_ish_original_ps2-}"$'@CONT_END@'
     else
         # Keep literal prompts literal when the user disables prompt expansion.
         PS2=$'@CONT_START@'"${_ish_original_ps2-}"$'@CONT_END@'
@@ -152,26 +154,10 @@ _ish_precmd() {
     _ish_mark_prompt
     return "$_ish_shell_exit_code"
 }
-# Bash only executes PROMPT_COMMAND arrays starting with 5.1.
-if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
-    # A scalar becomes one array entry; arrays retain order and boundaries.
-    if [[ "${PROMPT_COMMAND[0]:-}" != _ish_capture_status ]]; then
-        PROMPT_COMMAND=(_ish_capture_status "${PROMPT_COMMAND[@]}" _ish_precmd)
-    fi
-else
-    _ish_prompt_command() {
-        local _ish_shell_exit_code=$?
-        if [[ -n "$_ish_original_prompt_command" ]]; then
-            _ish_status "$_ish_shell_exit_code"
-            builtin eval -- "$_ish_original_prompt_command"
-        fi
-        _ish_precmd
-    }
-    if [[ "${PROMPT_COMMAND-}" != _ish_prompt_command ]]; then
-        # Old Bash uses only element zero when the variable is an array.
-        _ish_original_prompt_command=${PROMPT_COMMAND-}
-        PROMPT_COMMAND=_ish_prompt_command
-    fi
+# Supported Bash versions execute PROMPT_COMMAND arrays. A scalar becomes one
+# array entry; arrays retain their original order and command boundaries.
+if [[ "${PROMPT_COMMAND[0]:-}" != _ish_capture_status ]]; then
+    PROMPT_COMMAND=(_ish_capture_status "${PROMPT_COMMAND[@]}" _ish_precmd)
 fi
 """
     )
@@ -193,7 +179,11 @@ if (( ! ${+functions[TRAPINT]} )) && builtin trap >| @ZSH_TRAPS@; then
         TRAPINT() {
             if (( ZSH_SUBSHELL == 0 )); then
                 _ish_interrupt_pending=1
-                builtin printf '@LINE_INTERRUPT@' "$_ish_prompt_id"
+                local _ish_reading=0
+                if (( ${_ish_reading_command:-0} )) && [[ ${functions[preexec]-} == "${_ish_line_preexec_body-}" ]]; then
+                    _ish_reading=1
+                fi
+                builtin printf '@LINE_INTERRUPT@' "$_ish_prompt_id" "$_ish_reading"
             fi
             return 130
         }
@@ -203,6 +193,22 @@ if (( ! ${+functions[TRAPINT]} )) && builtin trap >| @ZSH_TRAPS@; then
 fi
 _ish_precmd() {
     _ish_interrupt_pending=0
+    # Rewrap user edits at a confirmed prompt, preserving the latest hook.
+    # Resolve autoloads under their original name before copying their body.
+    if [[ -z ${_ish_line_preexec_body-} || ${functions[preexec]-} != "$_ish_line_preexec_body" ]]; then
+        if [[ ${functions[preexec]-} != *'builtin autoload -X'* ]] || builtin autoload +X preexec; then
+            functions[_ish_original_preexec]=${functions[preexec]-:}
+            preexec() {
+                local _ish_saved_status=$?
+                # Revoke reader ownership before any user hook or command runs.
+                _ish_reading_command=0
+                builtin printf '@LINE_READY@' "$_ish_prompt_id" 0
+                _ish_status "$_ish_saved_status"
+                _ish_original_preexec "$@"
+            }
+            _ish_line_preexec_body=${functions[preexec]}
+        fi
+    fi
     if [[ "$PS1" != *$'@START@'* ]]; then
         PS1=$'@START@'"${PS1}"$'@END@'
     fi
@@ -212,9 +218,10 @@ _ish_precmd() {
     _ish_update "$1"
     _ish_forward
     local _ish_line_ready=0
-    if [[ -n ${_ish_line_interrupt_body-} && ${functions[TRAPINT]-} == "$_ish_line_interrupt_body" ]]; then
+    if [[ -n ${_ish_line_interrupt_body-} && ${functions[TRAPINT]-} == "$_ish_line_interrupt_body" && -n ${_ish_line_preexec_body-} && ${functions[preexec]-} == "$_ish_line_preexec_body" ]]; then
         _ish_line_ready=1
     fi
+    _ish_reading_command=1
     builtin printf '@LINE_READY@' "$_ish_prompt_id" "$_ish_line_ready"
     _ish_mark_prompt
 }

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
+import psutil
+
 from .constants import (
     LINE_INTERRUPT_ACK_PREFIX,
     LINE_READER_READY_PREFIX,
@@ -47,6 +49,7 @@ class InputPhase(Enum):
 
     SUBMISSION = "submission"
     HANDOFF = "handoff"
+    CONTINUATION = "continuation"
 
 
 class TerminalSignalHandler:
@@ -66,8 +69,13 @@ class TerminalSignalHandler:
         """Report whether this policy still owns input after cancellation."""
         return False
 
-    def handle(self, control: bytes, data: bytes, phase: InputPhase) -> None:
-        """Consume a matched control key at a submission or handoff boundary."""
+    @property
+    def native_continuation(self) -> bool:
+        """Opt into native continuation dispatch while the shell owns its reader."""
+        return False
+
+    def handle(self, control: bytes, data: bytes, phase: InputPhase) -> bool | None:
+        """Consume a matched key, or return False to keep the batch on its native path."""
         raise NotImplementedError
 
     def hold_input(self, control: bytes | None, data: bytes) -> None:
@@ -114,6 +122,7 @@ class LineInterrupt:
         self.observed_id = 0
         self.pending_id = 0
         self.released = False
+        self.continuation = False
         self.timer = None
 
     def reset(self):
@@ -123,9 +132,10 @@ class LineInterrupt:
             self.timer = None
         self.pending_id = 0
         self.released = False
+        self.continuation = False
 
     def observe_ready(self, data: bytes, accepted_id: int) -> None:
-        """Accept handler availability only for a newer, well-formed generation."""
+        """Accept fresh readiness, or revoke the current generation at preexec."""
         identity, separator, enabled = data.partition(b";")
         if (
             not separator
@@ -135,13 +145,17 @@ class LineInterrupt:
         ):
             return
         value = int(identity)
+        # preexec may revoke reader ownership within the accepted generation.
+        # It cannot reenable that generation, even if a ready frame is replayed.
+        if value == self.observed_id and enabled == b"0":
+            self.ready_id = 0
         if max(accepted_id, self.observed_id) < value < PROMPT_ID_LIMIT:
             self.observed_id = value
             self.ready_id = value if enabled == b"1" else 0
 
 
 class ZshInterrupt(SubmissionInterrupt):
-    """Wait for a verified TRAPINT response before completing a cancelled long line."""
+    """Release cancelled no-ZLE input only after a verified reader acknowledgement."""
 
     def __init__(self, shell):
         """Allocate acknowledgement state only for sessions using this policy."""
@@ -153,8 +167,30 @@ class ZshInterrupt(SubmissionInterrupt):
         """Keep the reader's input ownership until a fresh prompt is accepted."""
         return bool(self.state.pending_id)
 
+    @property
+    def native_continuation(self) -> bool:
+        """Guard continuation keys only until preexec revokes reader ownership."""
+        return bool(
+            self.state.ready_id
+            and self.state.ready_id == self.shell._accepted_prompt_id
+            and self.shell.continuation_active is not None
+            and self.shell.continuation_active.is_set()
+        )
+
+    def handle(self, control: bytes, data: bytes, phase: InputPhase) -> bool | None:
+        """Extend acknowledged cancellation to native continuation input."""
+        if phase is not InputPhase.CONTINUATION:
+            return super().handle(control, data, phase)
+        if os.tcgetpgrp(self.shell.master_fd) != self.shell.shell_pid:
+            return False
+        self.before_cancel(True)
+        self.state.continuation = True
+        remaining = data[data.rfind(control) + len(control) :]
+        self.shell._cancel_handoff(control, remaining)
+        return True
+
     def before_cancel(self, staged: bool) -> None:
-        """Arm a response deadline only while cancelling an active TTY lease."""
+        """Arm a response deadline for a staged line or native continuation."""
         if staged:
             self.state.pending_id = self.shell._accepted_prompt_id
             self.state.released = False
@@ -179,42 +215,58 @@ class ZshInterrupt(SubmissionInterrupt):
         sequencer.on_prefix(markers.scope(LINE_INTERRUPT_ACK_PREFIX), self.acknowledge)
 
     def validate_submission(self) -> None:
-        """Reject long input if the current prompt has no verified default-like trap."""
+        """Reject long input unless both interrupt and reader hooks are verified."""
         if self.state.ready_id != self.shell._accepted_prompt_id:
             raise InputRejected(
-                "Not sent: long input requires ish's acknowledged SIGINT handler. A custom or removed trap is active; use short input or reconnect after restoring the default trap."
+                "Not sent: long input requires ish's verified SIGINT and preexec hooks. A hook is unavailable or a custom trap is active; use short input or reconnect after restoring the default trap."
             )
 
     def ready(self, data: bytes) -> None:
-        """Receive the reader's capability alongside its primary prompt."""
+        """Track readiness and release input if command execution won the race."""
         self.state.observe_ready(data, self.shell._accepted_prompt_id)
+        if (
+            self.state.continuation
+            and self.state.pending_id
+            and not self.state.released
+            and not self.state.ready_id
+        ):
+            self.reset()
+            self.shell._resume_native_typeahead()
 
     def timeout(self) -> None:
         """Fail closed if a removed or broken trap cannot acknowledge cancellation."""
         self.state.timer = None
         if self.state.pending_id and not self.state.released:
             self.shell._io_failed(
-                RuntimeError("Shell did not acknowledge long-input cancellation")
+                RuntimeError("Shell did not acknowledge input cancellation")
             )
 
     def acknowledge(self, data: bytes) -> None:
         """Release exactly one newline after a matching reply from the owning shell."""
         state, shell = self.state, self.shell
+        identity, separator, reading = data.partition(b";")
         if (
             not state.pending_id
             or state.released
-            or data != str(state.pending_id).encode("ascii")
+            or identity != str(state.pending_id).encode("ascii")
+            or not separator
+            or reading not in (b"0", b"1")
         ):
             return
         if shell._closing_output or shell._stopping or shell._has_exited():
             return
+        if reading == b"0" and state.continuation:
+            self.reset()
+            shell._resume_native_typeahead()
+            return
         if (
-            shell._prompt_id != state.pending_id
+            reading != b"1"
+            or shell._prompt_id != state.pending_id
             or shell._context_id != state.pending_id
             or os.tcgetpgrp(shell.master_fd) != shell.shell_pid
         ):
             shell._io_failed(
-                RuntimeError("Shell ownership changed during long-input cancellation")
+                RuntimeError("Shell ownership changed during input cancellation")
             )
             return
         # TRAPINT returns 130 and sets zsh's interrupt flag before its reader
@@ -285,6 +337,71 @@ def _bindings(defaults, overrides):
     for binding in overrides:
         result[binding.signum] = binding
     return tuple(binding for binding in result.values() if binding.handler is not None)
+
+
+class _ForegroundGroup:
+    """Retain live member identities for one foreground group during shutdown.
+
+    Capture before signalling the shell, while its children still belong to the
+    original session. Process ancestry is not required. A retained member can
+    authorize group delivery after the leader exits, including delivery to new
+    members of that same group. Once all retained members disappear or leave,
+    fail closed instead of adopting a potentially reused group/session number.
+    No process enumeration or identity checks run during interactive input.
+    """
+
+    def __init__(self, group: int, session: int):
+        """Snapshot only this group's members, without using process_iter's cache as identity."""
+        self.group = group
+        self.session = session
+        self.members: list[psutil.Process] = []
+        if group <= 0 or session <= 0 or group == os.getpgrp():
+            return
+        try:
+            for candidate in psutil.process_iter():
+                try:
+                    if (
+                        os.getpgid(candidate.pid) != group
+                        or os.getsid(candidate.pid) != session
+                    ):
+                        continue
+                    # process_iter caches Process instances across calls. A fresh
+                    # object records the current PID/create-time identity instead.
+                    member = psutil.Process(candidate.pid)
+                    member.create_time()
+                    if self._matches(member):
+                        self.members.append(member)
+                except (OSError, psutil.Error):
+                    continue
+        except (OSError, psutil.Error):
+            # Partial visibility may still yield a verified surviving member.
+            pass
+
+    def _matches(self, member: psutil.Process) -> bool:
+        """Recheck identity and membership, excluding zombies that cannot be signalled."""
+        try:
+            return (
+                member.is_running()
+                and os.getpgid(member.pid) == self.group
+                and os.getsid(member.pid) == self.session
+                and member.status() != psutil.STATUS_ZOMBIE
+                and member.is_running()
+            )
+        except (OSError, psutil.Error):
+            return False
+
+    def send(self, signum: int) -> bool:
+        """Signal the group only while a captured live member still verifies ownership."""
+        if self.group <= 0 or self.group == os.getpgrp():
+            return False
+        for member in self.members:
+            if self._matches(member):
+                try:
+                    os.killpg(self.group, signum)
+                    return True
+                except OSError:
+                    return False
+        return False
 
 
 class ShellSignalController:
@@ -401,26 +518,36 @@ class ShellSignalController:
             None,
         )
         sending = shell._send_task is not None and not shell._send_task.done()
-        if not self._terminal or not (pending or sending or shell._handoff_pending):
+        native = any(handler.native_continuation for _, handler in self._terminal)
+        if not self._terminal or not (
+            pending or sending or shell._handoff_pending or native
+        ):
             return False
         attrs = termios.tcgetattr(shell.master_fd)
         if pending:
             binding, handler = pending
             handler.hold_input(self._control(attrs, binding.control_index), data)
             return True
-        phase = InputPhase.SUBMISSION if sending else InputPhase.HANDOFF
+        phase = (
+            InputPhase.SUBMISSION
+            if sending
+            else InputPhase.HANDOFF
+            if shell._handoff_pending
+            else InputPhase.CONTINUATION
+        )
         # If future policies register several keys, the first key in wire order
         # selects the batch owner. Each handler determines its remainder policy.
         matches = []
         for binding, handler in self._terminal:
+            if phase is InputPhase.CONTINUATION and not handler.native_continuation:
+                continue
             control = self._control(attrs, binding.control_index)
             if control is not None and control in data:
                 matches.append((data.index(control), handler, control))
         if not matches:
             return False
         _, handler, control = min(matches, key=lambda match: match[0])
-        handler.handle(control, data, phase)
-        return True
+        return handler.handle(control, data, phase) is not False
 
     def configure_sequencer(self, sequencer, markers) -> None:
         """Bind only registered policies' session-scoped acknowledgement messages."""
@@ -441,27 +568,20 @@ class ShellSignalController:
         for _, handler in self._terminal:
             handler.reset()
 
-    def _signal_foreground(self, group: int | None, signum: int) -> bool:
-        """Signal only a verified group in the shell's separately owned session."""
-        proc = self.shell.proc
-        if group is None or proc is None or group <= 0:
-            return False
-        try:
-            if group == os.getpgrp() or os.getsid(group) != proc.pid:
-                return False
-            os.killpg(group, signum)
-            return True
-        except ProcessLookupError:
-            return False
-
     async def stop_child(self) -> None:
         """Hang up and reap the shell, with bounded cleanup of its foreground job."""
         shell = self.shell
         foreground = None
-        if self.shutdown_signal is not None and shell.master_fd is not None:
+        if (
+            self.shutdown_signal is not None
+            and shell.master_fd is not None
+            and shell.proc is not None
+        ):
             with contextlib.suppress(OSError):
-                foreground = os.tcgetpgrp(shell.master_fd)
-                self._signal_foreground(foreground, signal.SIGTERM)
+                foreground = _ForegroundGroup(
+                    os.tcgetpgrp(shell.master_fd), shell.proc.pid
+                )
+                foreground.send(signal.SIGTERM)
         deadline = shell.loop.time() + CHILD_SHUTDOWN_GRACE
         try:
             if shell.proc is not None:
@@ -484,8 +604,8 @@ class ShellSignalController:
                 # The shell may exit before an uncooperative foreground job.
                 # These checks only run during shutdown, never in idle sessions.
                 with contextlib.suppress(OSError):
-                    while self._signal_foreground(foreground, 0):
+                    while foreground.send(0):
                         if shell.loop.time() >= deadline:
-                            self._signal_foreground(foreground, signal.SIGKILL)
+                            foreground.send(signal.SIGKILL)
                             break
                         await asyncio.sleep(CHILD_SHUTDOWN_CHECK_INTERVAL)

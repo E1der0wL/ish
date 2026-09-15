@@ -31,6 +31,12 @@ class I18N:
         self._messages: Dict[str, str] = {
             "error": "An error has been occurred: {error}",
             "file_not_found": '"{path}" not found.',
+            "shell_version_too_old": "{shell} {detected} is not supported. Requires {required} or newer.\nExecutable: {path}\nInstall a supported shell and select its executable path.",
+            "shell_version_unavailable": "Cannot verify {shell} version (requires {required} or newer).\nExecutable: {path}\nReason: {reason}",
+            "shell_version_unrecognized": "The executable did not report a recognized release version.",
+            "shell_version_timeout": "The version query timed out after {seconds:g} seconds.",
+            "shell_version_probe_exit": "The version query exited with status {status}.",
+            "shell_version_output_limit": "The version query produced too much output.",
             "cli_description": textwrap.dedent("""\
                 ish - An interactive command editor for Linux shells.
 

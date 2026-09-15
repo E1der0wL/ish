@@ -14,16 +14,26 @@ The selected shell must be installed on the host; the distribution does not bund
 shell executables. Specify a shell name or its executable path. If omitted, ish
 selects the login shell by name.
 
-| Shell | Argument | Support notes |
-| --- | --- | --- |
-| Bash | `bash` | Uses ish editing at the primary prompt with native Readline disabled. |
-| zsh | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
-| tcsh | `tcsh` | Supports prompt hooks and return to the ish editor. |
-| BSD csh | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
-| dash / sh | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
+| Shell | Minimum version | Argument | Support notes |
+| --- | --- | --- | --- |
+| Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
+| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
+| tcsh | 6.24.16 | `tcsh` | Supports prompt hooks and return to the ish editor. |
+| BSD csh | No numeric check | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
+| dash / sh | No numeric check | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
 A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
 named `sh` are not automatically covered by dash support.
+
+At interactive startup, ish checks the selected Bash, zsh, or tcsh executable
+once, before creating session files or changing terminal settings. An older or
+unverifiable version produces an error and exits. BSD csh and dash do not provide
+a portable numeric version query; their existing support limits still apply.
+Help, version, and diagnostic queries do not execute this check.
+
+On hosts with older system shells, install a supported shell in a separate
+directory and select it explicitly, for example
+`ish "$HOME/opt/bash-5.3.9/bin/bash"`. The host's system shell can remain in place.
 
 ## Building with build.sh
 
@@ -219,6 +229,34 @@ callable. Supply either `function` or the pair `plugin_name` and `function_name`
 Tools run in Python workers. Shell operators, substitutions, and redirections
 such as `greet Alice | cat` are handed to the shell, which needs an actual external
 command or shell function of that name.
+
+Each tool receives the exported environment from the latest confirmed shell
+context, including variables changed or removed since ish started. Its working
+directory comes from the live shell process, so an unset or modified `PWD` does
+not redirect the tool. Both are applied in the worker before importing the tool
+module. Worker changes do not affect ish or the shell. Shell-local variables,
+aliases, and interpreter startup settings such as Python's import path are not
+synchronized. If the context or directory is unavailable, the tool fails instead
+of using ish's startup directory.
+
+`prompt.last_exitcode` exposes the latest received shell status or completed tool
+status as an integer (`None` before the first result). Normal tool returns,
+including a returned integer, mean success (`0`); use `raise SystemExit(7)` to
+report status `7`. Unhandled exceptions report `1`, and an unhandled Ctrl+C
+reports `130`. Signal termination is displayed as `128 + signal_number`.
+`prompt.last_tool_exitcode` retains the raw worker result (negative for signal
+termination) until the next tool starts. Unavailable shell context reports `1`.
+Worker startup or I/O failures still follow the session's existing error cleanup.
+
+For example, display the latest result in `.ishrc.py`:
+
+```python
+prompt.bottom_toolbar = lambda: f"Exit: {prompt.last_exitcode}"
+```
+
+Python tools do not change the native shell's `$?` or `$status`.
+`prompt.context.exitcode` continues to contain the shell's reported status, and
+Python tools do not invoke `pre_hook`, `post_hook`, or `fallback_hook`.
 
 ### set_key
 
@@ -418,8 +456,9 @@ input handling used by ish.
 - Session files are stored under `~/ish/.cache` by default. This location must be
   writable and permit executable files. Regular shutdown and handled TERM/HUP
   perform terminal and session cleanup; SIGKILL and OOM termination cannot do so.
-  Cleanup of a pipeline whose leading process exits before its remaining
-  processes is a known remaining limitation.
+  During handled TERM/HUP, foreground pipeline cleanup verifies surviving group
+  members even if the leading process has exited. This requires permission to
+  inspect processes; jobs that leave the group or session are outside that cleanup.
 - Support is bounded by the host, shell version, startup configuration, and
   terminal. Indefinite unattended operation and compatibility with every Linux
   distribution are not guaranteed. RHEL 8.10 deployment requires a compatible

@@ -26,7 +26,7 @@ from ish.runtime.observer import InputObserver
 __all__ = ["ProcessHandler"]
 
 
-def _run_worker(func, args, kwargs, connection, encoder):
+def _run_worker(payload, cwd, environ, connection, encoder):
     """Spawn entry point; receive a PTY through SCM_RIGHTS, not an inherited fd."""
     try:
         slave_fd = recv_handle(connection)
@@ -46,6 +46,14 @@ def _run_worker(func, args, kwargs, connection, encoder):
         2, "w", encoding=encoder, errors="replace", buffering=1, closefd=False
     )
     try:
+        if environ is not None:
+            # Replace, rather than merge, so shell-side unset operations survive.
+            os.environ.clear()
+            os.environ.update(environ)
+        if cwd is not None:
+            os.chdir(cwd)
+        # Import plugin code only after applying the shell execution context.
+        func, args, kwargs = pickle.loads(payload)
         func(*args, **kwargs)
     except KeyboardInterrupt:
         raise SystemExit(130) from None
@@ -113,7 +121,31 @@ class ProcessHandler:
                 termios.tcsetwinsize(fd, size)
 
     async def run(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
-        """Run a tool and return its exit code after draining output.
+        """Run a callable in the parent's context and return its process exit code.
+
+        This entry point retains the existing hook and standalone-worker behavior.
+        """
+        return await self._run(func, args, kwargs)
+
+    async def run_in_context(
+        self,
+        func: Callable[..., Any],
+        cwd: str,
+        environ: dict[str, str],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        """Run a tool with a copied shell environment and working directory.
+
+        Apply both in the worker before importing its callable. Positional-only
+        context parameters leave similarly named tool keyword arguments available.
+        Parent state and Python interpreter startup settings remain unchanged.
+        """
+        return await self._run(func, args, kwargs, cwd, dict(environ))
+
+    async def _run(self, func, args, kwargs, cwd=None, environ=None) -> int:
+        """Run a serialized callable and return its exit code after draining output.
 
         The callable and arguments must be pickleable. Reject local functions before
         acquiring resources. On cancellation, stop the worker and restore the parent's
@@ -122,7 +154,7 @@ class ProcessHandler:
         if not callable(func):
             raise TypeError("Python tool must be callable")
         try:
-            pickle.dumps((func, args, kwargs))
+            payload = pickle.dumps((func, args, kwargs))
         except (pickle.PickleError, TypeError, AttributeError) as exc:
             raise TypeError(
                 "Python tools and arguments must be pickleable; define the tool in an importable module"
@@ -171,7 +203,7 @@ class ProcessHandler:
                 resources.callback(child_connection.close)
                 process = context.Process(
                     target=_run_worker,
-                    args=(func, args, kwargs, child_connection, self.encoder),
+                    args=(payload, cwd, environ, child_connection, self.encoder),
                 )
                 process.start()
                 started = True

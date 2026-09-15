@@ -15,6 +15,7 @@ import termios
 from enum import Enum
 
 from .constants import TIOCGPTPEER
+from .limits import TYPEAHEAD_LIMIT_BYTES
 
 CANONICAL_LINE_BYTES = 4095
 
@@ -33,6 +34,42 @@ class InputRejected(ValueError):
         """Keep a displayable explanation and the offending physical line's offset."""
         super().__init__(message)
         self.byte_offset = byte_offset
+
+
+class SubmittedInput:
+    """Retain native bytes returned during one accepted multiline submission.
+
+    A PTY has already interpreted terminal controls, so its returned bytes are
+    not fresh editor key presses. Keep this stream separate from keys retained
+    before PTY delivery. Do not infer provenance by comparing byte contents.
+    """
+
+    def __init__(self) -> None:
+        """Start outside a submission, with no returned native input."""
+        self.active = False
+        self.returned = bytearray()
+
+    def begin(self, data: bytes, *, enabled: bool) -> None:
+        """Enable native resumption only for accepted multiline shell blocks."""
+        self.clear()
+        self.active = enabled and b"\n" in data.removesuffix(b"\n")
+
+    def append(self, data: bytes) -> None:
+        """Bound retained native input independently of the editor key queue."""
+        if len(self.returned) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+            raise BufferError("Returned submission exceeds the pending input limit")
+        self.returned.extend(data)
+
+    def take(self) -> bytes:
+        """Detach the full returned stream once, without splitting shell syntax."""
+        data = bytes(self.returned)
+        self.returned.clear()
+        return data
+
+    def clear(self) -> None:
+        """Forget a completed or cancelled submission and its pending bytes."""
+        self.active = False
+        self.returned.clear()
 
 
 def staged_prefix(data: bytes, mode: LongInputMode, shell: str) -> int:

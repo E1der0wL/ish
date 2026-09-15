@@ -116,18 +116,22 @@ __all__ = ["Prompt"]
 
 
 def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
-    """Get shell builtins from the adapter's query command or static list."""
+    """Get builtins with startup files disabled where supported, or use a static list."""
     adapter = get_adapter(shell, executable)
     if not adapter.builtins_command:
         return list(adapter.builtins)
     try:
+        env = os.environ.copy()
+        # Bash reads BASH_ENV in noninteractive mode even with --norc.
+        # Only the discovery child loses these hooks; the session keeps them.
+        for name in ("BASH_ENV", "ENV"):
+            env.pop(name, None)
         stdout, stderr = subprocess.Popen(
-            adapter.builtins_command,
+            [executable or shell, *adapter.builtins_args, adapter.builtins_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            shell=True,
             text=True,
-            executable=executable or shell,
+            env=env,
         ).communicate()
         return stdout.split()
     except Exception:
@@ -218,6 +222,8 @@ class Prompt(PromptSession):
         self.context.register_handler(
             EXITCODE, lambda data: str_parser(data, encoder=self.encoder)
         )
+        self.last_exitcode: Optional[int] = None
+        self.last_tool_exitcode: Optional[int] = None
 
         self.interactive_shell = InteractiveShell(
             self.shell or "bash",
@@ -1019,6 +1025,11 @@ class Prompt(PromptSession):
     def update_context(self, category: str, data: Any) -> None:
         """Pass received raw shell state to the category-specific parsers."""
         self.context.update(category, data)
+        if category == EXITCODE:
+            try:
+                self.last_exitcode = int(self.context.exitcode)
+            except (TypeError, ValueError):
+                pass
 
     def load_rc(self) -> None:
         """Execute the user's .ishrc.py with prompt, config, and plugin objects.
@@ -1087,7 +1098,21 @@ class Prompt(PromptSession):
 
         argv = simple_command(command)
         if argv and argv[0] in self.internal_tools:
-            await self.process_handler.run(self.internal_tools[argv[0]], *argv[1:])
+            self.last_tool_exitcode = None
+            try:
+                cwd, environ = self.interactive_shell.tool_context()
+            except Exception:
+                self.logger.exception("Python tool context unavailable: %s", argv[0])
+                status = 1
+            else:
+                # Transport failures and application cancellation must still reach
+                # session cleanup; they are not ordinary tool exit statuses.
+                status = await self.process_handler.run_in_context(
+                    self.internal_tools[argv[0]], cwd, environ, *argv[1:]
+                )
+            self.last_tool_exitcode = status
+            # Retain the raw worker status as well as a shell-style display code.
+            self.last_exitcode = 128 - status if status < 0 else status
             return None
 
         return command
@@ -1096,11 +1121,14 @@ class Prompt(PromptSession):
         """Transfer unconsumed editor input to a native consumer exactly once.
 
         Prompt-toolkit stores keys after the accepted Enter for its next run.
-        A tool or a shell without prompt hooks must receive those keys instead.
+        A tool, an ongoing submitted block, or a shell without prompt hooks must
+        receive those keys instead.
         Cursor-position replies are terminal protocol, not user input.
         """
-        pending = self.interactive_shell.dupin_buffer
-        data = bytes(pending)
+        shell = self.interactive_shell
+        pending = shell.dupin_buffer
+        data = bytes(shell._literal_input) + bytes(pending)
+        shell._literal_input.clear()
         pending.clear()
         keys = get_typeahead(self.input)
         keys.extend(self.input.flush_keys())
@@ -1142,6 +1170,23 @@ class Prompt(PromptSession):
                 self.input.hold_decoder_prefix(self.encoder)
         finally:
             parser.feed_key_callback = original_callback
+
+    def feed_literal_input(self, data: bytes) -> None:
+        """Restore native text without applying editing bindings a second time.
+
+        Share the normal decoder so a split UTF-8 character can be completed by
+        future terminal input, with CPR replies still excluded from that prefix.
+        """
+        source = getattr(self.input, "source", self.input)
+        reader = getattr(source, "stdin_reader", None)
+        text = (
+            reader._stdin_decoder.decode(data)
+            if reader is not None
+            else data.decode(self.encoder, errors="replace")
+        )
+        self.default_buffer.insert_text(text)
+        if isinstance(self.input, ObservedInput):
+            self.input.hold_decoder_prefix(self.encoder)
 
     def run(self) -> None:
         """Call the connected shell runner's synchronous entry point."""
