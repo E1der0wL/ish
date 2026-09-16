@@ -26,7 +26,6 @@ from .constants import (
 )
 from .input import LongInputMode
 from .signals import SignalPolicy, TerminalSignal, ZshInterrupt
-from .version import VersionPolicy
 
 
 def csh_quote(value: str) -> str:
@@ -154,8 +153,6 @@ class ShellAdapter:
     builtins: tuple[str, ...] = ()
     long_input: LongInputMode = LongInputMode.REJECT
     signal_policy: SignalPolicy = SignalPolicy()
-    # None means this implementation has no portable numeric version query.
-    version: VersionPolicy | None = None
     builtins_args: tuple[str, ...] = ("-c",)
 
     @property
@@ -254,7 +251,6 @@ ADAPTERS = {
         builtins_command="compgen -b",
         builtins_args=("--noprofile", "--norc", "-c"),
         long_input=LongInputMode.STAGED_FIRST_LINE,
-        version=VersionPolicy((5, 3, 9), "GNU bash, version "),
     ),
     "zsh": ShellAdapter(
         "zsh",
@@ -270,7 +266,6 @@ ADAPTERS = {
         signal_policy=SignalPolicy(
             terminal=(TerminalSignal(signal.SIGINT, termios.VINTR, ZshInterrupt),)
         ),
-        version=VersionPolicy((5, 5, 1), "zsh "),
     ),
     "tcsh": ShellAdapter(
         "tcsh",
@@ -282,7 +277,6 @@ ADAPTERS = {
         builtins_command="builtins",
         builtins_args=("-f", "-c"),
         long_input=LongInputMode.STAGED_FIRST_LINE,
-        version=VersionPolicy((6, 21, 0), "tcsh "),
     ),
     "csh": ShellAdapter(
         "csh",

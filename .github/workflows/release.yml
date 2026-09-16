@@ -333,23 +333,6 @@ jobs:
               for option in ("--help", "--diagnose"):
                   subprocess.run(args + [option, shell], env=env, cwd=temporary, check=True, timeout=30)
 
-              # Keep the old system shell as a negative version-admission check.
-              system_version = subprocess.check_output(
-                  ["/bin/bash", "--noprofile", "--norc", "-c",
-                   'printf "%s.%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"'],
-                  env=env, timeout=30,
-              ).decode()
-              required = os.environ["TEST_BASH_VERSION"]
-              if tuple(map(int, system_version.split("."))) < tuple(map(int, required.split("."))):
-                  rejected = subprocess.run(
-                      args + ["/bin/bash"], env=env, cwd=temporary,
-                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
-                  )
-                  if rejected.returncode != 2 or any(
-                      text.encode() not in rejected.stderr for text in (system_version, required, "/bin/bash")
-                  ):
-                      raise RuntimeError("Old system Bash was not rejected clearly: " + repr(rejected.stderr))
-
               pid, master = pty.fork()
               if pid == 0:
                   fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -465,14 +448,15 @@ jobs:
 
           Extract the archive and keep the entire `ish.dist` directory together.
           Run `./ish.dist/ish bash` from the extracted directory. The selected shell
-          must be installed on the host: Bash 5.3.9+, zsh 5.5.1+, or tcsh 6.24.16+.
+          must be installed on the host: Bash 5.3.9+, zsh 5.5.1+, or tcsh 6.21.00+.
+          ish documents supported versions without automatically checking or enforcing them.
           See README for BSD csh and dash support. Native Windows and musl/Alpine
           are not covered. The test Bash is not included in this release archive.
 
           The same archive passed CLI and Bash session smoke checks on AlmaLinux 8.10,
           Ubuntu 22.04, and Ubuntu 24.04 containers using a separately built Bash 5.3.9.
-          Older system Bash versions are checked for clear rejection. These checks use the GitHub runner's
-          kernel and do not replace validation on the actual RHEL 8.10 host or of other shells.
+          These checks use the GitHub runner's kernel and do not replace validation
+          on the actual RHEL 8.10 host or of other shells.
           NOTES
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "ish $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"

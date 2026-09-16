@@ -14,22 +14,22 @@ The selected shell must be installed on the host; the distribution does not bund
 shell executables. Specify a shell name or its executable path. If omitted, ish
 selects the login shell by name.
 
-| Shell | Minimum version | Argument | Support notes |
+| Shell | Minimum supported version | Argument | Support notes |
 | --- | --- | --- | --- |
 | Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
 | zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
 | tcsh | 6.21.00 | `tcsh` | Supports prompt hooks and return to the ish editor. |
-| BSD csh | No numeric check | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
-| dash / sh | No numeric check | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
+| BSD csh | Not specified | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
+| dash / sh | Not specified | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
 A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
 named `sh` are not automatically covered by dash support.
 
-At interactive startup, ish checks the selected Bash, zsh, or tcsh executable
-once, before creating session files or changing terminal settings. An older or
-unverifiable version produces an error and exits. BSD csh and dash do not provide
-a portable numeric version query; their existing support limits still apply.
-Help, version, and diagnostic queries do not execute this check.
+These versions define the supported range. ish does not automatically query,
+compare, or enforce shell versions; select a supported version yourself. The same
+version guidance is available through `ish --help`. Older versions may fail to
+initialize or process commands incorrectly, including older tcsh releases affected
+by `postcmd` loop-handling defects.
 
 On hosts with older system shells, install a supported shell in a separate
 directory and select it explicitly, for example

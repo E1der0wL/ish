@@ -85,6 +85,7 @@ class ArgumentParser:
         parser = AltArgumentParser(
             prog="ish",
             description=self._description,
+            epilog=i18n.get("cli_shell_support"),
             formatter_class=Formatter,
             add_help=False,
             allow_abbrev=False,

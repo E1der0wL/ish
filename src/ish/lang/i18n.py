@@ -31,12 +31,6 @@ class I18N:
         self._messages: Dict[str, str] = {
             "error": "An error has been occurred: {error}",
             "file_not_found": '"{path}" not found.',
-            "shell_version_too_old": "{shell} {detected} is not supported. Requires {required} or newer.\nExecutable: {path}\nInstall a supported shell and select its executable path.",
-            "shell_version_unavailable": "Cannot verify {shell} version (requires {required} or newer).\nExecutable: {path}\nReason: {reason}",
-            "shell_version_unrecognized": "The executable did not report a recognized release version.",
-            "shell_version_timeout": "The version query timed out after {seconds:g} seconds.",
-            "shell_version_probe_exit": "The version query exited with status {status}.",
-            "shell_version_output_limit": "The version query produced too much output.",
             "cli_description": textwrap.dedent("""\
                 ish - An interactive command editor for Linux shells.
 
@@ -57,6 +51,16 @@ class I18N:
 
                 On Windows, run ish inside WSL.
 
+                """),
+            "cli_shell_support": textwrap.dedent("""\
+                Supported shell versions:
+                  Bash 5.3.9 or newer
+                  zsh 5.5.1 or newer
+                  tcsh 6.21.00 or newer
+                  BSD csh and dash/sh: see README for support limits.
+
+                Shell versions are not checked automatically. Select a supported version;
+                older versions may fail to initialize or process commands incorrectly.
                 """),
             "cli_arguments_title": "positional arguments",
             "cli_options_title": "options",

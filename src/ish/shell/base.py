@@ -69,7 +69,6 @@ from .request import ShellExitRequest, ShellPassRequest
 from .sequencer import Sequencer
 from .signals import ShellSignalController, SignalScope
 from .state import TerminalState
-from .version import ShellVersionError, check_version
 
 if TYPE_CHECKING:
     from asyncio import AbstractEventLoop
@@ -253,7 +252,6 @@ class InteractiveShell:
         "_init_event",
         "_frame_decoder",
         "adapter",
-        "shell_version",
         "_context_id",
         "_prompt_id",
         "_context_event",
@@ -335,7 +333,6 @@ class InteractiveShell:
         self.adapter = get_adapter(shell_name or shell, self.shell_path)
         self.shell = self.adapter.name
         self.shell_args = self.adapter.args
-        self.shell_version: str | None = None
         self.signals = SessionSignals.create()
         self.context_timeout = 5.0
         self._output_buffer = bytearray()
@@ -1363,12 +1360,6 @@ class InteractiveShell:
         self.command_done_event = asyncio.Event()
         self.tasks = []
 
-        # Run once per session while startup signal handling is already active,
-        # before creating session files, opening a PTY, or touching terminal modes.
-        self.shell_version = await check_version(
-            self.shell_path or self.shell, self.shell, self.adapter.version
-        )
-
         with contextlib.ExitStack() as resources:
             try:
                 # Each session owns its files; another session must never replace or
@@ -1572,11 +1563,7 @@ class InteractiveShell:
         """Check Linux support and run the asynchronous session from a synchronous call."""
         if platform.system() != "Linux":
             raise OSError(f"Unsupported operating system: {platform.system()}")
-        try:
-            status = asyncio.run(self.main())
-        except ShellVersionError as exc:
-            print(str(exc), file=sys.stderr)
-            raise SystemExit(2) from None
+        status = asyncio.run(self.main())
         if self.signal_controller.shutdown_signal is not None:
             # Python changes the exit status to 120 if its final stdio flush
             # fails. Only redirect a broken stream after cleanup, immediately
