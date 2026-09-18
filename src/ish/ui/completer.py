@@ -45,12 +45,25 @@ class PathCompleter(Completer):
         ):
             return
         raw_word = document.text_before_cursor[word.start :]
-        text = (
-            os.path.expanduser(word.value)
-            if self.expanduser and raw_word.startswith("~")
-            else word.value
-        )
+        text = word.value
+        home_prefix = ""
+        if self.expanduser and raw_word.startswith("~"):
+            tilde, separator, relative = word.value.partition("/")
+            # Quoted or escaped tildes/usernames remain literal filesystem names.
+            if raw_word.partition("/")[0] == tilde:
+                home = os.path.expanduser(tilde)
+                if home != tilde:
+                    if not separator:
+                        if os.path.isdir(home) and self.file_filter(home):
+                            yield Completion(
+                                text=tilde + "/",
+                                start_position=word.start - document.cursor_position,
+                            )
+                        return
+                    home_prefix = tilde + "/"
+                    text = home.rstrip("/") + "/" + relative
         dirname, prefix = os.path.split(text)
+        input_dirname = os.path.dirname(word.value)
         try:
             matches = {}
             for root in self.get_paths():
@@ -64,9 +77,16 @@ class PathCompleter(Completer):
                             if is_dir or not self.only_directories:
                                 matches[entry.name] = is_dir
             for name, is_dir in sorted(matches.items()):
-                path = os.path.join(dirname, name) + ("/" if is_dir else "")
+                path = os.path.join(input_dirname, name) + ("/" if is_dir else "")
+                # Keep the tilde unquoted so the shell expands it when submitted.
+                # Only the remaining path needs the shell's literal quoting.
+                quoted = (
+                    home_prefix + self.quote(path[len(home_prefix) :])
+                    if home_prefix
+                    else self.quote(path)
+                )
                 yield Completion(
-                    text=self.quote(path) + ("" if is_dir else " "),
+                    text=quoted + ("" if is_dir else " "),
                     start_position=word.start - document.cursor_position,
                     display=name + ("/" if is_dir else ""),
                 )

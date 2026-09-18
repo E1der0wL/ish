@@ -983,8 +983,9 @@ class Prompt(PromptSession):
         """Replace additional completion sources with one completer or an iterable.
 
         None or an empty iterable restores default completion. Validate all sources
-        before replacing the current completer, then deduplicate suggestions and
-        run completion in a worker thread.
+        before replacing the current completer. Additional sources precede the
+        default source, keeping their first occurrence of duplicate suggestions.
+        Run completion in a worker thread.
         """
         if completer is None:
             additional = []
@@ -1001,7 +1002,7 @@ class Prompt(PromptSession):
                 raise TypeError("Each completion source must be a Completer instance")
 
         comps = merge_completers(
-            [self.default_completer, *additional], deduplicate=True
+            [*additional, self.default_completer], deduplicate=True
         )
         self.completer = ThreadedCompleter(comps)
 

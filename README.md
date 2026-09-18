@@ -387,9 +387,10 @@ prompt.set_completer(WordCompleter(["greet", "say"], ignore_case=True))
 # prompt.set_completer()  # None or [] also clears additional sources.
 ```
 
-ish merges these with its default completer, removes duplicate suggestions, and
-runs completion in a worker thread. Each call replaces the previous additional
-completers; invalid sources raise `TypeError` without replacing the current setup.
+ish lists these sources before its default completer, removes duplicate suggestions
+while keeping the first occurrence, and runs completion in a worker thread.
+Each call replaces the previous additional completers; invalid sources raise
+`TypeError` without replacing the current setup.
 A custom `Completer` subclass instance can also be supplied directly; its completion
 code should not mutate UI state from the worker thread.
 
