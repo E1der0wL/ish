@@ -81,7 +81,7 @@ jobs:
               output.write(f"asset=ish-{version}-linux-x86_64\n")
           PY
 
-      - name: Compile and check every bundled ELF file
+      - name: Package CPython and check every bundled ELF file
         env:
           SOURCE_COMMIT: ${{ steps.metadata.outputs.commit }}
         run: |
@@ -160,9 +160,9 @@ jobs:
           cd /work
 
           uv python install "$PYTHON_VERSION"
-          sh tools/build.sh --mode standalone --jobs 4 \
+          sh tools/build.sh \
             --build-id "$RELEASE_TAG-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --output-dir /work/dist/nuitka/ci
+            --output-dir /work/dist/cpython/ci
 
           /tmp/ish-build-venv/bin/python - <<'PY'
           import json
@@ -172,9 +172,9 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          root = Path("dist/nuitka/ci")
+          root = Path("dist/cpython/ci")
           bundle = root / "ish.dist"
-          for name in ("ish", "libexec/ish_forward"):
+          for name in ("ish", "python/bin/python3", "libexec/ish_forward"):
               path = bundle / name
               if not path.is_file() or not os.access(path, os.X_OK):
                   raise SystemExit(f"Missing executable: {path}")
@@ -227,14 +227,14 @@ jobs:
           sha256sum "bash-$TEST_BASH_VERSION.tar.gz" > SHA256SUMS
           BUILD
 
-      - name: Package the complete standalone distribution
+      - name: Archive the complete CPython distribution
         env:
           ASSET: ${{ steps.metadata.outputs.asset }}
         run: |
           stage="$RUNNER_TEMP/package/$ASSET"
           mkdir -p "$stage" dist/release
-          cp -a dist/nuitka/ci/ish.dist "$stage/"
-          cp dist/nuitka/ci/build.json README.md "$stage/"
+          cp -a dist/cpython/ci/ish.dist "$stage/"
+          cp dist/cpython/ci/build.json README.md "$stage/"
           for license in LICENSE LICENSE.* COPYING COPYING.*; do
             if [[ -f "$license" ]]; then cp "$license" "$stage/"; fi
           done
@@ -271,6 +271,12 @@ jobs:
       matrix:
         image: ["almalinux:8.10", "ubuntu:22.04", "ubuntu:24.04"]
     steps:
+      - name: Check out the tagged validation tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
       - name: Download the candidate archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -317,7 +323,7 @@ jobs:
               home = Path(temporary)
               (home / ".bashrc").write_text("PS1='ISH_CI> '\nPROMPT_COMMAND=\n")
               env = {"HOME": temporary, "PATH": "/usr/bin:/bin", "TERM": "xterm-256color", "LANG": "C.UTF-8"}
-              # Fail if the frozen program falls back to host Python or a compiler.
+              # Fail if the installation falls back to host Python or a compiler.
               blocked = home / "blocked"
               blocked.mkdir()
               for name in ("python", "python3", "python3.12", "gcc", "cc"):
@@ -325,13 +331,31 @@ jobs:
                   tool.write_text('#!/bin/sh\necho "$0" >> "$HOME/forbidden-tools"\nexit 99\n')
                   tool.chmod(0o755)
               env["PATH"] = str(blocked) + ":" + env["PATH"]
-              args = [binary, "--lang", "en", "--no-rc", "--no-plugins", "--home", str(home / "state")]
+              args = [binary, "--lang", "en", "--home", str(home / "state")]
+              # Unrelated host Python settings must not poison ish or its workers.
+              env["PYTHONHOME"] = str(home / "missing-python")
+              env["PYTHONPATH"] = str(home / "unrelated-python")
+              runtime = str(Path(binary).parent / "python" / "bin" / "python3")
+              subprocess.run([runtime, "-I", "/check_runtime.py"], env=env, cwd=temporary, check=True, timeout=90)
               print(subprocess.check_output([shell, "--version"], env=env, timeout=30).decode(), flush=True)
               result = subprocess.check_output(args + ["--version"], env=env, cwd=temporary, timeout=30)
               if result.decode().strip() != "ish " + version:
                   raise RuntimeError("Unexpected binary version: " + repr(result))
               for option in ("--help", "--diagnose"):
                   subprocess.run(args + [option, shell], env=env, cwd=temporary, check=True, timeout=30)
+
+              plugin = home / "state" / "plugin" / "script" / "smoke_plugin"
+              plugin.mkdir(parents=True)
+              (plugin / "__init__.py").write_text(
+                  "PLUGIN_META = {'name': 'smoke_plugin'}\n"
+                  "import sys, subprocess, sqlite3\n"
+                  "from pathlib import Path\n"
+                  "def report():\n"
+                  "    assert sqlite3.connect(':memory:').execute('select 42').fetchone() == (42,)\n"
+                  "    assert subprocess.check_output([sys.executable, '-I', '-c', 'print(42)']).strip() == b'42'\n"
+                  "    Path('worker-executable').write_text(sys.executable)\n"
+              )
+              (home / "state" / ".ishrc.py").write_text("prompt.set_tool('runtime_probe', function=plugin.get('smoke_plugin').report)\n")
 
               pid, master = pty.fork()
               if pid == 0:
@@ -342,6 +366,7 @@ jobs:
               output = bytearray()
               try:
                   sent = False
+                  worker_sent = False
                   deadline = time.monotonic() + 45
                   while time.monotonic() < deadline:
                       if select.select([master], [], [], 0.1)[0]:
@@ -356,7 +381,11 @@ jobs:
                               os.write(master, b"\x1b[1;1R")
                               output = output.replace(b"\x1b[6n", b"")
                           # prompt-toolkit can style the final space separately.
-                          if not sent and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
+                          if not worker_sent and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
+                              os.write(master, b"runtime_probe\r")
+                              worker_sent = True
+                              output.clear()
+                          elif worker_sent and not sent and (home / "worker-executable").exists() and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
                               os.write(master, b"printf 'ISH_%s\\n' OK > answer; exit 7\r")
                               sent = True
                       ended, status = os.waitpid(pid, os.WNOHANG)
@@ -369,6 +398,8 @@ jobs:
                       raise RuntimeError("Timed out waiting for the Bash session")
                   if (home / "answer").read_text() != "ISH_OK\n":
                       raise RuntimeError("The command did not execute correctly")
+                  if Path((home / "worker-executable").read_text()).resolve() != Path(runtime).resolve():
+                      raise RuntimeError("The plugin worker used a different Python")
                   if list((home / "state" / ".cache").glob("session-*")):
                       raise RuntimeError("Session files survived normal exit")
                   if (home / "forbidden-tools").exists():
@@ -381,7 +412,7 @@ jobs:
                       os.kill(pid, signal.SIGKILL)
                       os.waitpid(pid, 0)
                   os.close(master)
-          print("Version, CLI, Bash command, exit status, and session cleanup passed.")
+          print("Runtime, stdlib, plugin spawn, CLI, Bash command, exit status, and session cleanup passed.")
           PY
 
       - name: Run outside the source tree and build environment
@@ -394,6 +425,7 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE/release/$ASSET,target=/opt/ish,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/test-shell,target=/opt/ish-test-shell,readonly" \
             --mount "type=bind,source=$RUNNER_TEMP/smoke.py,target=/smoke.py,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tools/check_runtime.py,target=/check_runtime.py,readonly" \
             --env VERSION --env TEST_BASH_VERSION "$IMAGE" bash -euo pipefail -c '
               if [[ -x /usr/libexec/platform-python ]]; then
                 driver=/usr/libexec/platform-python
@@ -444,7 +476,7 @@ jobs:
             fi
           else
             cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          Linux x86_64 standalone distribution, built against glibc 2.28.
+          Linux x86_64 distribution with bundled CPython 3.12.14, built against glibc 2.28.
 
           Extract the archive and keep the entire `ish.dist` directory together.
           Run `./ish.dist/ish bash` from the extracted directory. The selected shell
@@ -453,7 +485,13 @@ jobs:
           See README for BSD csh and dash support. Native Windows and musl/Alpine
           are not covered. The test Bash is not included in this release archive.
 
-          The same archive passed CLI and Bash session smoke checks on AlmaLinux 8.10,
+          No host Python or compiler is needed for normal use. Keep the bundled
+          Python, its standard library, and ish together. External Python plugins
+          can be added without rebuilding. This is a directory distribution with
+          no runtime extraction. Additional plugin packages require their own
+          compatible wheels or build dependencies.
+
+          The same archive passed runtime, plugin, CLI, and Bash checks on AlmaLinux 8.10,
           Ubuntu 22.04, and Ubuntu 24.04 containers using a separately built Bash 5.3.9.
           These checks use the GitHub runner's kernel and do not replace validation
           on the actual RHEL 8.10 host or of other shells.

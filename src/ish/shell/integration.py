@@ -18,6 +18,7 @@ from pathlib import Path
 from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
+from ish.runtime.distribution import bundled_forward_binary
 
 from .adapters import ADAPTERS
 from .constants import (
@@ -25,7 +26,6 @@ from .constants import (
     AFTER_PROMPT,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
-    BUNDLED_FORWARD_DIRECTORY,
     COMMAND_DONE,
     COMMAND_START,
     FORWARD_BINARY,
@@ -258,12 +258,8 @@ def build_binary(*, directory=None) -> bool:
     import subprocess
 
     try:
-        if "__compiled__" in globals():
-            # Keep data outside the package name: the executable itself is "ish".
-            # __file__ retains the synthetic ish/shell/integration.py module path.
-            bundled = (
-                Path(__file__).parents[2] / BUNDLED_FORWARD_DIRECTORY / FORWARD_BINARY
-            )
+        bundled = bundled_forward_binary()
+        if bundled is not None:
             shutil.copyfile(bundled, bin_path)
             os.chmod(bin_path, 0o700)
             return True
@@ -294,9 +290,9 @@ async def build_binary_async(*, directory: Path) -> bool:
 
     A source build owns a separate compiler process group, including compiler
     subprocesses. Cancellation stops the group and reaps the compiler before the
-    session directory can be removed. Frozen builds copy their compiled helper.
+    session directory can be removed. Distributions copy their bundled helper.
     """
-    if "__compiled__" in globals():
+    if bundled_forward_binary() is not None:
         return build_binary(directory=directory)
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / FORWARD_SOURCE

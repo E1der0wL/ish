@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional, Union
+
+from ish.runtime.distribution import bundled_root
 
 __all__ = ["config"]
 
@@ -81,15 +82,11 @@ class Config:
         return xdg_data_home
 
     @property
-    def EXEC_CMD(self) -> Path:
-        """Quote the current executable and arguments for reuse in a shell command."""
-        exe, *args = sys.argv
-        if os.path.sep in exe:
-            exe_path = os.path.abspath(exe)
-        else:
-            exe_path = shutil.which(exe)
-        quoted_args = [shlex.quote(arg) for arg in args]
-        return f"{shlex.quote(exe_path)} {' '.join(quoted_args)}"
+    def EXEC_CMD(self) -> str:
+        """Quote a restart command using the launcher or the active interpreter."""
+        root = bundled_root()
+        command = [str(root / "ish")] if root else [sys.executable, "-m", "ish.main"]
+        return shlex.join([*command, *sys.argv[1:]])
 
     def ensure_directories(self) -> None:
         """Create settings, translation, plugin, and cache directories as needed."""

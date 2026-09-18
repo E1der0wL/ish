@@ -1,0 +1,10 @@
+# Use the upstream stripped installation without altering its native binaries.
+# Obtain native dependency licenses and metadata from the matching full archive.
+# x86_64 is the baseline CPU target, not x86_64_v2/v3/v4.
+version = "3.12.14"
+release = "20260901"
+target = "x86_64-unknown-linux-gnu"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+sha256 = "72748da13197c1fb161e3afeef20a6a385ff24f2165e6e2758e47008e7faba4c"
+licenses_url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-pgo%2Blto-full.tar.zst"
+licenses_sha256 = "f2e7bf187eaa66f88432b13cc560528c328b51d452de2fd0875561c82f7168e7"

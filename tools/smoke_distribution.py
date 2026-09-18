@@ -1,4 +1,4 @@
-"""Exercise a relocated Nuitka executable through real PTYs, without host Python/GCC.
+"""Exercise a relocated CPython distribution through real PTYs, without host Python/GCC.
 
 Run with the development environment: `uv run python tools/smoke_distribution.py PATH`.
 Test homes and TMPDIRs are private; the real user's shell files are never changed.
@@ -13,13 +13,16 @@ import json
 import os
 import pty
 import select
+import shlex
 import shutil
 import signal
 import stat
 import struct
+import subprocess
 import tempfile
 import termios
 import time
+import zipfile
 from pathlib import Path
 
 import psutil
@@ -128,13 +131,36 @@ def prepare(root: Path) -> dict[str, str]:
         (root / name).write_text(posix)
     for name in (".tcshrc", ".cshrc"):
         (root / name).write_text("set prompt='READY> '\nset history=100\n")
+    wheels = root / "wheels"
+    wheels.mkdir()
+    # A local wheel exercises real pip installation without network access or
+    # changing the bundled interpreter's read-only site-packages directory.
+    files = {
+        "runtime_dependency/__init__.py": "VALUE = 42\n",
+        "runtime_dependency/data.txt": "package-data\n",
+        "runtime_dependency-1.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: runtime-dependency\nVersion: 1.0\n",
+        "runtime_dependency-1.0.dist-info/WHEEL": "Wheel-Version: 1.0\nGenerator: ish-smoke\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    with zipfile.ZipFile(
+        wheels / "runtime_dependency-1.0-py3-none-any.whl", "w"
+    ) as wheel:
+        for name, contents in files.items():
+            wheel.writestr(name, contents)
+        record = "runtime_dependency-1.0.dist-info/RECORD"
+        wheel.writestr(record, "".join(f"{name},,\n" for name in [*files, record]))
     plugin = root / "ish" / "plugin" / "script" / "smoke_plugin"
     plugin.mkdir(parents=True)
     (plugin / "__init__.py").write_text(
-        'PLUGIN_META = {"name": "smoke_plugin"}\n'
-        "import sys\n"
+        'PLUGIN_META = {"name": "smoke_plugin", "dependencies": ["runtime-dependency==1.0|runtime_dependency"]}\n'
+        "import sys, subprocess, sqlite3, lzma, xml.etree.ElementTree\n"
+        "import importlib.resources, runtime_dependency\n"
         "from pathlib import Path\n"
         "def report(path):\n"
+        "    assert runtime_dependency.VALUE == 42\n"
+        "    assert importlib.resources.files(runtime_dependency).joinpath('data.txt').read_text() == 'package-data\\n'\n"
+        "    assert sqlite3.connect(':memory:').execute('select 42').fetchone() == (42,)\n"
+        "    assert lzma.decompress(lzma.compress(b'worker')) == b'worker'\n"
+        "    assert subprocess.check_output([sys.executable, '-I', '-c', 'print(42)']).strip() == b'42'\n"
         "    Path(path).write_text('WORKER_OK')\n"
         "    Path(path + '.exe').write_text(sys.executable)\n"
         "    print('WORKER_OK', flush=True)\n"
@@ -142,11 +168,13 @@ def prepare(root: Path) -> dict[str, str]:
     (root / "ish" / ".ishrc.py").write_text(
         "from pathlib import Path\n"
         "import ish.shell.integration as integration\n"
+        "from ish.runtime.distribution import bundled_forward_binary\n"
         "from smoke_plugin import report\n"
         f"config.ISH_HOME = Path({str(root / 'custom state')!r})\n"
         "prompt.set_tool('worker', function=report)\n"
         "prompt.set_tool('say', function=print)\n"
         f"Path({str(root / 'module-location')!r}).write_text(integration.__file__)\n"
+        f"Path({str(root / 'helper-location')!r}).write_text(str(bundled_forward_binary()))\n"
     )
     blocked = root / "blocked-bin"
     blocked.mkdir()
@@ -167,13 +195,17 @@ def prepare(root: Path) -> dict[str, str]:
         "ENV": str(root / ".shrc"),
         "ZDOTDIR": str(root),
         "XDG_DATA_HOME": str(root / "data"),
-        "ISH_PLUGIN_PYTHON": str(blocked / "python3.12"),
+        # The launcher must isolate Python startup without removing these from
+        # the shell environment or making worker spawn depend on host settings.
+        "PYTHONHOME": str(root / "nonexistent-python"),
+        "PYTHONPATH": str(root / "unrelated-python"),
+        "PIP_NO_INDEX": "1",
+        "PIP_FIND_LINKS": str(wheels),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     }
 
 
-def exercise(
-    binary: Path, shell: str, root: Path, idle_seconds: float, *, onefile: bool
-) -> dict:
+def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
     """Check shell I/O, worker spawn, concurrent caches, tmp cleanup, and TUI return."""
     env = prepare(root)
     executable = os.environ.get("ISH_TEST_" + shell.upper()) or shutil.which(shell)
@@ -188,14 +220,9 @@ def exercise(
         terminals.append(first)
         first.until(first.ready, 60)
         startup = time.monotonic() - started
-        bundle_helper = (
-            Path((root / "module-location").read_text()).parents[2]
-            / "libexec"
-            / "ish_forward"
-        )
+        bundle_helper = Path((root / "helper-location").read_text())
+        assert bundle_helper == binary.parent / "libexec/ish_forward"
         bundle_mtime = bundle_helper.stat().st_mtime_ns
-        if onefile:
-            assert bundle_helper.is_relative_to(root / "ish" / ".cache" / "nuitka")
         cache = root / "custom state" / ".cache"
         sessions = list(cache.glob("session-*"))
         assert len(sessions) == 1, sessions
@@ -209,23 +236,27 @@ def exercise(
         second = Terminal([str(binary), executable], root, env)
         terminals.append(second)
         second.until(second.ready, 60)
-        second_helper = (
-            Path((root / "module-location").read_text()).parents[2]
-            / "libexec"
-            / "ish_forward"
-        )
-        if onefile:
-            assert second_helper != bundle_helper, (
-                "concurrent launches share extracted files"
-            )
+        second_helper = Path((root / "helper-location").read_text())
+        assert second_helper == bundle_helper
         assert len(list(cache.glob("session-*"))) == 2
         shutil.rmtree(root / "tmp")
         (root / "tmp").mkdir()
         if idle_seconds:
             time.sleep(idle_seconds)
         assert bundle_helper.is_file() and second_helper.is_file()
+        # A shell that prints a marker before spawning sleep has a SIGINT race
+        # even in native csh. Announce readiness from the process that will handle
+        # the signal, after its handler is installed and without another fork.
+        interrupt_command = shlex.join(
+            [
+                str(binary.parent / "python/bin/python3"),
+                "-I",
+                "-c",
+                "import signal, sys, time; signal.signal(signal.SIGINT, lambda *_: sys.exit(130)); print('INTERRUPT_READY', flush=True); time.sleep(30)",
+            ]
+        )
         for index, terminal in enumerate(terminals):
-            terminal.submit("sh -c 'echo INTERRUPT_READY; sleep 30'")
+            terminal.submit(interrupt_command)
             terminal.until(lambda t=terminal: b"INTERRUPT_READY\r\n" in t.output)
             terminal.output.clear()
             terminal.send(b"\x03")
@@ -246,8 +277,8 @@ def exercise(
             )
             assert (root / f"worker-{index}").read_text() == "WORKER_OK"
             worker_exe = Path((root / f"worker-{index}.exe").read_text())
-            assert worker_exe == binary or worker_exe.is_relative_to(
-                root / "ish" / ".cache" / "nuitka"
+            assert (
+                worker_exe.resolve() == (binary.parent / "python/bin/python3").resolve()
             ), worker_exe
             assert b"WORKER_OK\r\n" in terminal.output
         # The reader must receive only its value, even after an input wait.
@@ -305,9 +336,7 @@ def exercise(
         first.finish()
         assert not original.exists(), "ended session was not cleaned"
         assert len(list(cache.glob("session-*"))) == 1, "peer session was removed"
-        assert second_helper.is_file(), "peer extraction was removed"
-        if onefile:
-            assert not bundle_helper.exists(), "ended extraction leaked"
+        assert second_helper.is_file(), "installed helper was removed"
         second.submit("say SURVIVOR_OK")
         second.until(lambda: b"SURVIVOR_OK\r\n" in second.output and second.ready(), 30)
         second.finish()
@@ -315,19 +344,24 @@ def exercise(
             "session files leaked after normal exit"
         )
         assert not (root / "forbidden-tools").exists(), "host Python/GCC was invoked"
-        extractions = list((root / "ish" / ".cache" / "nuitka").glob("*/launch-*"))
-        assert not extractions, "ended extractions leaked"
         # A third launch checks restart after both concurrent instances have exited.
         reused = Terminal([str(binary), executable], root, env)
         terminals.append(reused)
         reused.until(reused.ready, 60)
         reused.finish()
         assert not list(cache.glob("session-*"))
-        assert not list((root / "ish" / ".cache" / "nuitka").glob("*/launch-*"))
-        if not onefile:
-            assert bundle_helper.stat().st_mtime_ns == bundle_mtime, (
-                "installed helper was rewritten"
-            )
+        assert bundle_helper.stat().st_mtime_ns == bundle_mtime, (
+            "installed helper was rewritten"
+        )
+        # The launcher must forward handled termination to the actual session
+        # owner, including its terminal restoration and session cleanup paths.
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            ending = Terminal([str(binary), executable], root, env)
+            terminals.append(ending)
+            ending.until(ending.ready, 60)
+            os.kill(ending.pid, signum)
+            ending.wait_exit(128 + signum)
+            assert not list(cache.glob("session-*"))
         return {
             "shell": shell,
             "startup_seconds": round(startup, 3),
@@ -338,66 +372,12 @@ def exercise(
             "vim_man": "passed"
             if all(shutil.which(tool) for tool in ("vim", "man", "less"))
             else "not installed",
-            "active_extractions_after_exit": len(extractions),
+            "term_hup_cleanup": "passed",
             "result": "passed",
         }
     finally:
         for terminal in reversed(terminals):
             terminal.close()
-
-
-def exercise_paused_extraction(binary: Path, parent: Path) -> dict:
-    """Pause one executable write and require another cold launch to remain independent."""
-    for attempt in range(3):
-        root = parent / f"cold-start-{attempt}"
-        env = prepare(root)
-        first = Terminal([str(binary), "/bin/bash"], root, env)
-        second = None
-        paused = False
-        try:
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                files = psutil.Process(first.pid).open_files()
-                if any(
-                    Path(f.path).name == "ish.bin" and f.mode.startswith("w")
-                    for f in files
-                ):
-                    os.kill(first.pid, signal.SIGSTOP)
-                    paused = True
-                    # Confirm that the writer did not close between inspection and stop.
-                    files = psutil.Process(first.pid).open_files()
-                    if any(
-                        Path(f.path).name == "ish.bin" and f.mode.startswith("w")
-                        for f in files
-                    ):
-                        break
-                    os.kill(first.pid, signal.SIGCONT)
-                    paused = False
-                time.sleep(0.001)
-            if not paused:
-                continue
-            second = Terminal([str(binary), "/bin/bash"], root, env)
-            second.until(second.ready, 60)
-            second.submit("say INDEPENDENT_OK")
-            second.until(
-                lambda t=second: b"INDEPENDENT_OK\r\n" in t.output and t.ready(), 30
-            )
-            os.kill(first.pid, signal.SIGCONT)
-            paused = False
-            first.until(first.ready, 60)
-            first.finish()
-            second.finish()
-            assert not list((root / "ish" / ".cache" / "nuitka").glob("*/launch-*"))
-            assert not list((root / "custom state" / ".cache").glob("session-*"))
-            return {"scenario": "paused_extraction", "result": "passed"}
-        finally:
-            if paused:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(first.pid, signal.SIGCONT)
-            for terminal in (second, first):
-                if terminal is not None:
-                    terminal.close()
-    raise AssertionError("Could not intercept extraction in three attempts")
 
 
 def main() -> None:
@@ -412,26 +392,43 @@ def main() -> None:
     results = []
     with tempfile.TemporaryDirectory(prefix="ish-distribution-test-") as directory:
         root = Path(directory)
-        relocated = root / "deployment"
-        if source.parent.name.endswith(".dist"):
-            shutil.copytree(source.parent, relocated)
-        else:
-            relocated.mkdir()
-            shutil.copy2(source, relocated / "ish")
-        for shell in args.shells or ["bash", "zsh", "sh", "csh", "tcsh"]:
-            result = exercise(
-                relocated / "ish",
-                shell,
-                root / shell,
-                args.idle_seconds,
-                onefile=not source.parent.name.endswith(".dist"),
-            )
-            results.append(result)
-            print(json.dumps(result), flush=True)
-        if not source.parent.name.endswith(".dist"):
-            result = exercise_paused_extraction(relocated / "ish", root)
-            results.append(result)
-            print(json.dumps(result), flush=True)
+        relocated = root / "deployment with spaces"
+        shutil.copytree(source.parent, relocated, symlinks=True)
+        link = root / "ish-link"
+        link.symlink_to(relocated / "ish")
+        # Verify the direct interpreter and launcher after moving the installation.
+        subprocess.run(
+            [
+                str(relocated / "python/bin/python3"),
+                "-I",
+                str(Path(__file__).with_name("check_runtime.py")),
+            ],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run([str(link), "--version"], cwd=root, check=True)
+        subprocess.run(
+            ["ish-link", "--version"],
+            cwd=root,
+            env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]},
+            check=True,
+        )
+        modes = {}
+        try:
+            for path in [relocated, *relocated.rglob("*")]:
+                if path.is_symlink():
+                    continue
+                modes[path] = stat.S_IMODE(path.stat().st_mode)
+                path.chmod(modes[path] & ~0o222)
+            for shell in args.shells or ["bash", "zsh", "sh", "csh", "tcsh"]:
+                result = exercise(
+                    relocated / "ish", shell, root / shell, args.idle_seconds
+                )
+                results.append(result)
+                print(json.dumps(result), flush=True)
+        finally:
+            for path, mode in modes.items():
+                path.chmod(mode)
     if args.report:
         args.report.write_text(json.dumps(results, indent=2) + "\n")
 

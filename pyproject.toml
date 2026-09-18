@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ish"
-version = "1.1.3"
+version = "1.1.4"
 description = "A prompt-toolkit command editor for interactive Linux shells"
 readme = "README.md"
 requires-python = ">=3.12.14,<3.13"
@@ -22,8 +22,7 @@ ish = "ish.main:main"
 
 [dependency-groups]
 build = [
-    "nuitka==4.2.1",
-    "patchelf==0.19.1.0",
+    "hatchling>=1.27,<2",
     "zstandard==0.25.0",
 ]
 dev = ["ruff==0.16.6"]
@@ -51,9 +50,6 @@ ignore = ["E501", "B008", "UP006", "UP007", "UP035", "UP045"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-# Imports are intentional: the generated module preloads optional stdlib modules.
-"src/ish/stdlib.py" = ["F401", "E722"]
-"src/ish/main.py" = ["F401"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION: tuple[int, int, int] = (1, 1, 3)
+VERSION: tuple[int, int, int] = (1, 1, 4)
 __version__: str = ".".join(map(str, VERSION))
 
 

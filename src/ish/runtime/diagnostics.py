@@ -7,13 +7,12 @@ import platform
 import shutil
 import sys
 from argparse import Namespace
-from pathlib import Path
 
 from ish import __version__
 from ish.config import config
 from ish.lang import i18n
+from ish.runtime.distribution import bundled_forward_binary, bundled_root
 from ish.shell.adapters import get_adapter
-from ish.shell.constants import BUNDLED_FORWARD_DIRECTORY, FORWARD_BINARY
 
 
 def _cache_status() -> tuple[str, str]:
@@ -38,8 +37,8 @@ def _cache_status() -> tuple[str, str]:
 
 def _helper_status() -> str:
     """Locate the bundled helper or compiler without importing the build machinery."""
-    if "__compiled__" in globals():
-        path = Path(__file__).parents[2] / BUNDLED_FORWARD_DIRECTORY / FORWARD_BINARY
+    path = bundled_forward_binary()
+    if path is not None:
         return i18n.get(
             "cli_diagnose_helper_bundled"
             if path.is_file()
@@ -77,8 +76,8 @@ def print_diagnostics(option: Namespace) -> None:
     values = {
         "version": __version__,
         "runtime": i18n.get(
-            "cli_diagnose_compiled"
-            if "__compiled__" in globals()
+            "cli_diagnose_bundled"
+            if bundled_root() is not None
             else "cli_diagnose_source"
         ),
         "python": platform.python_version(),

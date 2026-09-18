@@ -37,12 +37,16 @@ directory and select it explicitly, for example
 
 ## Building with build.sh
 
-Build on Linux or inside WSL. Install **uv**, **GCC**, and the usual C development
-tools and headers first, and make `uv` available on `PATH`. The project selects
-Python **3.12.14** through `.python-version`. uv prepares the project environment
-and installs the locked application and build dependencies, including Nuitka.
-Downloads require network access unless the required Python and packages are
-already installed or cached.
+Build on **x86_64 Linux** or inside WSL. Install **uv**, **GCC**,
+and the usual C development headers first. Make `uv` available
+on `PATH`. The project selects Python **3.12.14** through `.python-version`.
+uv prepares the build environment using `uv.lock`.
+
+The distribution contains a dedicated, relocatable **CPython 3.12.14** runtime,
+its Linux standard library and extension modules, ish, pip, the locked application
+dependencies, and the precompiled `ish_forward` helper. Python code is loaded
+normally; the build does not freeze imports or require a list of plugin modules.
+The runtime archive and SHA256 are pinned in `tools/python-runtime.toml`.
 
 From the repository root:
 
@@ -51,22 +55,29 @@ chmod +x tools/build.sh
 ./tools/build.sh
 ```
 
-The default is a **standalone** build. Build options are forwarded to the Python
-driver:
+Build options are forwarded to the packaging driver:
 
 ```sh
 ./tools/build.sh --help
-./tools/build.sh --jobs 4
 ./tools/build.sh --output-dir "$HOME/ish-release"
+./tools/build.sh --build-id local-check \
+    --runtime-archive /path/to/pinned-install_only_stripped.tar.gz \
+    --licenses-archive /path/to/pinned-full.tar.zst
 ```
 
 The script also works when invoked by an absolute path from another directory.
 Relative `--output-dir` values are resolved against the repository root. Existing
 release directories are not overwritten.
 
+The output must be on a case-sensitive Linux filesystem. If the checkout is on a
+Windows drive mounted under `/mnt/c` or `/mnt/d`, use
+`./tools/build.sh --output-dir "$HOME/ish-release"`. Transfer the result as a
+`tar.gz` archive; copying the unpacked Python tree to a case-insensitive filesystem
+can collide with case-sensitive runtime data.
+
 By default, the result is written under
-`dist/nuitka/<build-id>/standalone/`. The builder prints the actual path. Distribute
-the **entire `ish.dist` directory**, then run its executable:
+`dist/cpython/<build-id>/`. The builder prints the actual path. Distribute
+the **entire `ish.dist` directory**, then run its launcher:
 
 ```sh
 cd /path/to/release
@@ -75,16 +86,47 @@ cd /path/to/release
 ./ish.dist/ish --home "$HOME/ish-profile" zsh
 ```
 
-The standalone application includes Python and the compiled state helper; normal
-use does not require host Python or GCC. Installing additional Python plugin
-dependencies can require a compatible external Python with pip. The selected
-shell and external commands must still be installed on the host.
+Normal use requires no host Python, uv, GCC, or network access. The selected shell
+and external commands must still be installed on the host. The launcher preserves
+the caller's working directory and shell environment, and uses Python's isolated
+startup mode so unrelated `PYTHONHOME`, `PYTHONPATH`, or user-site packages cannot
+replace the packaged application. Plugins and their library directory are added
+explicitly by ish, as before.
 
-Onefile remains available through `--mode onefile`, but is not recommended with
-the pinned Nuitka 4.2.1: its bootstrap can bypass ish's TERM/HUP cleanup. Use
-standalone for the current release. Build on the oldest Linux/glibc environment
-you intend to support; a newer Ubuntu build is not automatically compatible with
-RHEL 8.10.
+The installation can be moved as a unit and may be read-only. Settings, plugins,
+logs, and session files stay under the configured ish home. There is no onefile
+extraction or background runtime download; keep the installation available while
+sessions are running. Upgrade by unpacking a new directory and restarting ish.
+
+The bundled interpreter is also usable directly:
+
+```sh
+./ish.dist/python/bin/python3 my_script.py
+./ish.dist/python/bin/python3 -m pip --version
+```
+
+Plugin dependencies use that same interpreter's pip and install into
+`config.PLUGIN_LIB_DIR`, without modifying the installation. On an offline host,
+provide compatible wheels through pip's `PIP_NO_INDEX=1` and `PIP_FIND_LINKS`
+settings. Packages compiled from source still need their own build tools and
+system dependencies. Standard-library GUI features require a display; OS-specific
+modules such as `winreg` are unavailable on Linux. This upstream runtime excludes
+the optional `dbm.gnu` (`_gdbm`) and `nis` extensions; `dbm.ndbm` is available.
+Deprecated `tkinter.tix` needs Tix, which is also not bundled. See the upstream
+[technical notes](https://gregoryszorc.com/docs/python-build-standalone/main/technotes.html)
+for those build choices. The distribution does not claim to supply every optional
+standard-library backend.
+
+Build downloads require network access unless Python, the locked packages, and
+the pinned runtime and license archives are already available. `--runtime-archive`
+and `--licenses-archive` accept offline copies and still verify their SHA256. The runtime's
+native dependency licenses are preserved under `ish.dist/python/licenses/`;
+Python-package licenses remain in their installed metadata.
+
+Build on the oldest Linux/glibc environment you intend to support. A newer Ubuntu
+build is not automatically compatible with RHEL 8.10, even with portable Python:
+the forwarding helper also links to glibc. The release workflow builds against
+glibc 2.28 and checks every bundled ELF file before publishing a candidate archive.
 
 ## Customizing ish
 
@@ -133,7 +175,7 @@ For Python packages whose distribution and import names differ, use
 `"distribution>=version|import_name"`, for example `"PyYAML>=6|yaml"` in
 `dependencies`. This separates the name passed to pip from the module checked
 for import availability. Package installation requires access to the packages
-and a compatible Python with pip, as described in the build section.
+through the bundled interpreter's pip, as described in the build section.
 
 Plugins normally load before `.ishrc.py` runs. `plugin.get("my_tools")` looks up
 the registered module; it does not import an arbitrary file or trigger loading.
@@ -422,7 +464,7 @@ on x86-64 Linux 6.6.87.2. The project uses:
 | uv | 0.12.12 |
 | prompt-toolkit | 3.0.53 |
 | Pygments | 2.21.0 |
-| Nuitka | 4.2.1 |
+| Bundled CPython build | python-build-standalone 20260901 |
 | GCC / glibc in the WSL build environment | 15 / 2.43 |
 
 For source execution, use a Linux virtual environment, including inside WSL:

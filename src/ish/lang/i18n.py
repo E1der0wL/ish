@@ -79,7 +79,7 @@ class I18N:
             "cli_diagnose_version": "ish version",
             "cli_diagnose_runtime": "Runtime",
             "cli_diagnose_source": "Python source",
-            "cli_diagnose_compiled": "Nuitka compiled",
+            "cli_diagnose_bundled": "Bundled CPython",
             "cli_diagnose_python": "Python version",
             "cli_diagnose_executable": "Executable",
             "cli_diagnose_platform": "Platform",

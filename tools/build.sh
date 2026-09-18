@@ -17,4 +17,4 @@ cd -- "$build_script_dir/.."
 
 # exec preserves the build exit status and forwards signals directly to uv.
 exec uv run --locked --no-default-groups --group build \
-    python "$build_script_dir/build_nuitka.py" "$@"
+    python "$build_script_dir/build_distribution.py" "$@"
