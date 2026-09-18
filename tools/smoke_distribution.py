@@ -207,6 +207,7 @@ def prepare(root: Path) -> dict[str, str]:
 
 def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
     """Check shell I/O, worker spawn, concurrent caches, tmp cleanup, and TUI return."""
+    bundle = binary.resolve(strict=True).parent
     env = prepare(root)
     executable = os.environ.get("ISH_TEST_" + shell.upper()) or shutil.which(shell)
     if not executable:
@@ -221,7 +222,7 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
         first.until(first.ready, 60)
         startup = time.monotonic() - started
         bundle_helper = Path((root / "helper-location").read_text())
-        assert bundle_helper == binary.parent / "libexec/ish_forward"
+        assert bundle_helper == bundle / "libexec/ish_forward"
         bundle_mtime = bundle_helper.stat().st_mtime_ns
         cache = root / "custom state" / ".cache"
         sessions = list(cache.glob("session-*"))
@@ -249,7 +250,7 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
         # the signal, after its handler is installed and without another fork.
         interrupt_command = shlex.join(
             [
-                str(binary.parent / "python/bin/python3"),
+                str(bundle / "python/bin/python3"),
                 "-I",
                 "-c",
                 "import signal, sys, time; signal.signal(signal.SIGINT, lambda *_: sys.exit(130)); print('INTERRUPT_READY', flush=True); time.sleep(30)",
@@ -277,9 +278,9 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
             )
             assert (root / f"worker-{index}").read_text() == "WORKER_OK"
             worker_exe = Path((root / f"worker-{index}.exe").read_text())
-            assert (
-                worker_exe.resolve() == (binary.parent / "python/bin/python3").resolve()
-            ), worker_exe
+            assert worker_exe.resolve() == (bundle / "python/bin/python3").resolve(), (
+                worker_exe
+            )
             assert b"WORKER_OK\r\n" in terminal.output
         # The reader must receive only its value, even after an input wait.
         read_command = (
@@ -389,17 +390,23 @@ def main() -> None:
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     source = args.executable.resolve(strict=True)
+    installation = source.parent.parent
+    assert source.parent.name == "bin", source
+    assert (installation / "ish").is_symlink(), installation
+    assert os.readlink(installation / "ish") == "./bin/ish"
     results = []
     with tempfile.TemporaryDirectory(prefix="ish-distribution-test-") as directory:
         root = Path(directory)
         relocated = root / "deployment with spaces"
-        shutil.copytree(source.parent, relocated, symlinks=True)
+        shutil.copytree(installation, relocated, symlinks=True)
+        assert (relocated / "ish").is_symlink()
+        assert os.readlink(relocated / "ish") == "./bin/ish"
         link = root / "ish-link"
         link.symlink_to(relocated / "ish")
         # Verify the direct interpreter and launcher after moving the installation.
         subprocess.run(
             [
-                str(relocated / "python/bin/python3"),
+                str(relocated / "bin/python/bin/python3"),
                 "-I",
                 str(Path(__file__).with_name("check_runtime.py")),
             ],

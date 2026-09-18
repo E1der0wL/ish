@@ -77,13 +77,27 @@ can collide with case-sensitive runtime data.
 
 By default, the result is written under
 `dist/cpython/<build-id>/`. The builder prints the actual path. Distribute
-the **entire `ish.dist` directory**, then run its launcher:
+the **entire output directory**, keeping `bin/` and the relative `ish -> ./bin/ish`
+launcher link together:
+
+```text
+<release>/
+├── ish -> ./bin/ish
+├── README.md
+├── build.json
+└── bin/
+    ├── ish
+    ├── libexec/ish_forward
+    └── python/
+```
+
+Run the launcher from the release directory:
 
 ```sh
 cd /path/to/release
-./ish.dist/ish bash
-./ish.dist/ish tcsh
-./ish.dist/ish --home "$HOME/ish-profile" zsh
+./ish bash
+./ish tcsh
+./ish --home "$HOME/ish-profile" zsh
 ```
 
 Normal use requires no host Python, uv, GCC, or network access. The selected shell
@@ -101,8 +115,8 @@ sessions are running. Upgrade by unpacking a new directory and restarting ish.
 The bundled interpreter is also usable directly:
 
 ```sh
-./ish.dist/python/bin/python3 my_script.py
-./ish.dist/python/bin/python3 -m pip --version
+./bin/python/bin/python3 my_script.py
+./bin/python/bin/python3 -m pip --version
 ```
 
 Plugin dependencies use that same interpreter's pip and install into
@@ -120,7 +134,7 @@ standard-library backend.
 Build downloads require network access unless Python, the locked packages, and
 the pinned runtime and license archives are already available. `--runtime-archive`
 and `--licenses-archive` accept offline copies and still verify their SHA256. The runtime's
-native dependency licenses are preserved under `ish.dist/python/licenses/`;
+native dependency licenses are preserved under `bin/python/licenses/`;
 Python-package licenses remain in their installed metadata.
 
 Build on the oldest Linux/glibc environment you intend to support. A newer Ubuntu

@@ -185,7 +185,7 @@ def main() -> None:
     )
     with tempfile.TemporaryDirectory(prefix="build-", dir=cache) as staging:
         work = Path(staging)
-        bundle = work / "ish.dist"
+        bundle = work / "bin"
         bundle.mkdir()
         extract_runtime(archive, bundle)
         extract_licenses(licenses, bundle)
@@ -310,8 +310,14 @@ def main() -> None:
             "created_utc": timestamp,
         }
         destination.mkdir(parents=True)
-        shutil.copytree(bundle, destination / "ish.dist", symlinks=True)
+        shutil.copytree(bundle, destination / "bin", symlinks=True)
+        (destination / "ish").symlink_to("./bin/ish")
+        shutil.copy2(root / "README.md", destination / "README.md")
+        for pattern in ("LICENSE", "LICENSE.*", "COPYING", "COPYING.*"):
+            for license_path in root.glob(pattern):
+                shutil.copy2(license_path, destination / license_path.name)
         (destination / "build.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        subprocess.run([str(destination / "ish"), "--version"], cwd=work, check=True)
     print(f"Distribution: {destination}", flush=True)
 
 

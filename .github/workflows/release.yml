@@ -173,7 +173,10 @@ jobs:
           from pathlib import Path
 
           root = Path("dist/cpython/ci")
-          bundle = root / "ish.dist"
+          bundle = root / "bin"
+          launcher = root / "ish"
+          if not launcher.is_symlink() or os.readlink(launcher) != "./bin/ish":
+              raise SystemExit("Expected the relative ish -> ./bin/ish launcher link.")
           for name in ("ish", "python/bin/python3", "libexec/ish_forward"):
               path = bundle / name
               if not path.is_file() or not os.access(path, os.X_OK):
@@ -233,11 +236,7 @@ jobs:
         run: |
           stage="$RUNNER_TEMP/package/$ASSET"
           mkdir -p "$stage" dist/release
-          cp -a dist/cpython/ci/ish.dist "$stage/"
-          cp dist/cpython/ci/build.json README.md "$stage/"
-          for license in LICENSE LICENSE.* COPYING COPYING.*; do
-            if [[ -f "$license" ]]; then cp "$license" "$stage/"; fi
-          done
+          cp -a dist/cpython/ci/. "$stage/"
           tar -czf "dist/release/$ASSET.tar.gz" -C "$RUNNER_TEMP/package" "$ASSET"
           cd dist/release
           sha256sum "$ASSET.tar.gz" > SHA256SUMS
@@ -296,6 +295,9 @@ jobs:
           cd release
           sha256sum --check SHA256SUMS
           tar -xzf "$ASSET.tar.gz"
+          test -L "$ASSET/ish"
+          test "$(readlink "$ASSET/ish")" = './bin/ish'
+          test -x "$ASSET/ish"
           cd "$GITHUB_WORKSPACE/test-shell"
           sha256sum --check SHA256SUMS
           tar -xzf "bash-$TEST_BASH_VERSION.tar.gz"
@@ -335,7 +337,7 @@ jobs:
               # Unrelated host Python settings must not poison ish or its workers.
               env["PYTHONHOME"] = str(home / "missing-python")
               env["PYTHONPATH"] = str(home / "unrelated-python")
-              runtime = str(Path(binary).parent / "python" / "bin" / "python3")
+              runtime = str(Path(binary).resolve().parent / "python" / "bin" / "python3")
               subprocess.run([runtime, "-I", "/check_runtime.py"], env=env, cwd=temporary, check=True, timeout=90)
               print(subprocess.check_output([shell, "--version"], env=env, timeout=30).decode(), flush=True)
               result = subprocess.check_output(args + ["--version"], env=env, cwd=temporary, timeout=30)
@@ -435,7 +437,7 @@ jobs:
                 driver=/usr/bin/python3
               fi
               cd /tmp
-              "$driver" /smoke.py /opt/ish/ish.dist/ish "$VERSION" /opt/ish-test-shell/bash
+              "$driver" /smoke.py /opt/ish/ish "$VERSION" /opt/ish-test-shell/bash
             '
 
   release:
@@ -478,8 +480,8 @@ jobs:
             cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
           Linux x86_64 distribution with bundled CPython 3.12.14, built against glibc 2.28.
 
-          Extract the archive and keep the entire `ish.dist` directory together.
-          Run `./ish.dist/ish bash` from the extracted directory. The selected shell
+          Extract the archive and keep `bin/` and the relative `ish -> ./bin/ish`
+          launcher link together. Run `./ish bash` from the extracted directory. The selected shell
           must be installed on the host: Bash 5.3.9+, zsh 5.5.1+, or tcsh 6.21.00+.
           ish documents supported versions without automatically checking or enforcing them.
           See README for BSD csh and dash support. Native Windows and musl/Alpine
