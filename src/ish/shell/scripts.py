@@ -11,6 +11,7 @@ from .constants import (
     BEFORE_BUFFERED_CONTINUATION,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
+    BUFFERED_CONTINUATION_HINT,
     CSH_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT,
     FORWARD_BINARY,
@@ -69,6 +70,9 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
             scope(BEFORE_BUFFERED_CONTINUATION)
         ),
         "@CONT_END@": bytes_to_shell_escape(scope(AFTER_CONTINUATION)),
+        "@BUFFERED_CONT_HINT@": bytes_to_shell_escape(
+            scope(BUFFERED_CONTINUATION_HINT)
+        ),
         "@PROMPT_ID@": bytes_to_shell_escape(
             scope(PROMPT_ID_PREFIX) + b"%s" + OSC_TERMINATOR
         ),
@@ -169,6 +173,42 @@ fi
         + r"""
 ish_recover() { source @ZSH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 unsetopt zle notify promptcr promptsp
+_ish_continuation_ready() {
+    emulate -L zsh
+    local -a _ish_available
+    local -i _ish_ready=0
+    # zsh's read -t consumes input when ready; zselect only observes readiness.
+    # This is a display hint, not an input-ownership or TTY-mode guarantee.
+    if builtin zselect -t 0 -a _ish_available -r 0 2>/dev/null; then
+        _ish_ready=1
+    fi
+    # A math function returns its last arithmetic value with a successful status.
+    (( _ish_ready )); builtin true
+}
+functions -M ish_continuation_ready 0 0 _ish_continuation_ready
+typeset -A _ish_continuation_suffixes=(
+    0 $'@CONT_END@'
+    1 $'@BUFFERED_CONT_HINT@@CONT_END@'
+)
+_ish_wrap_continuation() {
+    if [[ "$PS2" != "${_ish_wrapped_ps2-}" ]]; then
+        _ish_original_ps2=$PS2
+        # Preserve user edits around an existing wrapper without nesting it.
+        _ish_original_ps2=${_ish_original_ps2//'${_ish_continuation_suffixes[$((ish_continuation_ready()))]}'/}
+        _ish_original_ps2=${_ish_original_ps2//$'@CONT_START@'/}
+        _ish_original_ps2=${_ish_original_ps2//$'@BUFFERED_CONT_HINT@'/}
+        _ish_original_ps2=${_ish_original_ps2//$'@CONT_END@'/}
+    fi
+    if [[ -o promptsubst ]] && { builtin zmodload -e zsh/zselect || builtin zmodload zsh/zselect 2>/dev/null; }; then
+        # Inspect after user prompt substitutions, which may themselves read stdin.
+        # Keep the probe in this shell: no subprocess or timer per continuation.
+        PS2=$'@CONT_START@'"${_ish_original_ps2}"'${_ish_continuation_suffixes[$((ish_continuation_ready()))]}'
+    else
+        # Do not enable expansion of a user's literal prompt or require a module.
+        PS2=$'@CONT_START@'"${_ish_original_ps2}"$'@CONT_END@'
+    fi
+    _ish_wrapped_ps2=$PS2
+}
 # Install only over the default SIGINT behavior, never over a user's trap.
 # Capture in this shell: command substitution resets string traps. This private
 # session file is overwritten only when sourcing and removed by session cleanup.
@@ -212,9 +252,7 @@ _ish_precmd() {
     if [[ "$PS1" != *$'@START@'* ]]; then
         PS1=$'@START@'"${PS1}"$'@END@'
     fi
-    if [[ "$PS2" != *$'@CONT_START@'* ]]; then
-        PS2=$'@CONT_START@'"${PS2}"$'@CONT_END@'
-    fi
+    _ish_wrap_continuation
     _ish_update "$1"
     _ish_forward
     local _ish_line_ready=0

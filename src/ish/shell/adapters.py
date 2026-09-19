@@ -14,6 +14,7 @@ from .constants import (
     BEFORE_BUFFERED_CONTINUATION,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
+    BUFFERED_CONTINUATION_HINT,
     CARET_AFTER_PROMPT,
     CARET_BEFORE_PROMPT,
     CSH_INTEGRATION_SCRIPT,
@@ -149,6 +150,7 @@ class ShellAdapter:
     capture_refresh_status: bool = False
     unhooked_prompt: tuple[bytes, bytes] | None = None
     buffered_continuation: tuple[bytes, bytes] | None = None
+    buffered_continuation_suffix: bytes | None = None
     builtins_command: str = ""
     builtins: tuple[str, ...] = ()
     long_input: LongInputMode = LongInputMode.REJECT
@@ -224,10 +226,20 @@ class ShellAdapter:
         the sequencer.
         """
         scope = signals.scope
+        continuation_callback = continuation
+        if self.buffered_continuation_suffix:
+            suffix = scope(self.buffered_continuation_suffix)
+
+            def continuation_callback(payload):
+                """Apply a trailing display hint only to its own complete capture."""
+                if payload.endswith(suffix):
+                    return continuation(payload[: -len(suffix)], buffered=True)
+                return continuation(payload)
+
         sequencer.on_prefix(scope(PROMPT_ID_PREFIX), prompt_id, restart_capture=True)
         sequencer.between_sequence(scope(BEFORE_PROMPT), scope(AFTER_PROMPT), prompt)
         sequencer.between_sequence(
-            scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation
+            scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation_callback
         )
         if self.buffered_continuation:
             sequencer.between_sequence(
@@ -258,6 +270,7 @@ ADAPTERS = {
         ("-i",),
         ZSH_INTEGRATION_SCRIPT,
         source_command="source",
+        buffered_continuation_suffix=BUFFERED_CONTINUATION_HINT,
         builtins_command='printf "%s\\n" ${(k)builtins}',
         # -f skips user rc files; zsh always reads its system zshenv.
         builtins_args=("-f", "-c"),

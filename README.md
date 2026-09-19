@@ -17,13 +17,27 @@ selects the login shell by name.
 | Shell | Minimum supported version | Argument | Support notes |
 | --- | --- | --- | --- |
 | Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
-| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. |
+| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. Hiding queued continuation prompts requires `PROMPT_SUBST` and `zsh/zselect`. |
 | tcsh | 6.21.00 | `tcsh` | Supports prompt hooks and return to the ish editor. |
 | BSD csh | Not specified | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
 | dash / sh | Not specified | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
 A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
 named `sh` are not automatically covered by dash support.
+
+To hide repeated zsh continuation prompts when pasting multiline commands,
+**`PROMPT_SUBST` must be enabled and the `zsh/zselect` module must be available**.
+In zsh, enable the option and check that the module can be loaded with:
+
+```zsh
+setopt PROMPT_SUBST
+zmodload zsh/zselect
+```
+
+Keep `setopt PROMPT_SUBST` in your `.zshrc` to enable it in future sessions.
+ish loads the module automatically when available, but does not enable
+`PROMPT_SUBST` itself. If either condition is unmet, commands still run with
+native continuation prompts, which can repeat during multiline paste.
 
 These versions define the supported range. ish does not automatically query,
 compare, or enforce shell versions; select a supported version yourself. The same
@@ -503,6 +517,12 @@ input handling used by ish.
 - The primary prompt uses prompt-toolkit editing. Native Readline/ZLE bindings,
   native editor widgets, and every aspect of shell prompt rendering are not
   reproduced. At this prompt, Ctrl+C cancels editing without changing shell status.
+- In zsh, queued continuation prompts are hidden when `PROMPT_SUBST` is enabled
+  and the `zsh/zselect` module is available. ish preserves the existing option;
+  otherwise, it displays native continuation prompts. The readiness check does
+  not consume input or change TTY settings. With noncanonical input (such as
+  `stty -icanon`), an incomplete queued line can hide a prompt that is still
+  waiting for more input.
 - If integration hooks are replaced or removed, confirm the shell is waiting for
   a command and enter `ish_recover`. BSD csh requires this explicit return after
   commands as described above.
