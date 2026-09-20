@@ -33,10 +33,14 @@ def square(value: int) -> int:
 def main() -> None:
     """Exercise representative stdlib families and report the actual interpreter."""
     from ish.runtime.distribution import bundled_forward_binary
+    from ish.shell.adapters import preload_libraries
 
     assert sys.version_info[:3] == (3, 12, 14), sys.version
     helper = bundled_forward_binary()
     assert helper is not None and helper.is_file(), helper
+    for library in preload_libraries():
+        native = library.bundled_path()
+        assert native is not None and native.is_file(), native
     # sys.stdlib_module_names also lists modules for other operating systems.
     foreign = {
         "_msi",

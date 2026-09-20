@@ -3,7 +3,7 @@
 import shlex
 import shutil
 
-from .adapters import csh_quote
+from .adapters import ADAPTERS, csh_quote
 from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
@@ -17,6 +17,7 @@ from .constants import (
     FORWARD_BINARY,
     LINE_INTERRUPT_ACK_PREFIX,
     LINE_READER_READY_PREFIX,
+    NATIVE_CONTINUATION,
     OSC_TERMINATOR,
     POSIX_INTEGRATION_SCRIPT,
     POSIX_UPDATE_SCRIPT,
@@ -33,7 +34,9 @@ from .constants import (
 from .protocol import EOT, RS, SOH, US, VERSION
 
 
-def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
+def make_scripts(
+    directory, *, signals=SessionSignals(), forward_path=None, adapter=None
+):
     """Return shell-specific script filenames and session-rendered source.
 
     Quote paths for each shell syntax and use shared constants for state transfer and
@@ -44,6 +47,9 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
     # Resolve the few remaining external utilities once, before user commands
     # can change PATH. The context helper handles encoding and environments.
     printf_path = shutil.which("printf", path="/usr/bin:/bin") or "/usr/bin/printf"
+    checks = {entry.script: entry.preload_check() for entry in ADAPTERS.values()}
+    if adapter is not None:
+        checks[adapter.script] = adapter.preload_check()
     tokens = {
         "@VERSION@": VERSION.decode("ascii"),
         "@FORWARD@": shlex.quote(str(forward_path)),
@@ -83,13 +89,18 @@ def make_scripts(directory, *, signals=SessionSignals(), forward_path=None):
             scope(LINE_INTERRUPT_ACK_PREFIX) + b"%s;%s" + OSC_TERMINATOR
         ),
         # csh checks only the OSC body so both raw and caret prompts match.
+        "@CSH_NATIVE_CONTINUATION@": bytes_to_shell_escape(scope(NATIVE_CONTINUATION)),
+        "@CSH_CONT_START_PATTERN@": csh_quote(
+            scope(NATIVE_CONTINUATION)[2 : -len(OSC_TERMINATOR)].decode("ascii")
+        ),
         "@CSH_START_PATTERN@": csh_quote(
             scope(BEFORE_PROMPT)[2 : -len(OSC_TERMINATOR)].decode("ascii")
         ),
     }
 
-    def render(template):
+    def render(template, name):
         """Replace fixed placeholders with paths, frame separators, and session signals."""
+        template = template.replace("@PRELOAD_CHECK@", checks.get(name, ""))
         for key, value in tokens.items():
             template = template.replace(key, value)
         return template.lstrip("\n")
@@ -107,6 +118,7 @@ _ish_mark_prompt() { command printf '@PROMPT_ID@' "$_ish_prompt_id"; }
 _ish_pipe=$1
 _tty_pipe=$2
 _ish_prompt_id=${_ish_prompt_id:-0}
+@PRELOAD_CHECK@
 """
     bash = (
         init
@@ -298,7 +310,7 @@ fi
 """
     )
     posix = (
-        "_ish_prompt_id=${_ish_prompt_id:-0}\n"
+        "_ish_prompt_id=${_ish_prompt_id:-0}\n@PRELOAD_CHECK@\n"
         + update
         + r"""
 ish_recover() {
@@ -336,6 +348,7 @@ set _ish_before = "`@CSH_PRINTF@ '@START@'`"
 set _ish_after = "`@CSH_PRINTF@ '@END@'`"
 set _ish_cont_before = "`@CSH_PRINTF@ '@CONT_START@'`"
 set _ish_cont_after = "`@CSH_PRINTF@ '@CONT_END@'`"
+@PRELOAD_CHECK@
 """
     # BSD csh has no precmd. Only explicit ish_recover sources this update.
     csh_refresh = r"""
@@ -351,6 +364,12 @@ if ($?tcsh) then
     if (! $_ish_editor_suspended) set _ish_edit_enabled = $?edit
     set _ish_editor_suspended = 1
     unset edit
+    if (! $?prompt2) set prompt2 = "%R? "
+    # tcsh displays only the first word of prompt2. Preserve array elements
+    # instead of joining them into one prompt when installing the marker.
+    if ($#prompt2 > 0) then
+        if ("$prompt2[1]" !~ *@CSH_CONT_START_PATTERN@*) set prompt2[1] = "%{$_ish_native_continuation%}$prompt2[1]"
+    endif
 endif
 @ _ish_prompt_id ++
 setenv PWD "$cwd"
@@ -414,6 +433,11 @@ set _ish_bind_path = @CSH_BIND@
 set _ish_watch_path = @CSH_WATCH@
 if (! $?_ish_tcsh_installed) then
     set _ish_tcsh_installed = 1
+    # Keep Enter bytes recognizable when unread input returns through the FIFO.
+    setty -d -inlcr +icrnl
+    # A trailing invisible marker can wait for the editor's next redraw. A
+    # leading notification leaves all visible PS2 rendering with tcsh.
+    set _ish_native_continuation = "`@CSH_PRINTF@ '@CSH_NATIVE_CONTINUATION@'`"
     set _ish_editor_suspended = 0
     set _ish_edit_enabled = $?edit
     alias _ish_original_precmd "`alias precmd`"
@@ -445,7 +469,7 @@ endif
 """
     )
     return {
-        name: render(body)
+        name: render(body, name)
         for name, body in {
             BASH_INTEGRATION_SCRIPT: bash,
             ZSH_INTEGRATION_SCRIPT: zsh,

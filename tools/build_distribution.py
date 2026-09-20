@@ -1,7 +1,7 @@
 """Package a relocatable Linux x86_64 CPython installation and the locked ish wheel.
 
 Run with tools/build.sh. Build on the oldest glibc host you support: compiling the
-small forwarding helper on a newer system does not make it backward compatible.
+native helpers on a newer system does not make them backward compatible.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from pathlib import Path
 import zstandard
 
 from ish.runtime.distribution import RUNTIME_MARKER
+from ish.shell.adapters import preload_libraries
 from ish.shell.integration import build_binary
 
 
@@ -273,6 +274,9 @@ def main() -> None:
         )
         if not build_binary(directory=bundle / "libexec"):
             raise RuntimeError("Could not compile ish_forward")
+        for library in preload_libraries():
+            if not build_binary(directory=bundle / "libexec", library=library):
+                raise RuntimeError(f"Could not compile {library.binary_name}")
         relocate_python_scripts(bundle / "python")
         shutil.copy2(root / "tools/ish-launcher.sh", bundle / "ish")
         (bundle / "ish").chmod(0o755)

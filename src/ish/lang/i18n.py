@@ -57,6 +57,7 @@ class I18N:
                   Bash 5.3.9 or newer
                   zsh 5.5.1 or newer
                   tcsh 6.21.00 or newer
+                    Requires a dynamically linked Linux tcsh with preload support.
                   BSD csh and dash/sh: see README for support limits.
 
                 Shell versions are not checked automatically. Select a supported version;

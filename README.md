@@ -58,7 +58,8 @@ uv prepares the build environment using `uv.lock`.
 
 The distribution contains a dedicated, relocatable **CPython 3.12.14** runtime,
 its Linux standard library and extension modules, ish, pip, the locked application
-dependencies, and the precompiled `ish_forward` helper. Python code is loaded
+dependencies, the precompiled `ish_forward` helper, and the tcsh input library
+`ish_shell.so`. Python code is loaded
 normally; the build does not freeze imports or require a list of plugin modules.
 The runtime archive and SHA256 are pinned in `tools/python-runtime.toml`.
 
@@ -101,7 +102,9 @@ launcher link together:
 ├── build.json
 └── bin/
     ├── ish
-    ├── libexec/ish_forward
+    ├── libexec/
+    │   ├── ish_forward
+    │   └── ish_shell.so
     └── python/
 ```
 
@@ -153,7 +156,7 @@ Python-package licenses remain in their installed metadata.
 
 Build on the oldest Linux/glibc environment you intend to support. A newer Ubuntu
 build is not automatically compatible with RHEL 8.10, even with portable Python:
-the forwarding helper also links to glibc. The release workflow builds against
+the native helpers also link to glibc. The release workflow builds against
 glibc 2.28 and checks every bundled ELF file before publishing a candidate archive.
 
 ## Customizing ish
@@ -204,6 +207,15 @@ For Python packages whose distribution and import names differ, use
 `dependencies`. This separates the name passed to pip from the module checked
 for import availability. Package installation requires access to the packages
 through the bundled interpreter's pip, as described in the build section.
+
+Installations are staged before replacing package files. Failed installation or
+validation preserves the previous files, and upgrades remove obsolete files and
+metadata while retaining other distributions in shared namespace packages.
+Libraries already imported in the current process are not hot-reloaded. If a
+dependency conflicts with those libraries or with a loaded plugin's requirements,
+ish logs the failure and skips that plugin. Align the dependency requirements and
+restart ish before retrying a version change. Dotted import names, such as
+`"distribution|namespace.package"`, are supported.
 
 Plugins normally load before `.ishrc.py` runs. `plugin.get("my_tools")` looks up
 the registered module; it does not import an arbitrary file or trigger loading.
@@ -504,7 +516,7 @@ uv run ish bash
 ```
 
 Do not share a virtual environment between Windows Python and Linux Python.
-GCC is needed for the helper when running from source. The lockfile records the
+GCC is needed for the native helpers when running from source. The lockfile records the
 application and build dependencies.
 
 ## Support scope
@@ -530,6 +542,14 @@ input handling used by ish.
   tcsh, and BSD csh can accept a long first line at an eligible primary prompt.
   A long later line in a pasted block is rejected, and dash/sh retains its
   4,095-byte limit. Custom zsh SIGINT handling can disable long input support.
+- tcsh keeps its native editor for secondary input, including lines over 4,095
+  bytes once that editor is waiting. A bundled Linux preload library prevents
+  tcsh from hiding trailing input in its private read-ahead buffer. It affects
+  only the shell's own TTY readiness query, and is removed from the environment
+  inherited by external programs. tcsh must be dynamically linked and allow
+  preloading. Its editing TTY profile uses normal CR-to-LF conversion instead of
+  LF-to-CR conversion; custom Enter bindings should treat LF as newline. Disabling
+  `edit` also disables native long-secondary-line support.
 - Session files are stored under `~/ish/.cache` by default. This location must be
   writable and permit executable files. Regular shutdown and handled TERM/HUP
   perform terminal and session cleanup; SIGKILL and OOM termination cannot do so.

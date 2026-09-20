@@ -37,7 +37,7 @@ class InputRejected(ValueError):
 
 
 class SubmittedInput:
-    """Retain native bytes returned during one accepted multiline submission.
+    """Retain native bytes returned after a block or native continuation input.
 
     A PTY has already interpreted terminal controls, so its returned bytes are
     not fresh editor key presses. Keep this stream separate from keys retained

@@ -42,6 +42,7 @@ from .constants import (
     TTY_FIFO,
     SessionSignals,
 )
+from .guard import spawn_environment
 from .input import (
     InputModeLease,
     InputRejected,
@@ -256,6 +257,7 @@ class InteractiveShell:
         "_prompt_id",
         "_context_event",
         "_native_output_line",
+        "_preload_path",
         "_prompt_prefix",
         "signals",
         "context_timeout",
@@ -358,6 +360,7 @@ class InteractiveShell:
         self._input_mode_lease = None
         self._context_event = asyncio.Event()
         self._native_output_line = OutputLine()
+        self._preload_path = None
         self._prompt_prefix = b""
 
         self.shell_pid: int = -1
@@ -889,6 +892,11 @@ class InteractiveShell:
         policy.
         """
         self.continuation_active.set()
+        if not self.adapter.refresh:
+            # Bytes returned after native continuation input already passed
+            # through the PTY. Resume complete lines as a block and restore an
+            # unfinished tail literally, just like an initial multiline paste.
+            self._submitted_input.active = True
         if buffered:
             # The shell checked readiness before reading its next line. The
             # editor already displayed that submitted input; omit only this PS2.
@@ -971,25 +979,29 @@ class InteractiveShell:
         if not self.shell_path or not os.path.isfile(self.shell_path):
             raise FileNotFoundError(f"Shell not found: {self.shell}")
 
-        spawn = asyncio.create_task(
-            asyncio.create_subprocess_exec(
-                self.shell_path,
-                *self.shell_args,
-                stdin=self.slave_fd,
-                stdout=self.slave_fd,
-                stderr=self.slave_fd,
-                env=self._environ,
-                cwd=os.getcwd(),
-                preexec_fn=setup_pty,
+        with spawn_environment(
+            self._environ, self._preload_path, self.adapter.preload
+        ) as (env, fds):
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    self.shell_path,
+                    *self.shell_args,
+                    stdin=self.slave_fd,
+                    stdout=self.slave_fd,
+                    stderr=self.slave_fd,
+                    env=env,
+                    pass_fds=fds,
+                    cwd=os.getcwd(),
+                    preexec_fn=setup_pty,
+                )
             )
-        )
-        try:
-            self.proc = await asyncio.shield(spawn)
-        finally:
-            if self.proc is None:
-                # Cancellation during transport setup must not orphan the child.
-                with contextlib.suppress(Exception):
-                    self.proc = await spawn
+            try:
+                self.proc = await asyncio.shield(spawn)
+            finally:
+                if self.proc is None:
+                    # Keep the library FD alive until shielded exec has finished.
+                    with contextlib.suppress(Exception):
+                        self.proc = await spawn
 
         self.shell_pid = self.proc.pid
         # The parent must not keep the slave alive after the child inherits it.
@@ -1374,6 +1386,11 @@ class InteractiveShell:
                     raise RuntimeError(
                         "Failed to prepare ish_forward. Check the error above."
                     )
+                if self.adapter.preload is not None:
+                    library = self.adapter.preload.library
+                    if not await build_binary_async(directory=runtime, library=library):
+                        raise RuntimeError(f"Failed to prepare {library.binary_name}.")
+                    self._preload_path = runtime / library.binary_name
 
                 self.exec_attrs = termios.tcgetattr(self.stdin_fd)
                 resources.callback(self._restore_terminal)
@@ -1403,6 +1420,7 @@ class InteractiveShell:
                     directory=runtime,
                     signals=self.signals,
                     forward_path=runtime / FORWARD_BINARY,
+                    adapter=self.adapter,
                 )
                 self.shell_integration = str(self.xdg_home / self.adapter.script)
                 self.init_command = self.adapter.source(

@@ -19,14 +19,52 @@ from .constants import (
     CARET_BEFORE_PROMPT,
     CSH_INTEGRATION_SCRIPT,
     CSH_UPDATE_SCRIPT,
+    NATIVE_CONTINUATION,
     POSIX_INTEGRATION_SCRIPT,
     PROMPT_ID_PREFIX,
     TCSH_INTEGRATION_SCRIPT,
     ZSH_INTEGRATION_SCRIPT,
     SessionSignals,
 )
+from .guard import (
+    GUARD_ACTIVE,
+    GUARD_CHECKED,
+    SHELL_GUARD_SOURCE,
+    NativeFeature,
+    NativeLibrary,
+    PreloadPolicy,
+)
 from .input import LongInputMode
 from .signals import SignalPolicy, TerminalSignal, ZshInterrupt
+
+# Build and activation choices live here. Native implementations stay in guard.py.
+NATIVE_LIBRARIES = {
+    "shell": NativeLibrary("ish_shell.so", "ish_shell.c", SHELL_GUARD_SOURCE),
+}
+
+POSIX_PRELOAD_CHECK = """if [ "${{{checked}-}}" != {token} ]; then
+    if [ "${{{active}-}}" != {token} ]; then
+        printf '%s\\n' {message} >&2
+        exit 1
+    fi
+    unset {active}
+    {checked}={token}
+fi
+"""
+CSH_PRELOAD_CHECK = """if (! $?{checked}) set {checked} = ""
+if ("${checked}" != {token}) then
+    if (! $?{active}) then
+        echo {message}
+        exit 1
+    endif
+    if ("${active}" != {token}) then
+        echo {message}
+        exit 1
+    endif
+    unsetenv {active}
+    set {checked} = {token}
+endif
+"""
 
 
 def csh_quote(value: str) -> str:
@@ -66,6 +104,7 @@ class ShellSyntax:
     parse_aliases: Callable[[str], dict[str, str]]
     lexer: str
     restore_status: str = "_ish_status {value}"
+    preload_check: str = ""
 
     def assign(self, name: str, expression: str) -> str:
         """Assign an already quoted value or a shell expression."""
@@ -88,7 +127,13 @@ class ShellSyntax:
 # claims (notably, zsh shares this POSIX-style quoting/assignment profile).
 SYNTAXES = {
     "posix": ShellSyntax(
-        shlex.quote, "{name}={value}", "$?", ".", posix_aliases, "bash"
+        shlex.quote,
+        "{name}={value}",
+        "$?",
+        ".",
+        posix_aliases,
+        "bash",
+        preload_check=POSIX_PRELOAD_CHECK,
     ),
     "csh": ShellSyntax(
         csh_quote,
@@ -98,6 +143,7 @@ SYNTAXES = {
         csh_aliases,
         "tcsh",
         restore_status="set status = {value}",
+        preload_check=CSH_PRELOAD_CHECK,
     ),
 }
 
@@ -149,6 +195,8 @@ class ShellAdapter:
     refresh_script: str | None = None
     capture_refresh_status: bool = False
     unhooked_prompt: tuple[bytes, bytes] | None = None
+    native_continuation_signal: bytes | None = None
+    preload: PreloadPolicy | None = None
     buffered_continuation: tuple[bytes, bytes] | None = None
     buffered_continuation_suffix: bytes | None = None
     builtins_command: str = ""
@@ -166,6 +214,25 @@ class ShellAdapter:
     def refresh(self) -> bool:
         """Report whether state refresh requires an explicit user reconnect."""
         return self.refresh_script is not None
+
+    def preload_check(self) -> str:
+        """Render startup confirmation for this adapter's selected native policy."""
+        if self.preload is None:
+            return ""
+        if not self.syntax.preload_check:
+            raise ValueError(
+                f"Native startup confirmation is not defined for {self.family}"
+            )
+        message = (
+            f"ish: {self.name} requires {self.preload.library.binary_name} "
+            "with its configured policy (a dynamically linked Linux shell)."
+        )
+        return self.syntax.preload_check.format(
+            active=GUARD_ACTIVE,
+            checked=GUARD_CHECKED,
+            token=self.syntax.quote(self.preload.activation_token),
+            message=self.syntax.quote(message),
+        )
 
     def source(self, path, *args) -> str:
         """Build a source command with paths and arguments quoted for the shell syntax.
@@ -250,6 +317,10 @@ class ShellAdapter:
             sequencer.between_sequence(
                 *(scope(marker) for marker in self.unhooked_prompt), unhooked_prompt
             )
+        if self.native_continuation_signal:
+            sequencer.on_sequence(
+                scope(self.native_continuation_signal), lambda: continuation(b"")
+            )
 
 
 ADAPTERS = {
@@ -287,6 +358,10 @@ ADAPTERS = {
         TCSH_INTEGRATION_SCRIPT,
         behavior=CSH_BEHAVIOR,
         unhooked_prompt=(CARET_BEFORE_PROMPT, CARET_AFTER_PROMPT),
+        native_continuation_signal=NATIVE_CONTINUATION,
+        preload=PreloadPolicy(
+            NATIVE_LIBRARIES["shell"], NativeFeature.SUPPRESS_TTY_READAHEAD
+        ),
         builtins_command="builtins",
         builtins_args=("-f", "-c"),
         long_input=LongInputMode.STAGED_FIRST_LINE,
@@ -323,6 +398,19 @@ ADAPTERS = {
         ),
     ),
 }
+
+
+def preload_libraries() -> tuple[NativeLibrary, ...]:
+    """Collect only libraries used by adapters, once per distinct artifact name."""
+    libraries = {}
+    for adapter in ADAPTERS.values():
+        if adapter.preload is not None:
+            library = adapter.preload.library
+            previous = libraries.setdefault(library.binary_name, library)
+            if previous != library:
+                raise ValueError(f"Conflicting native library: {library.binary_name}")
+    return tuple(libraries.values())
+
 
 # Membership is declared only above; this view is useful for discovery/docs.
 SHELL_CATEGORIES = {

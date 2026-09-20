@@ -1,4 +1,4 @@
-"""Write session scripts and build the C helper for state framing and typeahead.
+"""Write session scripts and build native helpers for typeahead and tcsh input.
 
 Runtime files live in a caller-supplied directory; script templates are defined in
 scripts.
@@ -32,6 +32,7 @@ from .constants import (
     FORWARD_SOURCE,
     bytes_to_shell_escape,
 )
+from .guard import NativeLibrary
 from .protocol import EOT, RS, SOH, US, VERSION
 from .scripts import make_scripts
 
@@ -221,7 +222,9 @@ for _token, _value in {
     TTY_FORWARD = TTY_FORWARD.replace(_token, _value)
 
 
-def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
+def install_scripts(
+    *, directory=None, signals=None, forward_path=None, adapter=None
+) -> Path:
     """Write integration scripts with session identifiers and forwarding paths.
 
     Use UTF-8, LF line endings, and mode 0644. The caller owns directory cleanup.
@@ -234,6 +237,7 @@ def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
         ish_xdg_home,
         signals=signals or SessionSignals(),
         forward_path=forward_path or Path(ISH_FORWARD),
+        adapter=adapter,
     ).items():
         script_path = ish_xdg_home / name
         with open(script_path, "w", encoding="utf-8", newline="\n") as file:
@@ -242,8 +246,21 @@ def install_scripts(*, directory=None, signals=None, forward_path=None) -> Path:
     return ish_xdg_home
 
 
-def build_binary(*, directory=None) -> bool:
-    """Copy the bundled forwarding tool, or build it with GCC in a source checkout.
+def _binary_spec(library: NativeLibrary | None):
+    """Select the forwarding executable or the optional native-editor library."""
+    if library is not None:
+        return (
+            library.source_name,
+            library.binary_name,
+            library.source,
+            library.compiler_flags,
+            library.bundled_path(),
+        )
+    return FORWARD_SOURCE, FORWARD_BINARY, TTY_FORWARD, [], bundled_forward_binary()
+
+
+def build_binary(*, directory=None, library: NativeLibrary | None = None) -> bool:
+    """Copy a bundled helper, or build it with GCC in a source checkout.
 
     Log build diagnostics and remove temporary C source. The host must permit execution
     through both file permissions and the directory's mount policy, including noexec.
@@ -251,20 +268,22 @@ def build_binary(*, directory=None) -> bool:
     logger = get_logger()
     ish_xdg_home: Path = directory or config.XDG_DATA_HOME
     ish_xdg_home.mkdir(parents=True, exist_ok=True)
-    src_path = ish_xdg_home / FORWARD_SOURCE
+    source_name, binary_name, source_text, flags, bundled = _binary_spec(library)
+    src_path = ish_xdg_home / source_name
     bin_path = (
-        ish_xdg_home / FORWARD_BINARY if directory is not None else Path(ISH_FORWARD)
+        ish_xdg_home / binary_name
+        if directory is not None or library is not None
+        else Path(ISH_FORWARD)
     )
     import subprocess
 
     try:
-        bundled = bundled_forward_binary()
         if bundled is not None:
             shutil.copyfile(bundled, bin_path)
             os.chmod(bin_path, 0o700)
             return True
-        src_path.write_text(TTY_FORWARD, encoding="utf-8")
-        cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path)]
+        src_path.write_text(source_text, encoding="utf-8")
+        cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path), *flags]
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
             logger.error(
@@ -276,7 +295,7 @@ def build_binary(*, directory=None) -> bool:
         os.chmod(bin_path, 0o755)
         return True
     except FileNotFoundError as exc:
-        logger.error("Could not prepare ish_forward: %s", exc)
+        logger.error("Could not prepare %s: %s", binary_name, exc)
         return False
     except Exception:
         logger.error(i18n.get("error", error=traceback.format_exc()))
@@ -285,23 +304,26 @@ def build_binary(*, directory=None) -> bool:
         src_path.unlink(missing_ok=True)
 
 
-async def build_binary_async(*, directory: Path) -> bool:
+async def build_binary_async(
+    *, directory: Path, library: NativeLibrary | None = None
+) -> bool:
     """Prepare a session helper without blocking termination during compilation.
 
     A source build owns a separate compiler process group, including compiler
     subprocesses. Cancellation stops the group and reaps the compiler before the
     session directory can be removed. Distributions copy their bundled helper.
     """
-    if bundled_forward_binary() is not None:
-        return build_binary(directory=directory)
+    source_name, binary_name, source_text, flags, bundled = _binary_spec(library)
+    if bundled is not None:
+        return build_binary(directory=directory, library=library)
     directory.mkdir(parents=True, exist_ok=True)
-    source = directory / FORWARD_SOURCE
-    binary = directory / FORWARD_BINARY
+    source = directory / source_name
+    binary = directory / binary_name
     process = None
     spawn = None
     completed = False
     try:
-        source.write_text(TTY_FORWARD, encoding="utf-8")
+        source.write_text(source_text, encoding="utf-8")
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 "gcc",
@@ -309,6 +331,7 @@ async def build_binary_async(*, directory: Path) -> bool:
                 "-o",
                 str(binary),
                 str(source),
+                *flags,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -328,7 +351,7 @@ async def build_binary_async(*, directory: Path) -> bool:
         binary.chmod(0o755)
         return True
     except FileNotFoundError as exc:
-        get_logger().error("Could not prepare ish_forward: %s", exc)
+        get_logger().error("Could not prepare %s: %s", binary_name, exc)
         return False
     finally:
         if process is None and spawn is not None:

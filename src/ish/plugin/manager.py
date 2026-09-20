@@ -11,7 +11,6 @@ import importlib.metadata
 import importlib.util
 import re
 import shutil
-import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -19,12 +18,15 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion
 
 from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
+
+from .dependencies import has_duplicate_metadata, has_import, install_dependency
 
 __all__ = ["PluginManager", "PluginInfo"]
 
@@ -183,25 +185,50 @@ class PluginManager:
             )
             return False
 
-    def _ensure_library(self, library: str) -> bool:
-        """Check import availability and the distribution version, installing if needed."""
+    def _library_available(self, library: str, *, import_parents: bool = True) -> bool:
+        """Check metadata and imports, distinguishing missing parents from broken imports."""
         library_name, library_version, library_origin = self._parse_requirement(library)
-        if (
-            importlib.util.find_spec(
-                library_name if not library_origin else library_origin
-            )
-            is None
-        ):
-            return self._load_library(library)
-        try:
-            if library_version is None:
-                return True
-            version = importlib.metadata.version(library_name)
+        if has_duplicate_metadata(library_name, config.PLUGIN_LIB_DIR):
+            return False
+        # Check the version before find_spec can import a dotted name's parent.
+        if library_version is not None:
+            try:
+                version = importlib.metadata.version(library_name)
+            except PackageNotFoundError:
+                return False
             if not self._ensure_version(version, library_version):
-                return self._load_library(library)
-        except PackageNotFoundError:
-            return self._load_library(library)
-        return True
+                return False
+        name = library_origin or library_name
+        if not import_parents:
+            return has_import(name)
+        try:
+            return importlib.util.find_spec(name) is not None
+        except ModuleNotFoundError as exc:
+            if exc.name and (exc.name == name or name.startswith(exc.name + ".")):
+                return False
+            # An existing parent's failed dependency import is not an absent parent.
+            raise
+
+    def _ensure_library(self, library: str) -> bool:
+        """Use an available dependency or install and validate it before loading a plugin."""
+        return self._library_available(library) or self._load_library(library)
+
+    def _dependency_constraints(self) -> list[str]:
+        """Preserve requirements declared by plugins already registered in this session."""
+        constraints = []
+        for info in self.registry.list_info():
+            for dependency in info.dependencies:
+                try:
+                    req = Requirement(dependency.split(self.SEP, 1)[0])
+                except InvalidRequirement:
+                    continue
+                if req.marker is not None and not req.marker.evaluate():
+                    continue
+                if req.url:
+                    constraints.append(f"{req.name} @ {req.url}")
+                else:
+                    constraints.append(f"{req.name}{req.specifier}")
+        return constraints
 
     def _ensure_plugin(self, plugin: str) -> bool:
         """Check an already loaded plugin or recursively load a required plugin."""
@@ -237,26 +264,23 @@ class PluginManager:
             self.logger.warning(i18n.get("pip_install_fail", library=library))
             return False
 
-        library = library.split(self.SEP)[0]
-        cmd = [
-            self.python_exe,
-            "-I",
-            "-m",
-            "pip",
-            "install",
-            "--target",
-            str(config.PLUGIN_LIB_DIR),
-            library,
-        ]
         try:
-            result = subprocess.run(cmd, check=True)
-            if result.returncode == 0:
-                self._installed_libs.add(library)
-                return True
-            self.logger.warning(i18n.get("pip_install_fail", library=library))
-            return False
-        except Exception:
-            self.logger.warning(i18n.get("pip_install_fail", library=library))
+            with install_dependency(
+                self.python_exe,
+                library.split(self.SEP, 1)[0],
+                config.PLUGIN_LIB_DIR,
+                self._dependency_constraints(),
+            ):
+                if not self._library_available(library, import_parents=False):
+                    raise RuntimeError(
+                        "Installed dependency does not provide the requested import and version"
+                    )
+            self._installed_libs.add(library.split(self.SEP, 1)[0])
+            return True
+        except Exception as exc:
+            self.logger.warning(
+                "%s: %s", i18n.get("pip_install_fail", library=library), exc
+            )
             return False
 
     def _load_plugin(
