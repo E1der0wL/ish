@@ -148,20 +148,66 @@ static int context(const char *path, const char *status, const char *id) {
     return fclose(out) != 0 || failed;
 }
 
+static volatile sig_atomic_t interrupted;
+static void stop_forwarding(int signum) { interrupted = signum; }
+static void catch_forward_signal(int signum) {
+    struct sigaction old, action;
+    if (sigaction(signum, NULL, &old) != 0 || old.sa_handler == SIG_IGN) return;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = stop_forwarding;
+    sigemptyset(&action.sa_mask);
+    sigaction(signum, &action, NULL);
+}
+
 static int write_all(int fd, const unsigned char *buf, size_t size) {
     while (size > 0) {
+        if (interrupted) return -1;
         ssize_t n = write(fd, buf, size);
         if (n > 0) { buf += n; size -= (size_t)n; continue; }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             struct pollfd p = { .fd = fd, .events = POLLOUT };
             int ready;
-            do { ready = poll(&p, 1, -1); } while (ready < 0 && errno == EINTR);
+            do { ready = poll(&p, 1, -1); } while (ready < 0 && errno == EINTR && !interrupted);
             if (ready > 0 && !(p.revents & (POLLERR | POLLHUP | POLLNVAL))) continue;
         }
         return -1;
     }
     return 0;
+}
+
+/* A private FIFO closes a forwarding boundary without injecting shell input.
+ * An interrupted helper may leave an older acknowledgement behind. Read one
+ * byte at a time so the next helper's acknowledgement is never consumed here.
+ */
+static int acknowledge(int fd, const char *expected, char *line, size_t *used) {
+    unsigned char byte;
+    ssize_t n;
+    while ((n = read(fd, &byte, 1)) > 0) {
+        if (byte == '\n') {
+            line[*used] = 0;
+            int match = !strcmp(line, expected);
+            *used = 0;
+            if (match) return 1;
+        } else {
+            if (byte < '0' || byte > '9' || *used >= 31) return -1;
+            line[(*used)++] = (char)byte;
+        }
+    }
+    return n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR ? -1 : 0;
+}
+
+static int input_result(const char *path, const char *id, int failed) {
+    FILE *out = fopen(path, "w");
+    if (!out) return 1;
+    struct encoder e = { .out = out, .count = 0 };
+    fputs("@SOH@@VERSION@@RS@", out);
+    fputs(failed ? "input_error" : "input_done", out);
+    fputc('@US@', out);
+    encode_string(&e, id);
+    fputc('@EOT@', out);
+    int error = ferror(out);
+    return fclose(out) != 0 || error;
 }
 
 int main(int argc, char *argv[]) {
@@ -184,30 +230,71 @@ int main(int argc, char *argv[]) {
     if (flags < 0) return 1;
     int pipe_fd = open(argv[1], O_WRONLY | O_NONBLOCK);
     if (pipe_fd < 0) return 1;
+    int ack_fd = -1;
+    if (argc == 5 && *argv[2]) {
+        ack_fd = open(argv[2], O_RDONLY | O_NONBLOCK);
+        if (ack_fd < 0) { close(pipe_fd); return 1; }
+    }
     signal(SIGPIPE, SIG_IGN);
     raw = saved;
     raw.c_lflag &= ~ICANON;
+    /* Recovered text is rendered by the next editor/submission. Echoing the
+     * queued suffix here duplicates it, and ECHOCTL can turn LF into ^J while
+     * canonical mode is temporarily disabled. Standalone forwarding retains
+     * its legacy echo behavior. */
+    if (ack_fd >= 0) raw.c_lflag &= ~(ECHO | ECHONL);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     int result = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) { close(pipe_fd); return 1; }
+    catch_forward_signal(SIGINT);
+    catch_forward_signal(SIGTERM);
+    catch_forward_signal(SIGHUP);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+        if (ack_fd >= 0) close(ack_fd);
+        close(pipe_fd); return 1;
+    }
     if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) { result = 1; goto cleanup; }
     unsigned char buf[4096];
+    char ack_line[32];
+    size_t ack_used = 0;
+    int acknowledged = ack_fd < 0;
     for (;;) {
+        if (interrupted) break;
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
         if (n > 0) {
             if (write_all(pipe_fd, buf, (size_t)n) < 0) { result = 1; break; }
         } else if (n < 0 && errno == EINTR) {
             continue;
         } else {
-            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) result = 1;
-            break;
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { result = 1; break; }
+            if (acknowledged) break;
+            int ack = acknowledge(ack_fd, argv[3], ack_line, &ack_used);
+            if (ack < 0) { result = 1; break; }
+            if (ack) {
+                acknowledged = 1;
+                /* Drain once more after the producer has finished its writes. */
+                continue;
+            }
+            struct pollfd ready[2] = {
+                { .fd = STDIN_FILENO, .events = POLLIN },
+                { .fd = ack_fd, .events = POLLIN }
+            };
+            int count;
+            do { count = poll(ready, 2, 5000); } while (count < 0 && errno == EINTR && !interrupted);
+            if (count <= 0 || (ready[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+                (ready[1].revents & (POLLERR | POLLHUP | POLLNVAL))) { result = 1; break; }
         }
     }
 cleanup:
-    tcsetattr(STDIN_FILENO, TCSANOW, &saved);
-    fcntl(STDIN_FILENO, F_SETFL, flags);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &saved) != 0) result = 1;
+    if (fcntl(STDIN_FILENO, F_SETFL, flags) != 0) result = 1;
     close(pipe_fd);
+    if (ack_fd >= 0) {
+        close(ack_fd);
+        if (!interrupted && input_result(argv[4], argv[3], result)) result = 1;
+    }
+    /* Keep the original signal outcome after restoring shared terminal state. */
+    if (interrupted) { signal(interrupted, SIG_DFL); raise(interrupted); }
     return result;
 }
 """)
@@ -223,7 +310,12 @@ for _token, _value in {
 
 
 def install_scripts(
-    *, directory=None, signals=None, forward_path=None, adapter=None
+    *,
+    directory=None,
+    signals=None,
+    forward_path=None,
+    adapter=None,
+    input_ack_path=None,
 ) -> Path:
     """Write integration scripts with session identifiers and forwarding paths.
 
@@ -238,6 +330,7 @@ def install_scripts(
         signals=signals or SessionSignals(),
         forward_path=forward_path or Path(ISH_FORWARD),
         adapter=adapter,
+        input_ack_path=input_ack_path,
     ).items():
         script_path = ish_xdg_home / name
         with open(script_path, "w", encoding="utf-8", newline="\n") as file:

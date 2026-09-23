@@ -20,7 +20,7 @@ import traceback
 from multiprocessing.reduction import recv_handle, send_handle
 from typing import Any, Callable
 
-from ish.runtime.fdio import FDWriter
+from ish.runtime.fdio import FDWriter, InputBytes
 from ish.runtime.observer import InputObserver
 
 __all__ = ["ProcessHandler"]
@@ -84,6 +84,7 @@ class ProcessHandler:
         take_input: Callable[[], bytes] | None = None,
         return_input: Callable[[bytes], None] | None = None,
         observe_output: Callable[[bytes], None] | None = None,
+        return_native_input: Callable[[bytes], None] | None = None,
     ):
         """Store I/O descriptors and a lazy getter for the shell's current PTY.
 
@@ -97,6 +98,7 @@ class ProcessHandler:
         self.input_observer = input_observer or InputObserver()
         self.take_input = take_input
         self.return_input = return_input
+        self.return_native_input = return_native_input
         self.observe_output = observe_output
         self._master_fds: set[int] = set()
 
@@ -193,6 +195,7 @@ class ProcessHandler:
                 termios.tcsetwinsize(master_fd, self._terminal_size())
                 os.set_blocking(master_fd, False)
                 input_writer = FDWriter(loop, master_fd, fail)
+                input_total = native_prefix = 0
                 output_writer = FDWriter(loop, self.stdout_fd, fail)
                 resources.callback(input_writer.close)
                 resources.callback(output_writer.close)
@@ -230,7 +233,19 @@ class ProcessHandler:
                         self.input_observer.terminal("TOOL", master_fd, "worker_exit")
                         if self.return_input is not None:
                             remaining = self._remaining_input(slave_fd)
-                            self.return_input(remaining + unsent)
+                            if self.return_native_input is None:
+                                self.return_input(remaining + unsent)
+                            else:
+                                # Pending writer bytes are an exact suffix of
+                                # the offered stream, unlike PTY-returned text.
+                                written = input_total - len(unsent)
+                                native_unsent = min(
+                                    len(unsent), max(0, native_prefix - written)
+                                )
+                                self.return_native_input(
+                                    remaining + unsent[:native_unsent]
+                                )
+                                self.return_input(unsent[native_unsent:])
                     except Exception as exc:
                         fail(exc)
                     finally:
@@ -266,7 +281,7 @@ class ProcessHandler:
 
                 def on_input():
                     """Forward user input to the worker PTY and translate EOF to EOT."""
-                    nonlocal input_observation
+                    nonlocal input_observation, input_total
                     if input_writer.closed:
                         return
                     try:
@@ -278,6 +293,7 @@ class ProcessHandler:
                             input_observation = None
                             data = b"\x04"
                         input_writer.write(data)
+                        input_total += len(data)
                     except (BlockingIOError, InterruptedError):
                         pass
                     except Exception as exc:
@@ -335,7 +351,13 @@ class ProcessHandler:
                 if self.take_input is not None:
                     initial = self.take_input()
                     if initial:
+                        native_prefix = (
+                            initial.native_prefix
+                            if isinstance(initial, InputBytes)
+                            else 0
+                        )
                         input_writer.write(initial)
+                        input_total += len(initial)
                         self.input_observer.record(
                             "initial_input", "TOOL", bytes=len(initial)
                         )

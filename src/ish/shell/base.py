@@ -34,6 +34,9 @@ from ish.runtime.observer import InputObserver
 from .adapters import get_adapter
 from .constants import (
     FORWARD_BINARY,
+    INPUT_ACK_FIFO,
+    INPUT_DONE,
+    INPUT_ERROR,
     PROMPT_ID,
     PROMPT_ID_LIMIT,
     PROMPT_ID_MAX_DIGITS,
@@ -44,6 +47,7 @@ from .constants import (
 )
 from .guard import spawn_environment
 from .input import (
+    InputHandoffMode,
     InputModeLease,
     InputRejected,
     SubmittedInput,
@@ -283,6 +287,10 @@ class InteractiveShell:
         "signal_controller",
         "_submitted_input",
         "_literal_input",
+        "_returned_input",
+        "_input_return_id",
+        "_handoff_task",
+        "input_ack_pipe",
     )
 
     # =============================================
@@ -322,6 +330,7 @@ class InteractiveShell:
         self.shell_pipe: Optional[int] = None
         self.tty_pipe_path: Optional[str] = None
         self.tty_pipe: Optional[int] = None
+        self.input_ack_pipe: Optional[int] = None
 
         if os.path.sep in shell:
             self.shell_path = os.path.abspath(shell)
@@ -355,6 +364,9 @@ class InteractiveShell:
         self._send_generation = 0
         self._submitted_input = SubmittedInput()
         self._literal_input = bytearray()
+        self._returned_input = bytearray()
+        self._input_return_id = 0
+        self._handoff_task = None
         self.terminal_state = TerminalState()
         self._stopping = False
         self._input_mode_lease = None
@@ -498,16 +510,18 @@ class InteractiveShell:
                 self._submitted_input.append(chunk)
                 self.input_observer.record("submission_returned", bytes=len(chunk))
                 return True
-            if len(self.dupin_buffer) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
+            if len(self._returned_input) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
                 self._io_failed(
                     BufferError(
                         f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
                     )
                 )
                 return
-            self.dupin_buffer.extend(chunk)
+            self._returned_input.extend(chunk)
             self.input_observer.record(
-                "typeahead_received", bytes=len(chunk), pending=len(self.dupin_buffer)
+                "typeahead_received",
+                bytes=len(chunk),
+                pending=len(self._returned_input),
             )
             return True
         except BufferError as exc:
@@ -581,6 +595,7 @@ class InteractiveShell:
         discard_submitted = self._handoff_pending and self._submitted_input.active
         self._deferred_input.clear()
         self.dupin_buffer.clear()
+        self._returned_input.clear()
         self._submitted_input.clear()
         self._literal_input.clear()
         # A helper may already have written cancelled bytes to the FIFO before
@@ -600,7 +615,8 @@ class InteractiveShell:
 
     def _resume_native_typeahead(self) -> None:
         """Return held keys to a native command that won a continuation cancel race."""
-        data = bytes(self.dupin_buffer)
+        data = bytes(self._returned_input) + bytes(self.dupin_buffer)
+        self._returned_input.clear()
         self.dupin_buffer.clear()
         if data and not (self._closing_output or self._stopping or self._has_exited()):
             self._write(self.master_fd, data)
@@ -623,6 +639,7 @@ class InteractiveShell:
         self._deferred_input.clear()
         self.dupin_buffer.clear()
         self._submitted_input.clear()
+        self._returned_input.clear()
         self._literal_input.clear()
         self._accepted_prompt_id = self._prompt_id
         self._pending_prompt_id = 0
@@ -633,7 +650,7 @@ class InteractiveShell:
         if self.sequencer is not None:
             self.sequencer.at_masking(b"")
         self._write(self.master_fd, control)
-        if self.adapter.refresh:
+        if self.adapter.input_handoff is InputHandoffMode.NATIVE:
             # This adapter has no automatic prompt acknowledgement. Its old
             # FIFO is idle until explicit reconnect, so discard it now and keep
             # following user bytes with native input, including recovery.
@@ -840,14 +857,69 @@ class InteractiveShell:
                         and body.isdigit()
                         and int(body) < PROMPT_ID_LIMIT
                     ):
+                        previous_context = self._context_id
                         self._context_id = max(self._context_id, int(body))
                         if self._context_id > self._accepted_prompt_id:
                             self._handoff_pending = True
+                            if (
+                                self.input_ack_pipe is not None
+                                and self._context_id > previous_context
+                            ):
+                                if self._handoff_task is not None:
+                                    self._handoff_task.cancel()
+                                self._handoff_task = self.loop.create_task(
+                                    self._acknowledge_input(self._context_id)
+                                )
+                        self._context_event.set()
+                elif category in (INPUT_DONE, INPUT_ERROR):
+                    if (
+                        not body
+                        or len(body) > PROMPT_ID_MAX_DIGITS
+                        or not body.isdigit()
+                    ):
+                        raise RuntimeError("Invalid input-return acknowledgement")
+                    value = int(body)
+                    if not 0 < value < PROMPT_ID_LIMIT:
+                        raise RuntimeError("Invalid input-return acknowledgement")
+                    if category == INPUT_ERROR and value >= self._context_id:
+                        raise RuntimeError("Shell input recovery failed")
+                    if category == INPUT_DONE:
+                        self._input_return_id = max(self._input_return_id, value)
                         self._context_event.set()
                 else:
                     self.session.update_context(category, body)
         except (BlockingIOError, InterruptedError):
             return
+        except Exception as exc:
+            self._io_failed(exc)
+
+    async def _acknowledge_input(self, prompt_id: int) -> None:
+        """Let the forwarder finish only after all earlier PTY writes have drained.
+
+        New keyboard bytes stay deferred once the context frame starts the
+        handoff. The helper keeps draining native input while the old writer
+        finishes, avoiding a deadlock on a full PTY or typeahead FIFO.
+        """
+        try:
+            async with asyncio.timeout(self.context_timeout):
+                sender = self._send_task
+                if sender is not None and not sender.done():
+                    try:
+                        await asyncio.shield(sender)
+                    except asyncio.CancelledError:
+                        if asyncio.current_task().cancelling():
+                            raise
+                writer = self._writers.get(self.master_fd)
+                if writer is not None:
+                    await writer.drain()
+                if (
+                    self._closing_output
+                    or self._has_exited()
+                    or prompt_id != self._context_id
+                ):
+                    return
+                self._write(self.input_ack_pipe, f"{prompt_id}\n".encode("ascii"))
+                self.input_observer.record("input_return_ack", prompt_id=prompt_id)
         except Exception as exc:
             self._io_failed(exc)
 
@@ -892,7 +964,7 @@ class InteractiveShell:
         policy.
         """
         self.continuation_active.set()
-        if not self.adapter.refresh:
+        if self.adapter.input_handoff is InputHandoffMode.PROMPT_ACK:
             # Bytes returned after native continuation input already passed
             # through the PTY. Resume complete lines as a block and restore an
             # unfinished tail literally, just like an initial multiline paste.
@@ -912,11 +984,21 @@ class InteractiveShell:
 
     async def _wait_context(self) -> None:
         """Wait within a deadline for the state FIFO to reach the current prompt ID."""
-        while self._context_id != (self._pending_prompt_id or self._prompt_id):
+        while self._context_id != (self._pending_prompt_id or self._prompt_id) or (
+            self.input_ack_pipe is not None
+            and self._input_return_id != self._context_id
+        ):
             self._context_event.clear()
             try:
                 await asyncio.wait_for(self._context_event.wait(), self.context_timeout)
             except TimeoutError:
+                if (
+                    self.input_ack_pipe is not None
+                    and self._input_return_id != self._context_id
+                ):
+                    raise RuntimeError(
+                        "Shell input recovery was not acknowledged"
+                    ) from None
                 raise RuntimeError(
                     "Shell context was not received after a confirmed prompt"
                 ) from None
@@ -927,6 +1009,14 @@ class InteractiveShell:
             return
         if not self._accepted_prompt_id < self._pending_prompt_id == self._context_id:
             raise RuntimeError("Cannot accept an unconfirmed shell prompt")
+        if (
+            self.input_ack_pipe is not None
+            and self._input_return_id != self._pending_prompt_id
+        ):
+            raise RuntimeError("Cannot accept a prompt before input recovery completes")
+        writer = self._writers.get(self.master_fd)
+        if writer is not None and writer.pending_bytes:
+            raise RuntimeError("Cannot accept a prompt with pending PTY writes")
         self.signal_controller.reset()
         if self.loop is not None and self.dupin_fd is not None:
             self.loop.remove_reader(self.dupin_fd)
@@ -1074,7 +1164,9 @@ class InteractiveShell:
         """
         if isinstance(data, str):
             data = data.encode(self.encoder)
-        self._submitted_input.begin(data, enabled=not self.adapter.refresh)
+        self._submitted_input.begin(
+            data, enabled=self.adapter.input_handoff is InputHandoffMode.PROMPT_ACK
+        )
         try:
             while True:
                 await self._exec_once(data)
@@ -1112,14 +1204,23 @@ class InteractiveShell:
         self._deferred_input.clear()
         self._send_generation += 1
         self._input_epoch += 1
+        # Older native typeahead can include the next program's stdin. Offer
+        # it to the native consumer; the next primary boundary returns any
+        # unused suffix for normal editor/tool dispatch.
+        native_pending = bytes(self._returned_input)
+        self._returned_input.clear()
         if hasattr(self.session, "take_typeahead"):
-            if self.adapter.refresh:
+            if self.adapter.input_handoff is InputHandoffMode.NATIVE:
                 data += self.session.take_typeahead()
             elif self._submitted_input.active:
                 # Keys already retained by the editor or an earlier handoff
                 # precede future native reads, but follow the submitted block.
                 # Keep them separate from command echo and transport validation.
                 self._deferred_input.extend(self.session.take_typeahead())
+        # Returned text was already displayed during its first PTY delivery.
+        # Keep its retransmission in the same ordered sender and echo mask as
+        # the command, without changing the command's dispatch/hook identity.
+        data += native_pending
         try:
             # The PTY echoes every newline as CRLF, including pasted lines.
             attrs = termios.tcgetattr(self.master_fd)
@@ -1147,6 +1248,7 @@ class InteractiveShell:
                 self.command_start_event.clear()
                 self.command_done_event.set()
                 self.prompt_event.set()
+                self._returned_input.extend(native_pending)
                 self.return_typeahead(bytes(self._deferred_input))
                 raise
             except asyncio.CancelledError:
@@ -1189,6 +1291,26 @@ class InteractiveShell:
             if self._literal_input:
                 self.session.feed_literal_input(bytes(self._literal_input))
                 self._literal_input.clear()
+            while self._returned_input:
+                end = self._returned_input.find(b"\n")
+                size = len(self._returned_input) if end < 0 else end + 1
+                data = bytes(self._returned_input[:size])
+                del self._returned_input[:size]
+                self.session.feed_literal_input(data if end < 0 else data[:-1])
+                if end < 0:
+                    break
+                # Text has already passed through the native terminal. Only
+                # its accepted Enter goes through normal command/tool dispatch.
+                self.session.feed_typeahead(b"\r")
+                self.session.app.key_processor.process_keys()
+                if self.session.app.is_done:
+                    return
+            typehead = b""
+            if self.dupin_buffer:
+                idx = self.dupin_buffer.find(b"\n")
+                size = len(self.dupin_buffer) if idx < 0 else idx + 1
+                typehead = bytes(self.dupin_buffer[:size])
+                del self.dupin_buffer[:size]
             if typehead:
                 self.input_observer.record(
                     "typeahead_injected", "EDITOR", bytes=len(typehead)
@@ -1207,21 +1329,10 @@ class InteractiveShell:
         while True:
             if self._has_exited():
                 return
-            typehead = b""
             if self.shell_temp_buffer:
                 del self.shell_temp_buffer[:]
             while self._pre_input(self.tty_pipe):
                 pass
-            if self.dupin_buffer:
-                idx = self.dupin_buffer.find(b"\n")
-                if idx != -1:
-                    typehead_bytes = self.dupin_buffer[: idx + 1]
-                    typehead = bytes(typehead_bytes)
-                    del self.dupin_buffer[: idx + 1]
-                else:
-                    typehead = bytes(self.dupin_buffer)
-                    self.dupin_buffer.clear()
-
             try:
                 self._write(self.stdout_fd, b"\x1b[2K\r")
                 await self._drain_output()
@@ -1239,6 +1350,7 @@ class InteractiveShell:
                     continue
             except KeyboardInterrupt:
                 self.dupin_buffer.clear()
+                self._returned_input.clear()
                 self._literal_input.clear()
                 if self.continuation_active.is_set():
                     await self._exec(bytes(self.exec_attrs[6][termios.VINTR]))
@@ -1320,6 +1432,10 @@ class InteractiveShell:
             self.loop.remove_reader(self.dupin_fd)
         for task in self.tasks or []:
             task.cancel()
+        if self._handoff_task is not None:
+            self._handoff_task.cancel()
+            await asyncio.gather(self._handoff_task, return_exceptions=True)
+            self._handoff_task = None
         await asyncio.gather(*(self.tasks or []), return_exceptions=True)
         try:
             await self.signal_controller.stop_child()
@@ -1408,9 +1524,11 @@ class InteractiveShell:
 
                 self.shell_pipe_path = os.path.join(pipe_dir, SHELL_FIFO)
                 self.tty_pipe_path = os.path.join(pipe_dir, TTY_FIFO)
+                input_ack_path = os.path.join(pipe_dir, INPUT_ACK_FIFO)
                 for path, name in [
                     (self.shell_pipe_path, "shell_pipe"),
                     (self.tty_pipe_path, "tty_pipe"),
+                    (input_ack_path, "input_ack_pipe"),
                 ]:
                     os.mkfifo(path, 0o600)
                     setattr(self, name, os.open(path, os.O_RDWR | os.O_NONBLOCK))
@@ -1421,6 +1539,7 @@ class InteractiveShell:
                     signals=self.signals,
                     forward_path=runtime / FORWARD_BINARY,
                     adapter=self.adapter,
+                    input_ack_path=input_ack_path,
                 )
                 self.shell_integration = str(self.xdg_home / self.adapter.script)
                 self.init_command = self.adapter.source(
@@ -1538,6 +1657,12 @@ class InteractiveShell:
             self.input_observer.record(
                 "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
             )
+
+    def return_native_input(self, data: bytes) -> None:
+        """Retain worker-returned text without applying editor key bindings again."""
+        if len(self._returned_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+            raise BufferError("Returned native input exceeds the pending input limit")
+        self._returned_input.extend(data)
 
     def validate_submission(self, data: bytes) -> int:
         """Validate editor input without changing terminal settings or writing bytes."""

@@ -91,6 +91,7 @@ from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
 from ish.parser.shell import alias_parser, dict_parser, simple_command, str_parser
+from ish.runtime.fdio import InputBytes
 from ish.runtime.observer import InputObserver
 from ish.shell.adapters import get_adapter
 from ish.shell.base import InteractiveShell
@@ -243,6 +244,7 @@ class Prompt(PromptSession):
             input_observer=self.input_observer,
             take_input=self.take_typeahead,
             return_input=self.interactive_shell.return_typeahead,
+            return_native_input=self.interactive_shell.return_native_input,
             observe_output=self.interactive_shell.terminal_state.feed,
         )
         self.interactive_shell.resize_callback = self.process_handler.resize
@@ -1128,8 +1130,11 @@ class Prompt(PromptSession):
         """
         shell = self.interactive_shell
         pending = shell.dupin_buffer
-        data = bytes(shell._literal_input) + bytes(pending)
+        data = bytes(shell._literal_input) + bytes(shell._returned_input)
+        native_prefix = len(data)
+        data += bytes(pending)
         shell._literal_input.clear()
+        shell._returned_input.clear()
         pending.clear()
         keys = get_typeahead(self.input)
         keys.extend(self.input.flush_keys())
@@ -1148,7 +1153,7 @@ class Prompt(PromptSession):
             data += partial
             decoder.setstate((b"", state))
         self.input_observer.record("editor_input_transferred", bytes=len(data))
-        return data
+        return InputBytes(data, native_prefix)
 
     def feed_typeahead(self, data: bytes) -> None:
         """Feed returned bytes through the editor's existing decoder and VT100 parser.

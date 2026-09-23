@@ -20,6 +20,19 @@ from .limits import TYPEAHEAD_LIMIT_BYTES
 CANONICAL_LINE_BYTES = 4095
 
 
+class InputHandoffMode(Enum):
+    """Select input transfer independently of state-refresh script availability.
+
+    PROMPT_ACK preserves returned submissions and holds new keys until the
+    primary prompt and its context acknowledge the handoff. NATIVE keeps
+    following input with the shell until an explicit reconnect. Neither mode
+    changes which editor handles continuation input.
+    """
+
+    PROMPT_ACK = "prompt_ack"
+    NATIVE = "native"
+
+
 class LongInputMode(Enum):
     """Select an adapter's verified transport for an oversized physical line."""
 

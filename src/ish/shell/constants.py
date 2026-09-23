@@ -11,6 +11,8 @@ ENVIRON: Final = "environ"
 ALIAS: Final = "alias"
 EXITCODE: Final = "exitcode"
 PROMPT_ID: Final = "prompt_id"
+INPUT_DONE: Final = "input_done"
+INPUT_ERROR: Final = "input_error"
 PROMPT_ID_LIMIT: Final = 2**63
 PROMPT_ID_MAX_DIGITS: Final = len(str(PROMPT_ID_LIMIT - 1))
 PWD: Final = "PWD"
@@ -52,6 +54,7 @@ BUNDLED_FORWARD_DIRECTORY: Final = "libexec"
 FORWARD_SOURCE: Final = "ish_forward.c"
 SHELL_FIFO: Final = "shell.fifo"
 TTY_FIFO: Final = "tty.fifo"
+INPUT_ACK_FIFO: Final = "input-ack.fifo"
 # Linux since 4.13; Python's termios module does not expose this on every build.
 TIOCGPTPEER: Final = 0x5441
 

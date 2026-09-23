@@ -34,7 +34,7 @@ from .guard import (
     NativeLibrary,
     PreloadPolicy,
 )
-from .input import LongInputMode
+from .input import InputHandoffMode, LongInputMode
 from .signals import SignalPolicy, TerminalSignal, ZshInterrupt
 
 # Build and activation choices live here. Native implementations stay in guard.py.
@@ -204,6 +204,7 @@ class ShellAdapter:
     long_input: LongInputMode = LongInputMode.REJECT
     signal_policy: SignalPolicy = SignalPolicy()
     builtins_args: tuple[str, ...] = ("-c",)
+    input_handoff: InputHandoffMode = InputHandoffMode.PROMPT_ACK
 
     @property
     def syntax(self) -> ShellSyntax:
@@ -212,7 +213,7 @@ class ShellAdapter:
 
     @property
     def refresh(self) -> bool:
-        """Report whether state refresh requires an explicit user reconnect."""
+        """Report whether a separate state-refresh script is configured."""
         return self.refresh_script is not None
 
     def preload_check(self) -> str:
@@ -375,6 +376,7 @@ ADAPTERS = {
         source_args=INTEGRATION_ARGUMENTS,
         refresh_script=CSH_UPDATE_SCRIPT,
         capture_refresh_status=True,
+        input_handoff=InputHandoffMode.NATIVE,
         long_input=LongInputMode.STAGED_FIRST_LINE,
         builtins=tuple(
             "alias bg break breaksw case cd chdir continue default dirs echo else end endif endsw "

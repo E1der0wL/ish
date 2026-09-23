@@ -9,6 +9,23 @@ from collections import deque
 from typing import Callable
 
 
+class InputBytes(bytes):
+    """Carry a native-text prefix through a worker without changing its byte API.
+
+    The prefix has already passed through a previous PTY. If a worker exits
+    before writing all of it, that unsent part must retain its text provenance.
+    Bytes after the prefix are fresh key input.
+    """
+
+    def __new__(cls, data: bytes, native_prefix: int = 0):
+        """Validate the prefix against the immutable payload."""
+        if not 0 <= native_prefix <= len(data):
+            raise ValueError("Native prefix is outside the input payload")
+        value = super().__new__(cls, data)
+        value.native_prefix = native_prefix
+        return value
+
+
 class FDWriter:
     """Queue partial writes and resume on readiness without blocking the loop.
 
