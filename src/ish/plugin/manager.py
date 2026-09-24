@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion
 
 from ish.config import config
@@ -121,8 +122,10 @@ class PluginManager:
 
         self.logger = get_logger()
 
-    def _parse_requirement(self, req: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """Separate the distribution name, version constraint, and optional |import_name."""
+    def _parse_plugin_requirement(
+        self, req: str
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """Parse ish plugin names separately from Python distribution requirements."""
         sep = self.SEP
         lib_name = None
         if sep in req:
@@ -185,20 +188,63 @@ class PluginManager:
             )
             return False
 
-    def _library_available(self, library: str, *, import_parents: bool = True) -> bool:
+    def _extras_available(self, requirement: Requirement, seen=None) -> bool:
+        """Check installed metadata for an extras dependency tree without importing it.
+
+        Only extras requests traverse dependency metadata. The visited set is
+        local to this check, so cycles terminate without caching stale installs.
+        """
+        seen = set() if seen is None else seen
+        key = (canonicalize_name(requirement.name), frozenset(requirement.extras))
+        try:
+            distribution = importlib.metadata.distribution(requirement.name)
+        except PackageNotFoundError:
+            return False
+        if not self._ensure_version(distribution.version, str(requirement.specifier)):
+            return False
+        if key in seen:
+            return True
+        seen.add(key)
+        extras = {"", *requirement.extras}
+        for value in distribution.requires or ():
+            child = Requirement(value)
+            if child.marker is not None and not any(
+                child.marker.evaluate({"extra": extra}) for extra in extras
+            ):
+                continue
+            if not self._extras_available(child, seen):
+                return False
+        return True
+
+    def _library_available(
+        self, library: str, *, import_parents: bool = True, installed: bool = False
+    ) -> bool:
         """Check metadata and imports, distinguishing missing parents from broken imports."""
-        library_name, library_version, library_origin = self._parse_requirement(library)
-        if has_duplicate_metadata(library_name, config.PLUGIN_LIB_DIR):
+        specification, _, origin = library.partition(self.SEP)
+        requirement = Requirement(specification.strip())
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            return True
+        # A name/import alone cannot prove a direct URL's origin. Let pip resolve
+        # it once per session, then retain the existing successful-install record.
+        if (
+            requirement.url
+            and not installed
+            and specification not in self._installed_libs
+        ):
+            return False
+        if has_duplicate_metadata(requirement.name, config.PLUGIN_LIB_DIR):
             return False
         # Check the version before find_spec can import a dotted name's parent.
-        if library_version is not None:
+        if requirement.specifier:
             try:
-                version = importlib.metadata.version(library_name)
+                version = importlib.metadata.version(requirement.name)
             except PackageNotFoundError:
                 return False
-            if not self._ensure_version(version, library_version):
+            if not self._ensure_version(version, str(requirement.specifier)):
                 return False
-        name = library_origin or library_name
+        if requirement.extras and not self._extras_available(requirement):
+            return False
+        name = origin.strip() or requirement.name
         if not import_parents:
             return has_import(name)
         try:
@@ -211,7 +257,11 @@ class PluginManager:
 
     def _ensure_library(self, library: str) -> bool:
         """Use an available dependency or install and validate it before loading a plugin."""
-        return self._library_available(library) or self._load_library(library)
+        try:
+            return self._library_available(library) or self._load_library(library)
+        except InvalidRequirement as exc:
+            self.logger.warning("Invalid Python requirement %r: %s", library, exc)
+            return False
 
     def _dependency_constraints(self) -> list[str]:
         """Preserve requirements declared by plugins already registered in this session."""
@@ -232,7 +282,7 @@ class PluginManager:
 
     def _ensure_plugin(self, plugin: str) -> bool:
         """Check an already loaded plugin or recursively load a required plugin."""
-        plugin_name, plugin_version, _ = self._parse_requirement(plugin)
+        plugin_name, plugin_version, _ = self._parse_plugin_requirement(plugin)
         if self.registry.has(plugin_name):
             if plugin_version is None:
                 return True
@@ -271,7 +321,9 @@ class PluginManager:
                 config.PLUGIN_LIB_DIR,
                 self._dependency_constraints(),
             ):
-                if not self._library_available(library, import_parents=False):
+                if not self._library_available(
+                    library, import_parents=False, installed=True
+                ):
                     raise RuntimeError(
                         "Installed dependency does not provide the requested import and version"
                     )

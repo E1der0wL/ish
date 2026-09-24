@@ -85,7 +85,9 @@ class ArgumentParser:
         parser = AltArgumentParser(
             prog="ish",
             description=self._description,
-            epilog=i18n.get("cli_shell_support"),
+            epilog="\n".join(
+                (i18n.get("cli_shell_support"), i18n.get("cli_zsh_module_help"))
+            ),
             formatter_class=Formatter,
             add_help=False,
             allow_abbrev=False,

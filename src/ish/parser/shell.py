@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import shlex
 from typing import Dict, Optional
 
-from ish.shell.adapters import get_adapter
+from ish.shell.adapter import get_adapter
+
+from .command import literal_argv
 
 __all__ = ["str_parser", "dict_parser", "alias_parser", "simple_command"]
 
@@ -40,25 +41,5 @@ def alias_parser(raw_data: bytes, encoder: str, shell: str = "bash") -> Dict[str
 
 
 def simple_command(text: str) -> Optional[list[str]]:
-    """Parse literal argv. Expansion, redirection and compound syntax stay in the shell."""
-    quote = None
-    escaped = False
-    for char in text:
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-        elif quote:
-            if char == quote:
-                quote = None
-            elif quote == '"' and char in "$`":
-                return None
-        elif char in "'\"":
-            quote = char
-        elif char in ";&|()<>\n$`*?[]{}~#":
-            return None
-    try:
-        return shlex.split(text, posix=True)
-    except ValueError:
-        return None
+    """Keep the legacy POSIX literal helper; dispatch uses the active adapter policy."""
+    return literal_argv(text)

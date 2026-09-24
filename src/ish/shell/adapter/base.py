@@ -7,7 +7,7 @@ import termios
 from dataclasses import dataclass
 from typing import Callable
 
-from .constants import (
+from ..constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
     BASH_INTEGRATION_SCRIPT,
@@ -26,7 +26,7 @@ from .constants import (
     ZSH_INTEGRATION_SCRIPT,
     SessionSignals,
 )
-from .guard import (
+from ..guard import (
     GUARD_ACTIVE,
     GUARD_CHECKED,
     SHELL_GUARD_SOURCE,
@@ -34,8 +34,16 @@ from .guard import (
     NativeLibrary,
     PreloadPolicy,
 )
-from .input import InputHandoffMode, LongInputMode
-from .signals import SignalPolicy, TerminalSignal, ZshInterrupt
+from ..input import InputHandoffMode, LongInputMode
+from ..signals import SignalPolicy, TerminalSignal
+from .handlers import ZshInterrupt
+from .parsing import (
+    BASH_PARSING,
+    CSH_PARSING,
+    POSIX_PARSING,
+    ZSH_PARSING,
+    ParsingPolicy,
+)
 
 # Build and activation choices live here. Native implementations stay in guard.py.
 NATIVE_LIBRARIES = {
@@ -65,6 +73,12 @@ if ("${checked}" != {token}) then
     set {checked} = {token}
 endif
 """
+
+
+def posix_quote(value: str) -> str:
+    """Quote a literal POSIX-style word, including zsh's leading equals expansion."""
+    quoted = shlex.quote(value)
+    return f"'{value}'" if value.startswith("=") and quoted == value else quoted
 
 
 def csh_quote(value: str) -> str:
@@ -127,7 +141,7 @@ class ShellSyntax:
 # claims (notably, zsh shares this POSIX-style quoting/assignment profile).
 SYNTAXES = {
     "posix": ShellSyntax(
-        shlex.quote,
+        posix_quote,
         "{name}={value}",
         "$?",
         ".",
@@ -188,6 +202,7 @@ class ShellAdapter:
     family: str
     args: tuple[str, ...]
     script: str
+    parsing: ParsingPolicy
     behavior: ShellBehavior = POSIX_BEHAVIOR
     source_command: str | None = None
     # None passes positional arguments; a tuple binds variables before source.
@@ -205,6 +220,8 @@ class ShellAdapter:
     signal_policy: SignalPolicy = SignalPolicy()
     builtins_args: tuple[str, ...] = ("-c",)
     input_handoff: InputHandoffMode = InputHandoffMode.PROMPT_ACK
+    # Trusted literals in the corresponding template's shell quoting context.
+    template_tokens: tuple[tuple[str, str], ...] = ()
 
     @property
     def syntax(self) -> ShellSyntax:
@@ -330,10 +347,12 @@ ADAPTERS = {
         "posix",
         ("--noediting", "-i"),
         BASH_INTEGRATION_SCRIPT,
+        parsing=BASH_PARSING,
         source_command="source",
         buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
         builtins_args=("--noprofile", "--norc", "-c"),
+        template_tokens=(("@BASH_DEFAULT_CONTINUATION@", "> "),),
         long_input=LongInputMode.STAGED_FIRST_LINE,
     ),
     "zsh": ShellAdapter(
@@ -341,11 +360,13 @@ ADAPTERS = {
         "posix",
         ("-i",),
         ZSH_INTEGRATION_SCRIPT,
+        parsing=ZSH_PARSING,
         source_command="source",
         buffered_continuation_suffix=BUFFERED_CONTINUATION_HINT,
         builtins_command='printf "%s\\n" ${(k)builtins}',
         # -f skips user rc files; zsh always reads its system zshenv.
         builtins_args=("-f", "-c"),
+        template_tokens=(("@ZSH_DEFAULT_CONTINUATION@", "%_> "),),
         # Releasing a cancelled no-ZLE line requires a matching SIGINT response.
         long_input=LongInputMode.STAGED_FIRST_LINE,
         signal_policy=SignalPolicy(
@@ -357,9 +378,11 @@ ADAPTERS = {
         "csh",
         ("-i",),
         TCSH_INTEGRATION_SCRIPT,
+        parsing=CSH_PARSING,
         behavior=CSH_BEHAVIOR,
         unhooked_prompt=(CARET_BEFORE_PROMPT, CARET_AFTER_PROMPT),
         native_continuation_signal=NATIVE_CONTINUATION,
+        template_tokens=(("@TCSH_DEFAULT_CONTINUATION@", "%R? "),),
         preload=PreloadPolicy(
             NATIVE_LIBRARIES["shell"], NativeFeature.SUPPRESS_TTY_READAHEAD
         ),
@@ -372,6 +395,7 @@ ADAPTERS = {
         "csh",
         ("-i",),
         CSH_INTEGRATION_SCRIPT,
+        parsing=CSH_PARSING,
         behavior=CSH_BEHAVIOR,
         source_args=INTEGRATION_ARGUMENTS,
         refresh_script=CSH_UPDATE_SCRIPT,
@@ -390,6 +414,7 @@ ADAPTERS = {
         "posix",
         ("-i",),
         POSIX_INTEGRATION_SCRIPT,
+        parsing=POSIX_PARSING,
         source_args=INTEGRATION_ARGUMENTS,
         # dash can execute a suffix after rejecting an earlier long fragment.
         long_input=LongInputMode.REJECT,

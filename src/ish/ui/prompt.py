@@ -14,6 +14,7 @@ import sys
 import termios
 import traceback
 from collections import Counter
+from contextlib import contextmanager
 from functools import partial
 from typing import (
     TYPE_CHECKING,
@@ -34,7 +35,13 @@ from prompt_toolkit.application import in_terminal
 from prompt_toolkit.application.current import get_app, set_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer, ValidationState
-from prompt_toolkit.completion import Completer, ThreadedCompleter, merge_completers
+from prompt_toolkit.completion import (
+    Completer,
+    ThreadedCompleter,
+    get_common_complete_suffix,
+    merge_completers,
+)
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import (
     Condition,
     has_arg,
@@ -43,7 +50,6 @@ from prompt_toolkit.filters import (
     is_true,
     renderer_height_is_known,
 )
-from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -90,10 +96,11 @@ from ish.app.pytool import ProcessHandler
 from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
-from ish.parser.shell import alias_parser, dict_parser, simple_command, str_parser
+from ish.parser.completion import CompletionWord
+from ish.parser.shell import alias_parser, dict_parser, str_parser
 from ish.runtime.fdio import InputBytes
 from ish.runtime.observer import InputObserver
-from ish.shell.adapters import get_adapter
+from ish.shell.adapter import get_adapter
 from ish.shell.base import InteractiveShell
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE, PWD
 from ish.shell.context import ShellContext
@@ -102,7 +109,12 @@ from ish.shell.request import ShellExitRequest, ShellPassRequest
 
 from .ansi import ShellANSI
 from .completer import PromptCompleter
-from .input import ObservedInput
+from .input import (
+    ObservedInput,
+    feed_literal_text,
+    feed_pending_keys,
+    take_pending_keys,
+)
 
 if TYPE_CHECKING:
     from argparse import Namespace
@@ -271,7 +283,8 @@ class Prompt(PromptSession):
             cwd=lambda: [self._cwd],
             ignore_case=True,
             match_middle=False,
-            quote=self.interactive_shell.adapter.syntax.quote,
+            quote=self.quote_argument,
+            context=self.completion_context,
         )
         self.exit_command: str = "ish_exit"
         self.internal_commands: Dict[
@@ -284,12 +297,13 @@ class Prompt(PromptSession):
         self.option = kwargs.pop("option", option)
         self.internal_tools: Dict[str, Callable[..., Any]] = {}
 
+        if "auto_suggest" not in kwargs:
+            kwargs["auto_suggest"] = AutoSuggestFromHistory()
         super().__init__(*args, **kwargs)
         self.app.input = ObservedInput(self.app.input, self.input_observer)
         self.multiline = True
         self.color_depth = ColorDepth.TRUE_COLOR
         self.key_bindings = self._create_key_binding()
-        self.auto_suggest = AutoSuggestFromHistory()
         self.lexer = PygmentsLexer(
             type(get_lexer_by_name(self.interactive_shell.adapter.syntax.lexer))
         )
@@ -587,13 +601,6 @@ class Prompt(PromptSession):
             else:
                 buffer.insert_text(key)
 
-        def get_common_prefix(completions):
-            """Compute the common prefix of completion display strings."""
-            if not completions:
-                return ""
-            texts = [str(c.display.__pt_formatted_text__()[0][1]) for c in completions]
-            return os.path.commonprefix(texts)
-
         kb = KeyBindings()
 
         @kb.add(Keys.Enter)
@@ -672,10 +679,9 @@ class Prompt(PromptSession):
                         buffer.cancel_completion()
                         self._usage_counter[completion.text.strip()] += 1
                     else:
-                        common_prefix = get_common_prefix(completions)
-                        current_word = buffer.document.get_word_before_cursor(WORD=True)
-                        current_text = current_word[current_word.rfind(os.sep) + 1 :]
-                        extra_text = common_prefix[len(current_text) :]
+                        extra_text = get_common_complete_suffix(
+                            complete_state.original_document, completions
+                        )
                         if extra_text:
                             buffer.insert_text(extra_text, move_cursor=True)
                         else:
@@ -756,6 +762,13 @@ class Prompt(PromptSession):
                 continue
         return all_cmd
 
+    def _tool_argv(self, command: str) -> list[str] | None:
+        """Resolve a registered tool only through the active shell's literal policy."""
+        if not self.internal_tools:
+            return None
+        argv = self.interactive_shell.adapter.parsing.tool_argv(command)
+        return argv if argv and argv[0] in self.internal_tools else None
+
     def _validate_editor_submission(self, command: str) -> None:
         """Apply shell transport limits without restricting directly dispatched tools."""
         try:
@@ -768,8 +781,7 @@ class Prompt(PromptSession):
             key = command.strip()
             if key == self.exit_command or key in self.internal_commands:
                 return
-            argv = simple_command(command) if self.internal_tools else None
-            if argv and argv[0] in self.internal_tools:
+            if self._tool_argv(command) is not None:
                 return
         self.interactive_shell.validate_submission(data)
 
@@ -979,6 +991,20 @@ class Prompt(PromptSession):
         self._update_layout()
         return new_float
 
+    def completion_context(self, document: Document) -> CompletionWord | None:
+        """Analyze a replaceable prefix for built-in or user completion providers.
+
+        This pure policy runs in the completion worker without querying the shell.
+        A dynamic context needs native interpretation; literal providers leave it alone.
+        """
+        return self.interactive_shell.adapter.parsing.completion(
+            document.text, document.cursor_position
+        )
+
+    def quote_argument(self, value: str) -> str:
+        """Encode a whole literal word; do not apply this inside existing quotes."""
+        return self.interactive_shell.adapter.syntax.quote(value)
+
     def set_completer(
         self, completer: Optional[Union[Completer, Iterable[Completer]]] = None
     ) -> None:
@@ -1099,8 +1125,8 @@ class Prompt(PromptSession):
             handler, args, kwargs = self.internal_commands[key]
             raise ShellPassRequest(handler, command, *args, **kwargs)
 
-        argv = simple_command(command)
-        if argv and argv[0] in self.internal_tools:
+        argv = self._tool_argv(command)
+        if argv is not None:
             self.last_tool_exitcode = None
             try:
                 cwd, environ = self.interactive_shell.tool_context()
@@ -1128,30 +1154,8 @@ class Prompt(PromptSession):
         receive those keys instead.
         Cursor-position replies are terminal protocol, not user input.
         """
-        shell = self.interactive_shell
-        pending = shell.dupin_buffer
-        data = bytes(shell._literal_input) + bytes(shell._returned_input)
-        native_prefix = len(data)
-        data += bytes(pending)
-        shell._literal_input.clear()
-        shell._returned_input.clear()
-        pending.clear()
-        keys = get_typeahead(self.input)
-        keys.extend(self.input.flush_keys())
-        data += "".join(key.data for key in keys if key.key != Keys.CPRResponse).encode(
-            self.encoder, errors="surrogateescape"
-        )
-        if isinstance(self.input, ObservedInput):
-            data += self.input.take_decoder_prefix()
-        source = getattr(self.input, "source", self.input)
-        reader = getattr(source, "stdin_reader", None)
-        if reader is not None:
-            # The pinned VT100 input keeps incomplete encoded characters in
-            # its incremental decoder, outside the public typeahead store.
-            decoder = reader._stdin_decoder
-            partial, state = decoder.getstate()
-            data += partial
-            decoder.setstate((b"", state))
+        data, native_prefix = self.interactive_shell.take_pending_input()
+        data += take_pending_keys(self.input, self.encoder)
         self.input_observer.record("editor_input_transferred", bytes=len(data))
         return InputBytes(data, native_prefix)
 
@@ -1161,21 +1165,9 @@ class Prompt(PromptSession):
         Sharing these objects keeps a UTF-8 character or escape sequence split
         across the handoff joined to its later bytes from the terminal.
         """
-        source = getattr(self.input, "source", self.input)
-        reader = getattr(source, "stdin_reader", None)
-        parser = getattr(source, "vt100_parser", None)
-        if reader is None or parser is None:
-            self.parser.feed(data.decode(self.encoder, errors="replace"))
-            self.parser.flush()
-            return
-        original_callback = parser.feed_key_callback
-        parser.feed_key_callback = self.app.key_processor.feed
-        try:
-            parser.feed(reader._stdin_decoder.decode(data))
-            if isinstance(self.input, ObservedInput):
-                self.input.hold_decoder_prefix(self.encoder)
-        finally:
-            parser.feed_key_callback = original_callback
+        feed_pending_keys(
+            self.input, data, self.encoder, self.parser, self.app.key_processor.feed
+        )
 
     def feed_literal_input(self, data: bytes) -> None:
         """Restore native text without applying editing bindings a second time.
@@ -1183,16 +1175,36 @@ class Prompt(PromptSession):
         Share the normal decoder so a split UTF-8 character can be completed by
         future terminal input, with CPR replies still excluded from that prefix.
         """
-        source = getattr(self.input, "source", self.input)
-        reader = getattr(source, "stdin_reader", None)
-        text = (
-            reader._stdin_decoder.decode(data)
-            if reader is not None
-            else data.decode(self.encoder, errors="replace")
+        feed_literal_text(
+            self.input, data, self.encoder, self.default_buffer.insert_text
         )
-        self.default_buffer.insert_text(text)
-        if isinstance(self.input, ObservedInput):
-            self.input.hold_decoder_prefix(self.encoder)
+
+    @property
+    def output_active(self) -> bool:
+        """Report whether shell output must suspend the editor's rendering."""
+        return self.app.is_running
+
+    def process_typeahead(self, *, invalidate: bool = False) -> bool:
+        """Apply queued keys and report acceptance before another line is replayed."""
+        self.app.key_processor.process_keys()
+        if invalidate:
+            self.app.invalidate()
+        return self.app.is_done
+
+    @contextmanager
+    def observe_resize(self, callback):
+        """Notify the shell before the editor's resize callback and restore on exit."""
+        previous = self.app._on_resize
+
+        def on_resize():
+            callback()
+            previous()
+
+        self.app._on_resize = on_resize
+        try:
+            yield
+        finally:
+            self.app._on_resize = previous
 
     def run(self) -> None:
         """Call the connected shell runner's synchronous entry point."""

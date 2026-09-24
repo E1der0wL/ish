@@ -17,7 +17,7 @@ selects the login shell by name.
 | Shell | Minimum supported version | Argument | Support notes |
 | --- | --- | --- | --- |
 | Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
-| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. Hiding queued continuation prompts requires `PROMPT_SUBST` and `zsh/zselect`. |
+| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. ish enables `PROMPT_SUBST` at startup and on `ish_recover`; hiding queued continuation prompts also requires `zsh/zselect`. |
 | tcsh | 6.21.00 | `tcsh` | Supports prompt hooks and return to the ish editor. |
 | BSD csh | Not specified | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
 | dash / sh | Not specified | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
@@ -25,19 +25,37 @@ selects the login shell by name.
 A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
 named `sh` are not automatically covered by dash support.
 
-To hide repeated zsh continuation prompts when pasting multiline commands,
-**`PROMPT_SUBST` must be enabled and the `zsh/zselect` module must be available**.
-In zsh, enable the option and check that the module can be loaded with:
+ish enforces the default continuation prompt for Bash (`> `), zsh (`%_> `,
+such as `for> `), and tcsh (`%R? `, such as `foreach? `). At each primary prompt,
+including after `ish_recover`, integration replaces custom `PS2` / `prompt2`
+values with these defaults and its control markers. Custom continuation colors,
+text, and command substitutions are not retained; a `read` inside a custom PS2
+therefore cannot consume submitted input during prompt expansion. Primary prompt
+customization remains available.
+
+ish enables **`PROMPT_SUBST` when starting zsh and when running `ish_recover`**.
+It automatically loads the `zsh/zselect` module when available to hide repeated
+continuation prompts during multiline paste. No `.zshrc` changes are needed.
+To load the module and enable its builtin inside the zsh selected for ish:
 
 ```zsh
-setopt PROMPT_SUBST
-zmodload zsh/zselect
+builtin zmodload -F zsh/zselect b:zselect
 ```
 
-Keep `setopt PROMPT_SUBST` in your `.zshrc` to enable it in future sessions.
-ish loads the module automatically when available, but does not enable
-`PROMPT_SUBST` itself. If either condition is unmet, commands still run with
-native continuation prompts, which can repeat during multiline paste.
+`PROMPT_SUBST` expands variables, commands, and arithmetic in both primary and
+continuation prompts. To display literal text such as `$(date +%H:%M)`, escape the
+dollar sign and double the percent signs:
+
+```zsh
+PS1='\$(date +%%H:%%M) > '
+```
+
+You can run `unsetopt PROMPT_SUBST` during the session to disable expansion;
+ordinary prompt updates preserve that choice. Running `ish_recover` re-enables
+the option and retries loading `zsh/zselect`. Recovery cannot provide a module
+that is not installed or supported by the selected zsh build. If the option is
+disabled or the module is unavailable, commands still run with native
+continuation prompts, which can repeat during multiline paste.
 
 These versions define the supported range. ish does not automatically query,
 compare, or enforce shell versions; select a supported version yourself. The same
@@ -48,6 +66,94 @@ by `postcmd` loop-handling defects.
 On hosts with older system shells, install a supported shell in a separate
 directory and select it explicitly, for example
 `ish "$HOME/opt/bash-5.3.9/bin/bash"`. The host's system shell can remain in place.
+
+### Installing zsh/zselect
+
+`zselect` is part of zsh's module system, not a separate command-line program or
+Python package. Install the zsh package and its matching modules. These commands
+are instructions to run yourself; ish does not install packages or require the
+module to start.
+
+**With repository access**
+
+RHEL 8 / AlmaLinux 8:
+
+```sh
+sudo dnf install zsh
+```
+
+Debian / Ubuntu:
+
+```sh
+sudo apt-get update
+sudo apt-get install zsh zsh-common
+```
+
+If zsh is already installed but packaged module files are missing, use
+`sudo dnf reinstall zsh` or
+`sudo apt-get install --reinstall zsh zsh-common`.
+These packages repair the distribution's zsh; a custom zsh executable needs
+modules from its own build. After installation, run the load/check command above
+inside the selected zsh. Exit status 0 means the feature was enabled. Run
+`ish_recover` to restore ish's prompt integration.
+
+**Offline installation on RHEL 8.10 / AlmaLinux 8.10**
+
+On a connected machine with the **same distribution, release, architecture, and
+compatible repository snapshot** as the target, prepare the packages:
+
+```sh
+sudo dnf install dnf-plugins-core
+mkdir -p zsh-offline
+dnf download --resolve --alldeps --downloaddir=./zsh-offline zsh
+```
+
+`--alldeps` includes dependencies already installed on the download machine.
+Use the target organization's RHEL repositories for RHEL targets; do not mix
+RPMs from another distribution. Transfer the complete `zsh-offline` directory
+through your approved file-transfer method. On the offline target:
+
+```sh
+sudo dnf --disablerepo='*' install ./zsh-offline/*.rpm
+```
+
+If the same zsh package version is already installed and needs repair, use:
+
+```sh
+sudo dnf --disablerepo='*' reinstall ./zsh-offline/zsh-*.rpm
+```
+
+Missing dependencies must also be transferred; the install command above cannot
+download them. An internal mirror or matching installation media can also supply
+the packages. See the [DNF download options](https://dnf-plugins-core.readthedocs.io/en/latest/download.html)
+and [local RPM installation reference](https://dnf.readthedocs.io/en/latest/command_ref.html#install-examples).
+
+**Offline source installation under your home directory**
+
+Download an official release archive from the [zsh website](https://www.zsh.org/)
+on a connected machine and transfer it to the target. The example uses zsh 5.9.
+The target needs GCC, Make, tar/xz, and ncurses development headers: typically
+`gcc make tar xz ncurses-devel` on RHEL, or
+`build-essential tar xz-utils libncurses-dev` on Debian/Ubuntu. Arrange these
+packages and their dependencies before building offline.
+
+Run from the directory containing the archive:
+
+```sh
+tar -xf zsh-5.9.tar.xz
+cd zsh-5.9
+./configure --prefix="$HOME/opt/zsh-5.9" --enable-dynamic
+make -C Src -j2
+make install.bin install.modules install.fns
+"$HOME/opt/zsh-5.9/bin/zsh" -f -c 'builtin zmodload -F zsh/zselect b:zselect'
+ish "$HOME/opt/zsh-5.9/bin/zsh"
+```
+
+Building `Src` avoids documentation-generation dependencies. Installing modules
+is essential; copying only the executable is insufficient for a dynamic build.
+Do not transplant a module from an unrelated zsh build. This procedure installs
+the new shell under your home and leaves the system shell in place. See the
+[official zsh installation guide](https://github.com/zsh-users/zsh/blob/zsh-5.9/INSTALL).
 
 ## Building with build.sh
 
@@ -200,13 +306,17 @@ do not construct the dictionary with function calls, variables, or imports.
 | `author` | The author's name or attribution as a string. Defaults to `""`. |
 | `module` | The loaded Python module, populated by the loader in `PluginInfo.module`. Omit it from `PLUGIN_META`: a supplied value does not select an entry point or replace the loaded module. Use `plugin.get(...)` to access the module. |
 | `requirements` | A list of other **ish plugin** names, optionally with version constraints, such as `["shared_tools>=1.0,<2"]`. These plugins must exist under the plugin source directory; this does not download them. Defaults to `[]`. |
-| `dependencies` | A list of **Python package** requirements, such as `["requests>=2.31,<3"]`. Missing or incompatible packages are installed with pip into `config.PLUGIN_LIB_DIR`. Defaults to `[]`. |
+| `dependencies` | A list of **Python package** requirements in PEP 508 format, such as `["requests[socks]>=2.31,<3; python_version >= '3.10'"]`. Inactive environment markers are skipped; requested extras are checked against installed dependency metadata. Missing or incompatible packages are installed with pip into `config.PLUGIN_LIB_DIR`. Defaults to `[]`. |
 
 For Python packages whose distribution and import names differ, use
 `"distribution>=version|import_name"`, for example `"PyYAML>=6|yaml"` in
 `dependencies`. This separates the name passed to pip from the module checked
 for import availability. Package installation requires access to the packages
 through the bundled interpreter's pip, as described in the build section.
+
+Dependency markers use ish's Python runtime environment. Extras checks run only
+when loading a plugin. Direct URL requirements (`name @ URL`) are resolved by pip
+once per session because an installed package name alone cannot confirm its source.
 
 Installations are staged before replacing package files. Failed installation or
 validation preserves the previous files, and upgrades remove obsolete files and
@@ -420,6 +530,89 @@ Each call replaces the previous additional completers; invalid sources raise
 A custom `Completer` subclass instance can also be supplied directly; its completion
 code should not mutate UI state from the worker thread.
 
+For shell-aware custom completion, `prompt.completion_context(document)` returns
+the current word's `start`, decoded `value`, `command` position flag, `dynamic`
+flag for expansion or unsupported syntax, and open `quote`. It returns `None`
+when replacing the prefix could damage text after the cursor. Literal providers
+should skip dynamic contexts.
+`prompt.quote_argument(value)` quotes one complete literal word for the selected
+shell. Use it when replacing the whole current word, not inside existing quotes:
+
+```python
+from prompt_toolkit.completion import Completer, Completion
+
+
+class ProjectCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        context = prompt.completion_context(document)
+        if context is None or context.dynamic or context.command:
+            return
+        for name in ("project alpha", "project beta"):
+            if name.startswith(context.value):
+                yield Completion(
+                    text=prompt.quote_argument(name),
+                    start_position=context.start - document.cursor_position,
+                    display=name,
+                )
+
+
+prompt.set_completer(ProjectCompleter())
+```
+
+Additional completers keep control of their own insertion text; ish does not
+re-quote or filter their results through its default parsing policy.
+Default completion and direct Python-tool arguments use the selected shell's
+literal syntax. They do not evaluate variables, command substitutions, or globs.
+Uncertain syntax remains with the shell, so a Python-only tool name is not
+automatically available in a pipeline or expansion. In particular, C shell quoted
+backslashes, zsh adjacent single quotes, and zsh double-quoted `\!` are left native
+because their behavior depends on untracked shell options. These helpers do not
+mirror arbitrary custom history characters, aliases, or all live shell options.
+
+### Auto suggestions
+
+History-based suggestions are the default. Assign an `AutoSuggest` instance to
+`prompt.auto_suggest` in `.ishrc.py` to replace them:
+
+```python
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
+
+
+class CommandSuggest(AutoSuggest):
+    def get_suggestion(self, buffer, document):
+        """Suggest only the missing suffix of a matching command."""
+        if not document.is_cursor_at_the_end:
+            return None
+        text = document.text
+        for command in ("git status", "git diff", "git log --oneline"):
+            if text and command.startswith(text) and command != text:
+                return Suggestion(command[len(text):])
+        return None
+
+
+prompt.auto_suggest = CommandSuggest()
+```
+
+Return only the text to append in `Suggestion`, or `None` for no suggestion.
+This controls the inline suggestion, independently of `set_completer()` and its
+completion menu. The assignment also takes effect after `ish_reload`.
+
+```python
+# Disable inline suggestions.
+prompt.auto_suggest = None
+
+# Restore history-based suggestions.
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+
+prompt.auto_suggest = AutoSuggestFromHistory()
+```
+
+Suggestion callbacks normally run on the UI event loop, so keep them quick.
+For blocking work, wrap a thread-safe provider with
+`ThreadedAutoSuggest(CommandSuggest())` from `prompt_toolkit.auto_suggest`, or
+implement `get_suggestion_async()` for asynchronous I/O. Worker callbacks should
+not modify the UI.
+
 ### Bottom toolbar, right prompt, and styles
 
 Assign `prompt.bottom_toolbar` to show a bottom toolbar and `prompt.rprompt` to
@@ -530,11 +723,12 @@ input handling used by ish.
   native editor widgets, and every aspect of shell prompt rendering are not
   reproduced. At this prompt, Ctrl+C cancels editing without changing shell status.
 - In zsh, queued continuation prompts are hidden when `PROMPT_SUBST` is enabled
-  and the `zsh/zselect` module is available. ish preserves the existing option;
-  otherwise, it displays native continuation prompts. The readiness check does
-  not consume input or change TTY settings. With noncanonical input (such as
-  `stty -icanon`), an incomplete queued line can hide a prompt that is still
-  waiting for more input.
+  and the `zsh/zselect` module is available. ish enables the option at startup
+  and on explicit `ish_recover`; ordinary prompt updates preserve user changes.
+  If either condition is unmet, ish displays native continuation prompts.
+  The readiness check does not consume input or change TTY settings.
+  With noncanonical input (such as `stty -icanon`), an incomplete queued line can
+  hide a prompt that is still waiting for more input.
 - If integration hooks are replaced or removed, confirm the shell is waiting for
   a command and enter `ish_recover`. BSD csh requires this explicit return after
   commands as described above.

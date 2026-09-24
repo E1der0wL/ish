@@ -1,7 +1,7 @@
 """Write session scripts and build native helpers for typeahead and tcsh input.
 
 Runtime files live in a caller-supplied directory; script templates are defined in
-scripts.
+adapter.scripts.
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from ish.lang import i18n
 from ish.log import get_logger
 from ish.runtime.distribution import bundled_forward_binary
 
-from .adapters import ADAPTERS
+from .adapter import ADAPTERS
+from .adapter.scripts import make_scripts
 from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
@@ -34,7 +35,6 @@ from .constants import (
 )
 from .guard import NativeLibrary
 from .protocol import EOT, RS, SOH, US, VERSION
-from .scripts import make_scripts
 
 __all__ = [
     "BEFORE_PROMPT",

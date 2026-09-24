@@ -62,6 +62,32 @@ class I18N:
 
                 Shell versions are not checked automatically. Select a supported version;
                 older versions may fail to initialize or process commands incorrectly.
+
+                Continuation prompts are fixed to Bash '> ', zsh '%_> ', and tcsh '%R? '.
+                Custom PS2 / prompt2 text and command substitutions are replaced at each
+                primary prompt, including after ish_recover. Primary prompts are customizable.
+                """),
+            "cli_zsh_module_help": textwrap.dedent("""\
+                zsh continuation prompt setup:
+                  ish enables PROMPT_SUBST at startup and on ish_recover.
+                  Hiding queued continuation prompts also needs zsh/zselect.
+                  zselect is a zsh module, not a separate program or Python package.
+
+                  Load/check inside the zsh selected for ish:
+                    builtin zmodload -F zsh/zselect b:zselect
+
+                  Install the distribution's zsh and its matching modules:
+                    RHEL 8 / AlmaLinux 8: sudo dnf install zsh
+                    Debian / Ubuntu: sudo apt-get install zsh zsh-common
+                  To repair missing packaged files, use dnf reinstall zsh or
+                  apt-get install --reinstall zsh zsh-common with sudo.
+
+                  Offline: transfer packages and dependencies from a matching OS
+                  release and architecture, or build zsh from an official source
+                  archive with its modules. See README, "Installing zsh/zselect",
+                  for offline RPM commands and installation under your home.
+                  Custom zsh builds need their own matching modules.
+                  ish does not install packages or enforce module availability.
                 """),
             "cli_arguments_title": "positional arguments",
             "cli_options_title": "options",

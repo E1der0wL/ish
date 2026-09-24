@@ -4,10 +4,64 @@ import codecs
 from contextlib import contextmanager
 
 from prompt_toolkit.input.base import Input
+from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.keys import Keys
 
 from ish.runtime.observer import InputObserver
+
+
+def take_pending_keys(source: Input, encoding: str) -> bytes:
+    """Drain saved keys and decoder bytes once, excluding terminal CPR replies."""
+    keys = get_typeahead(source)
+    keys.extend(source.flush_keys())
+    data = "".join(key.data for key in keys if key.key != Keys.CPRResponse).encode(
+        encoding, errors="surrogateescape"
+    )
+    if isinstance(source, ObservedInput):
+        data += source.take_decoder_prefix()
+    reader = getattr(getattr(source, "source", source), "stdin_reader", None)
+    if reader is not None:
+        # The pinned VT100 input retains incomplete characters outside typeahead.
+        decoder = reader._stdin_decoder
+        partial, state = decoder.getstate()
+        data += partial
+        decoder.setstate((b"", state))
+    return data
+
+
+def feed_pending_keys(
+    source: Input, data: bytes, encoding: str, fallback, feed
+) -> None:
+    """Replay keys through the existing decoder and parser across UI handoffs."""
+    original = getattr(source, "source", source)
+    reader = getattr(original, "stdin_reader", None)
+    parser = getattr(original, "vt100_parser", None)
+    if reader is None or parser is None:
+        fallback.feed(data.decode(encoding, errors="replace"))
+        fallback.flush()
+        return
+    original_callback = parser.feed_key_callback
+    parser.feed_key_callback = feed
+    try:
+        parser.feed(reader._stdin_decoder.decode(data))
+        if isinstance(source, ObservedInput):
+            source.hold_decoder_prefix(encoding)
+    finally:
+        parser.feed_key_callback = original_callback
+
+
+def feed_literal_text(source: Input, data: bytes, encoding: str, insert) -> None:
+    """Decode native text without interpreting it as editor shortcuts again."""
+    reader = getattr(getattr(source, "source", source), "stdin_reader", None)
+    text = (
+        reader._stdin_decoder.decode(data)
+        if reader is not None
+        else data.decode(encoding, errors="replace")
+    )
+    insert(text)
+    if isinstance(source, ObservedInput):
+        source.hold_decoder_prefix(encoding)
 
 
 class ObservedInput(Input):

@@ -3,8 +3,7 @@
 import shlex
 import shutil
 
-from .adapters import ADAPTERS, csh_quote
-from .constants import (
+from ..constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
     BASH_INTEGRATION_SCRIPT,
@@ -31,7 +30,8 @@ from .constants import (
     SessionSignals,
     bytes_to_shell_escape,
 )
-from .protocol import EOT, RS, SOH, US, VERSION
+from ..protocol import EOT, RS, SOH, US, VERSION
+from .base import ADAPTERS, csh_quote
 
 _POSIX_INIT = r"""
 _ish_pipe=$1
@@ -100,9 +100,6 @@ def _make_tokens(directory, signals, forward_path, input_ack_path=None):
         ),
         # csh checks only the OSC body so both raw and caret prompts match.
         "@CSH_NATIVE_CONTINUATION@": bytes_to_shell_escape(scope(NATIVE_CONTINUATION)),
-        "@CSH_CONT_START_PATTERN@": csh_quote(
-            scope(NATIVE_CONTINUATION)[2 : -len(OSC_TERMINATOR)].decode("ascii")
-        ),
         "@CSH_START_PATTERN@": csh_quote(
             scope(BEFORE_PROMPT)[2 : -len(OSC_TERMINATOR)].decode("ascii")
         ),
@@ -171,23 +168,15 @@ _ish_precmd() {
     if [[ "$PS1" != *$'@START@'* ]]; then
         PS1="$(command printf '@START@')${PS1}$(command printf '@END@')"
     fi
-    if [[ ${PS2-} != "${_ish_wrapped_ps2-}" ]]; then
-        _ish_original_ps2=${PS2-}
-        # Users may prepend or append text to the already wrapped PS2. Remove
-        # only our own markers before wrapping the edited prompt once again.
-        _ish_original_ps2=${_ish_original_ps2//'${ _ish_continuation_start; }'/}
-        _ish_original_ps2=${_ish_original_ps2//$'@CONT_START@'/}
-        _ish_original_ps2=${_ish_original_ps2//$'@CONT_END@'/}
-    fi
+    # Rebuild from the default at every primary prompt. User PS2 substitutions
+    # must not consume command input while the continuation prompt is expanded.
     if builtin shopt -q promptvars; then
         # Bash 5.3 runs this check in the current shell without a subshell per
-        # continuation line. The startup version gate enforces a patched release.
-        PS2='${ _ish_continuation_start; }'"${_ish_original_ps2-}"$'@CONT_END@'
+        # continuation line.
+        PS2='${ _ish_continuation_start; }@BASH_DEFAULT_CONTINUATION@'$'@CONT_END@'
     else
-        # Keep literal prompts literal when the user disables prompt expansion.
-        PS2=$'@CONT_START@'"${_ish_original_ps2-}"$'@CONT_END@'
+        PS2=$'@CONT_START@@BASH_DEFAULT_CONTINUATION@@CONT_END@'
     fi
-    _ish_wrapped_ps2=$PS2
     _ish_update "$_ish_shell_exit_code"
     _ish_forward
     _ish_mark_prompt
@@ -210,6 +199,9 @@ def _zsh_template():
         + r"""
 ish_recover() { source @ZSH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 unsetopt zle notify promptcr promptsp
+# Startup and explicit recovery restore prompt expansion. The next prompt also
+# reloads zsh/zselect when available; ordinary prompt updates allow opt-outs.
+builtin setopt promptsubst
 _ish_continuation_ready() {
     emulate -L zsh
     local -a _ish_available
@@ -228,23 +220,14 @@ typeset -A _ish_continuation_suffixes=(
     1 $'@BUFFERED_CONT_HINT@@CONT_END@'
 )
 _ish_wrap_continuation() {
-    if [[ "$PS2" != "${_ish_wrapped_ps2-}" ]]; then
-        _ish_original_ps2=$PS2
-        # Preserve user edits around an existing wrapper without nesting it.
-        _ish_original_ps2=${_ish_original_ps2//'${_ish_continuation_suffixes[$((ish_continuation_ready()))]}'/}
-        _ish_original_ps2=${_ish_original_ps2//$'@CONT_START@'/}
-        _ish_original_ps2=${_ish_original_ps2//$'@BUFFERED_CONT_HINT@'/}
-        _ish_original_ps2=${_ish_original_ps2//$'@CONT_END@'/}
-    fi
+    # Keep zsh's parser-context prompt, excluding user command substitutions.
+    # Rebuild it at every primary prompt, including after explicit recovery.
     if [[ -o promptsubst ]] && { builtin zmodload -e zsh/zselect || builtin zmodload zsh/zselect 2>/dev/null; }; then
-        # Inspect after user prompt substitutions, which may themselves read stdin.
         # Keep the probe in this shell: no subprocess or timer per continuation.
-        PS2=$'@CONT_START@'"${_ish_original_ps2}"'${_ish_continuation_suffixes[$((ish_continuation_ready()))]}'
+        PS2=$'@CONT_START@@ZSH_DEFAULT_CONTINUATION@''${_ish_continuation_suffixes[$((ish_continuation_ready()))]}'
     else
-        # Do not enable expansion of a user's literal prompt or require a module.
-        PS2=$'@CONT_START@'"${_ish_original_ps2}"$'@CONT_END@'
+        PS2=$'@CONT_START@@ZSH_DEFAULT_CONTINUATION@@CONT_END@'
     fi
-    _ish_wrapped_ps2=$PS2
 }
 # Install only over the default SIGINT behavior, never over a user's trap.
 # Capture in this shell: command substitution resets string traps. This private
@@ -392,12 +375,9 @@ if ($?tcsh) then
     if (! $_ish_editor_suspended) set _ish_edit_enabled = $?edit
     set _ish_editor_suspended = 1
     unset edit
-    if (! $?prompt2) set prompt2 = "%R? "
-    # tcsh displays only the first word of prompt2. Preserve array elements
-    # instead of joining them into one prompt when installing the marker.
-    if ($#prompt2 > 0) then
-        if ("$prompt2[1]" !~ *@CSH_CONT_START_PATTERN@*) set prompt2[1] = "%{$_ish_native_continuation%}$prompt2[1]"
-    endif
+    # Rebuild the default prompt with its leading input-ownership marker.
+    # Custom scalar/array prompts must not bypass continuation notification.
+    set prompt2 = "%{$_ish_native_continuation%}@TCSH_DEFAULT_CONTINUATION@"
 endif
 @ _ish_prompt_id ++
 setenv PWD "$cwd"
@@ -506,6 +486,17 @@ endif
     }
 
 
+# Register each integration entry point with the builder for its complete bundle.
+# Shared builders run once per installation, even when several adapters use them.
+SCRIPT_BUILDERS = {
+    BASH_INTEGRATION_SCRIPT: lambda: {BASH_INTEGRATION_SCRIPT: _bash_template()},
+    ZSH_INTEGRATION_SCRIPT: lambda: {ZSH_INTEGRATION_SCRIPT: _zsh_template()},
+    CSH_INTEGRATION_SCRIPT: _csh_templates,
+    TCSH_INTEGRATION_SCRIPT: _csh_templates,
+    POSIX_INTEGRATION_SCRIPT: _posix_templates,
+}
+
+
 def make_scripts(
     directory,
     *,
@@ -517,24 +508,34 @@ def make_scripts(
     """Return the existing script names and sources for one integration session.
 
     Builders only assemble shell text; tokens and native startup checks are
-    resolved afresh for each call. Preserve installation and replacement order.
+    resolved afresh for each call. Adapters select registered script bundles;
+    adding a shell does not require another entry in this assembly function.
     """
-    tokens = _make_tokens(directory, signals, forward_path, input_ack_path)
+    tokens = {}
     checks = _preload_checks(adapter)
-    posix = _posix_templates()
-    csh = _csh_templates()
-    templates = {
-        BASH_INTEGRATION_SCRIPT: _bash_template(),
-        ZSH_INTEGRATION_SCRIPT: _zsh_template(),
-        CSH_INTEGRATION_SCRIPT: csh[CSH_INTEGRATION_SCRIPT],
-        TCSH_INTEGRATION_SCRIPT: csh[TCSH_INTEGRATION_SCRIPT],
-        POSIX_INTEGRATION_SCRIPT: posix[POSIX_INTEGRATION_SCRIPT],
-        POSIX_UPDATE_SCRIPT: posix[POSIX_UPDATE_SCRIPT],
-        CSH_UPDATE_SCRIPT: csh[CSH_UPDATE_SCRIPT],
-        TCSH_PRECMD_SCRIPT: csh[TCSH_PRECMD_SCRIPT],
-        TCSH_BIND_HOOKS_SCRIPT: csh[TCSH_BIND_HOOKS_SCRIPT],
-        TCSH_WATCH_HOOKS_SCRIPT: csh[TCSH_WATCH_HOOKS_SCRIPT],
-    }
+    entries = {entry.script: entry for entry in ADAPTERS.values()}
+    if adapter is not None:
+        entries[adapter.script] = adapter
+    templates = {}
+    built = set()
+    for entry in entries.values():
+        tokens.update(entry.template_tokens)
+        try:
+            builder = SCRIPT_BUILDERS[entry.script]
+        except KeyError:
+            raise ValueError(
+                f"No integration builder registered for {entry.script}"
+            ) from None
+        if builder not in built:
+            for name, body in builder().items():
+                if name in templates and templates[name] != body:
+                    raise ValueError(f"Conflicting integration script: {name}")
+                templates[name] = body
+            built.add(builder)
+        if entry.script not in templates:
+            raise ValueError(f"Integration builder did not provide {entry.script}")
+    # Resolve template policy before inserting paths, which may contain token text.
+    tokens.update(_make_tokens(directory, signals, forward_path, input_ack_path))
     return {
         name: _render_script(body, tokens, checks.get(name, ""))
         for name, body in templates.items()

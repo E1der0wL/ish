@@ -24,7 +24,7 @@ from pathlib import Path
 import zstandard
 
 from ish.runtime.distribution import RUNTIME_MARKER
-from ish.shell.adapters import preload_libraries
+from ish.shell.adapter import preload_libraries
 from ish.shell.integration import build_binary
 
 

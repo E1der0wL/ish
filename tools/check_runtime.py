@@ -33,7 +33,7 @@ def square(value: int) -> int:
 def main() -> None:
     """Exercise representative stdlib families and report the actual interpreter."""
     from ish.runtime.distribution import bundled_forward_binary
-    from ish.shell.adapters import preload_libraries
+    from ish.shell.adapter import preload_libraries
 
     assert sys.version_info[:3] == (3, 12, 14), sys.version
     helper = bundled_forward_binary()

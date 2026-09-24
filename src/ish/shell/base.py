@@ -31,7 +31,7 @@ from ish.config import config
 from ish.runtime.fdio import FDWriter
 from ish.runtime.observer import InputObserver
 
-from .adapters import get_adapter
+from .adapter import get_adapter
 from .constants import (
     FORWARD_BINARY,
     INPUT_ACK_FIFO,
@@ -72,7 +72,7 @@ from .prefix import OutputLine
 from .protocol import FrameDecoder
 from .request import ShellExitRequest, ShellPassRequest
 from .sequencer import Sequencer
-from .signals import ShellSignalController, SignalScope
+from .signals import InputPhase, ShellSignalController, SignalScope
 from .state import TerminalState
 
 if TYPE_CHECKING:
@@ -436,7 +436,7 @@ class InteractiveShell:
         except OSError:
             return
 
-    def _resize(self) -> None:
+    def resize(self) -> None:
         """Resize the shell first, then notify any active Python tool of its new size."""
         if self.master_fd is None:
             return
@@ -461,7 +461,7 @@ class InteractiveShell:
             data = b""
         return data
 
-    def _io_failed(self, exc: Exception) -> None:
+    def fail_io(self, exc: Exception) -> None:
         """Wake the main session waiter with the first I/O error."""
         if self._fatal_error is not None and not self._fatal_error.done():
             self._fatal_error.set_result(exc)
@@ -469,7 +469,7 @@ class InteractiveShell:
     def _writer(self, fd: int) -> FDWriter:
         """Create or reuse a writer that preserves output order for each FD."""
         if fd not in self._writers:
-            self._writers[fd] = FDWriter(self.loop, fd, self._io_failed)
+            self._writers[fd] = FDWriter(self.loop, fd, self.fail_io)
         return self._writers[fd]
 
     def _close_fd(self, name: str) -> None:
@@ -511,7 +511,7 @@ class InteractiveShell:
                 self.input_observer.record("submission_returned", bytes=len(chunk))
                 return True
             if len(self._returned_input) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
-                self._io_failed(
+                self.fail_io(
                     BufferError(
                         f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
                     )
@@ -525,7 +525,7 @@ class InteractiveShell:
             )
             return True
         except BufferError as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
             return
         except (BlockingIOError, OSError):
             return
@@ -572,7 +572,7 @@ class InteractiveShell:
             self._write(self.master_fd, data)
             self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
         except Exception as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
 
     def _discard_terminal_input(self) -> None:
         """Flush submitted bytes on both sides of the PTY input path, preserving output.
@@ -590,7 +590,7 @@ class InteractiveShell:
         finally:
             os.close(peer)
 
-    def _cancel_handoff(self, control: bytes, remaining: bytes) -> None:
+    def cancel_handoff(self, control: bytes, remaining: bytes) -> None:
         """Cancel an input handoff and retain only post-control typeahead."""
         discard_submitted = self._handoff_pending and self._submitted_input.active
         self._deferred_input.clear()
@@ -613,7 +613,7 @@ class InteractiveShell:
             self._write(self.master_fd, control)
         self.return_typeahead(remaining)
 
-    def _resume_native_typeahead(self) -> None:
+    def resume_native_typeahead(self) -> None:
         """Return held keys to a native command that won a continuation cancel race."""
         data = bytes(self._returned_input) + bytes(self.dupin_buffer)
         self._returned_input.clear()
@@ -622,7 +622,7 @@ class InteractiveShell:
             self._write(self.master_fd, data)
             self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
 
-    def _cancel_submission(self, control: bytes, remaining: bytes) -> None:
+    def cancel_submission(self, control: bytes, remaining: bytes) -> None:
         """Discard cancelled transport data before a policy-selected control byte.
 
         The signal policy has already restored any TTY lease. Queue ownership,
@@ -774,8 +774,7 @@ class InteractiveShell:
                     writer.write(data)
                     await writer.drain()
 
-                app = getattr(self.session, "app", None)
-                if getattr(app, "is_running", False) is True:
+                if getattr(self.session, "output_active", False) is True:
                     await self.session.write_output(write)
                 else:
                     await write()
@@ -783,7 +782,7 @@ class InteractiveShell:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
 
     async def _drain_output(self):
         """Wait until both output tasks and FD writer queues are empty."""
@@ -837,7 +836,7 @@ class InteractiveShell:
         except (BlockingIOError, InterruptedError):
             return
         except Exception as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
 
     # =============================================
     # [Internal API: Integration] Validate prompt signals and synchronize shell context.
@@ -891,7 +890,7 @@ class InteractiveShell:
         except (BlockingIOError, InterruptedError):
             return
         except Exception as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
 
     async def _acknowledge_input(self, prompt_id: int) -> None:
         """Let the forwarder finish only after all earlier PTY writes have drained.
@@ -921,7 +920,7 @@ class InteractiveShell:
                 self._write(self.input_ack_pipe, f"{prompt_id}\n".encode("ascii"))
                 self.input_observer.record("input_return_ack", prompt_id=prompt_id)
         except Exception as exc:
-            self._io_failed(exc)
+            self.fail_io(exc)
 
     def _set_prompt_id(self, data: bytes) -> bool:
         """Accept only valid, increasing session IDs and pass invalid signals through."""
@@ -1302,8 +1301,7 @@ class InteractiveShell:
                 # Text has already passed through the native terminal. Only
                 # its accepted Enter goes through normal command/tool dispatch.
                 self.session.feed_typeahead(b"\r")
-                self.session.app.key_processor.process_keys()
-                if self.session.app.is_done:
+                if self.session.process_typeahead():
                     return
             typehead = b""
             if self.dupin_buffer:
@@ -1315,15 +1313,8 @@ class InteractiveShell:
                 self.input_observer.record(
                     "typeahead_injected", "EDITOR", bytes=len(typehead)
                 )
-                if hasattr(self.session, "feed_typeahead"):
-                    self.session.feed_typeahead(typehead)
-                else:
-                    self.session.parser.feed(
-                        typehead.decode(self.encoder, errors="replace")
-                    )
-                    self.session.parser.flush()
-                self.session.app.key_processor.process_keys()
-                self.session.app.invalidate()
+                self.session.feed_typeahead(typehead)
+                self.session.process_typeahead(invalidate=True)
 
         retry_command = None
         while True:
@@ -1547,17 +1538,9 @@ class InteractiveShell:
                 ).encode(self.encoder)
 
                 tty.setraw(self.stdin_fd)
-                previous_resize = self.session.app._on_resize
-                resources.callback(
-                    setattr, self.session.app, "_on_resize", previous_resize
+                resources.enter_context(
+                    self.session.observe_resize(self.signal_controller.notify_resize)
                 )
-
-                def on_resize():
-                    """Dispatch the resize policy before prompt-toolkit updates its UI."""
-                    self.signal_controller.notify_resize()
-                    previous_resize()
-
-                self.session.app._on_resize = on_resize
 
                 self.sequencer = Sequencer(
                     encoder=self.encoder,
@@ -1583,7 +1566,7 @@ class InteractiveShell:
                 resources.enter_context(
                     self.signal_controller.install(SignalScope.RUNTIME)
                 )
-                self._resize()
+                self.resize()
 
                 self._initializing = True
                 await self._spawn()
@@ -1610,6 +1593,58 @@ class InteractiveShell:
             finally:
                 self._stopping = True
                 await self._stop()
+
+    # =============================================
+    # [Policy API] Keep signal decisions separate from engine-owned state mutation.
+    # =============================================
+
+    @property
+    def accepted_prompt_id(self) -> int:
+        """Expose the last accepted reader generation without allowing mutation."""
+        return self._accepted_prompt_id
+
+    @property
+    def stopping(self) -> bool:
+        """Report cleanup that must not be cancelled a second time."""
+        return self._stopping
+
+    @property
+    def input_open(self) -> bool:
+        """Use cached lifecycle state without probing the process or terminal."""
+        return not (self._closing_output or self._stopping or self._has_exited())
+
+    @property
+    def signal_input_phase(self):
+        """Identify staged input without any terminal query or state snapshot."""
+        if self._send_task is not None and not self._send_task.done():
+            return InputPhase.SUBMISSION
+        if self._handoff_pending:
+            return InputPhase.HANDOFF
+        return InputPhase.CONTINUATION
+
+    def prompt_matches(self, identity: int) -> bool:
+        """Require both protocol channels to identify the same prompt."""
+        return self._prompt_id == identity and self._context_id == identity
+
+    def restore_input_mode(self) -> bool:
+        """Restore a staged TTY lease before a policy sends a control character."""
+        if self._input_mode_lease is None:
+            return False
+        self._input_mode_lease.restore()
+        return True
+
+    def discard_typeahead(self) -> None:
+        """Discard only fresh keys owned by the current cancellation policy."""
+        self.dupin_buffer.clear()
+
+    def invalidate_input(self) -> None:
+        """Revoke native input and the current sender before shutdown cancellation."""
+        self._native_input_active = False
+        self._send_generation += 1
+
+    def write_control(self, data: bytes) -> None:
+        """Queue a policy-authorized control response on the existing PTY writer."""
+        self._write(self.master_fd, data)
 
     # =============================================
     # [External API] Expose input handoff, validation, and session entry points.
@@ -1658,6 +1693,16 @@ class InteractiveShell:
                 "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
             )
 
+    def take_pending_input(self) -> tuple[bytes, int]:
+        """Drain engine queues in wire order, retaining the native-text boundary."""
+        data = bytes(self._literal_input) + bytes(self._returned_input)
+        native_prefix = len(data)
+        data += bytes(self.dupin_buffer)
+        self._literal_input.clear()
+        self._returned_input.clear()
+        self.dupin_buffer.clear()
+        return data, native_prefix
+
     def return_native_input(self, data: bytes) -> None:
         """Retain worker-returned text without applying editor key bindings again."""
         if len(self._returned_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
@@ -1700,6 +1745,7 @@ class InteractiveShell:
     async def main(self):
         """Run acquisition and cleanup inside the adapter's signal-handler lifetime."""
         self.loop = asyncio.get_running_loop()
+        self._stopping = False
         return await self.signal_controller.run(self._run_session)
 
     def run(self):

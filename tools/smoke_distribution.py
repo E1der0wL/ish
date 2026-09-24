@@ -27,7 +27,7 @@ from pathlib import Path
 
 import psutil
 
-from ish.shell.adapters import get_adapter
+from ish.shell.adapter import get_adapter
 
 
 class Terminal:

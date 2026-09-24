@@ -7,11 +7,17 @@ import shlex
 from typing import Callable, Iterable, Mapping, Pattern, Sequence, Union
 
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import AnyFormattedText
 
-from ish.parser.completion import completion_word
+from ish.parser.completion import CompletionWord, completion_context
 
 __all__ = ["PathCompleter", "PromptCompleter"]
+
+
+def _default_context(document: Document) -> CompletionWord | None:
+    """Retain POSIX completion for independently constructed completers."""
+    return completion_context(document.text, document.cursor_position)
 
 
 class PathCompleter(Completer):
@@ -26,6 +32,7 @@ class PathCompleter(Completer):
         file_filter: Callable[[str], bool] | None = None,
         expanduser: bool = False,
         quote: Callable[[str], str] = shlex.quote,
+        context: Callable[[Document], CompletionWord | None] = _default_context,
     ) -> None:
         """Configure the search-path provider, file filter, and shell quoting function."""
         self.only_directories = only_directories
@@ -33,16 +40,19 @@ class PathCompleter(Completer):
         self.file_filter = file_filter or (lambda _: True)
         self.expanduser = expanduser
         self.quote = quote
+        self.context = context
 
     def get_completions(self, document, complete_event):
         """Generate directory and file candidates matching the literal path before the
         cursor.
         """
-        word = completion_word(document.text_before_cursor)
-        if word.dynamic or (
-            document.text_after_cursor
-            and document.text_after_cursor[0] not in " \t\n;&|"
-        ):
+        word = self.context(document)
+        if word is not None:
+            yield from self.complete_word(document, word)
+
+    def complete_word(self, document: Document, word: CompletionWord):
+        """Complete paths using an already analyzed context shared by the parent."""
+        if word.dynamic:
             return
         raw_word = document.text_before_cursor[word.start :]
         text = word.value
@@ -80,11 +90,15 @@ class PathCompleter(Completer):
                 path = os.path.join(input_dirname, name) + ("/" if is_dir else "")
                 # Keep the tilde unquoted so the shell expands it when submitted.
                 # Only the remaining path needs the shell's literal quoting.
-                quoted = (
-                    home_prefix + self.quote(path[len(home_prefix) :])
-                    if home_prefix
-                    else self.quote(path)
-                )
+                try:
+                    quoted = (
+                        home_prefix + self.quote(path[len(home_prefix) :])
+                        if home_prefix
+                        else self.quote(path)
+                    )
+                except ValueError:
+                    # Some shell syntaxes cannot represent a filename containing LF.
+                    continue
                 yield Completion(
                     text=quoted + ("" if is_dir else " "),
                     start_position=word.start - document.cursor_position,
@@ -107,6 +121,7 @@ class PromptCompleter(Completer):
         match_middle: bool = False,
         pattern: Union[Pattern[str], None] = None,
         quote: Callable[[str], str] = shlex.quote,
+        context: Callable[[Document], CompletionWord | None] = _default_context,
     ) -> None:
         """Prepare the command provider, display metadata, case policy, and path completer."""
         self.words = words
@@ -116,10 +131,12 @@ class PromptCompleter(Completer):
         self.match_middle = match_middle
         self.pattern = pattern
         self.quote = quote
+        self.context = context
         self.path_completer = PathCompleter(
             expanduser=True,
             get_paths=cwd,
             quote=quote,
+            context=context,
         )
 
     def get_completions(self, document, complete_event) -> Iterable[Completion]:
@@ -128,16 +145,11 @@ class PromptCompleter(Completer):
         if callable(words):
             words = words()
 
-        word = completion_word(document.text_before_cursor)
-        yield from self.path_completer.get_completions(document, complete_event)
-        if (
-            not word.command
-            or word.dynamic
-            or (
-                document.text_after_cursor
-                and document.text_after_cursor[0] not in " \t\n;&|"
-            )
-        ):
+        word = self.context(document)
+        if word is None:
+            return
+        yield from self.path_completer.complete_word(document, word)
+        if not word.command or word.dynamic:
             return
         prefix = word.value.casefold() if self.ignore_case else word.value
         for command in words:
@@ -148,8 +160,12 @@ class PromptCompleter(Completer):
                 else candidate.startswith(prefix)
             )
             if matches:
+                try:
+                    quoted = self.quote(command)
+                except ValueError:
+                    continue
                 yield Completion(
-                    text=self.quote(command) + " ",
+                    text=quoted + " ",
                     start_position=word.start - document.cursor_position,
                     display=self.display_dict.get(command, command),
                     display_meta=self.meta_dict.get(command, ""),

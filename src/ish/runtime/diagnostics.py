@@ -12,7 +12,7 @@ from ish import __version__
 from ish.config import config
 from ish.lang import i18n
 from ish.runtime.distribution import bundled_forward_binary, bundled_root
-from ish.shell.adapters import get_adapter
+from ish.shell.adapter import get_adapter
 
 
 def _cache_status() -> tuple[str, str]:
