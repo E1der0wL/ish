@@ -101,9 +101,9 @@ from ish.parser.shell import alias_parser, dict_parser, str_parser
 from ish.runtime.fdio import InputBytes
 from ish.runtime.observer import InputObserver
 from ish.shell.adapter import get_adapter
-from ish.shell.base import InteractiveShell
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE, PWD
 from ish.shell.context import ShellContext
+from ish.shell.engine import InteractiveShell
 from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
 from ish.shell.request import ShellExitRequest, ShellPassRequest
 

@@ -1,6 +1,7 @@
 """Expose shell definitions and policy selection without generating runtime scripts."""
 
-from .base import (
+from .parsing import ParsingPolicy
+from .registry import (
     ADAPTERS,
     CSH_BEHAVIOR,
     NATIVE_LIBRARIES,
@@ -13,7 +14,6 @@ from .base import (
     get_adapter,
     preload_libraries,
 )
-from .parsing import ParsingPolicy
 
 __all__ = [
     "ADAPTERS",

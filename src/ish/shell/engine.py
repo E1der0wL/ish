@@ -293,9 +293,9 @@ class InteractiveShell:
         "input_ack_pipe",
     )
 
-    # =============================================
+    # ==============================================================================================
     # [Initialization] Configure the adapter and prepare per-session state.
-    # =============================================
+    # ==============================================================================================
 
     def __init__(
         self,
@@ -419,9 +419,9 @@ class InteractiveShell:
         self._init_event = None
         self.signal_controller = ShellSignalController(self, self.adapter.signal_policy)
 
-    # =============================================
+    # ==============================================================================================
     # [Utility] Shared process, terminal, descriptor, and I/O helpers.
-    # =============================================
+    # ==============================================================================================
 
     def _has_exited(self) -> bool:
         """Consult the child watcher's cached status without probing the process."""
@@ -436,21 +436,6 @@ class InteractiveShell:
         except OSError:
             return
 
-    def resize(self) -> None:
-        """Resize the shell first, then notify any active Python tool of its new size."""
-        if self.master_fd is None:
-            return
-        try:
-            rows, columns = termios.tcgetwinsize(self.stdin_fd)
-        except (OSError, termios.error):
-            rows, columns = 0, 0
-        if not rows or not columns:
-            fallback = shutil.get_terminal_size()
-            rows, columns = rows or fallback.lines, columns or fallback.columns
-        self._set_window_size(self.master_fd, columns, rows)
-        if self.resize_callback is not None:
-            self.resize_callback()
-
     def _read(self, fd: int) -> bytes:
         """Read one chunk from an FD, returning empty bytes if nothing is currently
         readable.
@@ -461,16 +446,32 @@ class InteractiveShell:
             data = b""
         return data
 
-    def fail_io(self, exc: Exception) -> None:
-        """Wake the main session waiter with the first I/O error."""
-        if self._fatal_error is not None and not self._fatal_error.done():
-            self._fatal_error.set_result(exc)
-
     def _writer(self, fd: int) -> FDWriter:
         """Create or reuse a writer that preserves output order for each FD."""
         if fd not in self._writers:
             self._writers[fd] = FDWriter(self.loop, fd, self.fail_io)
         return self._writers[fd]
+
+    def _write(self, fd: int, data: Union[bytes, bytearray]) -> None:
+        """Send output to an FD writer or enqueue it for the UI and apply backpressure."""
+        if fd != self.stdout_fd:
+            self._writer(fd).write(data)
+            return
+        if not data:
+            return
+        if len(self._output_buffer) + len(data) > OUTPUT_QUEUE_LIMIT_BYTES:
+            raise BufferError(
+                f"Pending terminal output exceeds {OUTPUT_QUEUE_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
+            )
+        self._output_buffer.extend(data)
+        if (
+            len(self._output_buffer) >= OUTPUT_QUEUE_HIGH_BYTES
+            and not self._output_paused
+        ):
+            self._output_paused = True
+            self.loop.remove_reader(self.master_fd)
+        if self._output_task is None or self._output_task.done():
+            self._output_task = self.loop.create_task(self._flush_output())
 
     def _close_fd(self, name: str) -> None:
         """Close an owned FD once and clear its attribute to None."""
@@ -491,9 +492,9 @@ class InteractiveShell:
             ):
                 raise
 
-    # =============================================
-    # [Internal API: Input] Collect typeahead, cancel submissions, and transmit input.
-    # =============================================
+    # ==============================================================================================
+    # [Internal API: Input] Collect typeahead and transmit input with ordered handoff.
+    # ==============================================================================================
 
     def _pre_input(self, fd: int) -> Optional[bool]:
         """Collect forwarded typeahead in a bounded buffer and report whether data was
@@ -590,78 +591,6 @@ class InteractiveShell:
         finally:
             os.close(peer)
 
-    def cancel_handoff(self, control: bytes, remaining: bytes) -> None:
-        """Cancel an input handoff and retain only post-control typeahead."""
-        discard_submitted = self._handoff_pending and self._submitted_input.active
-        self._deferred_input.clear()
-        self.dupin_buffer.clear()
-        self._returned_input.clear()
-        self._submitted_input.clear()
-        self._literal_input.clear()
-        # A helper may already have written cancelled bytes to the FIFO before
-        # its read callback runs. Discard them through the confirmed boundary,
-        # keeping later keys outside that FIFO until ownership is transferred.
-        self._send_interrupted |= discard_submitted
-        self._handoff_pending = discard_submitted
-        confirmed_prompt = (
-            self._accepted_prompt_id < self._pending_prompt_id == self._context_id
-        )
-        if not (discard_submitted and confirmed_prompt):
-            # At an already confirmed primary prompt only the queued block is
-            # being cancelled. Signalling that idle reader can consume the next
-            # command as interrupt recovery (notably with zsh's disabled ZLE).
-            self._write(self.master_fd, control)
-        self.return_typeahead(remaining)
-
-    def resume_native_typeahead(self) -> None:
-        """Return held keys to a native command that won a continuation cancel race."""
-        data = bytes(self._returned_input) + bytes(self.dupin_buffer)
-        self._returned_input.clear()
-        self.dupin_buffer.clear()
-        if data and not (self._closing_output or self._stopping or self._has_exited()):
-            self._write(self.master_fd, data)
-            self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
-
-    def cancel_submission(self, control: bytes, remaining: bytes) -> None:
-        """Discard cancelled transport data before a policy-selected control byte.
-
-        The signal policy has already restored any TTY lease. Queue ownership,
-        cancellation generations, and post-control byte ordering remain here.
-        """
-        self._send_generation += 1
-        self._send_interrupted = True
-        self._handoff_pending = False
-        self.input_observer.record(
-            "submission_interrupt", "SHELL", generation=self._send_generation
-        )
-        if self._send_task is not None:
-            self._send_task.cancel()
-        self._deferred_input.clear()
-        self.dupin_buffer.clear()
-        self._submitted_input.clear()
-        self._returned_input.clear()
-        self._literal_input.clear()
-        self._accepted_prompt_id = self._prompt_id
-        self._pending_prompt_id = 0
-        if self.prompt_event is not None:
-            self.prompt_event.clear()
-        self._writer(self.master_fd).discard()
-        self._discard_terminal_input()
-        if self.sequencer is not None:
-            self.sequencer.at_masking(b"")
-        self._write(self.master_fd, control)
-        if self.adapter.input_handoff is InputHandoffMode.NATIVE:
-            # This adapter has no automatic prompt acknowledgement. Its old
-            # FIFO is idle until explicit reconnect, so discard it now and keep
-            # following user bytes with native input, including recovery.
-            while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
-                pass
-            self._send_interrupted = False
-            self._write(self.master_fd, remaining)
-        else:
-            self.return_typeahead(remaining)
-        self.input_observer.terminal("SHELL", self.master_fd, "interrupt")
-
     async def _send(
         self, data: Union[str, bytes], generation: int | None = None
     ) -> int:
@@ -722,30 +651,9 @@ class InteractiveShell:
         self.sequencer.at_masking(echo)
         return sent + await self._send(data[prefix:], generation)
 
-    # =============================================
-    # [Internal API: Output] Queue, parse, and display PTY output with backpressure.
-    # =============================================
-
-    def _write(self, fd: int, data: Union[bytes, bytearray]) -> None:
-        """Send output to an FD writer or enqueue it for the UI and apply backpressure."""
-        if fd != self.stdout_fd:
-            self._writer(fd).write(data)
-            return
-        if not data:
-            return
-        if len(self._output_buffer) + len(data) > OUTPUT_QUEUE_LIMIT_BYTES:
-            raise BufferError(
-                f"Pending terminal output exceeds {OUTPUT_QUEUE_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
-            )
-        self._output_buffer.extend(data)
-        if (
-            len(self._output_buffer) >= OUTPUT_QUEUE_HIGH_BYTES
-            and not self._output_paused
-        ):
-            self._output_paused = True
-            self.loop.remove_reader(self.master_fd)
-        if self._output_task is None or self._output_task.done():
-            self._output_task = self.loop.create_task(self._flush_output())
+    # ==============================================================================================
+    # [Internal API: Output] Drain, parse, and display PTY output with backpressure.
+    # ==============================================================================================
 
     def _resume_output(self):
         """Register PTY reads again when the output queue reaches its low watermark."""
@@ -838,9 +746,9 @@ class InteractiveShell:
         except Exception as exc:
             self.fail_io(exc)
 
-    # =============================================
+    # ==============================================================================================
     # [Internal API: Integration] Validate prompt signals and synchronize shell context.
-    # =============================================
+    # ==============================================================================================
 
     def _update(self, fd: int) -> None:
         """Consume FIFO frames to update shell state and the received prompt ID."""
@@ -1049,9 +957,9 @@ class InteractiveShell:
         await self._wait_context()
         self._accept_prompt()
 
-    # =============================================
+    # ==============================================================================================
     # [Core API] Coordinate shell startup, command execution, and session cleanup.
-    # =============================================
+    # ==============================================================================================
 
     async def _spawn(self) -> None:
         """Start an interactive shell with a controlling PTY and close the parent's slave
@@ -1594,9 +1502,9 @@ class InteractiveShell:
                 self._stopping = True
                 await self._stop()
 
-    # =============================================
-    # [Policy API] Keep signal decisions separate from engine-owned state mutation.
-    # =============================================
+    # ==============================================================================================
+    # [Policy API] Internal interface for signal handlers and engine state mutation.
+    # ==============================================================================================
 
     @property
     def accepted_prompt_id(self) -> int:
@@ -1646,9 +1554,101 @@ class InteractiveShell:
         """Queue a policy-authorized control response on the existing PTY writer."""
         self._write(self.master_fd, data)
 
-    # =============================================
-    # [External API] Expose input handoff, validation, and session entry points.
-    # =============================================
+    def cancel_handoff(self, control: bytes, remaining: bytes) -> None:
+        """Cancel an input handoff and retain only post-control typeahead."""
+        discard_submitted = self._handoff_pending and self._submitted_input.active
+        self._deferred_input.clear()
+        self.dupin_buffer.clear()
+        self._returned_input.clear()
+        self._submitted_input.clear()
+        self._literal_input.clear()
+        # A helper may already have written cancelled bytes to the FIFO before
+        # its read callback runs. Discard them through the confirmed boundary,
+        # keeping later keys outside that FIFO until ownership is transferred.
+        self._send_interrupted |= discard_submitted
+        self._handoff_pending = discard_submitted
+        confirmed_prompt = (
+            self._accepted_prompt_id < self._pending_prompt_id == self._context_id
+        )
+        if not (discard_submitted and confirmed_prompt):
+            # At an already confirmed primary prompt only the queued block is
+            # being cancelled. Signalling that idle reader can consume the next
+            # command as interrupt recovery (notably with zsh's disabled ZLE).
+            self._write(self.master_fd, control)
+        self.return_typeahead(remaining)
+
+    def resume_native_typeahead(self) -> None:
+        """Return held keys to a native command that won a continuation cancel race."""
+        data = bytes(self._returned_input) + bytes(self.dupin_buffer)
+        self._returned_input.clear()
+        self.dupin_buffer.clear()
+        if data and not (self._closing_output or self._stopping or self._has_exited()):
+            self._write(self.master_fd, data)
+            self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
+
+    def cancel_submission(self, control: bytes, remaining: bytes) -> None:
+        """Discard cancelled transport data before a policy-selected control byte.
+
+        The signal policy has already restored any TTY lease. Queue ownership,
+        cancellation generations, and post-control byte ordering remain here.
+        """
+        self._send_generation += 1
+        self._send_interrupted = True
+        self._handoff_pending = False
+        self.input_observer.record(
+            "submission_interrupt", "SHELL", generation=self._send_generation
+        )
+        if self._send_task is not None:
+            self._send_task.cancel()
+        self._deferred_input.clear()
+        self.dupin_buffer.clear()
+        self._submitted_input.clear()
+        self._returned_input.clear()
+        self._literal_input.clear()
+        self._accepted_prompt_id = self._prompt_id
+        self._pending_prompt_id = 0
+        if self.prompt_event is not None:
+            self.prompt_event.clear()
+        self._writer(self.master_fd).discard()
+        self._discard_terminal_input()
+        if self.sequencer is not None:
+            self.sequencer.at_masking(b"")
+        self._write(self.master_fd, control)
+        if self.adapter.input_handoff is InputHandoffMode.NATIVE:
+            # This adapter has no automatic prompt acknowledgement. Its old
+            # FIFO is idle until explicit reconnect, so discard it now and keep
+            # following user bytes with native input, including recovery.
+            while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+                pass
+            self._send_interrupted = False
+            self._write(self.master_fd, remaining)
+        else:
+            self.return_typeahead(remaining)
+        self.input_observer.terminal("SHELL", self.master_fd, "interrupt")
+
+    def resize(self) -> None:
+        """Resize the shell first, then notify any active Python tool of its new size."""
+        if self.master_fd is None:
+            return
+        try:
+            rows, columns = termios.tcgetwinsize(self.stdin_fd)
+        except (OSError, termios.error):
+            rows, columns = 0, 0
+        if not rows or not columns:
+            fallback = shutil.get_terminal_size()
+            rows, columns = rows or fallback.lines, columns or fallback.columns
+        self._set_window_size(self.master_fd, columns, rows)
+        if self.resize_callback is not None:
+            self.resize_callback()
+
+    def fail_io(self, exc: Exception) -> None:
+        """Wake the main session waiter with the first I/O error."""
+        if self._fatal_error is not None and not self._fatal_error.done():
+            self._fatal_error.set_result(exc)
+
+    # ==============================================================================================
+    # [Session API] Exchange context and input with the editor and Python tool runner.
+    # ==============================================================================================
 
     def tool_context(self) -> tuple[str, dict[str, str]]:
         """Snapshot exported state at a confirmed primary prompt for a Python tool.
@@ -1741,6 +1741,10 @@ class InteractiveShell:
                 "Not sent: the shell terminal is unavailable for long input."
             ) from exc
         return prefix
+
+    # ==============================================================================================
+    # [External API] Expose asynchronous and synchronous session entry points.
+    # ==============================================================================================
 
     async def main(self):
         """Run acquisition and cleanup inside the adapter's signal-handler lifetime."""

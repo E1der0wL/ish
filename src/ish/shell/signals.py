@@ -24,7 +24,7 @@ import psutil
 from .input import InputRejected
 
 if TYPE_CHECKING:
-    from .base import InteractiveShell
+    from .engine import InteractiveShell
 
 CHILD_SHUTDOWN_GRACE = 2.0
 CHILD_SHUTDOWN_CHECK_INTERVAL = 0.05

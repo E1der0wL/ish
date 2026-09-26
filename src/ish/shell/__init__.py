@@ -1,5 +1,5 @@
 """Export the public entry point for the interactive shell runner."""
 
-from .base import InteractiveShell
+from .engine import InteractiveShell
 
 __all__ = ["InteractiveShell"]

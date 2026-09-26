@@ -31,7 +31,7 @@ from ..constants import (
     bytes_to_shell_escape,
 )
 from ..protocol import EOT, RS, SOH, US, VERSION
-from .base import ADAPTERS, csh_quote
+from .registry import ADAPTERS, csh_quote
 
 _POSIX_INIT = r"""
 _ish_pipe=$1
