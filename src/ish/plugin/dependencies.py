@@ -267,13 +267,18 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(changed[path], destination)
                     installed.append(path)
+            # Empty old .dist-info directories can shadow the new metadata.
+            # Remove them before the caller validates the installed version.
+            _remove_empty_directories({target / path for path in removed}, target)
             importlib.invalidate_caches()
             yield
         except BaseException:
             for path in reversed(installed):
                 (target / path).unlink()
             for path in reversed(saved):
-                os.replace(backup / path, target / path)
+                destination = target / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup / path, destination)
             raise
         finally:
             _remove_empty_directories({target / path for path in affected}, target)

@@ -168,10 +168,14 @@ class ScrollBack:
             data = data[-limit:]
             self._partial_line.clear()
             self.history_truncated = True
-        parts = (self._partial_line + data).split(b"\n")
-        self._partial_line.clear()
-        for part in parts[:-1]:
-            self._add_line(part + b"\n")
+        # The retained partial line has no LF; scan only the newly received bytes.
+        parts = bytes(data).split(b"\n")
+        if len(parts) > 1:
+            first_line = b"".join((self._partial_line, parts[0], b"\n"))
+            self._partial_line.clear()
+            self._add_line(first_line)
+            for part in parts[1:-1]:
+                self._add_line(part + b"\n")
         self._partial_line.extend(parts[-1])
         self._trim_history()
 
