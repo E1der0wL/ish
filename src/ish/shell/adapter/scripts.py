@@ -497,7 +497,7 @@ SCRIPT_BUILDERS = {
 }
 
 
-def make_scripts(
+def render_scripts(
     directory,
     *,
     signals=SessionSignals(),

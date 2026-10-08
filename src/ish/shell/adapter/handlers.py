@@ -41,7 +41,7 @@ class LineInterrupt:
         self.released = False
         self.continuation = False
 
-    def observe_ready(self, data: bytes, accepted_id: int) -> None:
+    def observe(self, data: bytes, accepted_id: int) -> None:
         """Accept fresh readiness, or revoke the current generation at preexec."""
         identity, separator, enabled = data.partition(b";")
         if (
@@ -116,7 +116,7 @@ class ZshInterrupt(SubmissionInterrupt):
         """Release pending cancellation state at the engine's ownership boundary."""
         self.state.reset()
 
-    def configure_sequencer(self, sequencer, markers) -> None:
+    def bind(self, sequencer, markers) -> None:
         """Register the zsh template's capability and SIGINT acknowledgement frames."""
         sequencer.on_prefix(markers.scope(LINE_READER_READY_PREFIX), self.ready)
         sequencer.on_prefix(markers.scope(LINE_INTERRUPT_ACK_PREFIX), self.acknowledge)
@@ -130,7 +130,7 @@ class ZshInterrupt(SubmissionInterrupt):
 
     def ready(self, data: bytes) -> None:
         """Track readiness and release input if command execution won the race."""
-        self.state.observe_ready(data, self.shell.accepted_prompt_id)
+        self.state.observe(data, self.shell.accepted_prompt_id)
         if (
             self.state.continuation
             and self.state.pending_id

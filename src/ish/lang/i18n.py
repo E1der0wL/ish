@@ -24,7 +24,7 @@ class I18N:
         """Initialize the encoding, selected language, default messages, and update lock."""
         self.encoder = encoder or "utf-8"
         self.default_lang: str = "en"
-        self.current_lang: str = self._detect_language()
+        self.current_lang: str = self._detect()
         self.base_path: Path = config.LANG_DIR
 
         self._lock = threading.RLock()
@@ -193,7 +193,7 @@ class I18N:
 
         return default_file
 
-    def _detect_language(self) -> str:
+    def _detect(self) -> str:
         """Read the system locale's language code, falling back to the default on failure."""
         try:
             lang, _ = locale.getdefaultlocale()
@@ -203,7 +203,7 @@ class I18N:
             pass
         return self.default_lang
 
-    def load_messages(self, lang: Optional[str] = None, *, create: bool = True):
+    def load(self, lang: Optional[str] = None, *, create: bool = True):
         """Build messages from built-in values, the default language, and the selected
         language.
 

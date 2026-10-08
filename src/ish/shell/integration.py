@@ -21,7 +21,7 @@ from ish.log import get_logger
 from ish.runtime.distribution import bundled_forward_binary
 
 from .adapter import ADAPTERS
-from .adapter.scripts import make_scripts
+from .adapter.scripts import render_scripts
 from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
@@ -74,7 +74,7 @@ BIN_EOT = bytes_to_shell_escape(EOT)
 ISH_FORWARD = str(config.XDG_DATA_HOME / FORWARD_BINARY)
 
 
-SHELL_INTEGRATION = make_scripts(config.XDG_DATA_HOME)
+SHELL_INTEGRATION = render_scripts(config.XDG_DATA_HOME)
 SHELL_INTEGRATION_MAP = {name: adapter.script for name, adapter in ADAPTERS.items()}
 
 
@@ -325,7 +325,7 @@ def install_scripts(
 
     ish_xdg_home: Path = directory or config.XDG_DATA_HOME
     ish_xdg_home.mkdir(parents=True, exist_ok=True)
-    for name, content in make_scripts(
+    for name, content in render_scripts(
         ish_xdg_home,
         signals=signals or SessionSignals(),
         forward_path=forward_path or Path(ISH_FORWARD),

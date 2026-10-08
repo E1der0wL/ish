@@ -59,7 +59,7 @@ class TerminalState:
     def feed(self, data: bytes) -> None:
         """Inspect raw tool output, skipping Python parsing for plain text chunks."""
         if self.parser.state != Sequencer.GROUND or b"\x1b" in data:
-            self.parser.interpret(data)
+            self.parser.feed(data)
 
     def restore(self) -> bytes:
         """Return minimal common-mode resets for a terminating session."""

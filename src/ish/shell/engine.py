@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import errno
 import fcntl
-import itertools
 import os
 import platform
 import pty
@@ -21,7 +20,6 @@ import sys
 import tempfile
 import termios
 import tty
-from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
@@ -71,6 +69,7 @@ from .limits import (
 from .prefix import OutputLine
 from .protocol import FrameDecoder
 from .request import ShellExitRequest, ShellPassRequest
+from .scrollback import Scrollback
 from .sequencer import Sequencer
 from .signals import InputPhase, ShellSignalController, SignalScope
 from .state import TerminalState
@@ -81,129 +80,6 @@ if TYPE_CHECKING:
     from ish.ui.prompt import Prompt
 
 __all__ = ["InteractiveShell"]
-
-
-class ScrollBack:
-    """Split the payload byte budget equally between history and last output.
-
-    Discard the oldest bytes first. UTF-8 cuts display replacement characters;
-    truncation flags let consumers distinguish a retained tail from full output.
-    """
-
-    def __init__(
-        self,
-        max_lines=SCROLLBACK_MAX_LINES,
-        max_bytes=SCROLLBACK_MAX_BYTES,
-        encoder="utf-8",
-    ):
-        """Validate line and byte budgets and prepare history and last-output buffers."""
-        if max_lines < 0 or max_bytes < 0:
-            raise ValueError("Scrollback limits must be nonnegative")
-        self.max_lines, self.max_bytes, self.encoder = max_lines, max_bytes, encoder
-        self._buffer = deque()
-        self._current_bytes = 0
-        self._partial_line = bytearray()
-        self._last_output = bytearray()
-        self.history_truncated = self.last_output_truncated = False
-
-    def __len__(self):
-        """Return the number of complete history lines currently retained."""
-        return len(self._buffer)
-
-    @property
-    def retained_bytes(self):
-        """Return payload bytes retained in history, the partial line, and last output."""
-        return self._current_bytes + len(self._partial_line) + len(self._last_output)
-
-    @property
-    def last_output(self):
-        """Decode the last command output, replacing characters cut at byte boundaries."""
-        return self._last_output.decode(self.encoder, errors="replace")
-
-    @last_output.setter
-    def last_output(self, value):
-        """Replace the last output or clear it when given None."""
-        self._last_output.clear()
-        self.last_output_truncated = False
-        if value is not None:
-            self.append_ld(
-                value.encode(self.encoder) if isinstance(value, str) else value
-            )
-
-    def _trim_history(self):
-        """Discard the oldest history to meet line and history-byte budgets."""
-        limit = self.max_bytes // 2
-        while self._buffer and (
-            len(self._buffer) > self.max_lines
-            or self._current_bytes + len(self._partial_line) > limit
-        ):
-            self._current_bytes -= len(self._buffer.popleft())
-            self.history_truncated = True
-        if len(self._partial_line) > limit:
-            del self._partial_line[: len(self._partial_line) - limit]
-            self.history_truncated = True
-
-    def _add_line(self, line):
-        """Store a complete line within the budget and trim existing history as needed."""
-        limit = self.max_bytes // 2
-        if not limit or not self.max_lines:
-            self.history_truncated |= bool(line)
-            return
-        if len(line) > limit:
-            line = line[-limit:]
-            self.history_truncated = True
-        self._buffer.append(bytes(line))
-        self._current_bytes += len(line)
-        self._trim_history()
-
-    def append(self, data):
-        """Accumulate output by line and retain an incomplete tail for the next read."""
-        if not data:
-            return
-        limit = self.max_bytes // 2
-        if not limit or not self.max_lines:
-            self.history_truncated = True
-            return
-        if len(data) > limit:
-            data = data[-limit:]
-            self._partial_line.clear()
-            self.history_truncated = True
-        # The retained partial line has no LF; scan only the newly received bytes.
-        parts = bytes(data).split(b"\n")
-        if len(parts) > 1:
-            first_line = b"".join((self._partial_line, parts[0], b"\n"))
-            self._partial_line.clear()
-            self._add_line(first_line)
-            for part in parts[1:-1]:
-                self._add_line(part + b"\n")
-        self._partial_line.extend(parts[-1])
-        self._trim_history()
-
-    def append_ld(self, data):
-        """Retain the tail of the last command output within its byte budget."""
-        limit = self.max_bytes - self.max_bytes // 2
-        if len(self._last_output) + len(data) > limit:
-            self.last_output_truncated = True
-        if not limit:
-            return
-        self._last_output.extend(data[-limit:])
-        del self._last_output[: max(0, len(self._last_output) - limit)]
-
-    def get_lines(self, count=None):
-        """Return the last count complete lines, or all complete lines, as strings."""
-        start = 0 if count is None else max(0, len(self._buffer) - max(0, count))
-        return [
-            line.decode(self.encoder, errors="replace")
-            for line in itertools.islice(self._buffer, start, None)
-        ]
-
-    def clear(self):
-        """Clear history, last output, the partial line, and truncation flags."""
-        self._buffer.clear()
-        self._partial_line.clear()
-        self._last_output.clear()
-        self._current_bytes = 0
-        self.history_truncated = self.last_output_truncated = False
 
 
 class InteractiveShell:
@@ -222,7 +98,7 @@ class InteractiveShell:
         "stderr_fd",
         "master_fd",
         "slave_fd",
-        "dupin_fd",
+        "input_reader_fd",
         "exec_attrs",
         "shell_pipe_path",
         "shell_pipe",
@@ -250,10 +126,10 @@ class InteractiveShell:
         "message",
         "shell_pipe_buffer",
         "shell_temp_buffer",
-        "dupin_buffer",
-        "scroll_back",
+        "typeahead",
+        "scrollback",
         "sequencer",
-        "session",
+        "editor",
         "_writers",
         "_fatal_error",
         "_initializing",
@@ -326,7 +202,7 @@ class InteractiveShell:
 
         self.master_fd: Optional[int] = None
         self.slave_fd: Optional[int] = None
-        self.dupin_fd: Optional[int] = None
+        self.input_reader_fd: Optional[int] = None
 
         self.exec_attrs: Optional[List[Union[int, List[int]]]] = None
 
@@ -405,9 +281,9 @@ class InteractiveShell:
         self._frame_decoder = FrameDecoder()
         self.shell_pipe_buffer = self._frame_decoder.buffer
         self.shell_temp_buffer: bytearray = bytearray()
-        self.dupin_buffer: bytearray = bytearray()
+        self.typeahead: bytearray = bytearray()
 
-        self.scroll_back: ScrollBack = ScrollBack(
+        self.scrollback: Scrollback = Scrollback(
             max_lines=SCROLLBACK_MAX_LINES,
             max_bytes=SCROLLBACK_MAX_BYTES,
             encoder=self.encoder,
@@ -415,7 +291,7 @@ class InteractiveShell:
 
         self.sequencer: Optional[Sequencer] = None
 
-        self.session: Prompt = prompt
+        self.editor: Prompt = prompt
         self._writers = {}
         self._fatal_error = None
         self._initializing = False
@@ -500,7 +376,7 @@ class InteractiveShell:
     # [Internal API: Input] Collect typeahead and transmit input with ordered handoff.
     # ==============================================================================================
 
-    def _pre_input(self, fd: int) -> Optional[bool]:
+    def _collect_typeahead(self, fd: int) -> Optional[bool]:
         """Collect forwarded typeahead in a bounded buffer and report whether data was
         read.
         """
@@ -535,7 +411,7 @@ class InteractiveShell:
         except (BlockingIOError, OSError):
             return
 
-    def _input(self, fd: int, epoch: int | None = None) -> None:
+    def _forward_input(self, fd: int, epoch: int | None = None) -> None:
         """Forward input to the internal PTY during execution and retain a diagnostic tail."""
         if (
             not self._native_input_active
@@ -633,7 +509,7 @@ class InteractiveShell:
                 echo = echo.replace(b"\n", b"\r\n")
             # The prefix has echo disabled; only arm suffix masking when LF
             # is about to be sent, so intervening background output stays intact.
-            self.sequencer.at_masking(b"")
+            self.sequencer.mask(b"")
             lease.start()
             self.input_observer.record("long_input_started", "SHELL", bytes=prefix)
             sent = await self._send(data[:prefix], generation)
@@ -652,7 +528,7 @@ class InteractiveShell:
             finally:
                 self._input_mode_lease = None
                 self.input_observer.record("long_input_restored", "SHELL")
-        self.sequencer.at_masking(echo)
+        self.sequencer.mask(echo)
         return sent + await self._send(data[prefix:], generation)
 
     # ==============================================================================================
@@ -686,8 +562,8 @@ class InteractiveShell:
                     writer.write(data)
                     await writer.drain()
 
-                if getattr(self.session, "output_active", False) is True:
-                    await self.session.write_output(write)
+                if getattr(self.editor, "output_active", False) is True:
+                    await self.editor.write_output(write)
                 else:
                     await write()
                 self._resume_output()
@@ -711,13 +587,13 @@ class InteractiveShell:
 
     def _consume_output(self, raw_data: bytes) -> None:
         """Pass a PTY chunk through the sequencer and update history and queued output."""
-        data = self.sequencer.interpret(raw_data)
+        data = self.sequencer.feed(raw_data)
         if self._initializing:
             self._init_output.extend(raw_data)
             del self._init_output[:-DIAGNOSTIC_TAIL_BYTES]
             return
-        self.scroll_back.append(raw_data)
-        self.scroll_back.append_ld(data)
+        self.scrollback.append(raw_data)
+        self.scrollback.append_output(data)
         self._write(self.stdout_fd, data)
 
     def _display(self, fd: int) -> None:
@@ -754,7 +630,7 @@ class InteractiveShell:
     # [Internal API: Integration] Validate prompt signals and synchronize shell context.
     # ==============================================================================================
 
-    def _update(self, fd: int) -> None:
+    def _receive_context(self, fd: int) -> None:
         """Consume FIFO frames to update shell state and the received prompt ID."""
         try:
             chunk = os.read(fd, self.chunk_size)
@@ -798,7 +674,7 @@ class InteractiveShell:
                         self._input_return_id = max(self._input_return_id, value)
                         self._context_event.set()
                 else:
-                    self.session.update_context(category, body)
+                    self.editor.update_context(category, body)
         except (BlockingIOError, InterruptedError):
             return
         except Exception as exc:
@@ -889,7 +765,7 @@ class InteractiveShell:
             # its own buffer. Keep one input owner until the primary prompt.
             # Returning bytes preserves the prompt's position in the PTY output.
             return prompt
-        self.session.set_prompt(prompt, self.encoder)
+        self.editor.set_prompt(prompt, self.encoder)
         # A custom UI continuation policy must not flush or replay shell input.
         self.prompt_event.set()
 
@@ -929,8 +805,8 @@ class InteractiveShell:
         if writer is not None and writer.pending_bytes:
             raise RuntimeError("Cannot accept a prompt with pending PTY writes")
         self.signal_controller.reset()
-        if self.loop is not None and self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
+        if self.loop is not None and self.input_reader_fd is not None:
+            self.loop.remove_reader(self.input_reader_fd)
             self._native_input_active = False
             self.input_observer.end(self._input_observation)
             self._input_observation = None
@@ -938,13 +814,13 @@ class InteractiveShell:
             # A previous primary hook may have moved submitted suffix bytes
             # into the typeahead FIFO before VINTR arrived. The new prompt is
             # emitted after its forwarder exits, so drain those bytes now.
-            while self._pre_input(self.tty_pipe):
+            while self._collect_typeahead(self.tty_pipe):
                 pass
             self._send_interrupted = False
         self._accepted_prompt_id = self._pending_prompt_id
         # The helper forwarded older PTY input before emitting this prompt.
         # Read that FIFO before appending newer input held during the handoff.
-        while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+        while self.tty_pipe is not None and self._collect_typeahead(self.tty_pipe):
             pass
         self.return_typeahead(bytes(self._deferred_input))
         self._deferred_input.clear()
@@ -953,8 +829,8 @@ class InteractiveShell:
         )
         self.command_done_event.set()
         self.continuation_active.clear()
-        self.session.set_prompt(self._prompt_prefix + self.message, self.encoder)
-        self.input_observer.terminal("SHELL", self.master_fd, "prompt_accepted")
+        self.editor.set_prompt(self._prompt_prefix + self.message, self.encoder)
+        self.input_observer.sample("SHELL", self.master_fd, "prompt_accepted")
 
     async def _synchronize_prompt(self):
         """Confirm context without ever injecting recovery commands into shell stdin."""
@@ -1101,7 +977,7 @@ class InteractiveShell:
         to the shell while waiting, then detach the raw input reader after the
         completion boundary.
         """
-        self.scroll_back.last_output = None
+        self.scrollback.last_output = None
         self._native_output_line.clear()
         self._prompt_prefix = b""
         if isinstance(data, str):
@@ -1120,14 +996,14 @@ class InteractiveShell:
         # unused suffix for normal editor/tool dispatch.
         native_pending = bytes(self._returned_input)
         self._returned_input.clear()
-        if hasattr(self.session, "take_typeahead"):
+        if hasattr(self.editor, "take_typeahead"):
             if self.adapter.input_handoff is InputHandoffMode.NATIVE:
-                data += self.session.take_typeahead()
+                data += self.editor.take_typeahead()
             elif self._submitted_input.active:
                 # Keys already retained by the editor or an earlier handoff
                 # precede future native reads, but follow the submitted block.
                 # Keep them separate from command echo and transport validation.
-                self._deferred_input.extend(self.session.take_typeahead())
+                self._deferred_input.extend(self.editor.take_typeahead())
         # Returned text was already displayed during its first PTY delivery.
         # Keep its retransmission in the same ordered sender and echo mask as
         # the command, without changing the command's dispatch/hook identity.
@@ -1135,13 +1011,16 @@ class InteractiveShell:
         try:
             # The PTY echoes every newline as CRLF, including pasted lines.
             attrs = termios.tcgetattr(self.master_fd)
-            self.input_observer.terminal("SHELL", self.master_fd, "submission")
+            self.input_observer.sample("SHELL", self.master_fd, "submission")
             echo = data if attrs[3] & termios.ECHO else b""
             if attrs[1] & termios.OPOST and attrs[1] & termios.ONLCR:
                 echo = echo.replace(b"\n", b"\r\n")
-            self.sequencer.at_masking(echo)
+            self.sequencer.mask(echo)
             self.loop.add_reader(
-                self.dupin_fd, self._input, self.dupin_fd, self._input_epoch
+                self.input_reader_fd,
+                self._forward_input,
+                self.input_reader_fd,
+                self._input_epoch,
             )
             self._native_input_active = True
             self._input_observation = self.input_observer.begin("SHELL")
@@ -1184,7 +1063,7 @@ class InteractiveShell:
             await self._synchronize_prompt()
             await self._drain_output()
         finally:
-            self.loop.remove_reader(self.dupin_fd)
+            self.loop.remove_reader(self.input_reader_fd)
             self._native_input_active = False
             self.input_observer.end(self._input_observation)
             self._input_observation = None
@@ -1195,38 +1074,38 @@ class InteractiveShell:
         post-hook order.
         """
 
-        def inject_typehead():
+        def inject_typeahead():
             """Feed typeahead through the real key parser and update editor state and
             rendering.
             """
             if self._literal_input:
-                self.session.feed_literal_input(bytes(self._literal_input))
+                self.editor.feed_literal_input(bytes(self._literal_input))
                 self._literal_input.clear()
             while self._returned_input:
                 end = self._returned_input.find(b"\n")
                 size = len(self._returned_input) if end < 0 else end + 1
                 data = bytes(self._returned_input[:size])
                 del self._returned_input[:size]
-                self.session.feed_literal_input(data if end < 0 else data[:-1])
+                self.editor.feed_literal_input(data if end < 0 else data[:-1])
                 if end < 0:
                     break
                 # Text has already passed through the native terminal. Only
                 # its accepted Enter goes through normal command/tool dispatch.
-                self.session.feed_typeahead(b"\r")
-                if self.session.process_typeahead():
+                self.editor.feed_typeahead(b"\r")
+                if self.editor.process_typeahead():
                     return
-            typehead = b""
-            if self.dupin_buffer:
-                idx = self.dupin_buffer.find(b"\n")
-                size = len(self.dupin_buffer) if idx < 0 else idx + 1
-                typehead = bytes(self.dupin_buffer[:size])
-                del self.dupin_buffer[:size]
-            if typehead:
+            typeahead = b""
+            if self.typeahead:
+                idx = self.typeahead.find(b"\n")
+                size = len(self.typeahead) if idx < 0 else idx + 1
+                typeahead = bytes(self.typeahead[:size])
+                del self.typeahead[:size]
+            if typeahead:
                 self.input_observer.record(
-                    "typeahead_injected", "EDITOR", bytes=len(typehead)
+                    "typeahead_injected", "EDITOR", bytes=len(typeahead)
                 )
-                self.session.feed_typeahead(typehead)
-                self.session.process_typeahead(invalidate=True)
+                self.editor.feed_typeahead(typeahead)
+                self.editor.process_typeahead(invalidate=True)
 
         retry_command = None
         while True:
@@ -1234,16 +1113,16 @@ class InteractiveShell:
                 return
             if self.shell_temp_buffer:
                 del self.shell_temp_buffer[:]
-            while self._pre_input(self.tty_pipe):
+            while self._collect_typeahead(self.tty_pipe):
                 pass
             try:
                 self._write(self.stdout_fd, b"\x1b[2K\r")
                 await self._drain_output()
-                options = {"pre_run": inject_typehead}
+                options = {"pre_run": inject_typeahead}
                 if retry_command is not None:
                     options["default"] = retry_command
                     retry_command = None
-                command = await self.session.get(**options)
+                command = await self.editor.read_and_dispatch(**options)
                 await self._drain_output()
                 if self._has_exited():
                     return
@@ -1252,7 +1131,7 @@ class InteractiveShell:
                     # command. Their unread input belongs to the next editor.
                     continue
             except KeyboardInterrupt:
-                self.dupin_buffer.clear()
+                self.typeahead.clear()
                 self._returned_input.clear()
                 self._literal_input.clear()
                 if self.continuation_active.is_set():
@@ -1271,12 +1150,12 @@ class InteractiveShell:
                 for cmd in lines:
                     self.last_command = cmd
                     self.validate_submission((cmd + "\n").encode(self.encoder))
-                    await self.session.pre_exec()
+                    await self.editor.pre_exec()
 
                     await self._exec((cmd + "\n").encode(self.encoder))
 
-                    await self.session.post_exec()
-                    await self.session.fallback()
+                    await self.editor.post_exec()
+                    await self.editor.fallback()
 
             except InputRejected as exc:
                 # The UI normally rejects before accepting Enter. Revalidate
@@ -1291,8 +1170,8 @@ class InteractiveShell:
         """Return the child status after draining final output and control sequences."""
         status = await self.proc.wait()
         self._native_input_active = False
-        if self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
+        if self.input_reader_fd is not None:
+            self.loop.remove_reader(self.input_reader_fd)
         self._send_generation += 1
         writer = self._writers.get(self.master_fd)
         if writer is not None:
@@ -1331,8 +1210,8 @@ class InteractiveShell:
         self._native_input_active = False
         self._send_generation += 1
         self.signal_controller.reset()
-        if self.dupin_fd is not None:
-            self.loop.remove_reader(self.dupin_fd)
+        if self.input_reader_fd is not None:
+            self.loop.remove_reader(self.input_reader_fd)
         for task in self.tasks or []:
             task.cancel()
         if self._handoff_task is not None:
@@ -1422,8 +1301,8 @@ class InteractiveShell:
                 resources.callback(self._close_fd, "master_fd")
                 resources.callback(self._close_fd, "slave_fd")
                 os.set_blocking(self.master_fd, False)
-                self.dupin_fd = os.dup(self.stdin_fd)
-                resources.callback(self._close_fd, "dupin_fd")
+                self.input_reader_fd = os.dup(self.stdin_fd)
+                resources.callback(self._close_fd, "input_reader_fd")
 
                 self.shell_pipe_path = os.path.join(pipe_dir, SHELL_FIFO)
                 self.tty_pipe_path = os.path.join(pipe_dir, TTY_FIFO)
@@ -1451,7 +1330,7 @@ class InteractiveShell:
 
                 tty.setraw(self.stdin_fd)
                 resources.enter_context(
-                    self.session.observe_resize(self.signal_controller.notify_resize)
+                    self.editor.observe_resize(self.signal_controller.notify_resize)
                 )
 
                 self.sequencer = Sequencer(
@@ -1459,7 +1338,7 @@ class InteractiveShell:
                     output_callback=self._track_output_line,
                     control_callback=self.terminal_state.observe,
                 )
-                self.adapter.configure_sequencer(
+                self.adapter.bind(
                     self.sequencer,
                     prompt_id=self._set_prompt_id,
                     prompt=self._set_prompt,
@@ -1467,11 +1346,11 @@ class InteractiveShell:
                     unhooked_prompt=self._set_unhooked_prompt,
                     signals=self.signals,
                 )
-                self.signal_controller.configure_sequencer(self.sequencer, self.signals)
+                self.signal_controller.bind(self.sequencer, self.signals)
                 for fd, callback in [
                     (self.master_fd, self._display),
-                    (self.shell_pipe, self._update),
-                    (self.tty_pipe, self._pre_input),
+                    (self.shell_pipe, self._receive_context),
+                    (self.tty_pipe, self._collect_typeahead),
                 ]:
                     self.loop.add_reader(fd, callback, fd)
                     resources.callback(self.loop.remove_reader, fd)
@@ -1547,7 +1426,7 @@ class InteractiveShell:
 
     def discard_typeahead(self) -> None:
         """Discard only fresh keys owned by the current cancellation policy."""
-        self.dupin_buffer.clear()
+        self.typeahead.clear()
 
     def invalidate_input(self) -> None:
         """Revoke native input and the current sender before shutdown cancellation."""
@@ -1562,7 +1441,7 @@ class InteractiveShell:
         """Cancel an input handoff and retain only post-control typeahead."""
         discard_submitted = self._handoff_pending and self._submitted_input.active
         self._deferred_input.clear()
-        self.dupin_buffer.clear()
+        self.typeahead.clear()
         self._returned_input.clear()
         self._submitted_input.clear()
         self._literal_input.clear()
@@ -1583,9 +1462,9 @@ class InteractiveShell:
 
     def resume_native_typeahead(self) -> None:
         """Return held keys to a native command that won a continuation cancel race."""
-        data = bytes(self._returned_input) + bytes(self.dupin_buffer)
+        data = bytes(self._returned_input) + bytes(self.typeahead)
         self._returned_input.clear()
-        self.dupin_buffer.clear()
+        self.typeahead.clear()
         if data and not (self._closing_output or self._stopping or self._has_exited()):
             self._write(self.master_fd, data)
             self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
@@ -1605,7 +1484,7 @@ class InteractiveShell:
         if self._send_task is not None:
             self._send_task.cancel()
         self._deferred_input.clear()
-        self.dupin_buffer.clear()
+        self.typeahead.clear()
         self._submitted_input.clear()
         self._returned_input.clear()
         self._literal_input.clear()
@@ -1616,19 +1495,19 @@ class InteractiveShell:
         self._writer(self.master_fd).discard()
         self._discard_terminal_input()
         if self.sequencer is not None:
-            self.sequencer.at_masking(b"")
+            self.sequencer.mask(b"")
         self._write(self.master_fd, control)
         if self.adapter.input_handoff is InputHandoffMode.NATIVE:
             # This adapter has no automatic prompt acknowledgement. Its old
             # FIFO is idle until explicit reconnect, so discard it now and keep
             # following user bytes with native input, including recovery.
-            while self.tty_pipe is not None and self._pre_input(self.tty_pipe):
+            while self.tty_pipe is not None and self._collect_typeahead(self.tty_pipe):
                 pass
             self._send_interrupted = False
             self._write(self.master_fd, remaining)
         else:
             self.return_typeahead(remaining)
-        self.input_observer.terminal("SHELL", self.master_fd, "interrupt")
+        self.input_observer.sample("SHELL", self.master_fd, "interrupt")
 
     def resize(self) -> None:
         """Resize the shell first, then notify any active Python tool of its new size."""
@@ -1657,7 +1536,7 @@ class InteractiveShell:
     def tool_context(self) -> tuple[str, dict[str, str]]:
         """Snapshot exported state at a confirmed primary prompt for a Python tool.
 
-        FIFO updates populate session.context synchronously, independently of
+        FIFO updates populate editor.context synchronously, independently of
         completion scans. Read the actual shell cwd once per tool because PWD may
         be unset or modified. Never fall back to the ish parent's startup state.
         """
@@ -1675,7 +1554,7 @@ class InteractiveShell:
             or self.continuation_active.is_set()
         ):
             raise RuntimeError("Python tools require a confirmed primary shell prompt")
-        environ = self.session.context.environ
+        environ = self.editor.context.environ
         if environ is None:
             raise RuntimeError("Shell environment is unavailable for the Python tool")
         cwd = psutil.Process(self.shell_pid).cwd()
@@ -1687,24 +1566,24 @@ class InteractiveShell:
 
     def return_typeahead(self, data: bytes) -> None:
         """Append unread input returned by the previous consumer within the byte limit."""
-        if len(self.dupin_buffer) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+        if len(self.typeahead) + len(data) > TYPEAHEAD_LIMIT_BYTES:
             raise BufferError(
                 f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
             )
-        self.dupin_buffer.extend(data)
+        self.typeahead.extend(data)
         if data:
             self.input_observer.record(
-                "input_returned", bytes=len(data), pending=len(self.dupin_buffer)
+                "input_returned", bytes=len(data), pending=len(self.typeahead)
             )
 
     def take_pending_input(self) -> tuple[bytes, int]:
         """Drain engine queues in wire order, retaining the native-text boundary."""
         data = bytes(self._literal_input) + bytes(self._returned_input)
         native_prefix = len(data)
-        data += bytes(self.dupin_buffer)
+        data += bytes(self.typeahead)
         self._literal_input.clear()
         self._returned_input.clear()
-        self.dupin_buffer.clear()
+        self.typeahead.clear()
         return data, native_prefix
 
     def return_native_input(self, data: bytes) -> None:

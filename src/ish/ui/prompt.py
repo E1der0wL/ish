@@ -92,7 +92,7 @@ from prompt_toolkit.widgets.toolbars import (
 )
 from pygments.lexers import get_lexer_by_name
 
-from ish.app.pytool import ProcessHandler
+from ish.app.pytool import Runner
 from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
@@ -215,7 +215,7 @@ class Prompt(PromptSession):
             )
 
         self.context = ShellContext()
-        self.context.register_handler(
+        self.context.register(
             ENVIRON,
             lambda data: dict_parser(
                 data,
@@ -225,14 +225,14 @@ class Prompt(PromptSession):
             ),
             lambda data: asyncio.create_task(self._update_context(ENVIRON, data)),
         )
-        self.context.register_handler(
+        self.context.register(
             ALIAS,
             lambda data: alias_parser(
                 data, encoder=self.encoder, shell=self.interactive_shell.shell
             ),
             lambda data: asyncio.create_task(self._update_context(ALIAS, data)),
         )
-        self.context.register_handler(
+        self.context.register(
             EXITCODE, lambda data: str_parser(data, encoder=self.encoder)
         )
         self.last_exitcode: Optional[int] = None
@@ -248,7 +248,7 @@ class Prompt(PromptSession):
         )
         self.shell = self.interactive_shell.shell
 
-        self.process_handler: ProcessHandler = ProcessHandler(
+        self.runner: Runner = Runner(
             encoder=self.encoder,
             stdin=input_fd,
             stdout=output_fd,
@@ -259,7 +259,7 @@ class Prompt(PromptSession):
             return_native_input=self.interactive_shell.return_native_input,
             observe_output=self.interactive_shell.terminal_state.feed,
         )
-        self.interactive_shell.resize_callback = self.process_handler.resize
+        self.interactive_shell.resize_callback = self.runner.resize
 
         self.pre_hook: Optional[Callable[..., Any]] = None
         self.post_hook: Optional[Callable[..., Any]] = None
@@ -785,13 +785,13 @@ class Prompt(PromptSession):
                 return
         self.interactive_shell.validate_submission(data)
 
-    def _update_layout(self) -> None:
+    def _relayout(self) -> None:
         """Rebuild the layout after float or tool changes and request a redraw."""
         if hasattr(self, "app") and self.app is not None:
             self.app.layout = self._create_layout()
             self.app.invalidate()
 
-    def _rebuild_completer(self) -> None:
+    def _rank(self) -> None:
         """Sort builtin, PATH, and alias candidates by usage frequency and length."""
         combined = set()
         for values in self._completions.values():
@@ -827,13 +827,13 @@ class Prompt(PromptSession):
                 and set(self._completions[category]) != execs
             ):
                 self._completions[category][:] = execs
-                self._rebuild_completer()
+                self._rank()
 
         elif ALIAS == category:
             aliases = list(data.keys())
             if self._completions[category] != aliases:
                 self._completions[category][:] = aliases
-                self._rebuild_completer()
+                self._rank()
 
     def cmd(self, cmd: str) -> None:
         """Exit the current editor and return the specified command as its submission."""
@@ -845,7 +845,7 @@ class Prompt(PromptSession):
             return
 
         try:
-            await self.process_handler.run(self.post_hook)
+            await self.runner.run(self.post_hook)
         except Exception:
             self.logger.exception("post hook failed")
             return
@@ -856,7 +856,7 @@ class Prompt(PromptSession):
             return
 
         try:
-            await self.process_handler.run(self.pre_hook)
+            await self.runner.run(self.pre_hook)
         except Exception:
             self.logger.exception("pre hook failed")
             return
@@ -872,7 +872,7 @@ class Prompt(PromptSession):
         try:
             status = getattr(self.context, EXITCODE, None)
             if status is not None and str(status).strip() != "0":
-                await self.process_handler.run(self.fallback_hook)
+                await self.runner.run(self.fallback_hook)
         except Exception:
             self.logger.exception("fallback hook failed")
             return
@@ -979,7 +979,7 @@ class Prompt(PromptSession):
                 self.floats.remove(target_float)
             else:
                 return None
-            self._update_layout()
+            self._relayout()
             return None
 
         index = self.floats.index(target_float) if target_float is not None else None
@@ -988,7 +988,7 @@ class Prompt(PromptSession):
             self.floats.append(new_float)
         else:
             self.floats[index] = new_float
-        self._update_layout()
+        self._relayout()
         return new_float
 
     def completion_context(self, document: Document) -> CompletionWord | None:
@@ -1103,7 +1103,7 @@ class Prompt(PromptSession):
         """Run the user initialization script in a separate thread."""
         await asyncio.to_thread(self.load_rc)
 
-    async def get(self, **kwargs) -> Optional[str]:
+    async def read_and_dispatch(self, **kwargs) -> Optional[str]:
         """Read edited input and dispatch exit requests, internal commands, or Python
         tools.
 
@@ -1136,7 +1136,7 @@ class Prompt(PromptSession):
             else:
                 # Transport failures and application cancellation must still reach
                 # session cleanup; they are not ordinary tool exit statuses.
-                status = await self.process_handler.run_in_context(
+                status = await self.runner.run_in_context(
                     self.internal_tools[argv[0]], cwd, environ, *argv[1:]
                 )
             self.last_tool_exitcode = status

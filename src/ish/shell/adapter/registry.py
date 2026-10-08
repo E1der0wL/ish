@@ -229,7 +229,7 @@ class ShellAdapter:
         return SYNTAXES[self.family]
 
     @property
-    def refresh(self) -> bool:
+    def has_refresh_script(self) -> bool:
         """Report whether a separate state-refresh script is configured."""
         return self.refresh_script is not None
 
@@ -297,7 +297,7 @@ class ShellAdapter:
             )
         return command
 
-    def configure_sequencer(
+    def bind(
         self,
         sequencer,
         *,
@@ -322,17 +322,17 @@ class ShellAdapter:
                 return continuation(payload)
 
         sequencer.on_prefix(scope(PROMPT_ID_PREFIX), prompt_id, restart_capture=True)
-        sequencer.between_sequence(scope(BEFORE_PROMPT), scope(AFTER_PROMPT), prompt)
-        sequencer.between_sequence(
+        sequencer.capture(scope(BEFORE_PROMPT), scope(AFTER_PROMPT), prompt)
+        sequencer.capture(
             scope(BEFORE_CONTINUATION), scope(AFTER_CONTINUATION), continuation_callback
         )
         if self.buffered_continuation:
-            sequencer.between_sequence(
+            sequencer.capture(
                 *(scope(marker) for marker in self.buffered_continuation),
                 lambda prompt: continuation(prompt, buffered=True),
             )
         if self.unhooked_prompt:
-            sequencer.between_sequence(
+            sequencer.capture(
                 *(scope(marker) for marker in self.unhooked_prompt), unhooked_prompt
             )
         if self.native_continuation_signal:

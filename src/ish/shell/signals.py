@@ -78,7 +78,7 @@ class TerminalSignalHandler:
     def reset(self) -> None:
         """Release any pending policy state after a confirmed prompt or shutdown."""
 
-    def configure_sequencer(self, sequencer, markers) -> None:
+    def bind(self, sequencer, markers) -> None:
         """Optionally register session-scoped protocol replies for this policy."""
 
     def validate_submission(self) -> None:
@@ -316,7 +316,7 @@ class ShellSignalController:
         value = bytes((value,)) if isinstance(value, int) else bytes(value)
         return value if value != b"\0" else None
 
-    def terminal_handler(self, signum: int) -> TerminalSignalHandler | None:
+    def get_terminal_handler(self, signum: int) -> TerminalSignalHandler | None:
         """Return the session's selected handler without mutating adapter defaults."""
         return next(
             (
@@ -363,14 +363,14 @@ class ShellSignalController:
         _, handler, control = min(matches, key=lambda match: match[0])
         return handler.handle(control, data, phase) is not False
 
-    def configure_sequencer(self, sequencer, markers) -> None:
+    def bind(self, sequencer, markers) -> None:
         """Bind only registered policies' session-scoped acknowledgement messages."""
         for _, handler in self._terminal:
-            handler.configure_sequencer(sequencer, markers)
+            handler.bind(sequencer, markers)
 
     def validate_submission(self) -> None:
         """Ask selected policies to check capabilities before a staged submission."""
-        if self.terminal_handler(signal.SIGINT) is None:
+        if self.get_terminal_handler(signal.SIGINT) is None:
             raise InputRejected(
                 "Not sent: long input requires a registered terminal SIGINT policy."
             )

@@ -176,7 +176,7 @@ class PluginManager:
         except Exception:
             return None
 
-    def _ensure_version(self, installed: str, spec: Optional[str]) -> bool:
+    def _is_version_allowed(self, installed: str, spec: Optional[str]) -> bool:
         """Check a PEP 440 constraint and log and reject invalid constraints."""
         if not spec:
             return True
@@ -188,7 +188,7 @@ class PluginManager:
             )
             return False
 
-    def _extras_available(self, requirement: Requirement, seen=None) -> bool:
+    def _has_extras(self, requirement: Requirement, seen=None) -> bool:
         """Check installed metadata for an extras dependency tree without importing it.
 
         Only extras requests traverse dependency metadata. The visited set is
@@ -200,7 +200,9 @@ class PluginManager:
             distribution = importlib.metadata.distribution(requirement.name)
         except PackageNotFoundError:
             return False
-        if not self._ensure_version(distribution.version, str(requirement.specifier)):
+        if not self._is_version_allowed(
+            distribution.version, str(requirement.specifier)
+        ):
             return False
         if key in seen:
             return True
@@ -212,11 +214,11 @@ class PluginManager:
                 child.marker.evaluate({"extra": extra}) for extra in extras
             ):
                 continue
-            if not self._extras_available(child, seen):
+            if not self._has_extras(child, seen):
                 return False
         return True
 
-    def _library_available(
+    def _is_library_available(
         self, library: str, *, import_parents: bool = True, installed: bool = False
     ) -> bool:
         """Check metadata and imports, distinguishing missing parents from broken imports."""
@@ -240,9 +242,9 @@ class PluginManager:
                 version = importlib.metadata.version(requirement.name)
             except PackageNotFoundError:
                 return False
-            if not self._ensure_version(version, str(requirement.specifier)):
+            if not self._is_version_allowed(version, str(requirement.specifier)):
                 return False
-        if requirement.extras and not self._extras_available(requirement):
+        if requirement.extras and not self._has_extras(requirement):
             return False
         name = origin.strip() or requirement.name
         if not import_parents:
@@ -258,7 +260,7 @@ class PluginManager:
     def _ensure_library(self, library: str) -> bool:
         """Use an available dependency or install and validate it before loading a plugin."""
         try:
-            return self._library_available(library) or self._load_library(library)
+            return self._is_library_available(library) or self._install_library(library)
         except InvalidRequirement as exc:
             self.logger.warning("Invalid Python requirement %r: %s", library, exc)
             return False
@@ -287,7 +289,7 @@ class PluginManager:
             if plugin_version is None:
                 return True
             info = self.registry.get_info(plugin_name)
-            if info and self._ensure_version(info.version, plugin_version):
+            if info and self._is_version_allowed(info.version, plugin_version):
                 return True
             else:
                 return False
@@ -296,10 +298,10 @@ class PluginManager:
             if plugin_dir.exists():
                 info = self._resolve(plugin_dir)
                 if info is not None:
-                    return self._ensure_version(info.version, plugin_version)
+                    return self._is_version_allowed(info.version, plugin_version)
             return False
 
-    def _load_library(self, library: str) -> bool:
+    def _install_library(self, library: str) -> bool:
         """Install dependencies into the separate plugin directory using the selected
         Python's pip.
 
@@ -321,7 +323,7 @@ class PluginManager:
                 config.PLUGIN_LIB_DIR,
                 self._dependency_constraints(),
             ):
-                if not self._library_available(
+                if not self._is_library_available(
                     library, import_parents=False, installed=True
                 ):
                     raise RuntimeError(

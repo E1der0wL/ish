@@ -48,9 +48,9 @@ class PathCompleter(Completer):
         """
         word = self.context(document)
         if word is not None:
-            yield from self.complete_word(document, word)
+            yield from self.complete(document, word)
 
-    def complete_word(self, document: Document, word: CompletionWord):
+    def complete(self, document: Document, word: CompletionWord):
         """Complete paths using an already analyzed context shared by the parent."""
         if word.dynamic:
             return
@@ -148,7 +148,7 @@ class PromptCompleter(Completer):
         word = self.context(document)
         if word is None:
             return
-        yield from self.path_completer.complete_word(document, word)
+        yield from self.path_completer.complete(document, word)
         if not word.command or word.dynamic:
             return
         prefix = word.value.casefold() if self.ignore_case else word.value

@@ -212,7 +212,7 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
     executable = os.environ.get("ISH_TEST_" + shell.upper()) or shutil.which(shell)
     if not executable:
         raise RuntimeError(f"Shell not installed: {shell}")
-    reconnect = get_adapter(shell, executable).refresh
+    reconnect = get_adapter(shell, executable).has_refresh_script
     suffix = "; ish_recover" if reconnect else ""
     terminals = []
     started = time.monotonic()

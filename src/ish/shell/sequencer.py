@@ -112,7 +112,7 @@ class Sequencer:
         else:
             self._capture_restarts.discard(prefix)
 
-    def between_sequence(
+    def capture(
         self,
         start_seq: bytes,
         end_seq: bytes,
@@ -127,7 +127,7 @@ class Sequencer:
         if start_seq and start_seq[0] != 0x1B:
             self.literal_starts.setdefault(start_seq[0], set()).add(start_seq)
 
-    def at_masking(self, byte: bytes) -> None:
+    def mask(self, byte: bytes) -> None:
         # Large commands still execute, but their echo is not retained for masking.
         """Prepare to mask the next command's expected echo exactly once."""
         self.masking_bytes = (
@@ -175,7 +175,7 @@ class Sequencer:
                     max_sequence_bytes=self.max_sequence_bytes,
                     control_callback=self.control_callback,
                 )
-                observer.interpret(released)
+                observer.feed(released)
         self.between_buffer.clear()
         self._between_tail.clear()
         self.between_truncated = False
@@ -188,7 +188,7 @@ class Sequencer:
             self.output_callback(bytes(buffer[self._notified_output :]))
         self._notified_output = len(buffer)
 
-    def _union(self, buffer: bytearray) -> None:
+    def _dispatch(self, buffer: bytearray) -> None:
         """Route a complete control sequence to callbacks, prompt capture, or ordinary
         output.
         """
@@ -328,7 +328,7 @@ class Sequencer:
             self.buffer.clear()
             self._resume_text()
         else:
-            self._union(output)
+            self._dispatch(output)
         self._passthrough = False
         self._string_escape = False
 
@@ -358,7 +358,7 @@ class Sequencer:
         self._notify_output(output)
         return bytes(output)
 
-    def interpret(self, data: bytes):
+    def feed(self, data: bytes):
         """Process a chunk into display bytes and retain partial state for the next call."""
         output = bytearray()
         self._notified_output = 0
@@ -401,7 +401,7 @@ class Sequencer:
                 self.buffer.append(byte)
                 candidates = self.literal_starts[self.buffer[0]]
                 if bytes(self.buffer) in candidates:
-                    self._union(output)
+                    self._dispatch(output)
                 elif not any(seq.startswith(self.buffer) for seq in candidates):
                     if byte in self.literal_starts or byte == 0x1B:
                         output.extend(self.buffer[:-1])

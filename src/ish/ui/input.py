@@ -164,7 +164,7 @@ class ObservedInput(Input):
                         fd = self.fileno()
                     except (OSError, NotImplementedError):
                         fd = None
-                    self.observer.terminal("EDITOR", fd, "attach")
+                    self.observer.sample("EDITOR", fd, "attach")
                 yield
         finally:
             self.observer.end(self._tokens.pop())

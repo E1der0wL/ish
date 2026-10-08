@@ -97,7 +97,7 @@ class InputObserver:
             ],
         }
 
-    def terminal(self, owner: str, fd: int | None, boundary: str) -> None:
+    def sample(self, owner: str, fd: int | None, boundary: str) -> None:
         """Sample terminal metadata at transitions only, without changing any modes.
 
         A foreground group or raw mode does not prove who is reading input. These

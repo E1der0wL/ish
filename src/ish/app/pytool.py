@@ -23,7 +23,7 @@ from typing import Any, Callable
 from ish.runtime.fdio import FDWriter, InputBytes
 from ish.runtime.observer import InputObserver
 
-__all__ = ["ProcessHandler"]
+__all__ = ["Runner"]
 
 
 def _run_worker(payload, cwd, environ, connection, encoder):
@@ -65,7 +65,7 @@ def _run_worker(payload, cwd, environ, connection, encoder):
         sys.stderr.flush()
 
 
-class ProcessHandler:
+class Runner:
     """Run an importable, pickleable callable in a fresh interpreter with a PTY.
 
     Local functions and lambdas are rejected before acquiring resources. Define
@@ -225,12 +225,12 @@ class ProcessHandler:
                             )
                         loop.remove_reader(self.stdin_fd)
                         observe_input_end()
-                        unsent = input_writer.take_pending()
+                        unsent = input_writer.take()
                         input_writer.close()
                         self.input_observer.record(
                             "process_exit", "TOOL", status=process.exitcode
                         )
-                        self.input_observer.terminal("TOOL", master_fd, "worker_exit")
+                        self.input_observer.sample("TOOL", master_fd, "worker_exit")
                         if self.return_input is not None:
                             remaining = self._remaining_input(slave_fd)
                             if self.return_native_input is None:
@@ -361,7 +361,7 @@ class ProcessHandler:
                         self.input_observer.record(
                             "initial_input", "TOOL", bytes=len(initial)
                         )
-                self.input_observer.terminal("TOOL", master_fd, "worker_start")
+                self.input_observer.sample("TOOL", master_fd, "worker_start")
                 done, _ = await asyncio.wait(
                     [exited, failed], return_when=asyncio.FIRST_COMPLETED
                 )

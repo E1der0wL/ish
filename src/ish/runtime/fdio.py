@@ -92,7 +92,7 @@ class FDWriter:
         self._scheduled = None
         self._flush()
 
-    def _finish_waiters(self) -> None:
+    def _wake(self) -> None:
         """Wake drain waiters without setting an exception on their Futures."""
         for waiter in self._waiters:
             if not waiter.done():
@@ -136,7 +136,7 @@ class FDWriter:
                         self._scheduled = self.loop.call_soon(self._resume)
             else:
                 self._unwatch()
-                self._finish_waiters()
+                self._wake()
             if self.on_flow:
                 if (
                     not self._paused
@@ -152,7 +152,7 @@ class FDWriter:
             self.pending.clear()
             self.pending_bytes = 0
             self._unwatch()
-            self._finish_waiters()
+            self._wake()
             if self.on_error:
                 self.on_error(exc)
 
@@ -180,13 +180,13 @@ class FDWriter:
         self._unwatch()
         self.pending.clear()
         self.pending_bytes = 0
-        self._finish_waiters()
+        self._wake()
         if self._paused:
             self._paused = False
             if self.on_flow and not self.closed:
                 self.on_flow(False)
 
-    def take_pending(self) -> bytes:
+    def take(self) -> bytes:
         """Detach unsent bytes in order before transferring input to another consumer."""
         data = b"".join(self.pending)
         self.discard()

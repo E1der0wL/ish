@@ -75,12 +75,12 @@ class ArgumentParser:
     def _load_messages(self, lang: Optional[str] = None) -> None:
         """Refresh translations and cached help after the home or language changes."""
         i18n.base_path = config.LANG_DIR
-        i18n.load_messages(lang, create=False)
+        i18n.load(lang, create=False)
         self._description = i18n.get("cli_description")
-        self.__dict__.pop("option", None)
+        self.__dict__.pop("parser", None)
 
     @cached_property
-    def option(self) -> AltArgumentParser:
+    def parser(self) -> AltArgumentParser:
         """Create a parser whose information flags are handled after settings resolve."""
         parser = AltArgumentParser(
             prog="ish",
@@ -131,12 +131,12 @@ class ArgumentParser:
 
     def parse(self, args: Optional[list] = None) -> argparse.Namespace:
         """Handle read-only queries or initialize the selected interactive environment."""
-        option = self.option.parse_args(args)
+        option = self.parser.parse_args(args)
         if option.home is not None:
             try:
                 option.home = option.home.expanduser().resolve()
             except (OSError, RuntimeError) as exc:
-                self.option.error(
+                self.parser.error(
                     i18n.get("cli_home_error", path=str(option.home), error=exc)
                 )
             config.ISH_HOME = option.home
@@ -144,10 +144,10 @@ class ArgumentParser:
 
         if option.help:
             self.help()
-            self.option.exit()
+            self.parser.exit()
         if option.version:
             print(i18n.get("cli_version", version=__version__))
-            self.option.exit()
+            self.parser.exit()
         if option.diagnose:
             from ish.runtime.diagnostics import print_diagnostics
 
@@ -160,7 +160,7 @@ class ArgumentParser:
         register_logger(name="global")
 
         # Preserve default translation-file generation for interactive startup only.
-        i18n.load_messages(option.lang)
+        i18n.load(option.lang)
 
         if option.shell:
             from ish.plugin import plugin_manager
@@ -183,4 +183,4 @@ class ArgumentParser:
 
     def help(self):
         """Print help from the cached CLI parser."""
-        self.option.print_help()
+        self.parser.print_help()
