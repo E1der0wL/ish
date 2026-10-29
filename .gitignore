@@ -24,6 +24,7 @@ share/python-wheels/
 /tests/
 /dev/
 /docs/
+/.codex-remote-attachments/
 *.egg-info/
 .installed.cfg
 *.egg
