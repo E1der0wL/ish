@@ -17,6 +17,46 @@ if TYPE_CHECKING:
 __all__ = ["I18N"]
 
 
+class _Messages(dict):
+    """Validate message mutations once, retaining ordinary dictionary reads."""
+
+    __slots__ = ()
+
+    def __init__(self, *args, **kwargs):
+        """Copy validated values so caller-held dictionaries cannot bypass validation."""
+        super().__init__()
+        self.update(*args, **kwargs)
+
+    @staticmethod
+    def _validate(key, value):
+        """Keep the same string-to-string contract for every mutation path."""
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("Language messages must map strings to strings")
+
+    def __setitem__(self, key, value):
+        """Reject malformed values before changing a single translation."""
+        self._validate(key, value)
+        super().__setitem__(key, value)
+
+    def update(self, *args, **kwargs):
+        """Validate an entire update before publishing any of its entries."""
+        incoming = dict(*args, **kwargs)
+        for key, value in incoming.items():
+            self._validate(key, value)
+        super().update(incoming)
+
+    def setdefault(self, key, default=None):
+        """Validate defaults only when a new entry would be inserted."""
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, other):
+        """Apply the same atomic validation to augmented mapping updates."""
+        self.update(other)
+        return self
+
+
 class I18N:
     """Thread-safe message manager combining built-in defaults and language files."""
 
@@ -154,6 +194,7 @@ class I18N:
             "pm_python_version_mismatch": "{value} != {req}",
             "pip_install_fail": "Failed to install library '{library}'",
         }
+        self._messages = _Messages(self._messages)
         self._defaults = self._messages.copy()
 
     @property
@@ -165,7 +206,7 @@ class I18N:
     def message(self, value: Dict[str, str]) -> None:
         """Replace the active message mapping while holding the lock."""
         with self._lock:
-            self._messages = value
+            self._messages = _Messages(value)
 
     def _get_lang_file(self, lang: Optional[str], *, create: bool = True) -> Path:
         """Find the selected or default language file, optionally saving missing defaults."""
@@ -212,7 +253,7 @@ class I18N:
         """
         selected = lang or self.current_lang
         # Start fresh on each switch: old translations must not leak into a new locale.
-        messages = self._defaults.copy()
+        messages = _Messages(self._defaults)
         selected_path = self._get_lang_file(selected, create=create)
         paths = dict.fromkeys(
             [self.base_path / f"{self.default_lang}.json", selected_path]
@@ -223,10 +264,7 @@ class I18N:
             try:
                 with path.open("r", encoding=self.encoder) as f:
                     translated = json.load(f)
-                if not isinstance(translated, dict) or not all(
-                    isinstance(k, str) and isinstance(v, str)
-                    for k, v in translated.items()
-                ):
+                if not isinstance(translated, dict):
                     raise ValueError("Language messages must map strings to strings")
                 messages.update(translated)
             except (OSError, ValueError) as exc:

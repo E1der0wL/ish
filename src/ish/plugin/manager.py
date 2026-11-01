@@ -10,10 +10,10 @@ import ast
 import importlib.metadata
 import importlib.util
 import re
-import shutil
 import sys
 import traceback
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,8 +28,28 @@ from ish.lang import i18n
 from ish.log import get_logger
 
 from .dependencies import has_duplicate_metadata, has_import, install_dependency
+from .metadata import DependencySpec, split_requirement
 
 __all__ = ["PluginManager", "PluginInfo"]
+
+PLUGIN_META = "PLUGIN_META"
+_NORMALIZER = "normalize"
+
+
+def _metadata_string(value: object) -> str:
+    """Require a literal string for a declared text field."""
+    if not isinstance(value, str):
+        raise TypeError("expected a string")
+    return value
+
+
+def _metadata_list(value: object) -> list[str]:
+    """Copy a sequence of literal requirements into its owned list."""
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise TypeError("expected a list or tuple of strings")
+    return list(value)
 
 
 @dataclass
@@ -37,25 +57,50 @@ class PluginInfo:
     """Loaded plugin module and its declared version and dependency metadata."""
 
     name: str
-    version: str = "0.0.0"
-    description: str = ""
-    author: str = ""
+    version: str = field(default="0.0.0", metadata={_NORMALIZER: _metadata_string})
+    description: str = field(default="", metadata={_NORMALIZER: _metadata_string})
+    author: str = field(default="", metadata={_NORMALIZER: _metadata_string})
     module: Optional[Any] = None
-    requirements: List[str] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
+    requirements: List[str] = field(
+        default_factory=list, metadata={_NORMALIZER: _metadata_list}
+    )
+    dependencies: List[str] = field(
+        default_factory=list, metadata={_NORMALIZER: _metadata_list}
+    )
+
+    @classmethod
+    def from_mapping(cls, name: str, meta: object) -> PluginInfo | None:
+        """Normalize declared fields without overriding directory or module identity.
+
+        Absent metadata and empty mappings retain their unregistered behavior.
+        Unknown fields remain allowed; only fields owned by this declaration are
+        interpreted. Defaults and normalizers come from the dataclass fields.
+        """
+        if meta is None:
+            return None
+        if not isinstance(meta, Mapping):
+            raise TypeError(f"{PLUGIN_META} must be a mapping")
+        if not meta:
+            return None
+        values = {}
+        for field_name, normalize in _METADATA_FIELDS:
+            if field_name in meta:
+                try:
+                    values[field_name] = normalize(meta[field_name])
+                except TypeError as exc:
+                    raise TypeError(f"{PLUGIN_META}.{field_name}: {exc}") from exc
+        return cls(name=name, **values)
+
+
+_METADATA_FIELDS = tuple(
+    (declaration.name, declaration.metadata[_NORMALIZER])
+    for declaration in fields(PluginInfo)
+    if _NORMALIZER in declaration.metadata
+)
 
 
 class PluginRegistry:
     """In-memory registry mapping plugin names to modules and metadata."""
-
-    PLUGIN_META: str = "PLUGIN_META"
-    NAME: str = "name"
-    VERSION: str = "version"
-    DESCRIPTION: str = "description"
-    AUTHOR: str = "author"
-    MODULE: str = "module"
-    REQUIREMENTS: str = "requirements"
-    DEPENDENCIES: str = "dependencies"
 
     def __init__(self):
         """Initialize empty module and metadata stores."""
@@ -108,8 +153,6 @@ class PluginManager:
     dependency cycles with a loading stack and unregister failed modules.
     """
 
-    SEP: str = "|"
-
     def __init__(self):
         """Prepare the registry, installation history, cycle-detection set, and logger."""
         self.registry = PluginRegistry()
@@ -119,6 +162,8 @@ class PluginManager:
         self._installed_libs: set = set()
         self._installed_plugins: set = set()
         self._loading_stack: set = set()
+        self._module_roots: dict[str, Path] = {}
+        self._entry_modules: dict[str, tuple[str, Any]] = {}
 
         self.logger = get_logger()
 
@@ -126,12 +171,7 @@ class PluginManager:
         self, req: str
     ) -> Tuple[str, Optional[str], Optional[str]]:
         """Parse ish plugin names separately from Python distribution requirements."""
-        sep = self.SEP
-        lib_name = None
-        if sep in req:
-            parts = req.split(sep, 1)
-            req = parts[0].strip()
-            lib_name = parts[1].strip()
+        req, lib_name = split_requirement(req)
 
         pattern = r"^([a-zA-Z0-9_./-]+?)([><=!~]+.+)?$"
         match = re.match(pattern, req.strip())
@@ -158,7 +198,7 @@ class PluginManager:
         plugin_dir = config.PLUGIN_SCRIPT_DIR / name
         return plugin_dir
 
-    def _get_plugin_meta(self, path: Path) -> Optional[Dict]:
+    def _get_plugin_meta(self, path: Path) -> object:
         """Read the literal PLUGIN_META value without executing the module."""
         try:
             with path.open("r", encoding="utf-8") as f:
@@ -167,10 +207,7 @@ class PluginManager:
             for node in tree.body:
                 if isinstance(node, ast.Assign):
                     for target in node.targets:
-                        if (
-                            isinstance(target, ast.Name)
-                            and target.id == self.registry.PLUGIN_META
-                        ):
+                        if isinstance(target, ast.Name) and target.id == PLUGIN_META:
                             return ast.literal_eval(node.value)
             return None
         except Exception:
@@ -222,16 +259,16 @@ class PluginManager:
         self, library: str, *, import_parents: bool = True, installed: bool = False
     ) -> bool:
         """Check metadata and imports, distinguishing missing parents from broken imports."""
-        specification, _, origin = library.partition(self.SEP)
-        requirement = Requirement(specification.strip())
-        if requirement.marker is not None and not requirement.marker.evaluate():
+        dependency = DependencySpec.parse(library)
+        requirement = dependency.requirement
+        if not dependency.active:
             return True
         # A name/import alone cannot prove a direct URL's origin. Let pip resolve
         # it once per session, then retain the existing successful-install record.
         if (
             requirement.url
             and not installed
-            and specification not in self._installed_libs
+            and dependency.specification not in self._installed_libs
         ):
             return False
         if has_duplicate_metadata(requirement.name, config.PLUGIN_LIB_DIR):
@@ -246,7 +283,7 @@ class PluginManager:
                 return False
         if requirement.extras and not self._has_extras(requirement):
             return False
-        name = origin.strip() or requirement.name
+        name = dependency.import_name
         if not import_parents:
             return has_import(name)
         try:
@@ -271,20 +308,18 @@ class PluginManager:
         for info in self.registry.list_info():
             for dependency in info.dependencies:
                 try:
-                    req = Requirement(dependency.split(self.SEP, 1)[0])
+                    constraint = DependencySpec.parse(dependency).constraint
                 except InvalidRequirement:
                     continue
-                if req.marker is not None and not req.marker.evaluate():
-                    continue
-                if req.url:
-                    constraints.append(f"{req.name} @ {req.url}")
-                else:
-                    constraints.append(f"{req.name}{req.specifier}")
+                if constraint is not None:
+                    constraints.append(constraint)
         return constraints
 
     def _ensure_plugin(self, plugin: str) -> bool:
         """Check an already loaded plugin or recursively load a required plugin."""
         plugin_name, plugin_version, _ = self._parse_plugin_requirement(plugin)
+        if plugin_name in self._loading_stack:
+            return False
         if self.registry.has(plugin_name):
             if plugin_version is None:
                 return True
@@ -296,9 +331,7 @@ class PluginManager:
         else:
             plugin_dir = self._get_plugin_path(plugin_name)
             if plugin_dir.exists():
-                info = self._resolve(plugin_dir)
-                if info is not None:
-                    return self._is_version_allowed(info.version, plugin_version)
+                return self._resolve(plugin_dir, plugin_version) is not None
             return False
 
     def _install_library(self, library: str) -> bool:
@@ -317,9 +350,10 @@ class PluginManager:
             return False
 
         try:
+            specification, _ = split_requirement(library)
             with install_dependency(
                 self.python_exe,
-                library.split(self.SEP, 1)[0],
+                specification,
                 config.PLUGIN_LIB_DIR,
                 self._dependency_constraints(),
             ):
@@ -329,7 +363,7 @@ class PluginManager:
                     raise RuntimeError(
                         "Installed dependency does not provide the requested import and version"
                     )
-            self._installed_libs.add(library.split(self.SEP, 1)[0])
+            self._installed_libs.add(specification)
             return True
         except Exception as exc:
             self.logger.warning(
@@ -338,107 +372,86 @@ class PluginManager:
             return False
 
     def _load_plugin(
-        self, plugin_file: Path, plugin_name: str, meta: Optional[Dict]
+        self, plugin_file: Path, plugin_name: str, info: PluginInfo | None
     ) -> Optional[PluginInfo]:
-        """Check library dependencies, execute the module, and register its metadata."""
-        dependencies = []
-        if meta:
-            dependencies = meta.get(self.registry.DEPENDENCIES, [])
-        for dep in dependencies:
-            if not self._ensure_library(dep):
-                return None
-
+        """Execute an admitted module without publishing an incomplete registration."""
         entry_name = plugin_file.stem
         if entry_name == "__init__":
             full_module_name = plugin_name
         else:
             full_module_name = f"{plugin_name}.{entry_name}"
 
+        root = plugin_file.parent.resolve()
+        if full_module_name in sys.modules and not self._owns_module(
+            sys.modules[full_module_name], root
+        ):
+            raise ImportError(
+                f"Plugin entry {full_module_name!r} conflicts with an existing module"
+            )
+        if full_module_name != plugin_name and plugin_name in sys.modules:
+            parent = sys.modules[plugin_name]
+            paths = parent.__dict__.get("__path__", ()) if parent is not None else ()
+            if not any(Path(path).resolve() == root for path in paths):
+                raise ImportError(
+                    f"Plugin namespace {plugin_name!r} is owned by another package"
+                )
+
         spec = importlib.util.spec_from_file_location(full_module_name, plugin_file)
         if not spec or not spec.loader:
             return None
 
         module = importlib.util.module_from_spec(spec)
+        # Keep exact ownership even if the entry file is a symlink outside its
+        # package directory, or trusted module code changes its __file__ value.
+        self._entry_modules[plugin_name] = (full_module_name, module)
         sys.modules[full_module_name] = module
 
-        try:
-            spec.loader.exec_module(module)
-            if meta:
-                info = PluginInfo(
-                    module=module,
-                    name=plugin_name,
-                    version=meta.get(self.registry.VERSION, "0.0.0"),
-                    author=meta.get(self.registry.AUTHOR, ""),
-                    description=meta.get(self.registry.DESCRIPTION, ""),
-                    requirements=meta.get(self.registry.REQUIREMENTS, []),
-                    dependencies=meta.get(self.registry.DEPENDENCIES, []),
-                )
-                self.registry.register(plugin_name, module, info)
-                return info
-
-        except Exception:
-            sys.modules.pop(full_module_name, None)
-            raise
-
-        return None
+        spec.loader.exec_module(module)
+        if info is not None:
+            info.module = module
+        return info
 
     @staticmethod
-    def _unload_library(library_name: str) -> None:
-        """Remove a library and its metadata using the existing directory naming
-        convention.
-
-        This is not a complete pip RECORD-based uninstall and does not identify shared
-        namespace packages.
-        """
-        target_dist_infos = [
-            folder
-            for folder in config.PLUGIN_LIB_DIR.iterdir()
-            if folder.is_dir()
-            and folder.name.lower().startswith(f"{library_name.lower()}-")
-            and folder.name.endswith(".dist-info")
-        ]
-
-        if not target_dist_infos:
-            target_dist_infos = [
-                folder
-                for folder in config.PLUGIN_LIB_DIR.iterdir()
-                if folder.is_dir()
-                and folder.name.lower().startswith(f"{library_name.lower()}-")
-                and folder.name.endswith(".egg-info")
-            ]
-
-        if not target_dist_infos:
-            return
-
-        for dist_info in target_dist_infos:
-            shutil.rmtree(dist_info)
-
-            pkg_folder_name = dist_info.name.split("-")[0]
-            pkg_folder = config.PLUGIN_LIB_DIR / pkg_folder_name
-
-            if pkg_folder.exists() and pkg_folder.is_dir():
-                shutil.rmtree(pkg_folder)
-
-            cache_dir = config.PLUGIN_LIB_DIR / "__pycache__"
-            if cache_dir.exists():
-                for cache_file in cache_dir.glob(f"{pkg_folder_name}*.pyc"):
-                    cache_file.unlink()
+    def _owns_module(module: Any, root: Path) -> bool:
+        """Identify modules from this source root, including exclusive namespaces."""
+        if module is None:
+            return False
+        origin = module.__dict__.get("__file__")
+        if origin:
+            return Path(origin).resolve().is_relative_to(root)
+        locations = list(module.__dict__.get("__path__", ()))
+        return bool(locations) and all(
+            Path(path).resolve().is_relative_to(root) for path in locations
+        )
 
     def _unload_plugin(self, plugin_name: str) -> None:
-        """Remove the plugin tree from the registry and sys.modules."""
-        if self.registry.get(plugin_name) is None:
-            return None
-
-        module = self.registry.get(plugin_name)
+        """Remove owned namespace members after failed or completed plugin loading."""
         self.registry.unregister(plugin_name)
-        module_name = module.__name__
-        for name in list(sys.modules):
-            if name == module_name or name.startswith(module_name + "."):
-                sys.modules.pop(name, None)
+        root = self._module_roots.pop(plugin_name, None)
+        entry = self._entry_modules.pop(plugin_name, None)
+        if root is None:
+            return None
+        for name, module in tuple(sys.modules.items()):
+            if (
+                (name == plugin_name or name.startswith(plugin_name + "."))
+                and (
+                    module is entry[1]
+                    if entry is not None and name == entry[0]
+                    else self._owns_module(module, root)
+                )
+                and sys.modules.get(name) is module
+            ):
+                del sys.modules[name]
+                parent_name, _, attribute = name.rpartition(".")
+                parent = sys.modules.get(parent_name)
+                if parent is not None and parent.__dict__.get(attribute) is module:
+                    delattr(parent, attribute)
         importlib.invalidate_caches()
         return None
 
-    def _resolve(self, plugin_dir: Path) -> Optional[PluginInfo]:
+    def _resolve(
+        self, plugin_dir: Path, version_spec: Optional[str] = None
+    ) -> Optional[PluginInfo]:
         """Load a plugin and its dependencies and clean up failed or cyclic loading state."""
         plugin_name = plugin_dir.name
         entry_point = self._get_plugin_entry_point(plugin_dir)
@@ -446,16 +459,35 @@ class PluginManager:
         if not entry_point:
             return None
 
-        if self.registry.has(plugin_name):
-            return self.registry.get_info(plugin_name)
-
         if plugin_name in self._loading_stack:
             return None
+
+        if self.registry.has(plugin_name):
+            info = self.registry.get_info(plugin_name)
+            return (
+                info
+                if info and self._is_version_allowed(info.version, version_spec)
+                else None
+            )
 
         self._loading_stack.add(plugin_name)
         try:
             meta = self._get_plugin_meta(entry_point)
-            plugin_info = self._load_plugin(entry_point, plugin_name, meta)
+            info = PluginInfo.from_mapping(plugin_name, meta)
+            if version_spec and (
+                info is None or not self._is_version_allowed(info.version, version_spec)
+            ):
+                return None
+            if info is not None:
+                for requirement in info.requirements:
+                    if not self._ensure_plugin(requirement):
+                        return None
+                for dependency in info.dependencies:
+                    if not self._ensure_library(dependency):
+                        return None
+
+            self._module_roots[plugin_name] = plugin_dir.resolve()
+            plugin_info = self._load_plugin(entry_point, plugin_name, info)
             if not plugin_info:
                 return self._unload_plugin(plugin_name)
 
@@ -463,11 +495,12 @@ class PluginManager:
                 if not self._ensure_library(plugin_dep):
                     return self._unload_plugin(plugin_name)
 
-            for plugin_req in plugin_info.requirements:
-                if not self._ensure_plugin(plugin_req):
+            for requirement in plugin_info.requirements:
+                if not self._ensure_plugin(requirement):
                     return self._unload_plugin(plugin_name)
+            self.registry.register(plugin_name, plugin_info.module, plugin_info)
             return plugin_info
-        except Exception:
+        except BaseException:
             self._unload_plugin(plugin_name)
             raise
         finally:

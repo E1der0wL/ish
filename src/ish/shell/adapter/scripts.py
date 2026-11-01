@@ -1,5 +1,6 @@
 """Build shell templates separately from session tokens and final rendering."""
 
+import re
 import shlex
 import shutil
 
@@ -30,7 +31,17 @@ from ..constants import (
     SessionSignals,
     bytes_to_shell_escape,
 )
-from ..protocol import EOT, RS, SOH, US, VERSION
+from ..protocol import (
+    CLOCK_COMMAND,
+    CONTEXT_COMMAND,
+    EOT,
+    FORWARD_COMMAND,
+    RS,
+    SOH,
+    TIME_COMMAND,
+    US,
+    VERSION,
+)
 from .registry import ADAPTERS, csh_quote
 
 _POSIX_INIT = r"""
@@ -58,9 +69,32 @@ def _make_tokens(directory, signals, forward_path, input_ack_path=None):
     # Resolve the few remaining external utilities once, before user commands
     # can change PATH. The context helper handles encoding and environments.
     printf_path = shutil.which("printf", path="/usr/bin:/bin") or "/usr/bin/printf"
+    input_ack = str(input_ack_path or "")
     return {
-        "@INPUT_ACK@": shlex.quote(str(input_ack_path or "")),
-        "@CSH_INPUT_ACK@": csh_quote(str(input_ack_path or "")),
+        "@CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
+            path='"$_ish_pipe"', status='"$1"', prompt_id='"$_ish_prompt_id"'
+        ),
+        "@CSH_CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
+            path='"$_ish_pipe"',
+            status='"$_ish_shell_exit_code"',
+            prompt_id='"$_ish_prompt_id"',
+        ),
+        "@FORWARD_ARGS@": FORWARD_COMMAND.shell(
+            tty_path='"$_tty_pipe"',
+            ack_path=shlex.quote(input_ack),
+            prompt_id='"$_ish_prompt_id"',
+            context_path='"$_ish_pipe"',
+        ),
+        "@CSH_FORWARD_ARGS@": FORWARD_COMMAND.shell(
+            tty_path='"$_tty_pipe"',
+            ack_path=csh_quote(input_ack),
+            prompt_id='"$_ish_prompt_id"',
+            context_path='"$_ish_pipe"',
+        ),
+        "@TIME_ARGS@": TIME_COMMAND.shell(),
+        "@CLOCK_ARGS@": CLOCK_COMMAND.shell(),
+        "@INPUT_ACK@": shlex.quote(input_ack),
+        "@CSH_INPUT_ACK@": csh_quote(input_ack),
         "@VERSION@": VERSION.decode("ascii"),
         "@FORWARD@": shlex.quote(str(forward_path)),
         "@CSH_FORWARD@": csh_quote(str(forward_path)),
@@ -114,12 +148,10 @@ def _preload_checks(adapter):
     return checks
 
 
-def _render_script(template, tokens, preload_check):
-    """Render native checks before ordered tokens, preserving literal shell text."""
-    template = template.replace("@PRELOAD_CHECK@", preload_check)
-    for key, value in tokens.items():
-        template = template.replace(key, value)
-    return template.lstrip("\n")
+def _render_script(template, tokens, preload_check, pattern):
+    """Substitute complete values once, without interpreting inserted literal text."""
+    values = {**tokens, "@PRELOAD_CHECK@": preload_check}
+    return pattern.sub(lambda match: values[match.group()], template).lstrip("\n")
 
 
 def _posix_update(*, alias_command="alias", printf_command="command printf"):
@@ -127,9 +159,9 @@ def _posix_update(*, alias_command="alias", printf_command="command printf"):
     template = r"""
 _ish_update() {
     _ish_prompt_id=$((_ish_prompt_id + 1))
-    @UPDATE_ALIAS@ | @FORWARD@ --context "$_ish_pipe" "$1" "$_ish_prompt_id"
+    @UPDATE_ALIAS@ | @FORWARD@ @CONTEXT_ARGS@
 }
-_ish_forward() { @FORWARD@ "$_tty_pipe" @INPUT_ACK@ "$_ish_prompt_id" "$_ish_pipe"; }
+_ish_forward() { @FORWARD@ @FORWARD_ARGS@; }
 _ish_status() { return "$1"; }
 _ish_mark_prompt() { @UPDATE_PRINTF@ '@PROMPT_ID@' "$_ish_prompt_id"; }
 """
@@ -334,7 +366,7 @@ _ish_posix_before() {
     _ish_shell_exit_code=$?
     # PS1 expansion runs in a subshell, so a parent-shell counter cannot
     # advance here. A monotonic generation stays fresh across expansions.
-    _ish_prompt_id=$(@FORWARD@ --clock)
+    _ish_prompt_id=$(@FORWARD@ @CLOCK_ARGS@)
     _ish_update "$_ish_shell_exit_code"
     _ish_forward
     _ish_mark_prompt
@@ -381,8 +413,8 @@ if ($?tcsh) then
 endif
 @ _ish_prompt_id ++
 setenv PWD "$cwd"
-alias | @CSH_FORWARD@ --context "$_ish_pipe" "$_ish_shell_exit_code" "$_ish_prompt_id"
-@CSH_FORWARD@ "$_tty_pipe" @CSH_INPUT_ACK@ "$_ish_prompt_id" "$_ish_pipe"
+alias | @CSH_FORWARD@ @CSH_CONTEXT_ARGS@
+@CSH_FORWARD@ @CSH_FORWARD_ARGS@
 @CSH_PRINTF@ '@PROMPT_ID@' "$_ish_prompt_id"
 set status = $_ish_shell_exit_code
 """
@@ -401,7 +433,7 @@ if ("`alias precmd`" != "_ish_precmd") alias _ish_original_precmd "`alias precmd
 if ("`alias _ish_current_postcmd`" != "_ish_postcmd") alias _ish_original_postcmd "`alias _ish_current_postcmd`"
 if ("`alias periodic`" != "_ish_periodic") then
     alias _ish_original_periodic "`alias periodic`"
-    set _ish_periodic_last = "`@CSH_FORWARD@ --time`"
+    set _ish_periodic_last = "`@CSH_FORWARD@ @TIME_ARGS@`"
 endif
 if ($?tperiod) then
     if ("$tperiod" != "0") set _ish_user_tperiod = "$tperiod"
@@ -418,7 +450,7 @@ set tperiod = 0
 # every primary prompt. Only consult the clock when there is a user callback.
 alias _ish_periodic_dispatch ''
 if ("`alias _ish_original_periodic`" != "") then
-    set _ish_periodic_now = "`@CSH_FORWARD@ --time`"
+    set _ish_periodic_now = "`@CSH_FORWARD@ @TIME_ARGS@`"
     @ _ish_periodic_elapsed = $_ish_periodic_now - $_ish_periodic_last
     @ _ish_periodic_interval = $_ish_user_tperiod * 60
     if ($_ish_periodic_elapsed >= $_ish_periodic_interval) then
@@ -455,7 +487,7 @@ if (! $?_ish_tcsh_installed) then
     if ($?tperiod) then
         set _ish_user_tperiod = "$tperiod"
     endif
-    set _ish_periodic_last = "`@CSH_FORWARD@ --time`"
+    set _ish_periodic_last = "`@CSH_FORWARD@ @TIME_ARGS@`"
     # A sourced file also invokes postcmd for each line. Suspend that hook
     # only around our bookkeeping so it neither restores edit too early nor
     # calls the user's postcmd for integration commands.
@@ -511,7 +543,7 @@ def render_scripts(
     resolved afresh for each call. Adapters select registered script bundles;
     adding a shell does not require another entry in this assembly function.
     """
-    tokens = {}
+    tokens = _make_tokens(directory, signals, forward_path, input_ack_path)
     checks = _preload_checks(adapter)
     entries = {entry.script: entry for entry in ADAPTERS.values()}
     if adapter is not None:
@@ -519,7 +551,10 @@ def render_scripts(
     templates = {}
     built = set()
     for entry in entries.values():
-        tokens.update(entry.template_tokens)
+        for key, value in entry.template_tokens:
+            if key == "@PRELOAD_CHECK@" or (key in tokens and tokens[key] != value):
+                raise ValueError(f"Conflicting integration token: {key}")
+            tokens[key] = value
         try:
             builder = SCRIPT_BUILDERS[entry.script]
         except KeyError:
@@ -534,9 +569,10 @@ def render_scripts(
             built.add(builder)
         if entry.script not in templates:
             raise ValueError(f"Integration builder did not provide {entry.script}")
-    # Resolve template policy before inserting paths, which may contain token text.
-    tokens.update(_make_tokens(directory, signals, forward_path, input_ack_path))
+    pattern = re.compile(
+        "|".join(re.escape(key) for key in (*tokens, "@PRELOAD_CHECK@"))
+    )
     return {
-        name: _render_script(body, tokens, checks.get(name, ""))
+        name: _render_script(body, tokens, checks.get(name, ""), pattern)
         for name, body in templates.items()
     }

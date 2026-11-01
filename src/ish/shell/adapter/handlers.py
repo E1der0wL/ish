@@ -11,10 +11,9 @@ import os
 from ..constants import (
     LINE_INTERRUPT_ACK_PREFIX,
     LINE_READER_READY_PREFIX,
-    PROMPT_ID_LIMIT,
-    PROMPT_ID_MAX_DIGITS,
 )
 from ..input import InputRejected
+from ..protocol import parse_prompt_id
 from ..signals import InputPhase, SubmissionInterrupt
 
 INTERRUPT_ACK_TIMEOUT = 5.0
@@ -44,19 +43,16 @@ class LineInterrupt:
     def observe(self, data: bytes, accepted_id: int) -> None:
         """Accept fresh readiness, or revoke the current generation at preexec."""
         identity, separator, enabled = data.partition(b";")
-        if (
-            not separator
-            or enabled not in (b"0", b"1")
-            or not identity.isdigit()
-            or len(identity) > PROMPT_ID_MAX_DIGITS
-        ):
+        if not separator or enabled not in (b"0", b"1"):
             return
-        value = int(identity)
+        value = parse_prompt_id(identity)
+        if value is None:
+            return
         # preexec may revoke reader ownership within the accepted generation.
         # It cannot reenable that generation, even if a ready frame is replayed.
         if value == self.observed_id and enabled == b"0":
             self.ready_id = 0
-        if max(accepted_id, self.observed_id) < value < PROMPT_ID_LIMIT:
+        if max(accepted_id, self.observed_id) < value:
             self.observed_id = value
             self.ready_id = value if enabled == b"1" else 0
 

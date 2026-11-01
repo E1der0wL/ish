@@ -1,7 +1,7 @@
 # ish
 
 ish is an interactive command editor for Linux shells. It adds multiline editing,
-syntax highlighting, completion, paired-character input, and Python extensions
+syntax highlighting, completion, and Python extensions
 through prompt-toolkit while your selected shell executes commands.
 
 Use ish on Linux or inside WSL on Windows. Native Windows and macOS execution are
@@ -486,6 +486,82 @@ to prompt-toolkit's `KeyBindings.add`. Keep handlers short to avoid blocking inp
 string is submitted immediately instead of the current editor text. It can also
 name a registered internal tool, for example `event.app.exit("greet Alice")`.
 
+### Optional paired-character editing
+
+Quotes, backticks, and brackets insert only the character you type by default.
+Backspace deletes one preceding character. To enable automatic pair insertion,
+skipping an existing identical quote, and deleting adjacent pairs with Backspace,
+add this example to `.ishrc.py`:
+
+<!-- ish-example: paired-editing -->
+```python
+from functools import partial
+
+from prompt_toolkit.keys import Keys
+
+pairs = {"(": ")", "{": "}", "[": "]", '"': '"', "'": "'", "`": "`"}
+
+
+def insert_pair(event, opening):
+    """Pair at the input end, or skip an identical quote at the cursor."""
+    buffer = event.current_buffer
+    document = buffer.document
+    closing = pairs[opening]
+    symmetric = opening == closing
+    if symmetric and document.current_char == closing:
+        buffer.cursor_right()
+    elif document.is_cursor_at_the_end and (
+        not symmetric or document.text.count(opening) % 2 == 0
+    ):
+        buffer.insert_text(opening + closing)
+        buffer.cursor_left()
+    else:
+        buffer.insert_text(opening)
+
+
+def delete_pair(event):
+    """Delete an adjacent configured pair, or one preceding character."""
+    buffer = event.current_buffer
+    document = buffer.document
+    closing = pairs.get(document.char_before_cursor)
+    if closing is not None and document.current_char == closing:
+        buffer.cursor_right()
+        buffer.delete_before_cursor(2)
+    else:
+        buffer.delete_before_cursor(1)
+
+
+for opening in pairs:
+    prompt.set_key(opening, handler=partial(insert_pair, opening=opening))
+prompt.set_key(Keys.Backspace, handler=delete_pair)
+```
+<!-- /ish-example: paired-editing -->
+
+Change `pairs` to choose the characters you want to pair. This is an editing
+heuristic, not a shell syntax parser: quotes are counted without interpreting
+escapes or shell options. It pairs only at the end of the complete input buffer.
+Only symmetric pairs (quotes and backticks) skip an existing closer; closing
+parentheses, braces, and brackets still insert normally. Backspace deletes any
+matching adjacent pair, including one inserted manually or by paste.
+
+Bracketed paste and literal text returned from the shell bypass these key
+handlers, so existing command blocks are not paired again. These settings apply
+to ish's primary editor; native shell continuation editing remains unchanged.
+The handlers replace only their own key sequences, leaving Enter, Tab, and other
+bindings intact. Repeating the example with `ish_reload` does not add duplicate
+bindings. Removing lines or pair entries from `.ishrc.py` does not undo
+registrations in an already-running session; restart ish or explicitly remove
+the previously configured keys and restore the default behavior:
+
+```python
+for opening in pairs:
+    prompt.set_key(opening)
+prompt.set_key(
+    Keys.Backspace,
+    handler=lambda event: event.current_buffer.delete_before_cursor(1),
+)
+```
+
 ### set_float
 
 Add a floating UI element and keep the returned handle for replacement or removal:
@@ -612,6 +688,38 @@ For blocking work, wrap a thread-safe provider with
 `ThreadedAutoSuggest(CommandSuggest())` from `prompt_toolkit.auto_suggest`, or
 implement `get_suggestion_async()` for asynchronous I/O. Worker callbacks should
 not modify the UI.
+
+### Primary prompt
+
+By default, ish displays the prompt received from the shell. Set
+`prompt.prompt_text` in `.ishrc.py` to replace its appearance:
+
+```python
+from prompt_toolkit.formatted_text import HTML
+
+prompt.prompt_text = HTML("<ansicyan>ish</ansicyan> > ")
+```
+
+The setting follows prompt-toolkit's `AnyFormattedText` contract: plain strings,
+`HTML`, `ANSI`, `FormattedText`, style/text tuple lists, objects implementing
+`__pt_formatted_text__()`, and no-argument callables returning formatted text are
+supported. For example:
+
+```python
+prompt.prompt_text = lambda: [("class:prompt", f"[{prompt.last_exitcode}] > ")]
+```
+
+Set `prompt.prompt_text = None` to restore the latest shell prompt, or use `""`
+to hide only the prompt text. Existing command output without a trailing newline
+is preserved before the replacement prompt. A multiline value uses the existing
+prompt-toolkit layout, including the right prompt and completion menu.
+
+This setting controls the primary prompt's display. Shell prompt hooks, context
+updates, input handoff, and native continuation prompts keep running normally;
+it does not avoid the shell's original prompt computation. Shell escapes such as
+`\u`, `%n`, `$PWD`, or `$(date)` in a string are displayed literally rather than
+evaluated. Dynamic callbacks run during rendering, possibly more than once per
+redraw, so keep them fast and free of side effects. No polling is added.
 
 ### Bottom toolbar, right prompt, and styles
 

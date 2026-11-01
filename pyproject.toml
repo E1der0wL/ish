@@ -40,7 +40,7 @@ indent-width = 4
 src = ["src", "tests"]
 # Existing Git ignores include tests/; lint those files as well.
 respect-gitignore = false
-# This legacy generator runs on import and was explicitly excluded from work.
+# This standalone stdlib generator is not part of the maintained test suite.
 extend-exclude = ["tests/test.py"]
 force-exclude = true
 

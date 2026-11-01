@@ -25,16 +25,32 @@ from .adapter.scripts import render_scripts
 from .constants import (
     AFTER_CONTINUATION,
     AFTER_PROMPT,
+    ALIAS,
     BEFORE_CONTINUATION,
     BEFORE_PROMPT,
     COMMAND_DONE,
     COMMAND_START,
+    ENVIRON,
+    EXITCODE,
     FORWARD_BINARY,
     FORWARD_SOURCE,
+    INPUT_DONE,
+    INPUT_ERROR,
+    PROMPT_ID,
     bytes_to_shell_escape,
 )
 from .guard import NativeLibrary
-from .protocol import EOT, RS, SOH, US, VERSION
+from .protocol import (
+    CLOCK_COMMAND,
+    CONTEXT_COMMAND,
+    EOT,
+    FORWARD_COMMAND,
+    RS,
+    SOH,
+    TIME_COMMAND,
+    US,
+    VERSION,
+)
 
 __all__ = [
     "BEFORE_PROMPT",
@@ -129,19 +145,19 @@ static int context(const char *path, const char *status, const char *id) {
     FILE *out = fopen(path, "w");
     if (!out) return 1;
     struct encoder e = { .out = out, .count = 0 };
-    fputs("@SOH@@VERSION@@RS@exitcode@US@", out);
+    fputs("@SOH@@VERSION@@RS@@EXITCODE@@US@", out);
     encode_string(&e, status);
-    fputs("@RS@alias@US@", out);
+    fputs("@RS@@ALIAS@@US@", out);
     unsigned char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) encode(&e, buf, n);
     if (ferror(stdin)) { fclose(out); return 1; }
     encode_end(&e);
-    fputs("@RS@environ@US@", out);
+    fputs("@RS@@ENVIRON@@US@", out);
     for (char **entry = environ; *entry; ++entry)
         encode(&e, (const unsigned char *)*entry, strlen(*entry) + 1);
     encode_end(&e);
-    fputs("@RS@prompt_id@US@", out);
+    fputs("@RS@@PROMPT_ID@@US@", out);
     encode_string(&e, id);
     fputc('@EOT@', out);
     int failed = ferror(out);
@@ -180,6 +196,8 @@ static int write_all(int fd, const unsigned char *buf, size_t size) {
  * An interrupted helper may leave an older acknowledgement behind. Read one
  * byte at a time so the next helper's acknowledgement is never consumed here.
  */
+enum { ACK_LINE_CAPACITY = 32 };
+
 static int acknowledge(int fd, const char *expected, char *line, size_t *used) {
     unsigned char byte;
     ssize_t n;
@@ -190,7 +208,7 @@ static int acknowledge(int fd, const char *expected, char *line, size_t *used) {
             *used = 0;
             if (match) return 1;
         } else {
-            if (byte < '0' || byte > '9' || *used >= 31) return -1;
+            if (byte < '0' || byte > '9' || *used >= ACK_LINE_CAPACITY - 1) return -1;
             line[(*used)++] = (char)byte;
         }
     }
@@ -202,7 +220,7 @@ static int input_result(const char *path, const char *id, int failed) {
     if (!out) return 1;
     struct encoder e = { .out = out, .count = 0 };
     fputs("@SOH@@VERSION@@RS@", out);
-    fputs(failed ? "input_error" : "input_done", out);
+    fputs(failed ? "@INPUT_ERROR@" : "@INPUT_DONE@", out);
     fputc('@US@', out);
     encode_string(&e, id);
     fputc('@EOT@', out);
@@ -211,28 +229,28 @@ static int input_result(const char *path, const char *id, int failed) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc == 5 && !strcmp(argv[1], "--context"))
-        return context(argv[2], argv[3], argv[4]);
-    if (argc == 2 && !strcmp(argv[1], "--time")) {
+    if (argc == @CONTEXT_ARGC@ && !strcmp(argv[1], "@CONTEXT_OPTION@"))
+        return context(argv[@CONTEXT_PATH@], argv[@CONTEXT_STATUS@], argv[@CONTEXT_ID@]);
+    if (argc == @TIME_ARGC@ && !strcmp(argv[1], "@TIME_OPTION@")) {
         printf("%lld\n", (long long)time(NULL));
         return 0;
     }
-    if (argc == 2 && !strcmp(argv[1], "--clock")) {
+    if (argc == @CLOCK_ARGC@ && !strcmp(argv[1], "@CLOCK_OPTION@")) {
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 1;
         printf("%lld\n", (long long)now.tv_sec * 1000000000LL + now.tv_nsec);
         return 0;
     }
-    if (argc < 2) return 1;
+    if (argc < @FORWARD_MIN_ARGC@) return 1;
     struct termios saved, raw;
     if (tcgetattr(STDIN_FILENO, &saved) != 0) return 1;
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     if (flags < 0) return 1;
-    int pipe_fd = open(argv[1], O_WRONLY | O_NONBLOCK);
+    int pipe_fd = open(argv[@FORWARD_TTY@], O_WRONLY | O_NONBLOCK);
     if (pipe_fd < 0) return 1;
     int ack_fd = -1;
-    if (argc == 5 && *argv[2]) {
-        ack_fd = open(argv[2], O_RDONLY | O_NONBLOCK);
+    if (argc == @FORWARD_ARGC@ && *argv[@FORWARD_ACK@]) {
+        ack_fd = open(argv[@FORWARD_ACK@], O_RDONLY | O_NONBLOCK);
         if (ack_fd < 0) { close(pipe_fd); return 1; }
     }
     signal(SIGPIPE, SIG_IGN);
@@ -255,7 +273,7 @@ int main(int argc, char *argv[]) {
     }
     if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) { result = 1; goto cleanup; }
     unsigned char buf[4096];
-    char ack_line[32];
+    char ack_line[ACK_LINE_CAPACITY];
     size_t ack_used = 0;
     int acknowledged = ack_fd < 0;
     for (;;) {
@@ -268,7 +286,7 @@ int main(int argc, char *argv[]) {
         } else {
             if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { result = 1; break; }
             if (acknowledged) break;
-            int ack = acknowledge(ack_fd, argv[3], ack_line, &ack_used);
+            int ack = acknowledge(ack_fd, argv[@FORWARD_ID@], ack_line, &ack_used);
             if (ack < 0) { result = 1; break; }
             if (ack) {
                 acknowledged = 1;
@@ -291,7 +309,7 @@ cleanup:
     close(pipe_fd);
     if (ack_fd >= 0) {
         close(ack_fd);
-        if (!interrupted && input_result(argv[4], argv[3], result)) result = 1;
+        if (!interrupted && input_result(argv[@FORWARD_CONTEXT@], argv[@FORWARD_ID@], result)) result = 1;
     }
     /* Keep the original signal outcome after restoring shared terminal state. */
     if (interrupted) { signal(interrupted, SIG_DFL); raise(interrupted); }
@@ -305,6 +323,27 @@ for _token, _value in {
     "@RS@": BIN_RS,
     "@US@": BIN_US,
     "@EOT@": BIN_EOT,
+    "@EXITCODE@": EXITCODE,
+    "@ALIAS@": ALIAS,
+    "@ENVIRON@": ENVIRON,
+    "@PROMPT_ID@": PROMPT_ID,
+    "@INPUT_DONE@": INPUT_DONE,
+    "@INPUT_ERROR@": INPUT_ERROR,
+    "@CONTEXT_OPTION@": CONTEXT_COMMAND.option,
+    "@CONTEXT_ARGC@": str(CONTEXT_COMMAND.argc),
+    "@CONTEXT_PATH@": str(CONTEXT_COMMAND.index("path")),
+    "@CONTEXT_STATUS@": str(CONTEXT_COMMAND.index("status")),
+    "@CONTEXT_ID@": str(CONTEXT_COMMAND.index("prompt_id")),
+    "@TIME_OPTION@": TIME_COMMAND.option,
+    "@TIME_ARGC@": str(TIME_COMMAND.argc),
+    "@CLOCK_OPTION@": CLOCK_COMMAND.option,
+    "@CLOCK_ARGC@": str(CLOCK_COMMAND.argc),
+    "@FORWARD_MIN_ARGC@": str(FORWARD_COMMAND.index("tty_path") + 1),
+    "@FORWARD_ARGC@": str(FORWARD_COMMAND.argc),
+    "@FORWARD_TTY@": str(FORWARD_COMMAND.index("tty_path")),
+    "@FORWARD_ACK@": str(FORWARD_COMMAND.index("ack_path")),
+    "@FORWARD_ID@": str(FORWARD_COMMAND.index("prompt_id")),
+    "@FORWARD_CONTEXT@": str(FORWARD_COMMAND.index("context_path")),
 }.items():
     TTY_FORWARD = TTY_FORWARD.replace(_token, _value)
 

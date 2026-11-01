@@ -14,6 +14,7 @@ import multiprocessing as mp
 import os
 import pickle
 import pty
+import signal
 import sys
 import termios
 import traceback
@@ -22,6 +23,7 @@ from typing import Any, Callable
 
 from ish.runtime.fdio import FDWriter, InputBytes
 from ish.runtime.observer import InputObserver
+from ish.runtime.process import ProcessGroup
 
 __all__ = ["Runner"]
 
@@ -385,12 +387,27 @@ class Runner:
                     await asyncio.gather(exit_confirmation, return_exceptions=True)
                 if process is not None and started:
                     if process.is_alive():
-                        process.terminate()
-                        # Do not block the event loop waiting for a running child.
-                        await asyncio.to_thread(process.join, 2)
-                        if process.is_alive():
-                            process.kill()
-                            await asyncio.to_thread(process.join)
+                        # Capture while the unreaped worker still owns its PID.
+                        # Before setsid(), the snapshot is empty and only the
+                        # worker is signalled. Normal-return background jobs keep
+                        # their existing behavior; this path is cancellation/error.
+                        group = ProcessGroup(process.pid, process.pid)
+                        if sentinel is not None:
+                            loop.remove_reader(sentinel)
+                        loop.remove_reader(self.stdin_fd)
+                        input_writer.close()
+                        try:
+                            group.send(signal.SIGTERM)
+                            process.terminate()
+                            # Do not block the event loop waiting for a running child.
+                            await asyncio.to_thread(process.join, 2)
+                            if process.is_alive():
+                                process.kill()
+                                await asyncio.to_thread(process.join)
+                        finally:
+                            # The leader can exit before a child ignoring TERM/HUP.
+                            # Retained identities prevent signalling a reused group.
+                            group.send(signal.SIGKILL)
                     else:
                         process.join()
                     if sentinel is not None:
@@ -404,7 +421,8 @@ class Runner:
 
         This cannot recover bytes a tool already read into its own memory.
         Disable canonical buffering without flushing so an unfinished line is
-        available too. No process uses this PTY after its owning tool exits.
+        available too. Tools must finish their PTY readers before returning;
+        deliberately detached/background processes are not reclaimed here.
         """
         attrs = termios.tcgetattr(fd)
         attrs[3] &= ~(termios.ICANON | termios.ECHO)

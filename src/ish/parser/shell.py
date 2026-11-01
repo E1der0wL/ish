@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 from ish.shell.adapter import get_adapter
 
 from .command import literal_argv
 
-__all__ = ["str_parser", "dict_parser", "alias_parser", "simple_command"]
+__all__ = [
+    "str_parser",
+    "dict_parser",
+    "environ_parser",
+    "alias_parser",
+    "simple_command",
+]
 
 
 def str_parser(raw_data: bytes, encoder: str) -> str:
@@ -32,6 +39,18 @@ def dict_parser(
         except ValueError:
             continue
     return res
+
+
+def environ_parser(raw_data: bytes) -> dict[str, str]:
+    """Decode OS environment records losslessly, independently of terminal encoding."""
+    text = os.fsdecode(raw_data)
+    records = text.split("\0" if "\0" in text else "\n")
+    environ = {}
+    for record in records:
+        key, separator, value = record.partition("=")
+        if separator:
+            environ[key] = value
+    return environ
 
 
 def alias_parser(raw_data: bytes, encoder: str, shell: str = "bash") -> Dict[str, str]:

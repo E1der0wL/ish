@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import importlib
 import importlib.metadata
 import os
@@ -12,6 +13,32 @@ import tempfile
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
+
+INSTALL_LOCK_SUFFIX = ".install.lock"
+
+
+@contextlib.contextmanager
+def _installation_lock(target: Path):
+    """Protect promotion and rollback without blocking another session's startup.
+
+    The persistent sibling inode must not be unlinked: waiting/open sessions
+    must keep referring to the same lock even after a transaction finishes.
+    """
+    path = target.parent / ("." + target.name + INSTALL_LOCK_SUFFIX)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another dependency installation is using {target}; retry after it finishes"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def has_import(name: str) -> bool:
@@ -195,91 +222,95 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
         }
         if not new:
             raise RuntimeError("pip did not produce an installed distribution")
-        # Recheck after pip returns, in case another thread imported a dependency.
-        for dist in loaded_distributions():
-            name = canonicalize_name(dist.metadata["Name"] or "")
-            if name in new and dist.version != new[name].version:
+        # Pip stages independently. Re-read target ownership only after taking
+        # the lock, and hold it through the caller's validation and any rollback.
+        with _installation_lock(target):
+            for dist in loaded_distributions():
+                name = canonicalize_name(dist.metadata["Name"] or "")
+                if name in new and dist.version != new[name].version:
+                    raise RuntimeError(
+                        f"Dependency {name!r} is in use; restart ish before changing its version"
+                    )
+            incoming = {
+                path.relative_to(stage): path
+                for path in stage.rglob("*")
+                if path.is_file()
+            }
+            old_files, retained_files = set(), set()
+            for dist in importlib.metadata.distributions(path=[str(target)]):
+                files = distribution_files(dist, target)
+                if canonicalize_name(dist.metadata["Name"] or "") in new:
+                    old_files.update(files)
+                else:
+                    retained_files.update(files)
+            changed = {
+                path: source
+                for path, source in incoming.items()
+                if not (target / path).is_file()
+                or (target / path).read_bytes() != source.read_bytes()
+            }
+            # Never overwrite another distribution's shared file with different bytes.
+            if retained_files & changed.keys():
                 raise RuntimeError(
-                    f"Dependency {name!r} is in use; restart ish before changing its version"
+                    "Dependency installation would overwrite files owned by another package"
                 )
-        incoming = {
-            path.relative_to(stage): path for path in stage.rglob("*") if path.is_file()
-        }
-        old_files, retained_files = set(), set()
-        for dist in importlib.metadata.distributions(path=[str(target)]):
-            files = distribution_files(dist, target)
-            if canonicalize_name(dist.metadata["Name"] or "") in new:
-                old_files.update(files)
-            else:
-                retained_files.update(files)
-        changed = {
-            path: source
-            for path, source in incoming.items()
-            if not (target / path).is_file()
-            or (target / path).read_bytes() != source.read_bytes()
-        }
-        # Never overwrite another distribution's shared file with different bytes.
-        if retained_files & changed.keys():
-            raise RuntimeError(
-                "Dependency installation would overwrite files owned by another package"
+            removed = old_files - incoming.keys() - retained_files
+            # Older pip installs may record bytecode. Removing a cache is safe even
+            # when its unchanged source package is already imported.
+            check_loaded_files(
+                changed,
+                {
+                    path
+                    for path in removed
+                    if not (path.suffix == ".pyc" and "__pycache__" in path.parts)
+                },
+                target,
             )
-        removed = old_files - incoming.keys() - retained_files
-        # Older pip installs may record bytecode. Removing a cache is safe even
-        # when its unchanged source package is already imported.
-        check_loaded_files(
-            changed,
-            {
-                path
-                for path in removed
-                if not (path.suffix == ".pyc" and "__pycache__" in path.parts)
-            },
-            target,
-        )
-        # Runtime bytecode is not necessarily recorded by pip. Unchanged sources
-        # retain their caches; replaced sources must not reuse timestamp caches.
-        for path in set(changed) | removed.copy():
-            if path.suffix == ".py":
-                cache = (target / path).parent / "__pycache__"
-                removed.update(
-                    p.relative_to(target) for p in cache.glob(path.stem + ".*.pyc")
-                )
-        affected = set(changed) | removed
-        for path in affected:
-            if not (target / path).resolve().is_relative_to(target):
-                raise RuntimeError(
-                    f"Dependency path leaves the plugin directory: {path}"
-                )
-            if (target / path).is_dir():
-                raise RuntimeError(
-                    f"Dependency file conflicts with an existing directory: {path}"
-                )
-        backup = temporary / "backup"
-        saved, installed = [], []
-        try:
-            for path in sorted(affected):
-                destination = target / path
-                if destination.exists():
-                    previous = backup / path
-                    previous.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(destination, previous)
-                    saved.append(path)
-                if path in changed:
+            # Runtime bytecode is not necessarily recorded by pip. Unchanged sources
+            # retain their caches; replaced sources must not reuse timestamp caches.
+            for path in set(changed) | removed.copy():
+                if path.suffix == ".py":
+                    cache = (target / path).parent / "__pycache__"
+                    removed.update(
+                        p.relative_to(target) for p in cache.glob(path.stem + ".*.pyc")
+                    )
+            affected = set(changed) | removed
+            for path in affected:
+                if not (target / path).resolve().is_relative_to(target):
+                    raise RuntimeError(
+                        f"Dependency path leaves the plugin directory: {path}"
+                    )
+                if (target / path).is_dir():
+                    raise RuntimeError(
+                        f"Dependency file conflicts with an existing directory: {path}"
+                    )
+            backup = temporary / "backup"
+            saved, installed = [], []
+            try:
+                for path in sorted(affected):
+                    destination = target / path
+                    if destination.exists():
+                        previous = backup / path
+                        previous.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(destination, previous)
+                        saved.append(path)
+                    if path in changed:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(changed[path], destination)
+                        installed.append(path)
+                # Empty old .dist-info directories can shadow the new metadata.
+                # Remove them before the caller validates the installed version.
+                _remove_empty_directories({target / path for path in removed}, target)
+                importlib.invalidate_caches()
+                yield
+            except BaseException:
+                for path in reversed(installed):
+                    (target / path).unlink()
+                for path in reversed(saved):
+                    destination = target / path
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(changed[path], destination)
-                    installed.append(path)
-            # Empty old .dist-info directories can shadow the new metadata.
-            # Remove them before the caller validates the installed version.
-            _remove_empty_directories({target / path for path in removed}, target)
-            importlib.invalidate_caches()
-            yield
-        except BaseException:
-            for path in reversed(installed):
-                (target / path).unlink()
-            for path in reversed(saved):
-                destination = target / path
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(backup / path, destination)
-            raise
-        finally:
-            _remove_empty_directories({target / path for path in affected}, target)
-            importlib.invalidate_caches()
+                    os.replace(backup / path, destination)
+                raise
+            finally:
+                _remove_empty_directories({target / path for path in affected}, target)
+                importlib.invalidate_caches()

@@ -1,4 +1,6 @@
-"""FIFO framing: SOH ISH2 RS (category US base64(body) RS ... ) EOT.
+"""Shared context identities, FIFO framing, and native helper call layouts.
+
+FIFO framing: SOH ISH2 RS (category US base64(body) RS ... ) EOT.
 
 Version 2 bodies cannot contain frame/record delimiters. Environments use
 NUL-separated NAME=value records to preserve embedded newlines in values.
@@ -6,9 +8,55 @@ Legacy unversioned frames remain readable during integration script updates.
 """
 
 import base64
+from dataclasses import dataclass
+
+from .constants import PROMPT_ID_LIMIT, PROMPT_ID_MAX_DIGITS
 
 SOH, RS, US, EOT = b"\x01", b"\x1e", b"\x1f", b"\x04"
 VERSION = b"ISH2"
+
+
+def parse_prompt_id(raw: bytes) -> int | None:
+    """Read a bounded decimal identity; callers own freshness and transition checks.
+
+    Zero remains valid for context frames before a prompt has been accepted.
+    """
+    if not raw or len(raw) > PROMPT_ID_MAX_DIGITS or not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value < PROMPT_ID_LIMIT else None
+
+
+@dataclass(frozen=True)
+class ForwardCommand:
+    """Declare one native helper call and project its argv layout into C and shell."""
+
+    option: str
+    arguments: tuple[str, ...] = ()
+
+    @property
+    def argc(self) -> int:
+        """Return the argument count including the executable and optional flag."""
+        return 1 + bool(self.option) + len(self.arguments)
+
+    def index(self, argument: str) -> int:
+        """Return the C argv index of a declared argument."""
+        return 1 + bool(self.option) + self.arguments.index(argument)
+
+    def shell(self, **arguments: str) -> str:
+        """Order already quoted shell expressions without changing their quoting."""
+        if arguments.keys() != set(self.arguments):
+            raise ValueError(f"Expected helper arguments: {self.arguments!r}")
+        words = (self.option,) if self.option else ()
+        return " ".join((*words, *(arguments[name] for name in self.arguments)))
+
+
+CONTEXT_COMMAND = ForwardCommand("--context", ("path", "status", "prompt_id"))
+TIME_COMMAND = ForwardCommand("--time")
+CLOCK_COMMAND = ForwardCommand("--clock")
+FORWARD_COMMAND = ForwardCommand(
+    "", ("tty_path", "ack_path", "prompt_id", "context_path")
+)
 
 
 class FrameDecoder:

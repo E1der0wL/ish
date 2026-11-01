@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import shlex
 from typing import Callable, Iterable, Mapping, Pattern, Sequence, Union
 
@@ -33,6 +34,7 @@ class PathCompleter(Completer):
         expanduser: bool = False,
         quote: Callable[[str], str] = shlex.quote,
         context: Callable[[Document], CompletionWord | None] = _default_context,
+        get_home: Callable[[], str | None] | None = None,
     ) -> None:
         """Configure the search-path provider, file filter, and shell quoting function."""
         self.only_directories = only_directories
@@ -41,6 +43,19 @@ class PathCompleter(Completer):
         self.expanduser = expanduser
         self.quote = quote
         self.context = context
+        self.get_home = get_home
+
+    def _home_directory(self, tilde: str) -> str:
+        """Use the shell's HOME for bare tilde and passwd data for named users."""
+        if tilde != "~" or self.get_home is None:
+            return os.path.expanduser(tilde)
+        home = self.get_home()
+        if home is not None:
+            return home
+        try:
+            return pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            return tilde
 
     def get_completions(self, document, complete_event):
         """Generate directory and file candidates matching the literal path before the
@@ -61,14 +76,20 @@ class PathCompleter(Completer):
             tilde, separator, relative = word.value.partition("/")
             # Quoted or escaped tildes/usernames remain literal filesystem names.
             if raw_word.partition("/")[0] == tilde:
-                home = os.path.expanduser(tilde)
+                home = self._home_directory(tilde)
                 if home != tilde:
                     if not separator:
-                        if os.path.isdir(home) and self.file_filter(home):
-                            yield Completion(
-                                text=tilde + "/",
-                                start_position=word.start - document.cursor_position,
-                            )
+                        directory = home or "/"
+                        roots = [""] if os.path.isabs(directory) else self.get_paths()
+                        for root in roots:
+                            path = os.path.join(root, directory)
+                            if os.path.isdir(path) and self.file_filter(path):
+                                yield Completion(
+                                    text=tilde + "/",
+                                    start_position=word.start
+                                    - document.cursor_position,
+                                )
+                                break
                         return
                     home_prefix = tilde + "/"
                     text = home.rstrip("/") + "/" + relative
@@ -76,7 +97,8 @@ class PathCompleter(Completer):
         input_dirname = os.path.dirname(word.value)
         try:
             matches = {}
-            for root in self.get_paths():
+            roots = [""] if os.path.isabs(dirname) else self.get_paths()
+            for root in roots:
                 directory = os.path.join(root or ".", dirname)
                 with os.scandir(directory) as entries:
                     for entry in entries:
@@ -122,6 +144,7 @@ class PromptCompleter(Completer):
         pattern: Union[Pattern[str], None] = None,
         quote: Callable[[str], str] = shlex.quote,
         context: Callable[[Document], CompletionWord | None] = _default_context,
+        get_home: Callable[[], str | None] | None = None,
     ) -> None:
         """Prepare the command provider, display metadata, case policy, and path completer."""
         self.words = words
@@ -137,6 +160,7 @@ class PromptCompleter(Completer):
             get_paths=cwd,
             quote=quote,
             context=context,
+            get_home=get_home,
         )
 
     def get_completions(self, document, complete_event) -> Iterable[Completion]:

@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import pkgutil
+import signal
 import subprocess
 import sys
 import termios
+import threading
 import traceback
 from collections import Counter
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ from typing import (
     Union,
 )
 
+import psutil
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import in_terminal
 from prompt_toolkit.application.current import get_app, set_app
@@ -50,6 +52,7 @@ from prompt_toolkit.filters import (
     is_true,
     renderer_height_is_known,
 )
+from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -97,11 +100,12 @@ from ish.config import config
 from ish.lang import i18n
 from ish.log import get_logger
 from ish.parser.completion import CompletionWord
-from ish.parser.shell import alias_parser, dict_parser, str_parser
+from ish.parser.shell import alias_parser, environ_parser, str_parser
 from ish.runtime.fdio import InputBytes
 from ish.runtime.observer import InputObserver
+from ish.runtime.process import ProcessGroup
 from ish.shell.adapter import get_adapter
-from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE, PWD
+from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE
 from ish.shell.context import ShellContext
 from ish.shell.engine import InteractiveShell
 from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
@@ -119,6 +123,7 @@ from .input import (
 if TYPE_CHECKING:
     from argparse import Namespace
 
+    from prompt_toolkit.formatted_text import AnyFormattedText, StyleAndTextTuples
     from prompt_toolkit.key_binding.key_bindings import KeyHandlerCallable
     from prompt_toolkit.key_binding.key_processor import KeyPressEvent
     from prompt_toolkit.layout.containers import AnyContainer
@@ -127,28 +132,53 @@ if TYPE_CHECKING:
 
 __all__ = ["Prompt"]
 
+BUILTIN_QUERY_TIMEOUT = 3.0
+BUILTIN_CLEANUP_TIMEOUT = 0.5
+_PROMPT_STYLE = "class:prompt"
+
 
 def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
-    """Get builtins with startup files disabled where supported, or use a static list."""
+    """Bound optional startup-free discovery and fall back to the adapter's static list."""
     adapter = get_adapter(shell, executable)
+    fallback = list(adapter.builtins)
     if not adapter.builtins_command:
-        return list(adapter.builtins)
+        return fallback
+    process = None
     try:
         env = os.environ.copy()
         # Bash reads BASH_ENV in noninteractive mode even with --norc.
         # Only the discovery child loses these hooks; the session keeps them.
         for name in ("BASH_ENV", "ENV"):
             env.pop(name, None)
-        stdout, stderr = subprocess.Popen(
+        process = subprocess.Popen(
             [executable or shell, *adapter.builtins_args, adapter.builtins_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             env=env,
-        ).communicate()
-        return stdout.split()
+            start_new_session=True,
+        )
+        stdout, _ = process.communicate(timeout=BUILTIN_QUERY_TIMEOUT)
+        return stdout.split() if process.returncode == 0 else fallback
     except Exception:
-        return []
+        return fallback
+    finally:
+        if process is not None:
+            if process.returncode is None:
+                # Retain group identities before poll/kill/wait can reap its leader.
+                group = ProcessGroup(process.pid, process.pid)
+                group.send(signal.SIGKILL)
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            if process.stdout is not None:
+                process.stdout.close()
+            try:
+                process.wait(timeout=BUILTIN_CLEANUP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # Even an uninterruptible child must not block optional completion.
+                pass
 
 
 class Prompt(PromptSession):
@@ -168,6 +198,7 @@ class Prompt(PromptSession):
         output_fd: Optional[int] = None,
         plugin_manager: Optional[PluginManager] = None,
         option: Optional[Namespace] = None,
+        prompt_text: AnyFormattedText = None,
         **kwargs,
     ) -> None:
         """Configure the shell runner, state parsers, Python worker, UI layout, and key
@@ -217,12 +248,7 @@ class Prompt(PromptSession):
         self.context = ShellContext()
         self.context.register(
             ENVIRON,
-            lambda data: dict_parser(
-                data,
-                encoder=self.encoder,
-                x_sep="=",
-                y_sep="\0" if b"\0" in data else "\n",
-            ),
+            environ_parser,
             lambda data: asyncio.create_task(self._update_context(ENVIRON, data)),
         )
         self.context.register(
@@ -274,17 +300,21 @@ class Prompt(PromptSession):
             ALIAS: [],
         }
         self._completion_words = []
-        self._cwd = ""
+        self._cwd = None
+        self._home = None
+        self._cwd_generation = -1
+        self._cwd_lock = threading.Lock()
         self._path_scan_key = None
         self._path_scan_task = None
         self._path_generation = 0
         self.default_completer = PromptCompleter(
             words=lambda: self._completion_words,
-            cwd=lambda: [self._cwd],
+            cwd=self._completion_paths,
             ignore_case=True,
             match_middle=False,
             quote=self.quote_argument,
             context=self.completion_context,
+            get_home=lambda: self._home,
         )
         self.exit_command: str = "ish_exit"
         self.internal_commands: Dict[
@@ -299,6 +329,11 @@ class Prompt(PromptSession):
 
         if "auto_suggest" not in kwargs:
             kwargs["auto_suggest"] = AutoSuggestFromHistory()
+        self.prompt_text = prompt_text
+        self._primary_prompt = True
+        self._prompt_prefix = b""
+        self._prefix_encoder = self.encoder
+        self._prefix_fragments: StyleAndTextTuples | None = None
         super().__init__(*args, **kwargs)
         self.app.input = ObservedInput(self.app.input, self.input_observer)
         self.multiline = True
@@ -532,6 +567,27 @@ class Prompt(PromptSession):
 
         return Layout(layout, default_buffer_window)
 
+    def _get_prompt(self) -> StyleAndTextTuples:
+        """Choose primary display text while retaining ordinary output before it.
+
+        None retains prompt-toolkit's existing message path. The toolkit owns
+        formatted-text interpretation, including callable and protocol objects.
+        Parse a retained output prefix only when an override actually needs it.
+        """
+        if self.prompt_text is None or not self._primary_prompt:
+            return super()._get_prompt()
+        fragments = to_formatted_text(self.prompt_text, style=_PROMPT_STYLE)
+        if not self._prompt_prefix:
+            return fragments
+        if self._prefix_fragments is None:
+            prefix = self._prompt_prefix.replace(b"\r\n", b"\n").decode(
+                self._prefix_encoder, errors="replace"
+            )
+            self._prefix_fragments = to_formatted_text(
+                ShellANSI(prefix), style=_PROMPT_STYLE
+            )
+        return self._prefix_fragments + fragments
+
     def _create_default_buffer(self) -> Buffer:
         """Check transport admission on acceptance, including cached user validation.
 
@@ -566,40 +622,11 @@ class Prompt(PromptSession):
         return buffer
 
     def _create_key_binding(self) -> KeyBindings:
-        """Register editing keys for submission, indentation, paired characters, and
-        completion.
-        """
-
-        def is_balanced(string, quotation: str) -> bool:
-            """Use an editing heuristic to check whether paired characters occur an even
-            number of times.
-            """
-            return string.count(quotation) % 2 == 0
+        """Register submission, indentation, deletion, and completion keys."""
 
         def get_indentation(line) -> int:
             """Return the number of leading spaces on a line."""
             return len(line) - len(line.lstrip(" "))
-
-        def input_pair(event, key: str, insert: str) -> None:
-            """Skip a matching quote or open a pair at buffer end; close unmatched quotes."""
-            buffer = event.current_buffer
-            document = buffer.document
-            if document.current_char == key:
-                buffer.cursor_right()
-            elif document.is_cursor_at_the_end and is_balanced(buffer.text, key):
-                buffer.insert_text(insert)
-                buffer.cursor_left()
-            else:
-                buffer.insert_text(key)
-
-        def input_set(event, key: str, insert: str) -> None:
-            """Open a bracket pair at buffer end, or insert only the typed character."""
-            buffer = event.current_buffer
-            if buffer.document.is_cursor_at_the_end:
-                buffer.insert_text(insert)
-                buffer.cursor_left()
-            else:
-                buffer.insert_text(key)
 
         kb = KeyBindings()
 
@@ -633,34 +660,8 @@ class Prompt(PromptSession):
 
         @kb.add(Keys.Backspace)
         def _(event: KeyPressEvent):
-            """On Backspace, remove an empty character pair or the preceding character."""
-            buffer = event.current_buffer
-            cursor_position = buffer.document.cursor_position
-            char_before_cursor = buffer.document.char_before_cursor
-            try:
-                if char_before_cursor == "(" and buffer.text[cursor_position] == ")":
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                elif char_before_cursor == "{" and buffer.text[cursor_position] == "}":
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                elif char_before_cursor == "[" and buffer.text[cursor_position] == "]":
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                elif char_before_cursor == '"' and buffer.text[cursor_position] == '"':
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                elif char_before_cursor == "'" and buffer.text[cursor_position] == "'":
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                elif char_before_cursor == "`" and buffer.text[cursor_position] == "`":
-                    event.current_buffer.cursor_right()
-                    event.current_buffer.delete_before_cursor(2)
-                else:
-                    event.current_buffer.delete_before_cursor(1)
-
-            except Exception:
-                event.current_buffer.delete_before_cursor(1)
+            """Delete the preceding character without changing adjacent text."""
+            event.current_buffer.delete_before_cursor(1)
 
         @kb.add(Keys.Tab)
         def _(event: KeyPressEvent):
@@ -714,36 +715,6 @@ class Prompt(PromptSession):
             else:
                 event.current_buffer.insert_text("\n")
 
-        @kb.add("(")
-        def _(event: KeyPressEvent):
-            """Insert an opening parenthesis, pairing it only at the end of the input."""
-            input_set(event, "(", "()")
-
-        @kb.add("{")
-        def _(event: KeyPressEvent):
-            """Insert an opening brace, pairing it only at the end of the input."""
-            input_set(event, "{", "{}")
-
-        @kb.add("[")
-        def _(event: KeyPressEvent):
-            """Insert an opening bracket, pairing it only at the end of the input."""
-            input_set(event, "[", "[]")
-
-        @kb.add('"')
-        def _(event: KeyPressEvent):
-            """Apply paired-quote editing when a double quote is typed."""
-            input_pair(event, '"', '""')
-
-        @kb.add("'")
-        def _(event: KeyPressEvent):
-            """Apply paired-quote editing when a single quote is typed."""
-            input_pair(event, "'", "''")
-
-        @kb.add("`")
-        def _(event: KeyPressEvent):
-            """Apply paired-quote editing when a backtick is typed."""
-            input_pair(event, "`", "``")
-
         return kb
 
     @staticmethod
@@ -761,6 +732,30 @@ class Prompt(PromptSession):
             except (FileNotFoundError, PermissionError):
                 continue
         return all_cmd
+
+    def _completion_directory(self) -> str | None:
+        """Resolve cwd lazily once per environment update, never from parent state."""
+        generation = self._path_generation
+        if self._cwd_generation == generation:
+            return self._cwd
+        with self._cwd_lock:
+            generation = self._path_generation
+            if self._cwd_generation == generation:
+                return self._cwd
+            try:
+                cwd = self.interactive_shell.working_directory()
+            except (OSError, psutil.Error, RuntimeError):
+                cwd = None
+            if generation != self._path_generation:
+                return None
+            self._cwd = cwd
+            self._cwd_generation = generation
+            return cwd
+
+    def _completion_paths(self) -> list[str]:
+        """Omit relative filesystem candidates if the shell directory is unavailable."""
+        cwd = self._completion_directory()
+        return [cwd] if cwd is not None else []
 
     def _tool_argv(self, command: str) -> list[str] | None:
         """Resolve a registered tool only through the active shell's literal policy."""
@@ -809,12 +804,21 @@ class Prompt(PromptSession):
         generation is current.
         """
         if ENVIRON == category:
-            self._cwd = data.get(PWD)
+            self._home = data.get("HOME")
             self._path_generation += 1
             generation = self._path_generation
+            search_path = os.get_exec_path(data)
+            cwd = None
+            if any(not os.path.isabs(path) for path in search_path):
+                cwd = await asyncio.to_thread(self._completion_directory)
+                if generation != self._path_generation:
+                    return
             paths = tuple(
-                os.path.normpath(os.path.join(self._cwd or os.getcwd(), path))
-                for path in os.get_exec_path(data)
+                os.path.normpath(
+                    path if os.path.isabs(path) else os.path.join(cwd, path)
+                )
+                for path in search_path
+                if os.path.isabs(path) or cwd is not None
             )
             if self._path_scan_key != paths or self._path_scan_task.done():
                 self._path_scan_key = paths
@@ -1034,12 +1038,28 @@ class Prompt(PromptSession):
         )
         self.completer = ThreadedCompleter(comps)
 
-    def set_prompt(self, prompt: bytes, encoder: Optional[str] = None) -> None:
-        """Decode shell prompt bytes into an ANSI value without executing screen controls."""
-        cleaned_prompt = prompt.replace(b"\r\n", b"\n")
+    def set_prompt(
+        self,
+        prompt: bytes,
+        encoder: Optional[str] = None,
+        *,
+        prefix: bytes = b"",
+        primary: bool = True,
+    ) -> None:
+        """Receive native prompt bytes and preserve their independent output prefix.
+
+        Keep message's existing combined ANSI interpretation and color inheritance.
+        Only _get_prompt selects an optional user override; secondary input keeps
+        its native prompt. A new frame invalidates the lazily formatted prefix.
+        """
+        cleaned_prompt = (prefix + prompt).replace(b"\r\n", b"\n")
         self.message = ShellANSI(
             cleaned_prompt.decode(encoder or self.encoder, errors="replace")
         )
+        self._prompt_prefix = prefix
+        self._prefix_encoder = encoder or self.encoder
+        self._prefix_fragments = None
+        self._primary_prompt = primary
 
     async def write_output(self, write) -> None:
         # Reader callbacks run outside prompt_async's context. Select this app
@@ -1066,17 +1086,6 @@ class Prompt(PromptSession):
         The user script runs in the current process; log loading failures and exit.
         """
         try:
-            import ish
-
-            for loader, module_name, _is_pkg in pkgutil.walk_packages(
-                ish.__path__, ish.__name__ + "."
-            ):
-                try:
-                    module = loader.find_module(module_name).load_module(module_name)
-                    sys.modules[module_name] = module
-                except Exception:
-                    continue
-
             init_globals = {
                 "__name__": "__main__",
                 "__file__": str(config.RC_FILE),

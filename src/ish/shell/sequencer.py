@@ -157,6 +157,17 @@ class Sequencer:
         """Resume the current capture after a complete or cancelled control."""
         self.state = self.BETWEEN if self.active_between is not None else self.GROUND
 
+    def _observe_capture(self, data) -> None:
+        """Observe controls only when retained bytes are released to the terminal."""
+        if self.control_callback is not None and b"\x1b" in data:
+            # Reuse the lexer without session callbacks: released captures must
+            # update terminal modes without replaying prompt or identity hooks.
+            observer = Sequencer(
+                max_sequence_bytes=self.max_sequence_bytes,
+                control_callback=self.control_callback,
+            )
+            observer.feed(data)
+
     def _release_capture(self, buffer: bytearray) -> None:
         """Display an abandoned capture once, without invoking its prompt callback."""
         if self.active_between is None:
@@ -167,15 +178,7 @@ class Sequencer:
             if self.between_truncated:
                 buffer.extend(b" [prompt truncated] ")
             buffer.extend(self._between_tail)
-            # These bytes now reach the real terminal instead of the prompt
-            # renderer. Observe their controls without replaying session hooks.
-            released = bytes(buffer[offset:])
-            if self.control_callback is not None and b"\x1b" in released:
-                observer = Sequencer(
-                    max_sequence_bytes=self.max_sequence_bytes,
-                    control_callback=self.control_callback,
-                )
-                observer.feed(released)
+            self._observe_capture(buffer[offset:])
         self.between_buffer.clear()
         self._between_tail.clear()
         self.between_truncated = False
@@ -267,8 +270,9 @@ class Sequencer:
             self._notify_output(buffer)
             replacement = callback(payload)
             if remove_seq and replacement is False:
-                buffer.extend(start_seq + payload + end_seq)
+                replacement = start_seq + payload + end_seq
             if remove_seq and isinstance(replacement, bytes):
+                self._observe_capture(replacement)
                 buffer.extend(replacement)
             self.between_buffer.clear()
             self._between_tail.clear()
@@ -345,6 +349,7 @@ class Sequencer:
         if self.state == self.OSC and self._string_escape:
             output.append(0x1B)
         output.extend(self.masking_buffer)
+        self._observe_capture(output)
         self.buffer.clear()
         self.between_buffer.clear()
         self._between_tail.clear()

@@ -36,8 +36,6 @@ from .constants import (
     INPUT_DONE,
     INPUT_ERROR,
     PROMPT_ID,
-    PROMPT_ID_LIMIT,
-    PROMPT_ID_MAX_DIGITS,
     SHELL_FIFO,
     TIOCGPTPEER,
     TTY_FIFO,
@@ -67,7 +65,7 @@ from .limits import (
     TYPEAHEAD_LIMIT_BYTES,
 )
 from .prefix import OutputLine
-from .protocol import FrameDecoder
+from .protocol import FrameDecoder, parse_prompt_id
 from .request import ShellExitRequest, ShellPassRequest
 from .scrollback import Scrollback
 from .sequencer import Sequencer
@@ -300,12 +298,31 @@ class InteractiveShell:
         self.signal_controller = ShellSignalController(self, self.adapter.signal_policy)
 
     # ==============================================================================================
-    # [Utility] Shared process, terminal, descriptor, and I/O helpers.
+    # [Utility] Shared state, process, terminal, descriptor, and I/O helpers.
     # ==============================================================================================
 
     def _has_exited(self) -> bool:
         """Consult the child watcher's cached status without probing the process."""
         return self.proc is not None and self.proc.returncode is not None
+
+    def _primary_confirmed(self) -> bool:
+        """Check the accepted prompt snapshot; callers retain lifecycle admission rules."""
+        return (
+            self._accepted_prompt_id > 0
+            and self.prompt_matches(self._accepted_prompt_id)
+            and self.command_done_event is not None
+            and self.command_done_event.is_set()
+            and self.continuation_active is not None
+            and not self.continuation_active.is_set()
+        )
+
+    def _pending_prompt_matches(self) -> bool:
+        """Identify a fresh candidate whose context agrees, independently of input ACK."""
+        return self._accepted_prompt_id < self._pending_prompt_id == self._context_id
+
+    def _input_return_complete(self, identity: int) -> bool:
+        """Check the current input-return acknowledgement for the requested generation."""
+        return self.input_ack_pipe is None or self._input_return_id == identity
 
     @staticmethod
     def _set_window_size(fd, col, row, xpix=0, ypix=0) -> None:
@@ -638,14 +655,10 @@ class InteractiveShell:
                 return
             for category, body in self._frame_decoder.feed(chunk):
                 if category == PROMPT_ID:
-                    if (
-                        body
-                        and len(body) <= PROMPT_ID_MAX_DIGITS
-                        and body.isdigit()
-                        and int(body) < PROMPT_ID_LIMIT
-                    ):
+                    value = parse_prompt_id(body)
+                    if value is not None:
                         previous_context = self._context_id
-                        self._context_id = max(self._context_id, int(body))
+                        self._context_id = max(self._context_id, value)
                         if self._context_id > self._accepted_prompt_id:
                             self._handoff_pending = True
                             if (
@@ -659,14 +672,8 @@ class InteractiveShell:
                                 )
                         self._context_event.set()
                 elif category in (INPUT_DONE, INPUT_ERROR):
-                    if (
-                        not body
-                        or len(body) > PROMPT_ID_MAX_DIGITS
-                        or not body.isdigit()
-                    ):
-                        raise RuntimeError("Invalid input-return acknowledgement")
-                    value = int(body)
-                    if not 0 < value < PROMPT_ID_LIMIT:
+                    value = parse_prompt_id(body)
+                    if value is None or value == 0:
                         raise RuntimeError("Invalid input-return acknowledgement")
                     if category == INPUT_ERROR and value >= self._context_id:
                         raise RuntimeError("Shell input recovery failed")
@@ -712,10 +719,8 @@ class InteractiveShell:
 
     def _set_prompt_id(self, data: bytes) -> bool:
         """Accept only valid, increasing session IDs and pass invalid signals through."""
-        if not data or len(data) > PROMPT_ID_MAX_DIGITS or not data.isdigit():
-            return False
-        value = int(data)
-        if not self._prompt_id < value < PROMPT_ID_LIMIT:
+        value = parse_prompt_id(data)
+        if value is None or value <= self._prompt_id:
             return False
         self._prompt_id = value
         return True
@@ -765,24 +770,20 @@ class InteractiveShell:
             # its own buffer. Keep one input owner until the primary prompt.
             # Returning bytes preserves the prompt's position in the PTY output.
             return prompt
-        self.editor.set_prompt(prompt, self.encoder)
+        self.editor.set_prompt(prompt, self.encoder, primary=False)
         # A custom UI continuation policy must not flush or replay shell input.
         self.prompt_event.set()
 
     async def _wait_context(self) -> None:
         """Wait within a deadline for the state FIFO to reach the current prompt ID."""
-        while self._context_id != (self._pending_prompt_id or self._prompt_id) or (
-            self.input_ack_pipe is not None
-            and self._input_return_id != self._context_id
-        ):
+        while self._context_id != (
+            self._pending_prompt_id or self._prompt_id
+        ) or not self._input_return_complete(self._context_id):
             self._context_event.clear()
             try:
                 await asyncio.wait_for(self._context_event.wait(), self.context_timeout)
             except TimeoutError:
-                if (
-                    self.input_ack_pipe is not None
-                    and self._input_return_id != self._context_id
-                ):
+                if not self._input_return_complete(self._context_id):
                     raise RuntimeError(
                         "Shell input recovery was not acknowledged"
                     ) from None
@@ -794,12 +795,9 @@ class InteractiveShell:
         """Transfer input ownership only after a fresh prompt and its state agree."""
         if self._closing_output or self._has_exited():
             return
-        if not self._accepted_prompt_id < self._pending_prompt_id == self._context_id:
+        if not self._pending_prompt_matches():
             raise RuntimeError("Cannot accept an unconfirmed shell prompt")
-        if (
-            self.input_ack_pipe is not None
-            and self._input_return_id != self._pending_prompt_id
-        ):
+        if not self._input_return_complete(self._pending_prompt_id):
             raise RuntimeError("Cannot accept a prompt before input recovery completes")
         writer = self._writers.get(self.master_fd)
         if writer is not None and writer.pending_bytes:
@@ -829,7 +827,7 @@ class InteractiveShell:
         )
         self.command_done_event.set()
         self.continuation_active.clear()
-        self.editor.set_prompt(self._prompt_prefix + self.message, self.encoder)
+        self.editor.set_prompt(self.message, self.encoder, prefix=self._prompt_prefix)
         self.input_observer.sample("SHELL", self.master_fd, "prompt_accepted")
 
     async def _synchronize_prompt(self):
@@ -1450,9 +1448,7 @@ class InteractiveShell:
         # keeping later keys outside that FIFO until ownership is transferred.
         self._send_interrupted |= discard_submitted
         self._handoff_pending = discard_submitted
-        confirmed_prompt = (
-            self._accepted_prompt_id < self._pending_prompt_id == self._context_id
-        )
+        confirmed_prompt = self._pending_prompt_matches()
         if not (discard_submitted and confirmed_prompt):
             # At an already confirmed primary prompt only the queued block is
             # being cancelled. Signalling that idle reader can consume the next
@@ -1533,6 +1529,15 @@ class InteractiveShell:
     # [Session API] Exchange context and input with the editor and Python tool runner.
     # ==============================================================================================
 
+    def working_directory(self) -> str:
+        """Read the shell's actual directory without trusting the exported PWD value."""
+        if self.shell_pid is None:
+            raise RuntimeError("Shell working directory is unavailable")
+        cwd = psutil.Process(self.shell_pid).cwd()
+        if not cwd or not os.path.isabs(cwd):
+            raise RuntimeError("Shell working directory is unavailable")
+        return cwd
+
     def tool_context(self) -> tuple[str, dict[str, str]]:
         """Snapshot exported state at a confirmed primary prompt for a Python tool.
 
@@ -1545,24 +1550,13 @@ class InteractiveShell:
             or self._stopping
             or self._closing_output
             or self._initializing
-            or self._accepted_prompt_id <= 0
-            or self._accepted_prompt_id != self._context_id
-            or self._accepted_prompt_id != self._prompt_id
-            or self.command_done_event is None
-            or not self.command_done_event.is_set()
-            or self.continuation_active is None
-            or self.continuation_active.is_set()
+            or not self._primary_confirmed()
         ):
             raise RuntimeError("Python tools require a confirmed primary shell prompt")
         environ = self.editor.context.environ
         if environ is None:
             raise RuntimeError("Shell environment is unavailable for the Python tool")
-        cwd = psutil.Process(self.shell_pid).cwd()
-        if not cwd or not os.path.isabs(cwd):
-            raise RuntimeError(
-                "Shell working directory is unavailable for the Python tool"
-            )
-        return cwd, dict(environ)
+        return self.working_directory(), dict(environ)
 
     def return_typeahead(self, data: bytes) -> None:
         """Append unread input returned by the previous consumer within the byte limit."""
@@ -1598,17 +1592,7 @@ class InteractiveShell:
         if not prefix:
             return 0
         self.signal_controller.validate_submission()
-        if (
-            self._has_exited()
-            or self._closing_output
-            or self._accepted_prompt_id <= 0
-            or self._accepted_prompt_id != self._context_id
-            or self._accepted_prompt_id != self._prompt_id
-            or self.command_done_event is None
-            or not self.command_done_event.is_set()
-            or self.continuation_active is None
-            or self.continuation_active.is_set()
-        ):
+        if self._has_exited() or self._closing_output or not self._primary_confirmed():
             raise InputRejected(
                 "Not sent: long input requires a confirmed primary shell prompt."
             )
