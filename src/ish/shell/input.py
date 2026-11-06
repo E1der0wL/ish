@@ -18,6 +18,8 @@ from .constants import TIOCGPTPEER
 from .limits import TYPEAHEAD_LIMIT_BYTES
 
 CANONICAL_LINE_BYTES = 4095
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
 
 
 class InputHandoffMode(Enum):

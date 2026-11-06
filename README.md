@@ -8,6 +8,32 @@ Use ish on Linux or inside WSL on Windows. Native Windows and macOS execution ar
 not supported. Run `ish --help` for command-line options and `ish --diagnose tcsh`
 for an environment report without starting an interactive session.
 
+### Typing while a command is running
+
+The foreground program gets the keyboard first. At the next confirmed ish
+prompt, ish restores any unread text in batches and interprets editing keys
+such as the arrows and Backspace. For example, ↑ during `sleep 2` may echo
+`^[[A` while the command runs, then recall `sleep 2` for editing when it
+finishes. Recall uses the history available to the ish editor.
+
+In the default Emacs editing mode, Alt+B and Alt+F use the selected shell's
+stock word boundaries for Bash, zsh, and tcsh. Keys returned from the
+foreground PTY use default bindings. Keys typed directly into the ish
+prompt or held by ish before reaching that PTY retain your `.ishrc.py`
+bindings. Shell-specific Readline, ZLE, and tcsh keymaps belong to their
+respective native editors. For example, some native keymaps leave Ctrl+Left
+unbound while ish uses it for word motion.
+
+When Enter submits a command, subsequent bytes stay available for that
+command or Python tool to read. Complete bracketed pastes keep their
+contents together, and already-submitted command blocks retain their text.
+The terminal can erase or transform bytes before ish gets them back. For
+example, in canonical mode, Ctrl+V can quote a literal Backspace. If that
+byte is forwarded to another command's canonical terminal, it can act as
+Backspace there because the original quoting has already been consumed.
+Native continuation prompts and programs such as Vim still receive their
+own input.
+
 ## Supported shells
 
 The selected shell must be installed on the host; the distribution does not bundle
@@ -544,9 +570,9 @@ Only symmetric pairs (quotes and backticks) skip an existing closer; closing
 parentheses, braces, and brackets still insert normally. Backspace deletes any
 matching adjacent pair, including one inserted manually or by paste.
 
-Bracketed paste and literal text returned from the shell bypass these key
-handlers, so existing command blocks are not paired again. These settings apply
-to ish's primary editor; native shell continuation editing remains unchanged.
+These handlers apply to keys typed in the primary editor. Text that comes
+back from a foreground program, bracketed paste contents, and previously
+submitted commands keep their original quotes and parentheses.
 The handlers replace only their own key sequences, leaving Enter, Tab, and other
 bindings intact. Repeating the example with `ish_reload` does not add duplicate
 bindings. Removing lines or pair entries from `.ishrc.py` does not undo

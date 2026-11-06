@@ -193,6 +193,40 @@ INTEGRATION_ARGUMENTS = ("_ish_pipe", "_tty_pipe")
 
 
 @dataclass(frozen=True)
+class WordMotion:
+    """Stock Emacs word movement for keys recovered from the foreground PTY."""
+
+    extra: str
+    forward_to_start: bool = False
+    control_arrows: bool = False
+
+    def position(self, text: str, cursor: int, count: int) -> int:
+        """Move across words by a signed count, stopping at either buffer boundary."""
+
+        def word(char):
+            return char.isalnum() or char in self.extra
+
+        end = len(text)
+        for _ in range(abs(count)):
+            if count < 0:
+                if cursor == 0:
+                    break
+                while cursor and not word(text[cursor - 1]):
+                    cursor -= 1
+                while cursor and word(text[cursor - 1]):
+                    cursor -= 1
+            else:
+                if cursor == end:
+                    break
+                # ZLE's forward-word stops at the next word's beginning.
+                # Readline and tcsh stop at the end of the current/next word.
+                for match_word in (self.forward_to_start, not self.forward_to_start):
+                    while cursor < end and word(text[cursor]) == match_word:
+                        cursor += 1
+        return cursor
+
+
+@dataclass(frozen=True)
 class ShellAdapter:
     """Immutable configuration linking shell arguments, syntax, behavior, and integration
     signals.
@@ -222,6 +256,7 @@ class ShellAdapter:
     input_handoff: InputHandoffMode = InputHandoffMode.PROMPT_ACK
     # Trusted literals in the corresponding template's shell quoting context.
     template_tokens: tuple[tuple[str, str], ...] = ()
+    word_motion: WordMotion | None = None
 
     @property
     def syntax(self) -> ShellSyntax:
@@ -348,6 +383,7 @@ ADAPTERS = {
         ("--noediting", "-i"),
         BASH_INTEGRATION_SCRIPT,
         parsing=BASH_PARSING,
+        word_motion=WordMotion("", control_arrows=True),
         source_command="source",
         buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
@@ -361,6 +397,7 @@ ADAPTERS = {
         ("-i",),
         ZSH_INTEGRATION_SCRIPT,
         parsing=ZSH_PARSING,
+        word_motion=WordMotion("*?_-.[]~=/&;!#$%^(){}<>", forward_to_start=True),
         source_command="source",
         buffered_continuation_suffix=BUFFERED_CONTINUATION_HINT,
         builtins_command='printf "%s\\n" ${(k)builtins}',
@@ -379,6 +416,7 @@ ADAPTERS = {
         ("-i",),
         TCSH_INTEGRATION_SCRIPT,
         parsing=CSH_PARSING,
+        word_motion=WordMotion("*?_-.[]~="),
         behavior=CSH_BEHAVIOR,
         unhooked_prompt=(CARET_BEFORE_PROMPT, CARET_AFTER_PROMPT),
         native_continuation_signal=NATIVE_CONTINUATION,

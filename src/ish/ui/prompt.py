@@ -53,8 +53,10 @@ from prompt_toolkit.filters import (
     renderer_height_is_known,
 )
 from prompt_toolkit.formatted_text import to_formatted_text
-from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.search import accept_search_and_accept_input
+from prompt_toolkit.key_binding.key_bindings import merge_key_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Float, FloatContainer, HSplit, Window
@@ -109,16 +111,13 @@ from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE
 from ish.shell.context import ShellContext
 from ish.shell.engine import InteractiveShell
 from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
+from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
 from ish.shell.request import ShellExitRequest, ShellPassRequest
 
 from .ansi import ShellANSI
 from .completer import PromptCompleter
-from .input import (
-    ObservedInput,
-    feed_literal_text,
-    feed_pending_keys,
-    take_pending_keys,
-)
+from .input import HandoffKeyProcessor, NativeKey, ObservedInput, ReplayInput, wire_text
+from .words import native_word_bindings
 
 if TYPE_CHECKING:
     from argparse import Namespace
@@ -135,6 +134,8 @@ __all__ = ["Prompt"]
 BUILTIN_QUERY_TIMEOUT = 3.0
 BUILTIN_CLEANUP_TIMEOUT = 0.5
 _PROMPT_STYLE = "class:prompt"
+_REPLAY_CHUNK_BYTES = 4096
+_INTERRUPT_KEYS = (Keys.ControlC, Keys.ControlD)
 
 
 def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
@@ -335,15 +336,31 @@ class Prompt(PromptSession):
         self._prefix_encoder = self.encoder
         self._prefix_fragments: StyleAndTextTuples | None = None
         super().__init__(*args, **kwargs)
-        self.app.input = ObservedInput(self.app.input, self.input_observer)
+        self.app.input = ObservedInput(
+            self.app.input, self.input_observer, self.encoder
+        )
+        native_bindings = merge_key_bindings(
+            [
+                self.app._default_bindings,
+                self._create_prompt_bindings(),
+                self._create_key_binding(),
+                native_word_bindings(self.interactive_shell.adapter),
+            ]
+        )
+        self.app.key_processor = HandoffKeyProcessor(
+            self.app.key_processor._bindings, native_bindings
+        )
+        self._replay_lookahead = b""
         self.multiline = True
         self.color_depth = ColorDepth.TRUE_COLOR
         self.key_bindings = self._create_key_binding()
+        self._submit_binding = self.key_bindings.get_bindings_for_keys((Keys.Enter,))[
+            -1
+        ]
         self.lexer = PygmentsLexer(
             type(get_lexer_by_name(self.interactive_shell.adapter.syntax.lexer))
         )
         self.completer = ThreadedCompleter(self.default_completer)
-        self.parser = Vt100Parser(feed_key_callback=self.app.key_processor.feed)
 
     @property
     def key_list(self) -> List[Dict[str, Any]]:
@@ -635,6 +652,14 @@ class Prompt(PromptSession):
             """On Enter, insert a newline for explicit line continuation or submit the
             input.
             """
+            if (
+                self.app.key_processor.native_search
+                and accept_search_and_accept_input.filter()
+            ):
+                # The search may have started during replay and finished with a
+                # live Enter. Submit its result from the searchable main buffer.
+                accept_search_and_accept_input.call(event)
+                return
             buffer = event.current_buffer
             text = buffer.text
             lines = text.split("\n")
@@ -1156,49 +1181,251 @@ class Prompt(PromptSession):
         return command
 
     def take_typeahead(self) -> bytes:
-        """Transfer unconsumed editor input to a native consumer exactly once.
-
-        Prompt-toolkit stores keys after the accepted Enter for its next run.
-        A tool, an ongoing submitted block, or a shell without prompt hooks must
-        receive those keys instead.
-        Cursor-position replies are terminal protocol, not user input.
-        """
+        """Transfer unread input, including VT and paste framing, to foreground stdin."""
         data, native_prefix = self.interactive_shell.take_pending_input()
-        data += take_pending_keys(self.input, self.encoder)
+        prefix, self._replay_lookahead = self._replay_lookahead, b""
+        data = prefix + data + self.input.take_pending()
         self.input_observer.record("editor_input_transferred", bytes=len(data))
-        return InputBytes(data, native_prefix)
+        return InputBytes(data, native_prefix + len(prefix))
 
     def feed_typeahead(self, data: bytes) -> None:
-        """Feed returned bytes through the editor's existing decoder and VT100 parser.
+        """Queue returned bytes through the same VT parser used for replay."""
+        self.app.key_processor.feed_multiple(self.input.replay.read(data))
 
-        Sharing these objects keeps a UTF-8 character or escape sequence split
-        across the handoff joined to its later bytes from the terminal.
+    def replay_raw(self, data: bytes | bytearray, *, native: bool) -> int:
+        """Apply real bindings, stopping at the byte that accepted the prompt.
+
+        PTK can read ahead to resolve an escape or key chord. Map its unhandled
+        events back to the original wire suffix, which may be a program's stdin.
+        Keep parsing bounded even when many commands arrived in one PTY read.
         """
-        feed_pending_keys(
-            self.input, data, self.encoder, self.parser, self.app.key_processor.feed
-        )
+        replay = self.input.replay
+        processor = self.app.key_processor
+        offset = 0
+        while offset < len(data) and not self.app.is_done:
+            stop = min(offset + _REPLAY_CHUNK_BYTES, len(data))
+            if native:
+                run = replay.ascii_run(data, offset, stop)
+                if run and processor.can_insert_run(self.default_buffer):
+                    processor.feed(NativeKey(Keys.Any, run[0].decode("ascii")))
+                    processor.process_keys()
+                    offset = run.end()
+                    continue
+            # Most submissions end on a newline. Avoid parsing a following
+            # command's potentially large stdin unless dispatch actually continues.
+            newline = data.find(b"\n", offset, stop)
+            if newline >= 0 and not replay.parser._in_bracketed_paste:
+                stop = newline + 1
+            wire = replay.pending
+            older = len(wire)
+            buffered = processor.key_buffer[:]
+            keys = replay.read(data[offset:stop], native=native)
+            processor.process_replay(keys, self.default_buffer)
+            if self.app.is_done:
+                consumed, previous = processor.accepted_offset(
+                    keys, buffered, self.encoder
+                )
+                replay.take()
+                boundary = offset + consumed - older - len(previous)
+                if boundary < 0:
+                    # A prefix from an earlier replay call resolved to multiple
+                    # keys. The unconsumed part precedes this call's first byte.
+                    self._replay_lookahead = (previous + wire[consumed:older])[
+                        :-boundary
+                    ]
+                return max(0, boundary)
+            offset = stop
+        if replay.pending and self.app.is_running:
+            self.input.schedule_flush(self.app)
+        self.app.invalidate()
+        return offset
+
+    def start_typeahead(
+        self, replay, native: bytes | bytearray, fresh: bytearray
+    ) -> None:
+        """Run older input before saved and live keys, with history ready for bindings."""
+        saved = get_typeahead(self.input)
+        if not (native or fresh or saved or self._replay_lookahead):
+            replay()
+            return
+        live = []
+        processor = self.app.key_processor
+        result = self.app.future
+        restored = False
+
+        def dispatch(keys):
+            if keys and not self.app.is_done:
+                ready = self.input.prepare_keys(keys)
+                processor.feed_multiple(ready)
+                keys.clear()
+                processor.process_keys()
+
+        def restore(_=None):
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            if self.input.hold_keys is hold:
+                self.input.hold_keys = None
+                loader.remove_done_callback(restore)
+                result.remove_done_callback(restore)
+            try:
+                if not self.app.is_done and self._replay_lookahead:
+                    prefix, self._replay_lookahead = self._replay_lookahead, b""
+                    used = self.replay_raw(prefix, native=False)
+                    self._replay_lookahead += prefix[used:]
+                if not self.app.is_done:
+                    replay()
+                dispatch(saved)
+                dispatch(live)
+            except (Exception, KeyboardInterrupt) as exc:
+                if not self.app.is_done:
+                    self.app.exit(exception=exc)
+            finally:
+                # Application saves the unread suffix at the end of this run.
+                processor.feed_multiple(saved)
+                processor.feed_multiple(live)
+                self.app.invalidate()
+
+        live_size = 0
+
+        def hold(keys):
+            """Let renderer CPRs through and keep live edits behind the older input."""
+            nonlocal live_size
+            replies = []
+            for index, key in enumerate(keys):
+                if key.key == Keys.CPRResponse:
+                    replies.append(key)
+                elif key.key in _INTERRUPT_KEYS and self._queued_interrupt(
+                    native, fresh, [*saved, *live], live_key=key
+                ):
+                    # A stalled history backend must remain interruptible.
+                    restore()
+                    return replies + keys[index:]
+                else:
+                    live_size += max(
+                        1, len(wire_text(key).encode(self.encoder, "surrogateescape"))
+                    )
+                    if live_size > TYPEAHEAD_LIMIT_BYTES:
+                        self.app.exit(
+                            exception=BufferError(
+                                "Pending editor input exceeds the typeahead limit"
+                            )
+                        )
+                        restore()
+                        return replies
+                    live.append(key)
+            return replies
+
+        if not self._replay_lookahead and not self._needs_history(native, fresh, saved):
+            restore()
+            return
+
+        self.default_buffer.load_history_if_not_yet_loaded()
+        loader = self.default_buffer._load_history_task
+        self.input.hold_keys = hold
+        loader.add_done_callback(restore)
+        result.add_done_callback(restore)
+        if self._queued_interrupt(native, fresh, saved):
+            # Give a ready history one turn, but never block a queued interrupt
+            # on a stalled provider. Actual dispatch still follows wire order.
+            asyncio.get_running_loop().call_soon(restore)
+
+    def _queued_interrupt(self, native, fresh, saved, *, live_key=None):
+        """Recognize cancellation before submission, excluding bracketed-paste data."""
+        streams = (self.input.replay.pending, self._replay_lookahead, native, fresh)
+        if live_key is None and not (
+            any(b"\x03" in data or b"\x04" in data for data in streams)
+            or any(key.key in _INTERRUPT_KEYS for key in saved)
+        ):
+            return False
+        probe = ReplayInput(self.encoder)
+        normal_enter = self._default_enter_active()
+        saved_data = "".join(
+            wire_text(key) for key in saved if key.key != Keys.CPRResponse
+        ).encode(self.encoder, "surrogateescape")
+        for data, canonical in (
+            (streams[0], False),
+            (streams[1], False),
+            (native, True),
+            (fresh, False),
+            (saved_data, False),
+        ):
+            for offset in range(0, len(data), _REPLAY_CHUNK_BYTES):
+                events = probe.read(data[offset : offset + _REPLAY_CHUNK_BYTES])
+                if live_key is not None:
+                    continue
+                for key in events:
+                    if key.key in _INTERRUPT_KEYS:
+                        return True
+                    if (canonical or normal_enter) and (
+                        key.key == Keys.Enter or canonical and key.key == Keys.ControlJ
+                    ):
+                        # A following line can be this command's stdin.
+                        return False
+        if live_key is not None:
+            # A new cancellation key can release the wait even after a queued
+            # Enter. Only suppress it if it is data in an ongoing paste.
+            data = wire_text(live_key).encode(self.encoder, "surrogateescape")
+            return any(key.key in _INTERRUPT_KEYS for key in probe.read(data))
+        return False
+
+    def _default_enter_active(self):
+        """Identify the original Enter binding, including longer user-defined chords."""
+        return [b for b in self.key_bindings.bindings if b.keys[0] == Keys.Enter] == [
+            self._submit_binding
+        ]
+
+    def _needs_history(self, native, fresh, saved):
+        """Wait for history on navigation and user bindings; keep plain typing responsive."""
+        customized_input = bool(fresh or saved)
+        bindings = self.key_bindings.bindings if customized_input else ()
+        printables = {b.keys[0] for b in bindings if not isinstance(b.keys[0], Keys)}
+        if any(b.keys[0] == Keys.Any for b in bindings):
+            return True
+        normal_enter = not customized_input or self._default_enter_active()
+        if any(
+            key.key in printables
+            or isinstance(key.key, Keys)
+            and (key.key != Keys.Enter or not normal_enter)
+            for key in saved
+        ):
+            return True
+
+        for data, delimiter, customized in (
+            (native, b"\n", False),
+            (fresh, b"\r", True),
+        ):
+            end = data.find(delimiter)
+            if end >= 0:
+                # A user Enter binding can navigate history or continue editing.
+                # The default Enter can also continue a backslash-terminated line.
+                if (
+                    (customized and not normal_enter)
+                    or end
+                    and data[end - 1] == ord("\\")
+                ):
+                    return True
+                data = data[:end]
+            if any(byte < 32 or byte == 127 for byte in data):
+                return True
+            if customized and printables:
+                text = data.decode(self.encoder, "surrogateescape")
+                if any(key in text for key in printables):
+                    return True
+        return False
 
     def feed_literal_input(self, data: bytes) -> None:
-        """Restore native text without applying editing bindings a second time.
-
-        Share the normal decoder so a split UTF-8 character can be completed by
-        future terminal input, with CPR replies still excluded from that prefix.
-        """
-        feed_literal_text(
-            self.input, data, self.encoder, self.default_buffer.insert_text
-        )
+        """Restore already-submitted text without invoking editor bindings again."""
+        decoder = self.input.replay.decoder
+        text = decoder.decode(data)
+        self.default_buffer.insert_text(text)
+        self.input.replay.pending[:] = decoder.getstate()[0]
 
     @property
     def output_active(self) -> bool:
         """Report whether shell output must suspend the editor's rendering."""
         return self.app.is_running
-
-    def process_typeahead(self, *, invalidate: bool = False) -> bool:
-        """Apply queued keys and report acceptance before another line is replayed."""
-        self.app.key_processor.process_keys()
-        if invalidate:
-            self.app.invalidate()
-        return self.app.is_done
 
     @contextmanager
     def observe_resize(self, callback):

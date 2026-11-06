@@ -14,6 +14,7 @@ import fcntl
 import os
 import platform
 import pty
+import re
 import shutil
 import struct
 import sys
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import psutil
 
 from ish.config import config
-from ish.runtime.fdio import FDWriter
+from ish.runtime.fdio import FDWriter, InputBytes
 from ish.runtime.observer import InputObserver
 
 from .adapter import get_adapter
@@ -43,6 +44,8 @@ from .constants import (
 )
 from .guard import spawn_environment
 from .input import (
+    PASTE_END,
+    PASTE_START,
     InputHandoffMode,
     InputModeLease,
     InputRejected,
@@ -78,6 +81,8 @@ if TYPE_CHECKING:
     from ish.ui.prompt import Prompt
 
 __all__ = ["InteractiveShell"]
+
+_PASTE_MARKER = re.compile(re.escape(PASTE_START) + b"|" + re.escape(PASTE_END))
 
 
 class InteractiveShell:
@@ -166,6 +171,10 @@ class InteractiveShell:
         "_submitted_input",
         "_literal_input",
         "_returned_input",
+        "_offered_literal",
+        "_paste_marker",
+        "_paste_prefix",
+        "_paste_tail",
         "_input_return_id",
         "_handoff_task",
         "input_ack_pipe",
@@ -243,6 +252,10 @@ class InteractiveShell:
         self._submitted_input = SubmittedInput()
         self._literal_input = bytearray()
         self._returned_input = bytearray()
+        self._offered_literal = False
+        self._paste_marker = b""
+        self._paste_prefix = b""
+        self._paste_tail = 0
         self._input_return_id = 0
         self._handoff_task = None
         self.terminal_state = TerminalState()
@@ -408,18 +421,21 @@ class InteractiveShell:
                 self._submitted_input.append(chunk)
                 self.input_observer.record("submission_returned", bytes=len(chunk))
                 return True
-            if len(self._returned_input) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
+            queue = (
+                self._literal_input if self._offered_literal else self._returned_input
+            )
+            if len(queue) + len(chunk) > TYPEAHEAD_LIMIT_BYTES:
                 self.fail_io(
                     BufferError(
                         f"Pending typeahead exceeds {TYPEAHEAD_LIMIT_BYTES / BYTES_PER_MIB:g} MiB"
                     )
                 )
                 return
-            self._returned_input.extend(chunk)
+            queue.extend(chunk)
             self.input_observer.record(
                 "typeahead_received",
                 bytes=len(chunk),
-                pending=len(self._returned_input),
+                pending=len(queue),
             )
             return True
         except BufferError as exc:
@@ -427,6 +443,23 @@ class InteractiveShell:
             return
         except (BlockingIOError, OSError):
             return
+
+    def _observe_paste_framing(self, data: bytes | bytearray) -> None:
+        """Remember only explicit paste framing offered to the foreground reader."""
+        if self._paste_marker is None or (
+            not self._paste_prefix and b"\x1b" not in data
+        ):
+            return
+        if self._paste_prefix:
+            data = self._paste_prefix + data
+        for marker in _PASTE_MARKER.finditer(data):
+            if marker[0] == PASTE_END and self._paste_marker != PASTE_START:
+                # A stray closer makes an orphan in the return ambiguous.
+                self._paste_marker = None
+                return
+            self._paste_marker = marker[0]
+        esc = data.rfind(b"\x1b", -len(PASTE_START) + 1)
+        self._paste_prefix = bytes(data[esc:]) if esc >= 0 else b""
 
     def _forward_input(self, fd: int, epoch: int | None = None) -> None:
         """Forward input to the internal PTY during execution and retain a diagnostic tail."""
@@ -468,6 +501,7 @@ class InteractiveShell:
                 )
                 return
             self._write(self.master_fd, data)
+            self._observe_paste_framing(data)
             self.input_observer.record("input_forwarded", "SHELL", bytes=len(data))
         except Exception as exc:
             self.fail_io(exc)
@@ -820,6 +854,13 @@ class InteractiveShell:
         # Read that FIFO before appending newer input held during the handoff.
         while self.tty_pipe is not None and self._collect_typeahead(self.tty_pipe):
             pass
+        if self._paste_marker and self._returned_input:
+            first = _PASTE_MARKER.search(self._returned_input)
+            if first is not None and first[0] == PASTE_END:
+                # The command consumed the opener. Only a complete surviving
+                # closer identifies a literal span in the recovered stream.
+                self._paste_tail = first.end()
+        self._offered_literal = False
         self.return_typeahead(bytes(self._deferred_input))
         self._deferred_input.clear()
         self.input_observer.record(
@@ -992,20 +1033,26 @@ class InteractiveShell:
         # Older native typeahead can include the next program's stdin. Offer
         # it to the native consumer; the next primary boundary returns any
         # unused suffix for normal editor/tool dispatch.
-        native_pending = bytes(self._returned_input)
-        self._returned_input.clear()
+        literal_size = len(self._literal_input)
+        paste_tail = self._paste_tail
+        self._paste_marker = self._paste_prefix = b""
         if hasattr(self.editor, "take_typeahead"):
-            if self.adapter.input_handoff is InputHandoffMode.NATIVE:
-                data += self.editor.take_typeahead()
-            elif self._submitted_input.active:
-                # Keys already retained by the editor or an earlier handoff
-                # precede future native reads, but follow the submitted block.
-                # Keep them separate from command echo and transport validation.
-                self._deferred_input.extend(self.editor.take_typeahead())
-        # Returned text was already displayed during its first PTY delivery.
-        # Keep its retransmission in the same ordered sender and echo mask as
-        # the command, without changing the command's dispatch/hook identity.
+            pending = self.editor.take_typeahead()
+            native_size = (
+                pending.native_prefix if isinstance(pending, InputBytes) else 0
+            )
+        else:
+            pending, native_size = self.take_pending_input()
+        native_pending, fresh = pending[:native_size], pending[native_size:]
+        self._observe_paste_framing(native_pending)
         data += native_pending
+        if self.adapter.input_handoff is InputHandoffMode.NATIVE:
+            data += fresh
+            self._observe_paste_framing(fresh)
+        else:
+            # A single accepted command can read stdin too. Its unread keys
+            # precede live reads but follow the submitted command and echo.
+            self._deferred_input.extend(fresh)
         try:
             # The PTY echoes every newline as CRLF, including pasted lines.
             attrs = termios.tcgetattr(self.master_fd)
@@ -1036,7 +1083,12 @@ class InteractiveShell:
                 self.command_start_event.clear()
                 self.command_done_event.set()
                 self.prompt_event.set()
-                self._returned_input.extend(native_pending)
+                self._literal_input.extend(native_pending[:literal_size])
+                self._returned_input.extend(native_pending[literal_size:])
+                self._paste_tail = paste_tail
+                self._offered_literal = False
+                if self.adapter.input_handoff is InputHandoffMode.NATIVE:
+                    self.return_typeahead(fresh)
                 self.return_typeahead(bytes(self._deferred_input))
                 raise
             except asyncio.CancelledError:
@@ -1053,6 +1105,7 @@ class InteractiveShell:
                 and not self._has_exited()
             ):
                 self._write(self.master_fd, self._deferred_input)
+                self._observe_paste_framing(self._deferred_input)
                 self.input_observer.record(
                     "deferred_forwarded", "SHELL", bytes=len(self._deferred_input)
                 )
@@ -1073,37 +1126,33 @@ class InteractiveShell:
         """
 
         def inject_typeahead():
-            """Feed typeahead through the real key parser and update editor state and
-            rendering.
-            """
+            """Give PTK the confirmed reader's bytes until a binding accepts."""
             if self._literal_input:
                 self.editor.feed_literal_input(bytes(self._literal_input))
                 self._literal_input.clear()
-            while self._returned_input:
-                end = self._returned_input.find(b"\n")
-                size = len(self._returned_input) if end < 0 else end + 1
-                data = bytes(self._returned_input[:size])
-                del self._returned_input[:size]
-                self.editor.feed_literal_input(data if end < 0 else data[:-1])
-                if end < 0:
+            if self._paste_tail:
+                end = self._paste_tail - len(PASTE_END)
+                self.editor.feed_literal_input(bytes(self._returned_input[:end]))
+                del self._returned_input[: self._paste_tail]
+                self._paste_tail = 0
+            for queue, native in (
+                (self._returned_input, True),
+                (self.typeahead, False),
+            ):
+                if queue:
+                    consumed = self.editor.replay_raw(queue, native=native)
+                    del queue[:consumed]
+                    self.input_observer.record(
+                        "typeahead_injected", "EDITOR", bytes=consumed
+                    )
+                if self.editor.app.is_done:
                     break
-                # Text has already passed through the native terminal. Only
-                # its accepted Enter goes through normal command/tool dispatch.
-                self.editor.feed_typeahead(b"\r")
-                if self.editor.process_typeahead():
-                    return
-            typeahead = b""
-            if self.typeahead:
-                idx = self.typeahead.find(b"\n")
-                size = len(self.typeahead) if idx < 0 else idx + 1
-                typeahead = bytes(self.typeahead[:size])
-                del self.typeahead[:size]
-            if typeahead:
-                self.input_observer.record(
-                    "typeahead_injected", "EDITOR", bytes=len(typeahead)
-                )
-                self.editor.feed_typeahead(typeahead)
-                self.editor.process_typeahead(invalidate=True)
+
+        def start_typeahead():
+            """Run older replay before saved keys and newly readable terminal input."""
+            self.editor.start_typeahead(
+                inject_typeahead, self._returned_input, self.typeahead
+            )
 
         retry_command = None
         while True:
@@ -1116,7 +1165,7 @@ class InteractiveShell:
             try:
                 self._write(self.stdout_fd, b"\x1b[2K\r")
                 await self._drain_output()
-                options = {"pre_run": inject_typeahead}
+                options = {"pre_run": start_typeahead}
                 if retry_command is not None:
                     options["default"] = retry_command
                     retry_command = None
@@ -1129,9 +1178,8 @@ class InteractiveShell:
                     # command. Their unread input belongs to the next editor.
                     continue
             except KeyboardInterrupt:
-                self.typeahead.clear()
-                self._returned_input.clear()
-                self._literal_input.clear()
+                # PTK consumed the interrupt. Bytes following it still belong
+                # to the next prompt, just like keys read together from stdin.
                 if self.continuation_active.is_set():
                     await self._exec(bytes(self.exec_attrs[6][termios.VINTR]))
                 continue
@@ -1438,6 +1486,8 @@ class InteractiveShell:
     def cancel_handoff(self, control: bytes, remaining: bytes) -> None:
         """Cancel an input handoff and retain only post-control typeahead."""
         discard_submitted = self._handoff_pending and self._submitted_input.active
+        self._paste_tail = 0
+        self._paste_marker = None
         self._deferred_input.clear()
         self.typeahead.clear()
         self._returned_input.clear()
@@ -1474,6 +1524,8 @@ class InteractiveShell:
         self._send_generation += 1
         self._send_interrupted = True
         self._handoff_pending = False
+        self._paste_tail = 0
+        self._paste_marker = None
         self.input_observer.record(
             "submission_interrupt", "SHELL", generation=self._send_generation
         )
@@ -1572,6 +1624,8 @@ class InteractiveShell:
 
     def take_pending_input(self) -> tuple[bytes, int]:
         """Drain engine queues in wire order, retaining the native-text boundary."""
+        self._offered_literal = bool(self._literal_input or self._paste_tail)
+        self._paste_tail = 0
         data = bytes(self._literal_input) + bytes(self._returned_input)
         native_prefix = len(data)
         data += bytes(self.typeahead)
@@ -1581,10 +1635,20 @@ class InteractiveShell:
         return data, native_prefix
 
     def return_native_input(self, data: bytes) -> None:
-        """Retain worker-returned text without applying editor key bindings again."""
-        if len(self._returned_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
+        """Return unread worker input, preserving an offered submitted fragment."""
+        if (
+            len(self._literal_input) + len(self._returned_input) + len(data)
+            > TYPEAHEAD_LIMIT_BYTES
+        ):
             raise BufferError("Returned native input exceeds the pending input limit")
-        self._returned_input.extend(data)
+        if self._offered_literal:
+            # Reads and termios edits obscure where the submitted fragment
+            # ended in a mixed PTY return. Keep this ambiguous batch as text;
+            # the worker returns provably unwritten fresh keys separately.
+            self._literal_input.extend(data)
+            self._offered_literal = False
+        else:
+            self._returned_input.extend(data)
 
     def validate_submission(self, data: bytes) -> int:
         """Validate editor input without changing terminal settings or writing bytes."""

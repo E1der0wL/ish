@@ -1,140 +1,308 @@
-"""Observe prompt-toolkit attachments and preserve characters across native handoffs."""
+"""Keep prompt-toolkit input ordered across foreground and primary prompt handoffs."""
 
+import asyncio
 import codecs
+import re
 from contextlib import contextmanager
+from itertools import groupby, takewhile
 
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.filters import (
+    emacs_insert_mode,
+    emacs_mode,
+    is_searching,
+    vi_insert_mode,
+)
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.key_binding import KeyPress
+from prompt_toolkit.key_binding.key_processor import KeyProcessor
 from prompt_toolkit.keys import Keys
 
 from ish.runtime.observer import InputObserver
+from ish.shell.input import PASTE_END, PASTE_START
+from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
+
+_PASTE_START = PASTE_START.decode("ascii")
+_PASTE_END = PASTE_END.decode("ascii")
+_ASCII_TEXT = re.compile(rb"[ -~]+")
 
 
-def take_pending_keys(source: Input, encoding: str) -> bytes:
-    """Drain saved keys and decoder bytes once, excluding terminal CPR replies."""
-    keys = get_typeahead(source)
-    keys.extend(source.flush_keys())
-    data = "".join(key.data for key in keys if key.key != Keys.CPRResponse).encode(
-        encoding, errors="surrogateescape"
-    )
-    if isinstance(source, ObservedInput):
-        data += source.take_decoder_prefix()
-    reader = getattr(getattr(source, "source", source), "stdin_reader", None)
-    if reader is not None:
-        # The pinned VT100 input retains incomplete characters outside typeahead.
-        decoder = reader._stdin_decoder
-        partial, state = decoder.getstate()
-        data += partial
-        decoder.setstate((b"", state))
-    return data
+def wire_text(key: KeyPress) -> str:
+    """Recover a parsed key's terminal input, including bracketed-paste framing."""
+    if key.key == Keys.BracketedPaste:
+        return _PASTE_START + key.data + _PASTE_END
+    return key.data
 
 
-def feed_pending_keys(
-    source: Input, data: bytes, encoding: str, fallback, feed
-) -> None:
-    """Replay keys through the existing decoder and parser across UI handoffs."""
-    original = getattr(source, "source", source)
-    reader = getattr(original, "stdin_reader", None)
-    parser = getattr(original, "vt100_parser", None)
-    if reader is None or parser is None:
-        fallback.feed(data.decode(encoding, errors="replace"))
-        fallback.flush()
-        return
-    original_callback = parser.feed_key_callback
-    parser.feed_key_callback = feed
-    try:
-        parser.feed(reader._stdin_decoder.decode(data))
-        if isinstance(source, ObservedInput):
-            source.hold_decoder_prefix(encoding)
-    finally:
-        parser.feed_key_callback = original_callback
+class HandoffKeyProcessor(KeyProcessor):
+    """Leave PTK's lookahead on its input queue when a shorter binding accepts."""
+
+    def __init__(self, editor_bindings, native_bindings):
+        """Keep separate bindings for a live chord and one begun on the foreground PTY."""
+        self.editor_bindings = editor_bindings
+        self.native_bindings = native_bindings
+        super().__init__(editor_bindings)
+
+    def _get_matches(self, key_presses):
+        # PTK looks up exact matches before longer prefixes, including on retry.
+        # The first key owns the chord even when its last key arrived live.
+        self._bindings = (
+            self.native_bindings
+            if isinstance(key_presses[0], NativeKey)
+            else self.editor_bindings
+        )
+        return super()._get_matches(key_presses)
+
+    def reset(self):
+        """End any returned-key search when a new prompt starts."""
+        self.native_search = False
+        super().reset()
+
+    def can_insert_run(self, buffer):
+        """Batch returned text only when every character is an ordinary self-insert."""
+        app = get_app()
+        return (
+            not self.key_buffer
+            and not self.input_queue
+            and self.arg is None
+            and not app.quoted_insert
+            and app.current_buffer is buffer
+            and (emacs_insert_mode() or vi_insert_mode())
+            and not app.emacs_state.is_recording
+            and not app.vi_state.recording_register
+        )
+
+    def process_replay(self, keys, buffer):
+        """Apply editing controls normally and batch consecutive ordinary native text."""
+
+        def plain(key):
+            return (
+                isinstance(key, NativeKey)
+                and not isinstance(key.key, Keys)
+                and key.key == key.data
+            )
+
+        for printable, group in groupby(keys, key=plain):
+            if not printable:
+                self.feed_multiple(group)
+                self.process_keys()
+                continue
+            run = list(group)
+            for index, key in enumerate(run):
+                if get_app().is_done:
+                    self.feed_multiple(run[index:])
+                    break
+                # A pending Meta chord, repeat count, search or vi operation may
+                # consume the first printable before normal insertion resumes.
+                if self.can_insert_run(buffer):
+                    self.feed(
+                        NativeKey(Keys.Any, "".join(item.data for item in run[index:]))
+                    )
+                    self.process_keys()
+                    break
+                self.feed(key)
+                self.process_keys()
+
+    def _call_handler(self, handler, key_sequence):
+        first = key_sequence[0]
+        may_start_search = (
+            isinstance(first, NativeKey)
+            and first.key in (Keys.ControlR, Keys.ControlS)
+            and emacs_mode()
+        )
+        super()._call_handler(handler, key_sequence)
+        if self.native_search or may_start_search:
+            self.native_search = is_searching()
+        if get_app().is_done and len(self.key_buffer) > len(key_sequence):
+            # PTK normally retries the unmatched chord tail immediately, even
+            # if the shorter binding just transferred ownership of stdin.
+            self.feed_multiple(self.key_buffer[len(key_sequence) :], first=True)
+            del self.key_buffer[len(key_sequence) :]
+
+    def accepted_offset(self, keys, buffered, encoding):
+        """Unqueue replay's remaining events and report their original byte boundary.
+
+        Key bindings may also enqueue synthetic input. Keep those events for
+        the next prompt. A shorter chord may leave keys from an earlier batch.
+        """
+        unread = {id(key) for key in self.input_queue}
+        replayed = {id(key) for key in (*buffered, *keys)}
+        retained = [key for key in self.input_queue if id(key) not in replayed]
+        self.input_queue.clear()
+        self.feed_multiple(retained)
+        handled = takewhile(lambda key: id(key) not in unread, keys)
+        consumed = len(
+            "".join(map(wire_text, handled)).encode(encoding, "surrogateescape")
+        )
+        previous = "".join(wire_text(key) for key in buffered if id(key) in unread)
+        return consumed, previous.encode(encoding, "surrogateescape")
 
 
-def feed_literal_text(source: Input, data: bytes, encoding: str, insert) -> None:
-    """Decode native text without interpreting it as editor shortcuts again."""
-    reader = getattr(getattr(source, "source", source), "stdin_reader", None)
-    text = (
-        reader._stdin_decoder.decode(data)
-        if reader is not None
-        else data.decode(encoding, errors="replace")
-    )
-    insert(text)
-    if isinstance(source, ObservedInput):
-        source.hold_decoder_prefix(encoding)
+class NativeKey(KeyPress):
+    """A key whose first wire byte came back from the foreground PTY."""
+
+
+class ReplayInput:
+    """Decode returned bytes with VT100 semantics, retaining the unfinished wire suffix.
+
+    The live input keeps its own parser so that a renderer CPR arriving between
+    halves of a character or escape sequence can be handled independently.
+    """
+
+    def __init__(self, encoding: str):
+        """Keep incomplete characters, protocol bytes and decoded events together."""
+        self.encoding = encoding
+        self.ascii_text = codecs.lookup(encoding).name in ("ascii", "utf-8")
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="surrogateescape")
+        self.keys = []
+        self.parser = Vt100Parser(self.keys.append)
+        self.pending = bytearray()
+        self.pending_native = False
+
+    def ascii_run(self, data, start, stop):
+        """Match bytes guaranteed to decode as ordinary text at a VT boundary."""
+        if self.ascii_text and not self.pending:
+            return _ASCII_TEXT.match(data, start, stop)
+        return None
+
+    def read(self, data: bytes, *, native=False, flush: bool = False) -> list[KeyPress]:
+        """Return decoded events and retain bytes for the next partial key or paste."""
+        older = len(self.pending)
+        self.pending.extend(data)
+        self.parser.feed(self.decoder.decode(data))
+        if flush:
+            self.parser.flush()
+        keys = self.keys[:]
+        self.keys.clear()
+        consumed = 0
+        owner = self.pending_native if older else native
+        for index, key in enumerate(keys):
+            wire = wire_text(key)
+            if wire:
+                owner = self.pending_native if consumed < older else native
+                consumed += len(wire.encode(self.encoding, "surrogateescape"))
+            if owner:
+                # Linux ICANON may have mapped the original Enter (CR) to LF.
+                keys[index] = NativeKey(
+                    Keys.Enter if key.key == Keys.ControlJ else key.key, key.data
+                )
+        if consumed:
+            self.pending = self.pending[consumed:]
+        if consumed >= older:
+            self.pending_native = native
+        if len(self.pending) > TYPEAHEAD_LIMIT_BYTES:
+            raise BufferError("Incomplete terminal input exceeds the typeahead limit")
+        return keys
+
+    def take(self) -> bytes:
+        """Transfer an unfinished character, escape or paste verbatim."""
+        pending = bytes(self.pending)
+        self.pending.clear()
+        self.decoder.reset()
+        self.parser.reset()
+        self.pending_native = False
+        return pending
 
 
 class ObservedInput(Input):
-    """Preserve the underlying input and join partial characters returned by a tool."""
+    """Observe real input ownership and join returned prefixes to subsequent keys."""
 
-    def __init__(self, source: Input, observer: InputObserver) -> None:
-        """Store the existing input and a shared, observational trace."""
+    def __init__(
+        self, source: Input, observer: InputObserver, encoding: str = "utf-8"
+    ) -> None:
+        """Attach tracing and replay state to the existing terminal input."""
         self.source = source
         self.observer = observer
         self._tokens: list[int | None] = []
-        self._returned_prefix = b""
-        self._prefix_encoding = "utf-8"
+        self.hold_keys = None
+        self.replay = ReplayInput(encoding)
+        self.flush_task = None
 
     def fileno(self):
         """Return the original descriptor."""
         return self.source.fileno()
 
     def typeahead_hash(self):
-        """Keep prompt-toolkit's saved typeahead associated with the original input."""
+        """Associate saved typeahead with the original prompt-toolkit input."""
         return self.source.typeahead_hash()
 
     def read_keys(self):
-        """Read existing keys, joining a returned character prefix when one is pending."""
+        """Read live keys and join an older unfinished sequence if one is pending."""
+        if self.flush_task is not None:
+            self.flush_task.cancel()
+            self.flush_task = None
         keys = self.source.read_keys()
         token = self._tokens[-1] if self._tokens else None
         self.observer.read("EDITOR", token, len(keys), unit="keys")
-        return self._complete_returned_prefix(keys)
+        return self.prepare_keys(keys)
+
+    def schedule_flush(self, app):
+        """Start PTK's escape timeout when replay happened before the first live read."""
+        if self.flush_task is not None:
+            self.flush_task.cancel()
+
+        async def flush():
+            await asyncio.sleep(app.ttimeoutlen)
+            if not app.is_done:
+                app.key_processor.feed_multiple(self.replay.read(b"", flush=True))
+                app.key_processor.process_keys()
+
+        self.flush_task = app.create_background_task(flush())
 
     def flush_keys(self):
-        """Delegate the existing parser flush and record only the number of keys."""
+        """Flush ambiguous live and returned VT sequences on PTK's normal timeout."""
         keys = self.source.flush_keys()
         self.observer.record("parser_flush", "EDITOR", keys=len(keys))
-        return self._complete_returned_prefix(keys)
+        keys = self.prepare_keys(keys)
+        if self.hold_keys is None and self.replay.pending:
+            keys.extend(self.replay.read(b"", flush=True))
+        return keys
 
-    def hold_decoder_prefix(self, encoding: str) -> None:
-        """Keep a returned partial character separate from terminal CPR replies."""
-        reader = getattr(self.source, "stdin_reader", None)
-        if reader is None:
-            return
-        partial, state = reader._stdin_decoder.getstate()
-        if partial:
-            self._returned_prefix += partial
-            self._prefix_encoding = encoding
-            reader._stdin_decoder.setstate((b"", state))
-
-    def take_decoder_prefix(self) -> bytes:
-        """Transfer the unfinished returned character to a native input consumer."""
-        data = self._returned_prefix
-        self._returned_prefix = b""
-        return data
-
-    def _complete_returned_prefix(self, keys):
-        """Join user bytes to the prefix without inserting intervening CPR responses.
-
-        A new editor requests cursor position after replaying returned input.
-        Those ASCII protocol replies must not invalidate a partial UTF-8 value.
-        Only this exceptional prefix path reconstructs parsed keys.
-        """
-        if not self._returned_prefix:
+    def prepare_keys(self, keys):
+        """Preserve live key identities except while finishing an older VT sequence."""
+        if self.hold_keys is not None:
+            keys = self.hold_keys(keys)
+        if not self.replay.pending:
             return keys
-        replies = [key for key in keys if key.key == Keys.CPRResponse]
-        raw = "".join(key.data for key in keys if key.key != Keys.CPRResponse).encode(
-            self._prefix_encoding, errors="surrogateescape"
-        )
-        decoder = codecs.getincrementaldecoder(self._prefix_encoding)(
-            errors="surrogateescape"
-        )
-        text = decoder.decode(self._returned_prefix + raw)
-        self._returned_prefix = decoder.getstate()[0]
-        parser = Vt100Parser(replies.append)
-        parser.feed(text)
-        parser.flush()
-        return replies
+        joined = []
+        for reply, group in groupby(keys, key=lambda key: key.key == Keys.CPRResponse):
+            if reply or not self.replay.pending:
+                joined.extend(group)
+            else:
+                # One physical VT sequence can emit two logical keys. Reparse
+                # the wire data as a group so its second event isn't duplicated.
+                data = "".join(map(wire_text, group)).encode(
+                    self.replay.encoding, "surrogateescape"
+                )
+                joined.extend(self.replay.read(data))
+        return joined
+
+    def take_pending(self) -> bytes:
+        """Transfer unread keys and unfinished protocol/decoder bytes exactly once."""
+        encoding = self.replay.encoding
+        data = self.replay.take()
+        keys = get_typeahead(self)
+        keys.extend(self.source.flush_keys())
+        data += "".join(
+            wire_text(key) for key in keys if key.key != Keys.CPRResponse
+        ).encode(encoding, "surrogateescape")
+        parser = getattr(self.source, "vt100_parser", None)
+        if parser is not None and parser._in_bracketed_paste:
+            # PTK's flush waits for a closing marker. A different stdin owner
+            # must instead receive all the bytes already read from the terminal.
+            data += (_PASTE_START + parser._paste_buffer).encode(
+                encoding, "surrogateescape"
+            )
+            parser.reset()
+        reader = getattr(self.source, "stdin_reader", None)
+        if reader is not None:
+            decoder = reader._stdin_decoder
+            partial, state = decoder.getstate()
+            data += partial
+            decoder.setstate((b"", state))
+        return data
 
     def flush(self):
         """Delegate the input's original flush behavior."""
