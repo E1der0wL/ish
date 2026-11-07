@@ -9,6 +9,10 @@ from .limits import SCROLLBACK_MAX_BYTES, SCROLLBACK_MAX_LINES
 
 __all__ = ["Scrollback"]
 
+_BUDGET_PARTS = 2
+_DECODE_ERRORS = "replace"
+_LINE_END = b"\n"
+
 
 class Scrollback:
     """Split the payload byte budget equally between history and last output.
@@ -43,9 +47,14 @@ class Scrollback:
         return self._current_bytes + len(self._partial_line) + len(self._last_output)
 
     @property
+    def _history_limit(self):
+        """Derive the history share from the current public byte budget."""
+        return self.max_bytes // _BUDGET_PARTS
+
+    @property
     def last_output(self):
         """Decode the last command output, replacing characters cut at byte boundaries."""
-        return self._last_output.decode(self.encoder, errors="replace")
+        return self._last_output.decode(self.encoder, errors=_DECODE_ERRORS)
 
     @last_output.setter
     def last_output(self, value):
@@ -59,7 +68,7 @@ class Scrollback:
 
     def _trim_history(self):
         """Discard the oldest history to meet line and history-byte budgets."""
-        limit = self.max_bytes // 2
+        limit = self._history_limit
         while self._buffer and (
             len(self._buffer) > self.max_lines
             or self._current_bytes + len(self._partial_line) > limit
@@ -72,7 +81,7 @@ class Scrollback:
 
     def _add_line(self, line):
         """Store a complete line within the budget and trim existing history as needed."""
-        limit = self.max_bytes // 2
+        limit = self._history_limit
         if not limit or not self.max_lines:
             self.history_truncated |= bool(line)
             return
@@ -87,7 +96,7 @@ class Scrollback:
         """Accumulate output by line and retain an incomplete tail for the next read."""
         if not data:
             return
-        limit = self.max_bytes // 2
+        limit = self._history_limit
         if not limit or not self.max_lines:
             self.history_truncated = True
             return
@@ -96,22 +105,25 @@ class Scrollback:
             self._partial_line.clear()
             self.history_truncated = True
         # The retained partial line has no LF; scan only the newly received bytes.
-        parts = bytes(data).split(b"\n")
+        parts = bytes(data).split(_LINE_END)
         if len(parts) > 1:
-            first_line = b"".join((self._partial_line, parts[0], b"\n"))
+            first_line = b"".join((self._partial_line, parts[0], _LINE_END))
             self._partial_line.clear()
             self._add_line(first_line)
             for part in parts[1:-1]:
-                self._add_line(part + b"\n")
+                self._add_line(part + _LINE_END)
         self._partial_line.extend(parts[-1])
         self._trim_history()
 
     def append_output(self, data):
         """Retain the tail of the last command output within its byte budget."""
-        limit = self.max_bytes - self.max_bytes // 2
+        limit = self.max_bytes - self._history_limit
         if len(self._last_output) + len(data) > limit:
             self.last_output_truncated = True
         if not limit:
+            return
+        if 0 < limit <= len(data):
+            self._last_output[:] = data[-limit:]
             return
         self._last_output.extend(data[-limit:])
         del self._last_output[: max(0, len(self._last_output) - limit)]
@@ -120,7 +132,7 @@ class Scrollback:
         """Return the last count complete lines, or all complete lines, as strings."""
         start = 0 if count is None else max(0, len(self._buffer) - max(0, count))
         return [
-            line.decode(self.encoder, errors="replace")
+            line.decode(self.encoder, errors=_DECODE_ERRORS)
             for line in itertools.islice(self._buffer, start, None)
         ]
 

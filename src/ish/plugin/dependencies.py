@@ -15,6 +15,30 @@ from pathlib import Path
 from packaging.utils import canonicalize_name
 
 INSTALL_LOCK_SUFFIX = ".install.lock"
+_LOCK_MODE = 0o600
+_STAGE_PREFIX = ".install-"
+_STAGE_DIR = "stage"
+_BACKUP_DIR = "backup"
+_CONSTRAINTS_FILE = "constraints.txt"
+_CONSTRAINTS_ENCODING = "utf-8"
+_PIP_INSTALL = (
+    "-I",
+    "-m",
+    "pip",
+    "install",
+    "--disable-pip-version-check",
+    "--no-compile",
+)
+_PIP_TARGET = "--target"
+_PIP_CONSTRAINT = "--constraint"
+_DIST_NAME = "Name"
+PYTHON_SOURCE_SUFFIX = ".py"
+_BYTECODE = ".pyc"
+_BYTECODE_DIR = "__pycache__"
+_NATIVE_EXTENSIONS = (".so", ".pyd")
+PACKAGE_ENTRY = "__init__" + PYTHON_SOURCE_SUFFIX
+_COMPARE_BYTES = 128 * 1024
+_MISSING_MODULE = object()
 
 
 @contextlib.contextmanager
@@ -25,7 +49,7 @@ def _installation_lock(target: Path):
     must keep referring to the same lock even after a transaction finishes.
     """
     path = target.parent / ("." + target.name + INSTALL_LOCK_SUFFIX)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, _LOCK_MODE)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -51,8 +75,12 @@ def has_import(name: str) -> bool:
     parts = name.split(".")
     for index in range(len(parts)):
         fullname = ".".join(parts[: index + 1])
-        module = sys.modules.get(fullname)
-        if module is not None:
+        module = sys.modules.get(fullname, _MISSING_MODULE)
+        if module is not _MISSING_MODULE:
+            if module is None:
+                # The interpreter explicitly blocks this import, even if a finder
+                # could locate it on disk.
+                return False
             if index == len(parts) - 1:
                 return True
             path = module.__dict__.get("__path__")
@@ -80,14 +108,20 @@ def distribution_files(distribution, root: Path) -> set[Path]:
     return paths
 
 
+def _distribution_name(distribution) -> str:
+    """Read a distribution's canonical metadata identity for install ownership checks."""
+    return canonicalize_name(distribution.metadata[_DIST_NAME] or "")
+
+
 def has_duplicate_metadata(name: str, target: Path) -> bool:
     """Detect mixed installations left by pip --target without file replacement."""
+    wanted = canonicalize_name(name)
     matches = (
         dist
         for dist in importlib.metadata.distributions(path=[str(target)])
-        if canonicalize_name(dist.metadata["Name"] or "") == canonicalize_name(name)
+        if _distribution_name(dist) == wanted
     )
-    return sum(1 for _ in matches) > 1
+    return next(matches, None) is not None and next(matches, None) is not None
 
 
 def loaded_distributions():
@@ -105,8 +139,22 @@ def loaded_distributions():
             yield distribution
 
 
+def _same_contents(existing: Path, staged: Path) -> bool:
+    """Compare regular files without caching mutable contents or loading whole wheels."""
+    if not existing.is_file():
+        return False
+    with existing.open("rb") as old, staged.open("rb") as new:
+        while True:
+            block = old.read(_COMPARE_BYTES)
+            if block != new.read(_COMPARE_BYTES):
+                return False
+            if not block:
+                return True
+
+
 def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: Path):
     """Reject changes to imported packages, including unversioned module shadows."""
+    removed_files = {target / path for path in removed}
     for name, module in tuple(sys.modules.items()):
         if module is None:
             continue
@@ -115,7 +163,7 @@ def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: P
         relative = Path(*name.split("."))
         if not origin:
             # Adding a regular package over an active namespace changes imports.
-            if locations is not None and relative / "__init__.py" in incoming:
+            if locations is not None and relative / PACKAGE_ENTRY in incoming:
                 raise RuntimeError(
                     f"Package {name!r} is in use; restart ish before replacing it"
                 )
@@ -125,32 +173,26 @@ def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: P
             for path, source in incoming.items():
                 if path.is_relative_to(relative):
                     current = origin.parent / path.relative_to(relative)
-                    if (
-                        not current.is_file()
-                        or current.read_bytes() != source.read_bytes()
-                    ):
+                    if not _same_contents(current, source):
                         raise RuntimeError(
                             f"Package {name!r} is in use; restart ish before replacing it"
                         )
-            if any((target / path).is_relative_to(origin.parent) for path in removed):
+            if any(path.is_relative_to(origin.parent) for path in removed_files):
                 raise RuntimeError(
                     f"Package {name!r} is in use; restart ish before replacing it"
                 )
         else:
             for path, source in incoming.items():
                 if path.parent == relative.parent and (
-                    path.name == relative.name + ".py"
+                    path.name == relative.name + PYTHON_SOURCE_SUFFIX
                     or path.name.startswith(relative.name + ".")
-                    and path.suffix in (".so", ".pyd")
+                    and path.suffix in _NATIVE_EXTENSIONS
                 ):
-                    if (
-                        not origin.is_file()
-                        or origin.read_bytes() != source.read_bytes()
-                    ):
+                    if not _same_contents(origin, source):
                         raise RuntimeError(
                             f"Module {name!r} is in use; restart ish before replacing it"
                         )
-            if origin in {target / path for path in removed}:
+            if origin in removed_files:
                 raise RuntimeError(
                     f"Module {name!r} is in use; restart ish before replacing it"
                 )
@@ -180,16 +222,16 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
     target = target.resolve()
     target.mkdir(parents=True, exist_ok=True)
     protected = {
-        canonicalize_name(dist.metadata["Name"]): dist.version
+        name: dist.version
         for dist in loaded_distributions()
-        if dist.metadata["Name"]
+        if (name := _distribution_name(dist))
     }
     with tempfile.TemporaryDirectory(
-        prefix=".install-", dir=target.parent
+        prefix=_STAGE_PREFIX, dir=target.parent
     ) as temporary:
         temporary = Path(temporary)
-        stage = temporary / "stage"
-        constraints_path = temporary / "constraints.txt"
+        stage = temporary / _STAGE_DIR
+        constraints_path = temporary / _CONSTRAINTS_FILE
         constraints_path.write_text(
             "\n".join(
                 [
@@ -198,27 +240,22 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
                 ]
             )
             + "\n",
-            encoding="utf-8",
+            encoding=_CONSTRAINTS_ENCODING,
         )
         cmd = [
             python,
-            "-I",
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-compile",
-            "--target",
+            *_PIP_INSTALL,
+            _PIP_TARGET,
             str(stage),
-            "--constraint",
+            _PIP_CONSTRAINT,
             str(constraints_path),
             requirement,
         ]
         subprocess.run(cmd, check=True)
         new = {
-            canonicalize_name(dist.metadata["Name"]): dist
+            name: dist
             for dist in importlib.metadata.distributions(path=[str(stage)])
-            if dist.metadata["Name"]
+            if (name := _distribution_name(dist))
         }
         if not new:
             raise RuntimeError("pip did not produce an installed distribution")
@@ -226,7 +263,7 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
         # the lock, and hold it through the caller's validation and any rollback.
         with _installation_lock(target):
             for dist in loaded_distributions():
-                name = canonicalize_name(dist.metadata["Name"] or "")
+                name = _distribution_name(dist)
                 if name in new and dist.version != new[name].version:
                     raise RuntimeError(
                         f"Dependency {name!r} is in use; restart ish before changing its version"
@@ -239,15 +276,14 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
             old_files, retained_files = set(), set()
             for dist in importlib.metadata.distributions(path=[str(target)]):
                 files = distribution_files(dist, target)
-                if canonicalize_name(dist.metadata["Name"] or "") in new:
+                if _distribution_name(dist) in new:
                     old_files.update(files)
                 else:
                     retained_files.update(files)
             changed = {
                 path: source
                 for path, source in incoming.items()
-                if not (target / path).is_file()
-                or (target / path).read_bytes() != source.read_bytes()
+                if not _same_contents(target / path, source)
             }
             # Never overwrite another distribution's shared file with different bytes.
             if retained_files & changed.keys():
@@ -262,17 +298,18 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
                 {
                     path
                     for path in removed
-                    if not (path.suffix == ".pyc" and "__pycache__" in path.parts)
+                    if not (path.suffix == _BYTECODE and _BYTECODE_DIR in path.parts)
                 },
                 target,
             )
             # Runtime bytecode is not necessarily recorded by pip. Unchanged sources
             # retain their caches; replaced sources must not reuse timestamp caches.
-            for path in set(changed) | removed.copy():
-                if path.suffix == ".py":
-                    cache = (target / path).parent / "__pycache__"
+            for path in changed.keys() | removed:
+                if path.suffix == PYTHON_SOURCE_SUFFIX:
+                    cache = (target / path).parent / _BYTECODE_DIR
                     removed.update(
-                        p.relative_to(target) for p in cache.glob(path.stem + ".*.pyc")
+                        p.relative_to(target)
+                        for p in cache.glob(path.stem + ".*" + _BYTECODE)
                     )
             affected = set(changed) | removed
             for path in affected:
@@ -284,7 +321,7 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
                     raise RuntimeError(
                         f"Dependency file conflicts with an existing directory: {path}"
                     )
-            backup = temporary / "backup"
+            backup = temporary / _BACKUP_DIR
             saved, installed = [], []
             try:
                 for path in sorted(affected):

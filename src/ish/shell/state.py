@@ -1,6 +1,22 @@
 """Track terminal mode state that may need cleanup after interrupted TUIs."""
 
+from .constants import ALTERNATE_SCREENS, CSI, ESC
 from .sequencer import Sequencer
+
+_PRIVATE_MODE = CSI + b"?"
+_SET = b"h"
+_RESET = b"l"
+_MODE_FINALS = (_SET, _RESET)
+_MAX_MODE_BYTES = 128
+_MAX_PARAMETER_DIGITS = 4
+_PARAMETER_SEPARATOR = b";"
+_TERMINAL_RESET = ESC + b"c"
+_KEYPAD_APPLICATION = ESC + b"="
+_KEYPAD_NUMERIC = ESC + b">"
+_KEYPAD_MODES = (_KEYPAD_APPLICATION, _KEYPAD_NUMERIC)
+_SGR = b"m"
+_SGR_RESET = CSI + b"0" + _SGR
+_SGR_RESETS = (CSI + _SGR, _SGR_RESET)
 
 
 class TerminalState:
@@ -13,9 +29,7 @@ class TerminalState:
     DEFAULTS = {
         1: False,
         25: True,
-        47: False,
-        1047: False,
-        1049: False,
+        **dict.fromkeys(ALTERNATE_SCREENS, False),
         1000: False,
         1002: False,
         1003: False,
@@ -35,39 +49,47 @@ class TerminalState:
 
     def observe(self, sequence: bytes) -> None:
         """Observe complete controls already parsed by the shell's sequencer."""
-        if sequence == b"\x1bc":
+        if sequence == _TERMINAL_RESET:
             self.modes.clear()
             self.keypad = self.styled = False
-        elif sequence.startswith(b"\x1b[?") and sequence[-1:] in (b"h", b"l"):
+        elif sequence.startswith(_PRIVATE_MODE) and sequence.endswith(_MODE_FINALS):
             # Avoid parsing huge or private extensions as ordinary DEC modes.
-            if len(sequence) > 128:
+            if len(sequence) > _MAX_MODE_BYTES:
                 return
-            for parameter in sequence[3:-1].split(b";"):
-                if parameter.isdigit() and len(parameter) <= 4:
+            enabled = sequence.endswith(_SET)
+            for parameter in sequence[len(_PRIVATE_MODE) : -1].split(
+                _PARAMETER_SEPARATOR
+            ):
+                if len(parameter) <= _MAX_PARAMETER_DIGITS and parameter.isdigit():
                     mode = int(parameter)
                     if mode in self.DEFAULTS:
-                        enabled = sequence.endswith(b"h")
                         if enabled == self.DEFAULTS[mode]:
                             self.modes.pop(mode, None)
                         else:
                             self.modes[mode] = enabled
-        elif sequence in (b"\x1b=", b"\x1b>"):
-            self.keypad = sequence == b"\x1b="
-        elif sequence.startswith(b"\x1b[") and sequence.endswith(b"m"):
-            self.styled = sequence not in (b"\x1b[m", b"\x1b[0m")
+        elif sequence in _KEYPAD_MODES:
+            self.keypad = sequence == _KEYPAD_APPLICATION
+        elif sequence.startswith(CSI) and sequence.endswith(_SGR):
+            self.styled = sequence not in _SGR_RESETS
 
     def feed(self, data: bytes) -> None:
         """Inspect raw tool output, skipping Python parsing for plain text chunks."""
-        if self.parser.state != Sequencer.GROUND or b"\x1b" in data:
+        if self.parser.state != Sequencer.GROUND or ESC in data:
             self.parser.feed(data)
 
     def restore(self) -> bytes:
         """Return minimal common-mode resets for a terminating session."""
         result = bytearray()
-        for mode in sorted(self.modes, key=lambda value: value not in (47, 1047, 1049)):
-            result.extend(f"\x1b[?{mode}{'h' if self.DEFAULTS[mode] else 'l'}".encode())
+        for mode in sorted(
+            self.modes, key=lambda value: value not in ALTERNATE_SCREENS
+        ):
+            result.extend(
+                _PRIVATE_MODE
+                + str(mode).encode("ascii")
+                + (_SET if self.DEFAULTS[mode] else _RESET)
+            )
         if self.keypad:
-            result.extend(b"\x1b>")
+            result.extend(_KEYPAD_NUMERIC)
         if self.styled:
-            result.extend(b"\x1b[0m")
+            result.extend(_SGR_RESET)
         return bytes(result)

@@ -6,10 +6,41 @@ words are left to the shell; completion never evaluates a substitution.
 
 from dataclasses import dataclass
 
+from .lexical import (
+    ASSIGNMENT,
+    BASH_OPTIONS,
+    BLANKS,
+    COMMAND_SEPARATORS,
+    COMMENT,
+    CSH_OPTIONS,
+    CSH_QUOTED_NATIVE,
+    DOUBLE_QUOTE,
+    ESCAPE,
+    HISTORY,
+    ORDINARY_RUN,
+    PARENTHESES,
+    QUICK_SUBSTITUTION,
+    QUOTES,
+    REDIRECTIONS,
+    REJECTED_CONTROLS,
+    SINGLE_QUOTE,
+    TILDE,
+    UNQUOTED_EXPANSIONS,
+    ZSH_OPTIONS,
+    decode_escape,
+    history_expands,
+)
+
 _POSIX_COMMAND_PREFIXES = frozenset(
     {"if", "then", "else", "elif", "do", "while", "until", "!", "command", "exec"}
 )
 _CSH_COMMAND_PREFIXES = frozenset({"exec", "time", "nohup"})
+_WORD_BOUNDARIES = BLANKS + COMMAND_SEPARATORS + PARENTHESES + REDIRECTIONS
+_CURSOR_BOUNDARIES = BLANKS + COMMAND_SEPARATORS
+_ARITHMETIC_START, _ARITHMETIC_END = "$((", "))"
+_COMMAND_SUBSTITUTION, _SUBSTITUTION_END = "$(", ")"
+_BACKTICK = "`"
+_HEREDOC_START = "<<"
 
 
 @dataclass
@@ -50,7 +81,7 @@ def completion_word(
         nonlocal active, value, dynamic, need_command, redirect, quoted_word
         if active:
             word = "".join(value)
-            assignment, separator, _ = text[start:i].partition("=")
+            assignment, separator, _ = text[start:i].partition(ASSIGNMENT)
             prefix = (
                 not csh
                 and bool(separator)
@@ -64,53 +95,60 @@ def completion_word(
         active, value, dynamic, quoted_word = False, [], False, False
 
     while i < len(text):
+        ordinary = ORDINARY_RUN.match(text, i)
+        if ordinary:
+            if not active:
+                start, active = i, True
+            value.append(ordinary[0])
+            i = ordinary.end()
+            continue
         c = text[i]
-        if c == "\r" or ord(c) < 32 and c not in "\t\n":
+        if c in REJECTED_CONTROLS:
             return CompletionWord(start, "", False, True)
-        if c == "!" and history and (csh or quote != "'"):
+        if c == HISTORY and history and history_expands(quote, csh):
             return CompletionWord(start, "", False, True)
-        if c == "^" and history and quote is None and not value and need_command:
+        if (
+            c == QUICK_SUBSTITUTION
+            and history
+            and quote is None
+            and not value
+            and need_command
+        ):
             return CompletionWord(start, "", False, True)
-        if not active and c not in " \t\r\n;&|()<>":
+        if not active and c not in _WORD_BOUNDARIES:
             start, active = i, True
-        if c == "\\" and quote != "'":
+        if c == ESCAPE and quote != SINGLE_QUOTE:
             quoted_word = True
-            if csh and quote:
-                return CompletionWord(start, "", False, True)
             if i + 1 < len(text):
-                nxt = text[i + 1]
-                if zsh and quote == '"' and nxt == "!":
+                escaped = decode_escape(text[i + 1], quote, csh, zsh)
+                if escaped is None:
                     return CompletionWord(start, "", False, True)
-                if nxt == "\r" or ord(nxt) < 32 and nxt not in "\t\n":
-                    return CompletionWord(start, "", False, True)
-                if csh and nxt == "\n":
-                    return CompletionWord(start, "", False, True)
-                if quote == '"' and nxt not in '$`"\\\n':
-                    value.append("\\")
-                if nxt != "\n":
-                    value.append(nxt)
+                if escaped:
+                    value.append(escaped)
                 i += 2
                 continue
+            if csh and quote:
+                return CompletionWord(start, "", False, True)
             dynamic = True  # A trailing escape is not yet a complete prefix.
-        elif quote == "'":
-            if c == "'":
-                if zsh and text[i + 1 : i + 2] == "'":
+        elif quote == SINGLE_QUOTE:
+            if c == SINGLE_QUOTE:
+                if zsh and text.startswith(SINGLE_QUOTE, i + 1):
                     return CompletionWord(start, "", False, True)
                 quote = None
-            elif csh and c in "\\\n":
+            elif csh and c in CSH_QUOTED_NATIVE:
                 return CompletionWord(start, "", False, True)
             else:
                 value.append(c)
-        elif not csh and text.startswith("$((", i):
+        elif not csh and text.startswith(_ARITHMETIC_START, i):
             # Arithmetic is an expression, not a command position.
-            end = text.find("))", i + 3)
+            end = text.find(_ARITHMETIC_END, i + len(_ARITHMETIC_START))
             if end < 0:
                 return CompletionWord(start, "", False, True)
             dynamic = True
-            i = end + 2
+            i = end + len(_ARITHMETIC_END)
             continue
-        elif (not csh and text.startswith("$(", i)) or (
-            c == "`" and (not stack or stack[-1][-1] != "`")
+        elif (not csh and text.startswith(_COMMAND_SUBSTITUTION, i)) or (
+            c == _BACKTICK and (not stack or stack[-1][-1] != _BACKTICK)
         ):
             stack.append(
                 (
@@ -121,10 +159,10 @@ def completion_word(
                     need_command,
                     redirect,
                     quoted_word,
-                    ")" if c == "$" else "`",
+                    _SUBSTITUTION_END if c != _BACKTICK else _BACKTICK,
                 )
             )
-            i += 2 if c == "$" else 1
+            i += len(_COMMAND_SUBSTITUTION) if c != _BACKTICK else 1
             start, value, active, quote, dynamic = i, [], False, None, False
             need_command, redirect = True, False
             quoted_word = False
@@ -134,40 +172,44 @@ def completion_word(
                 stack.pop()
             )
             dynamic = True
-        elif quote == '"':
-            if c == '"':
+        elif quote == DOUBLE_QUOTE:
+            if c == DOUBLE_QUOTE:
                 quote = None
             elif csh and c == "\n":
                 return CompletionWord(start, "", False, True)
             else:
                 value.append(c)
                 dynamic |= c == "$"
-        elif c in "'\"":
+        elif c in QUOTES:
             quote = c
             quoted_word = True
-        elif c in " \t\r":
+        elif c in BLANKS:
             end_word()
             start = i + 1
-        elif c in "()":
+        elif c in PARENTHESES:
             if csh or active or not need_command:
                 return CompletionWord(start, "", False, True)
             end_word()
             need_command, redirect, start = True, False, i + 1
-        elif c in ";|&\n":
+        elif c in COMMAND_SEPARATORS:
             end_word()
             need_command, redirect, start = True, False, i + 1
-        elif c in "<>":
-            if text.startswith("<<", i):
+        elif c in REDIRECTIONS:
+            if text.startswith(_HEREDOC_START, i):
                 return CompletionWord(start, "", False, True)
             end_word()
             redirect, start = True, i + 1
-        elif c == "#" and (not value or csh or zsh):
+        elif c == COMMENT and (not value or csh or zsh):
             return CompletionWord(len(text), "", False, True)
         else:
             value.append(c)
-            dynamic |= c in "$`*?[]{}"
+            dynamic |= c in UNQUOTED_EXPANSIONS
             dynamic |= zsh and (
-                c == "^" or c == "~" and len(value) > 1 or c == "=" and len(value) == 1
+                c == QUICK_SUBSTITUTION
+                or c == TILDE
+                and len(value) > 1
+                or c == ASSIGNMENT
+                and len(value) == 1
             )
         i += 1
     return CompletionWord(
@@ -187,21 +229,21 @@ def completion_context(
     if not 0 <= cursor <= len(text):
         return None
     word = completion_word(text[:cursor], csh=csh, history=history, zsh=zsh)
-    if cursor < len(text) and (word.quote or text[cursor] not in " \t\n;&|"):
+    if cursor < len(text) and (word.quote or text[cursor] not in _CURSOR_BOUNDARIES):
         return None
     return word
 
 
 def bash_completion(text: str, cursor: int) -> CompletionWord | None:
     """Keep Bash history references out of literal completion contexts."""
-    return completion_context(text, cursor, history=True)
+    return completion_context(text, cursor, **BASH_OPTIONS)
 
 
 def zsh_completion(text: str, cursor: int) -> CompletionWord | None:
     """Respect zsh expansion and uncertain quote-option boundaries."""
-    return completion_context(text, cursor, history=True, zsh=True)
+    return completion_context(text, cursor, **ZSH_OPTIONS)
 
 
 def csh_completion(text: str, cursor: int) -> CompletionWord | None:
     """Avoid POSIX assignments, substitutions, and quoted escapes in C shells."""
-    return completion_context(text, cursor, csh=True, history=True)
+    return completion_context(text, cursor, **CSH_OPTIONS)

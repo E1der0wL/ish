@@ -22,10 +22,28 @@ from multiprocessing.reduction import recv_handle, send_handle
 from typing import Any, Callable
 
 from ish.runtime.fdio import FDWriter, InputBytes
-from ish.runtime.observer import InputObserver
-from ish.runtime.process import ProcessGroup
+from ish.runtime.observer import PROCESS_EXIT, TOOL, InputObserver
+from ish.runtime.process import SIGINT_EXITCODE, ProcessGroup
 
 __all__ = ["Runner"]
+
+_START_METHOD = "spawn"
+_DEFAULT_ENCODING = "utf-8"
+_STREAM_ERRORS = "replace"
+_EXCEPTION_EXITCODE = 1
+_DEFAULT_ROWS, _DEFAULT_COLUMNS = 24, 80
+_INPUT_CHUNK_BYTES = 4096
+_OUTPUT_CHUNK_BYTES = 64 * 1024
+_MIB = 1024 * 1024
+_MAX_UNREAD_BYTES = _MIB
+_EOF_INPUT = b"\x04"
+_OUTPUT_EOF_TIMEOUT = 1
+_TERMINATE_TIMEOUT = 2
+_WORKER_START = "worker_start"
+_WORKER_EXIT = "worker_exit"
+_EXIT_CONFIRMATION_WAIT = "exit_confirmation_wait"
+_INITIAL_INPUT = "initial_input"
+_WORKER_INPUT_RETURNED = "worker_input_returned"
 
 
 def _run_worker(payload, cwd, environ, connection, encoder):
@@ -40,12 +58,14 @@ def _run_worker(payload, cwd, environ, connection, encoder):
         os.dup2(slave_fd, fd)
     if slave_fd > 2:
         os.close(slave_fd)
-    sys.stdin = os.fdopen(0, "r", encoding=encoder, errors="replace", closefd=False)
+    sys.stdin = os.fdopen(
+        0, "r", encoding=encoder, errors=_STREAM_ERRORS, closefd=False
+    )
     sys.stdout = os.fdopen(
-        1, "w", encoding=encoder, errors="replace", buffering=1, closefd=False
+        1, "w", encoding=encoder, errors=_STREAM_ERRORS, buffering=1, closefd=False
     )
     sys.stderr = os.fdopen(
-        2, "w", encoding=encoder, errors="replace", buffering=1, closefd=False
+        2, "w", encoding=encoder, errors=_STREAM_ERRORS, buffering=1, closefd=False
     )
     try:
         if environ is not None:
@@ -58,10 +78,10 @@ def _run_worker(payload, cwd, environ, connection, encoder):
         func, args, kwargs = pickle.loads(payload)
         func(*args, **kwargs)
     except KeyboardInterrupt:
-        raise SystemExit(130) from None
+        raise SystemExit(SIGINT_EXITCODE) from None
     except Exception:
         traceback.print_exc()
-        raise SystemExit(1) from None
+        raise SystemExit(_EXCEPTION_EXITCODE) from None
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -77,7 +97,7 @@ class Runner:
 
     def __init__(
         self,
-        encoder: str = "utf-8",
+        encoder: str = _DEFAULT_ENCODING,
         *,
         stdin: int | None = None,
         stdout: int | None = None,
@@ -111,7 +131,7 @@ class Runner:
             rows, columns = termios.tcgetwinsize(self.stdin_fd if fd is None else fd)
         except (OSError, termios.error):
             rows, columns = 0, 0
-        return rows or 24, columns or 80
+        return rows or _DEFAULT_ROWS, columns or _DEFAULT_COLUMNS
 
     def resize(self) -> None:
         """Copy the shell's size to active workers without changing signal handlers.
@@ -202,7 +222,7 @@ class Runner:
                 resources.callback(input_writer.close)
                 resources.callback(output_writer.close)
 
-                context = mp.get_context("spawn")
+                context = mp.get_context(_START_METHOD)
                 parent_connection, child_connection = context.Pipe(duplex=True)
                 resources.callback(parent_connection.close)
                 resources.callback(child_connection.close)
@@ -230,9 +250,9 @@ class Runner:
                         unsent = input_writer.take()
                         input_writer.close()
                         self.input_observer.record(
-                            "process_exit", "TOOL", status=process.exitcode
+                            PROCESS_EXIT, TOOL, status=process.exitcode
                         )
-                        self.input_observer.sample("TOOL", master_fd, "worker_exit")
+                        self.input_observer.sample(TOOL, master_fd, _WORKER_EXIT)
                         if self.return_input is not None:
                             remaining = self._remaining_input(slave_fd)
                             if self.return_native_input is None:
@@ -276,24 +296,23 @@ class Runner:
                         return
                     loop.remove_reader(sentinel)
                     if process.exitcode is None:
-                        self.input_observer.record("exit_confirmation_wait", "TOOL")
+                        self.input_observer.record(_EXIT_CONFIRMATION_WAIT, TOOL)
                         exit_confirmation = loop.create_task(confirm_exit())
                     else:
                         finish_exit()
 
                 def on_input():
                     """Forward user input to the worker PTY and translate EOF to EOT."""
-                    nonlocal input_observation, input_total
+                    nonlocal input_total
                     if input_writer.closed:
                         return
                     try:
-                        data = os.read(self.stdin_fd, 4096)
-                        self.input_observer.read("TOOL", input_observation, len(data))
+                        data = os.read(self.stdin_fd, _INPUT_CHUNK_BYTES)
+                        self.input_observer.read(TOOL, input_observation, len(data))
                         if not data:
                             loop.remove_reader(self.stdin_fd)
-                            self.input_observer.end(input_observation)
-                            input_observation = None
-                            data = b"\x04"
+                            observe_input_end()
+                            data = _EOF_INPUT
                         input_writer.write(data)
                         input_total += len(data)
                     except (BlockingIOError, InterruptedError):
@@ -311,7 +330,7 @@ class Runner:
                     """Queue worker output and record PTY EOF."""
                     try:
                         try:
-                            data = os.read(master_fd, 65536)
+                            data = os.read(master_fd, _OUTPUT_CHUNK_BYTES)
                         except OSError as exc:
                             if exc.errno != errno.EIO:
                                 raise
@@ -347,23 +366,19 @@ class Runner:
                 ]:
                     loop.add_reader(fd, callback)
                     if fd == self.stdin_fd:
-                        input_observation = self.input_observer.begin("TOOL")
+                        input_observation = self.input_observer.begin(TOOL)
                         resources.callback(observe_input_end)
                     resources.callback(loop.remove_reader, fd)
                 if self.take_input is not None:
                     initial = self.take_input()
                     if initial:
-                        native_prefix = (
-                            initial.native_prefix
-                            if isinstance(initial, InputBytes)
-                            else 0
-                        )
+                        native_prefix = InputBytes.native_size(initial)
                         input_writer.write(initial)
                         input_total += len(initial)
                         self.input_observer.record(
-                            "initial_input", "TOOL", bytes=len(initial)
+                            _INITIAL_INPUT, TOOL, bytes=len(initial)
                         )
-                self.input_observer.sample("TOOL", master_fd, "worker_start")
+                self.input_observer.sample(TOOL, master_fd, _WORKER_START)
                 done, _ = await asyncio.wait(
                     [exited, failed], return_when=asyncio.FIRST_COMPLETED
                 )
@@ -374,7 +389,9 @@ class Runner:
                 await output_writer.drain()
                 # Process death can precede the final readable PTY bytes.
                 done, _ = await asyncio.wait(
-                    [eof, failed], timeout=1, return_when=asyncio.FIRST_COMPLETED
+                    [eof, failed],
+                    timeout=_OUTPUT_EOF_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 if failed in done:
                     raise failed.result()
@@ -400,7 +417,7 @@ class Runner:
                             group.send(signal.SIGTERM)
                             process.terminate()
                             # Do not block the event loop waiting for a running child.
-                            await asyncio.to_thread(process.join, 2)
+                            await asyncio.to_thread(process.join, _TERMINATE_TIMEOUT)
                             if process.is_alive():
                                 process.kill()
                                 await asyncio.to_thread(process.join)
@@ -433,13 +450,15 @@ class Runner:
         data = bytearray()
         while True:
             try:
-                chunk = os.read(fd, 4096)
+                chunk = os.read(fd, _INPUT_CHUNK_BYTES)
             except BlockingIOError:
                 break
             if not chunk:
                 break
             data.extend(chunk)
-            if len(data) > 1024 * 1024:
-                raise BufferError("Unread worker input exceeds 1 MiB")
-        self.input_observer.record("worker_input_returned", "TOOL", bytes=len(data))
+            if len(data) > _MAX_UNREAD_BYTES:
+                raise BufferError(
+                    f"Unread worker input exceeds {_MAX_UNREAD_BYTES / _MIB:g} MiB"
+                )
+        self.input_observer.record(_WORKER_INPUT_RETURNED, TOOL, bytes=len(data))
         return bytes(data)

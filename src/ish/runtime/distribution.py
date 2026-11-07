@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 RUNTIME_MARKER = "ish-runtime.json"
+LAUNCHER_NAME = "ish"
 
 
 def bundled_root() -> Path | None:

@@ -14,6 +14,27 @@ from .constants import PROMPT_ID_LIMIT, PROMPT_ID_MAX_DIGITS
 
 SOH, RS, US, EOT = b"\x01", b"\x1e", b"\x1f", b"\x04"
 VERSION = b"ISH2"
+_VERSION_PREFIX = VERSION + RS
+_FRAME_HEADER = SOH + _VERSION_PREFIX
+_DEFAULT_FRAME_BYTES = 16 * 1024 * 1024
+# The helper transmits each native environ string including its NUL terminator.
+ENV_RECORD_SEPARATOR = b"\0"
+
+# Zsh readiness and interrupt acknowledgements use the same two-field body.
+_READER_SEPARATOR = b";"
+READER_FALSE = b"0"
+READER_TRUE = b"1"
+READER_REPORT_FORMAT = b"%s" + _READER_SEPARATOR + b"%s"
+
+
+def split_reader_report(data: bytes) -> tuple[bytes, bool] | None:
+    """Decode the flag, preserving the ID spelling for the recipient's freshness check."""
+    identity, _, flag = data.partition(_READER_SEPARATOR)
+    if flag == READER_TRUE:
+        return identity, True
+    if flag == READER_FALSE:
+        return identity, False
+    return None
 
 
 def parse_prompt_id(raw: bytes) -> int | None:
@@ -62,7 +83,7 @@ FORWARD_COMMAND = ForwardCommand(
 class FrameDecoder:
     """Decode multiple FIFO frames and partial tails within a byte limit."""
 
-    def __init__(self, max_frame_bytes=16 * 1024 * 1024):
+    def __init__(self, max_frame_bytes=_DEFAULT_FRAME_BYTES):
         """Initialize the receive buffer and maximum frame size."""
         self.buffer = bytearray()
         self.max_frame_bytes = max_frame_bytes
@@ -87,7 +108,7 @@ class FrameDecoder:
             # fresh versioned header cannot occur inside a base64 body; resume
             # there instead of decoding two generations as one damaged frame.
             restart = self.buffer.rfind(
-                SOH + VERSION + RS,
+                _FRAME_HEADER,
                 start + 1,
                 end if end >= 0 else len(self.buffer),
             )
@@ -104,9 +125,9 @@ class FrameDecoder:
                 raise ValueError("Shell context frame exceeds size limit")
             payload = bytes(self.buffer[start + 1 : end])
             consumed = end + 1
-            encoded = payload.startswith(VERSION + RS)
+            encoded = payload.startswith(_VERSION_PREFIX)
             if encoded:
-                payload = payload[len(VERSION) + 1 :]
+                payload = payload[len(_VERSION_PREFIX) :]
             for record in payload.split(RS):
                 if US not in record:
                     continue

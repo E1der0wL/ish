@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import os
 
+from ish.runtime.observer import SHELL
+
 from ..constants import (
     LINE_INTERRUPT_ACK_PREFIX,
     LINE_READER_READY_PREFIX,
 )
 from ..input import InputRejected
-from ..protocol import parse_prompt_id
+from ..protocol import parse_prompt_id, split_reader_report
 from ..signals import InputPhase, SubmissionInterrupt
 
 INTERRUPT_ACK_TIMEOUT = 5.0
+_ABORT_LINE = b"\n"
+_LINE_INTERRUPT_RELEASED = "line_interrupt_released"
 
 
 class LineInterrupt:
@@ -42,19 +46,20 @@ class LineInterrupt:
 
     def observe(self, data: bytes, accepted_id: int) -> None:
         """Accept fresh readiness, or revoke the current generation at preexec."""
-        identity, separator, enabled = data.partition(b";")
-        if not separator or enabled not in (b"0", b"1"):
+        report = split_reader_report(data)
+        if report is None:
             return
+        identity, enabled = report
         value = parse_prompt_id(identity)
         if value is None:
             return
         # preexec may revoke reader ownership within the accepted generation.
         # It cannot reenable that generation, even if a ready frame is replayed.
-        if value == self.observed_id and enabled == b"0":
+        if value == self.observed_id and not enabled:
             self.ready_id = 0
         if max(accepted_id, self.observed_id) < value:
             self.observed_id = value
-            self.ready_id = value if enabled == b"1" else 0
+            self.ready_id = value if enabled else 0
 
 
 class ZshInterrupt(SubmissionInterrupt):
@@ -147,23 +152,22 @@ class ZshInterrupt(SubmissionInterrupt):
     def acknowledge(self, data: bytes) -> None:
         """Release exactly one newline after a matching reply from the owning shell."""
         state, shell = self.state, self.shell
-        identity, separator, reading = data.partition(b";")
-        if (
-            not state.pending_id
-            or state.released
-            or identity != str(state.pending_id).encode("ascii")
-            or not separator
-            or reading not in (b"0", b"1")
-        ):
+        if not state.pending_id or state.released:
+            return
+        report = split_reader_report(data)
+        if report is None:
+            return
+        identity, reading = report
+        if identity != str(state.pending_id).encode("ascii"):
             return
         if not shell.input_open:
             return
-        if reading == b"0" and state.continuation:
+        if not reading and state.continuation:
             self.reset()
             shell.resume_native_typeahead()
             return
         if (
-            reading != b"1"
+            not reading
             or not shell.prompt_matches(state.pending_id)
             or os.tcgetpgrp(shell.master_fd) != shell.shell_pid
         ):
@@ -177,7 +181,7 @@ class ZshInterrupt(SubmissionInterrupt):
         if state.timer is not None:
             state.timer.cancel()
             state.timer = None
-        shell.write_control(b"\n")
+        shell.write_control(_ABORT_LINE)
         shell.input_observer.record(
-            "line_interrupt_released", "SHELL", prompt_id=state.pending_id
+            _LINE_INTERRUPT_RELEASED, SHELL, prompt_id=state.pending_id
         )

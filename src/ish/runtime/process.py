@@ -1,8 +1,19 @@
-"""Verify owned process groups only at cancellation and shutdown boundaries."""
+"""Interpret process return codes and verify owned groups during cancellation."""
 
 import os
+import signal
 
 import psutil
+
+_SHELL_SIGNAL_BASE = 128
+
+
+def shell_exitcode(returncode: int) -> int:
+    """Convert a negative subprocess signal result to the conventional shell status."""
+    return _SHELL_SIGNAL_BASE - returncode if returncode < 0 else returncode
+
+
+SIGINT_EXITCODE = shell_exitcode(-signal.SIGINT)
 
 
 class ProcessGroup:
@@ -26,10 +37,7 @@ class ProcessGroup:
         try:
             for candidate in psutil.process_iter():
                 try:
-                    if (
-                        os.getpgid(candidate.pid) != group
-                        or os.getsid(candidate.pid) != session
-                    ):
+                    if not self._contains(candidate.pid):
                         continue
                     # process_iter caches Process instances across calls. A fresh
                     # object records the current PID/create-time identity instead.
@@ -43,13 +51,16 @@ class ProcessGroup:
             # Partial visibility may still yield a verified surviving member.
             pass
 
+    def _contains(self, pid: int) -> bool:
+        """Read actual group and session membership at the point of use."""
+        return os.getpgid(pid) == self.group and os.getsid(pid) == self.session
+
     def _matches(self, member: psutil.Process) -> bool:
         """Recheck identity and membership, excluding zombies that cannot be signalled."""
         try:
             return (
                 member.is_running()
-                and os.getpgid(member.pid) == self.group
-                and os.getsid(member.pid) == self.session
+                and self._contains(member.pid)
                 and member.status() != psutil.STATUS_ZOMBIE
                 and member.is_running()
             )

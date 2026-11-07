@@ -24,6 +24,10 @@ GUARD_FEATURES = "_ISH_NATIVE_FEATURES"
 GUARD_ACTIVE = "_ISH_NATIVE_ACTIVE"
 GUARD_CHECKED = "_ish_native_policy"
 GUARD_ABI = 1
+_GUARD_ENV = (GUARD_FD, GUARD_PRELOAD, GUARD_FEATURES, GUARD_ACTIVE, GUARD_CHECKED)
+_PRELOAD_ENV = "LD_PRELOAD"
+_PRELOAD_FD_DIRECTORY = "/proc/self/fd"
+_LIBRARY_FLAGS = ("-shared", "-fPIC", "-ldl")
 
 
 class NativeFeature(IntFlag):
@@ -33,6 +37,9 @@ class NativeFeature(IntFlag):
     SUPPRESS_TTY_READAHEAD = 1
 
 
+_SUPPORTED_FEATURES = sum(int(feature) for feature in NativeFeature)
+
+
 @dataclass(frozen=True)
 class NativeLibrary:
     """Describe a native build artifact without binding it to a shell name."""
@@ -40,7 +47,7 @@ class NativeLibrary:
     binary_name: str
     source_name: str
     source: str
-    compiler_flags: tuple[str, ...] = ("-shared", "-fPIC", "-ldl")
+    compiler_flags: tuple[str, ...] = _LIBRARY_FLAGS
 
     def bundled_path(self) -> Path | None:
         """Locate a marked distribution's artifact, even if packaging omitted it."""
@@ -59,7 +66,7 @@ class PreloadPolicy:
         """Reject unimplemented features before opening a PTY or spawning a shell."""
         if not isinstance(self.features, NativeFeature):
             raise TypeError("Native features must use NativeFeature")
-        if int(self.features) & ~sum(int(feature) for feature in NativeFeature):
+        if int(self.features) & ~_SUPPORTED_FEATURES:
             raise ValueError(f"Unsupported native features: {self.features!r}")
 
     @property
@@ -117,8 +124,8 @@ __attribute__((constructor)) static void initialize(void) {
             close((int)fd);
         }
         const char *previous = getenv("@GUARD_PRELOAD@");
-        if (previous) setenv("LD_PRELOAD", previous, 1);
-        else unsetenv("LD_PRELOAD");
+        if (previous) setenv("@PRELOAD_ENV@", previous, 1);
+        else unsetenv("@PRELOAD_ENV@");
         unsetenv("@GUARD_FD@");
         unsetenv("@GUARD_PRELOAD@");
         unsetenv("@GUARD_FEATURES@");
@@ -157,7 +164,8 @@ for _token, _value in {
     "GUARD_FEATURES": GUARD_FEATURES,
     "GUARD_ACTIVE": GUARD_ACTIVE,
     "GUARD_ABI": GUARD_ABI,
-    "SUPPORTED_FEATURES": sum(int(feature) for feature in NativeFeature),
+    "SUPPORTED_FEATURES": _SUPPORTED_FEATURES,
+    "PRELOAD_ENV": _PRELOAD_ENV,
     "SUPPRESS_TTY_READAHEAD": int(NativeFeature.SUPPRESS_TTY_READAHEAD),
 }.items():
     SHELL_GUARD_SOURCE = SHELL_GUARD_SOURCE.replace(f"@{_token}@", str(_value))
@@ -177,19 +185,13 @@ def spawn_environment(
         )
     with library.open("rb") as handle:
         env = environ.copy()
-        for key in (
-            GUARD_FD,
-            GUARD_PRELOAD,
-            GUARD_FEATURES,
-            GUARD_ACTIVE,
-            GUARD_CHECKED,
-        ):
+        for key in _GUARD_ENV:
             env.pop(key, None)
-        if "LD_PRELOAD" in environ:
-            env[GUARD_PRELOAD] = environ["LD_PRELOAD"]
+        if _PRELOAD_ENV in environ:
+            env[GUARD_PRELOAD] = environ[_PRELOAD_ENV]
         env[GUARD_FD] = str(handle.fileno())
         env[GUARD_FEATURES] = str(int(policy.features))
-        env["LD_PRELOAD"] = f"/proc/self/fd/{handle.fileno()}"
-        if environ.get("LD_PRELOAD"):
-            env["LD_PRELOAD"] += " " + environ["LD_PRELOAD"]
+        env[_PRELOAD_ENV] = f"{_PRELOAD_FD_DIRECTORY}/{handle.fileno()}"
+        if environ.get(_PRELOAD_ENV):
+            env[_PRELOAD_ENV] += " " + environ[_PRELOAD_ENV]
         yield env, (handle.fileno(),)

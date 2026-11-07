@@ -6,7 +6,14 @@ import errno
 import os
 import stat
 from collections import deque
+from operator import index
 from typing import Callable
+
+_DEFAULT_QUEUE_BYTES = 4 * 1024 * 1024
+_FLUSH_BYTES = 64 * 1024
+_FLUSH_ATTEMPTS = 16
+_PAUSE_DIVISOR = 2
+_RESUME_DIVISOR = 4
 
 
 class InputBytes(bytes):
@@ -19,11 +26,26 @@ class InputBytes(bytes):
 
     def __new__(cls, data: bytes, native_prefix: int = 0):
         """Validate the prefix against the immutable payload."""
-        if not 0 <= native_prefix <= len(data):
-            raise ValueError("Native prefix is outside the input payload")
         value = super().__new__(cls, data)
-        value.native_prefix = native_prefix
+        value.native_prefix = cls._prefix_size(value, native_prefix)
         return value
+
+    @staticmethod
+    def _prefix_size(data: bytes, length: int) -> int:
+        size = index(length)
+        if not 0 <= size <= len(data):
+            raise ValueError("Native prefix is outside the input payload")
+        return size
+
+    @staticmethod
+    def native_size(data: bytes) -> int:
+        """Return the leading byte count already offered to a PTY; plain input is fresh."""
+        # The byte payload is immutable, but callers can update the public tag.
+        return (
+            InputBytes._prefix_size(data, data.native_prefix)
+            if isinstance(data, InputBytes)
+            else 0
+        )
 
 
 class FDWriter:
@@ -39,7 +61,7 @@ class FDWriter:
         fd: int,
         on_error: Callable[[Exception], None] | None = None,
         *,
-        max_pending_bytes: int = 4 * 1024 * 1024,
+        max_pending_bytes: int = _DEFAULT_QUEUE_BYTES,
         on_flow=None,
     ):
         """Prepare the write queue and error and backpressure callbacks without owning the
@@ -72,7 +94,10 @@ class FDWriter:
         if data:
             if self.pending_bytes + len(data) > self.max_pending_bytes:
                 raise BufferError("Pending terminal writes exceed the byte limit")
-            self.pending.append(memoryview(bytes(data)))
+            # A tagged handoff is immutable too. Converting it to plain bytes
+            # would copy the entire payload solely to queue a read-only view.
+            payload = data if type(data) is InputBytes else bytes(data)
+            self.pending.append(memoryview(payload))
             self.pending_bytes += len(data)
             self._flush()
         if self.error:
@@ -104,9 +129,9 @@ class FDWriter:
         """Drain the queue within a callback work budget and wait for readiness as needed."""
         if self.closed or self.error:
             return
-        budget = 65536
+        budget = _FLUSH_BYTES
         try:
-            for _ in range(16):
+            for _ in range(_FLUSH_ATTEMPTS):
                 if not self.pending or budget <= 0:
                     break
                 data = self.pending[0]
@@ -140,19 +165,19 @@ class FDWriter:
             if self.on_flow:
                 if (
                     not self._paused
-                    and self.pending_bytes >= self.max_pending_bytes // 2
+                    and self.pending_bytes >= self.max_pending_bytes // _PAUSE_DIVISOR
                 ):
                     self._paused = True
                     self.on_flow(True)
-                elif self._paused and self.pending_bytes <= self.max_pending_bytes // 4:
+                elif (
+                    self._paused
+                    and self.pending_bytes <= self.max_pending_bytes // _RESUME_DIVISOR
+                ):
                     self._paused = False
                     self.on_flow(False)
         except Exception as exc:
             self.error = exc
-            self.pending.clear()
-            self.pending_bytes = 0
-            self._unwatch()
-            self._wake()
+            self._drop_pending()
             if self.on_error:
                 self.on_error(exc)
 
@@ -175,12 +200,16 @@ class FDWriter:
         self.closed = True
         self.discard()
 
-    def discard(self) -> None:
-        """Cancel queued bytes without closing the writer, for an interrupted submission."""
+    def _drop_pending(self) -> None:
+        """Release queued storage, readiness watches and drain waiters together."""
         self._unwatch()
         self.pending.clear()
         self.pending_bytes = 0
         self._wake()
+
+    def discard(self) -> None:
+        """Cancel queued bytes without closing the writer, for an interrupted submission."""
+        self._drop_pending()
         if self._paused:
             self._paused = False
             if self.on_flow and not self.closed:

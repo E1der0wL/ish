@@ -15,6 +15,7 @@ import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError
+from itertools import count, islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,16 +25,26 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion
 
 from ish.config import config
-from ish.lang import i18n
+from ish.lang import Message, i18n
 from ish.log import get_logger
 
-from .dependencies import has_duplicate_metadata, has_import, install_dependency
+from .dependencies import (
+    PACKAGE_ENTRY,
+    PYTHON_SOURCE_SUFFIX,
+    has_duplicate_metadata,
+    has_import,
+    install_dependency,
+)
 from .metadata import DependencySpec, split_requirement
 
 __all__ = ["PluginManager", "PluginInfo"]
 
 PLUGIN_META = "PLUGIN_META"
 _NORMALIZER = "normalize"
+_PLUGIN_REQUIREMENT = re.compile(r"^([a-zA-Z0-9_./-]+?)([><=!~]+.+)?$")
+_HIDDEN_PREFIX = "."
+_DEBUG_FILE_LIMIT = 10
+_EXTRA_MARKER = "extra"
 
 
 def _metadata_string(value: object) -> str:
@@ -99,51 +110,72 @@ _METADATA_FIELDS = tuple(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _Registration:
+    """Record one published module with its optional metadata and metadata-list position."""
+
+    module: Any
+    info: PluginInfo | None
+    info_order: int
+
+
 class PluginRegistry:
     """In-memory registry mapping plugin names to modules and metadata."""
 
     def __init__(self):
-        """Initialize empty module and metadata stores."""
-        self._modules: Dict[str, Any] = {}
-        self._info: Dict[str, PluginInfo] = {}
+        """Initialize a single registration store with independently ordered metadata."""
+        self._entries: dict[str, _Registration] = {}
+        self._info_order = count()
 
     def register(self, name: str, module: Any, info: PluginInfo = None) -> None:
-        """Register a module and store its metadata when provided."""
-        self._modules[name] = module
-        if info:
-            self._info[name] = info
+        """Publish a module, retaining existing metadata only for that same module."""
+        previous = self._entries.get(name)
+        if info is None and previous is not None and previous.module is module:
+            return
+        order = 0
+        if info is not None:
+            order = (
+                previous.info_order
+                if previous is not None and previous.info is not None
+                else next(self._info_order)
+            )
+        self._entries[name] = _Registration(module, info, order)
 
     def unregister(self, name: str) -> bool:
         """Remove a registered module and its metadata and report whether removal occurred."""
-        if name in self._modules:
-            del self._modules[name]
-            self._info.pop(name, None)
-            return True
-        return False
+        return self._entries.pop(name, None) is not None
 
     def get(self, name: str) -> Optional[Any]:
         """Return the registered module, or None for an unknown name."""
-        return self._modules.get(name)
+        entry = self._entries.get(name)
+        return entry.module if entry is not None else None
 
     def get_info(self, name: str) -> Optional[PluginInfo]:
         """Look up metadata for a registered plugin."""
-        return self._info.get(name)
+        entry = self._entries.get(name)
+        return entry.info if entry is not None else None
 
     def has(self, name: str) -> bool:
         """Check whether a module is registered under the given name."""
-        return name in self._modules
+        return name in self._entries
 
     def list(self) -> Dict[str, Any]:
         """Return a copy of the module mapping to protect the internal store."""
-        return self._modules.copy()
+        return {name: entry.module for name, entry in self._entries.items()}
 
     def list_info(self) -> List[PluginInfo]:
         """Return the currently registered metadata objects as a list."""
-        return list(self._info.values())
+        with_info = (
+            entry for entry in self._entries.values() if entry.info is not None
+        )
+        return [
+            entry.info
+            for entry in sorted(with_info, key=lambda entry: entry.info_order)
+        ]
 
     def count(self) -> int:
         """Return the number of registered modules."""
-        return len(self._modules)
+        return len(self._entries)
 
 
 class PluginManager:
@@ -160,7 +192,6 @@ class PluginManager:
         self.plugins: List[Any] = []
 
         self._installed_libs: set = set()
-        self._installed_plugins: set = set()
         self._loading_stack: set = set()
         self._module_roots: dict[str, Path] = {}
         self._entry_modules: dict[str, tuple[str, Any]] = {}
@@ -173,8 +204,7 @@ class PluginManager:
         """Parse ish plugin names separately from Python distribution requirements."""
         req, lib_name = split_requirement(req)
 
-        pattern = r"^([a-zA-Z0-9_./-]+?)([><=!~]+.+)?$"
-        match = re.match(pattern, req.strip())
+        match = _PLUGIN_REQUIREMENT.match(req.strip())
         if match:
             name = match.group(1).strip()
             version_spec = match.group(2).strip() if match.group(2) else None
@@ -185,7 +215,10 @@ class PluginManager:
     def _get_plugin_entry_point(plugin_dir: Path) -> Optional[Path]:
         """Find the plugin's named Python file or __init__.py entry point."""
         name = plugin_dir.name
-        candidate_files = [plugin_dir / f"{name}.py", plugin_dir / "__init__.py"]
+        candidate_files = (
+            plugin_dir / (name + PYTHON_SOURCE_SUFFIX),
+            plugin_dir / PACKAGE_ENTRY,
+        )
 
         for candidate in candidate_files:
             if candidate.exists() and candidate.is_file():
@@ -200,25 +233,34 @@ class PluginManager:
 
     def _get_plugin_meta(self, path: Path) -> object:
         """Read the literal PLUGIN_META value without executing the module."""
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                source = f.read()
-            tree = ast.parse(source)
-            for node in tree.body:
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id == PLUGIN_META:
-                            return ast.literal_eval(node.value)
-            return None
-        except Exception:
-            return None
+        # Parse the bytes just as the import loader does, including PEP 263 headers.
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets = (node.target,)
+            else:
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == PLUGIN_META
+                for target in targets
+            ):
+                try:
+                    return ast.literal_eval(node.value)
+                except (ValueError, TypeError) as exc:
+                    raise TypeError(f"{PLUGIN_META} must be literal") from exc
+        return None
 
-    def _is_version_allowed(self, installed: str, spec: Optional[str]) -> bool:
+    def _is_version_allowed(
+        self, installed: str, spec: str | SpecifierSet | None
+    ) -> bool:
         """Check a PEP 440 constraint and log and reject invalid constraints."""
         if not spec:
             return True
         try:
-            return SpecifierSet(spec).contains(installed)
+            allowed = spec if isinstance(spec, SpecifierSet) else SpecifierSet(spec)
+            return allowed.contains(installed)
         except (InvalidSpecifier, InvalidVersion) as exc:
             self.logger.warning(
                 "Invalid version requirement %r for %r: %s", spec, installed, exc
@@ -237,9 +279,7 @@ class PluginManager:
             distribution = importlib.metadata.distribution(requirement.name)
         except PackageNotFoundError:
             return False
-        if not self._is_version_allowed(
-            distribution.version, str(requirement.specifier)
-        ):
+        if not self._is_version_allowed(distribution.version, requirement.specifier):
             return False
         if key in seen:
             return True
@@ -248,7 +288,7 @@ class PluginManager:
         for value in distribution.requires or ():
             child = Requirement(value)
             if child.marker is not None and not any(
-                child.marker.evaluate({"extra": extra}) for extra in extras
+                child.marker.evaluate({_EXTRA_MARKER: extra}) for extra in extras
             ):
                 continue
             if not self._has_extras(child, seen):
@@ -274,15 +314,16 @@ class PluginManager:
         if has_duplicate_metadata(requirement.name, config.PLUGIN_LIB_DIR):
             return False
         # Check the version before find_spec can import a dotted name's parent.
-        if requirement.specifier:
+        if requirement.extras:
+            if not self._has_extras(requirement):
+                return False
+        elif requirement.specifier:
             try:
                 version = importlib.metadata.version(requirement.name)
             except PackageNotFoundError:
                 return False
-            if not self._is_version_allowed(version, str(requirement.specifier)):
+            if not self._is_version_allowed(version, requirement.specifier):
                 return False
-        if requirement.extras and not self._has_extras(requirement):
-            return False
         name = dependency.import_name
         if not import_parents:
             return has_import(name)
@@ -321,18 +362,22 @@ class PluginManager:
         if plugin_name in self._loading_stack:
             return False
         if self.registry.has(plugin_name):
-            if plugin_version is None:
-                return True
-            info = self.registry.get_info(plugin_name)
-            if info and self._is_version_allowed(info.version, plugin_version):
-                return True
-            else:
-                return False
-        else:
-            plugin_dir = self._get_plugin_path(plugin_name)
-            if plugin_dir.exists():
-                return self._resolve(plugin_dir, plugin_version) is not None
-            return False
+            return self._matches_plugin_version(
+                self.registry.get_info(plugin_name), plugin_version
+            )
+        plugin_dir = self._get_plugin_path(plugin_name)
+        return (
+            plugin_dir.exists()
+            and self._resolve(plugin_dir, plugin_version) is not None
+        )
+
+    def _matches_plugin_version(
+        self, info: PluginInfo | None, spec: str | None
+    ) -> bool:
+        """Check the same version admission rule before execution and for registered plugins."""
+        return not spec or (
+            info is not None and self._is_version_allowed(info.version, spec)
+        )
 
     def _install_library(self, library: str) -> bool:
         """Install dependencies into the separate plugin directory using the selected
@@ -341,12 +386,8 @@ class PluginManager:
         Pass an argument vector rather than a shell string, and report installation
         failures as False.
         """
-        if not config.PLUGIN_LIB_DIR:
-            self.logger.warning(i18n.get("pip_install_fail", library=library))
-            return False
-
-        if not self.python_exe:
-            self.logger.warning(i18n.get("pip_install_fail", library=library))
+        if not config.PLUGIN_LIB_DIR or not self.python_exe:
+            self.logger.warning(i18n.get(Message.PIP_INSTALL_FAIL, library=library))
             return False
 
         try:
@@ -367,7 +408,7 @@ class PluginManager:
             return True
         except Exception as exc:
             self.logger.warning(
-                "%s: %s", i18n.get("pip_install_fail", library=library), exc
+                "%s: %s", i18n.get(Message.PIP_INSTALL_FAIL, library=library), exc
             )
             return False
 
@@ -376,7 +417,7 @@ class PluginManager:
     ) -> Optional[PluginInfo]:
         """Execute an admitted module without publishing an incomplete registration."""
         entry_name = plugin_file.stem
-        if entry_name == "__init__":
+        if plugin_file.name == PACKAGE_ENTRY:
             full_module_name = plugin_name
         else:
             full_module_name = f"{plugin_name}.{entry_name}"
@@ -464,19 +505,13 @@ class PluginManager:
 
         if self.registry.has(plugin_name):
             info = self.registry.get_info(plugin_name)
-            return (
-                info
-                if info and self._is_version_allowed(info.version, version_spec)
-                else None
-            )
+            return info if self._matches_plugin_version(info, version_spec) else None
 
         self._loading_stack.add(plugin_name)
         try:
             meta = self._get_plugin_meta(entry_point)
             info = PluginInfo.from_mapping(plugin_name, meta)
-            if version_spec and (
-                info is None or not self._is_version_allowed(info.version, version_spec)
-            ):
+            if not self._matches_plugin_version(info, version_spec):
                 return None
             if info is not None:
                 for requirement in info.requirements:
@@ -529,17 +564,16 @@ class PluginManager:
         plugin_dirs = [
             d
             for d in config.PLUGIN_SCRIPT_DIR.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
+            if d.is_dir() and not d.name.startswith(_HIDDEN_PREFIX)
         ]
         for plugin_dir in plugin_dirs:
-            plugin_name = plugin_dir.name
             try:
                 info = self._resolve(plugin_dir)
                 if info:
                     loaded_infos.append(info)
                 else:
                     self.logger.warning(
-                        i18n.get("pm_load_fail", plugin_file=plugin_dir)
+                        i18n.get(Message.PM_LOAD_FAIL, plugin_file=plugin_dir)
                     )
             except Exception:
                 format_exc = str(traceback.format_exc())
@@ -551,18 +585,19 @@ class PluginManager:
                 lib_dir_contents = ""
                 if lib_dir_exists:
                     try:
-                        dir_contents = config.PLUGIN_LIB_DIR.iterdir()
-                        if dir_contents:
-                            lib_dir_contents = "\n" + "\n".join(
-                                [f"  - {f.name}" for f in dir_contents][:10]
-                            )
+                        dir_contents = islice(
+                            config.PLUGIN_LIB_DIR.iterdir(), _DEBUG_FILE_LIMIT
+                        )
+                        lib_dir_contents = "\n" + "\n".join(
+                            f"  - {f.name}" for f in dir_contents
+                        )
                     except Exception:
                         lib_dir_contents = "Error reading directory"
 
                 log_lib_dir = (
                     f"Plugin Lib Dir exists: {lib_dir_exists}\n"
                     f"Plugin Lib Dir path: {target_path}\n"
-                    f"Plugin Lib Dir contents (top 10): {lib_dir_contents}"
+                    f"Plugin Lib Dir contents (top {_DEBUG_FILE_LIMIT}): {lib_dir_contents}"
                 )
                 log_python_info = (
                     f"Python Executable: {self.python_exe}\n"
@@ -581,12 +616,11 @@ class PluginManager:
                 ]
                 self.logger.error(
                     i18n.get(
-                        "pm_load_error", plugin_file=plugin_dir, error="\n".join(errors)
+                        Message.PM_LOAD_ERROR,
+                        plugin_file=plugin_dir,
+                        error="\n".join(errors),
                     )
                 )
-                self._unload_plugin(plugin_name)
-            finally:
-                self._loading_stack.discard(plugin_name)
 
         return loaded_infos
 

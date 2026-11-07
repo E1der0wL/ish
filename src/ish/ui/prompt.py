@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -99,24 +100,30 @@ from pygments.lexers import get_lexer_by_name
 
 from ish.app.pytool import Runner
 from ish.config import config
-from ish.lang import i18n
+from ish.lang import Message, i18n
 from ish.log import get_logger
 from ish.parser.completion import CompletionWord
 from ish.parser.shell import alias_parser, environ_parser, str_parser
 from ish.runtime.fdio import InputBytes
-from ish.runtime.observer import InputObserver
-from ish.runtime.process import ProcessGroup
+from ish.runtime.observer import EDITOR, InputObserver
+from ish.runtime.process import ProcessGroup, shell_exitcode
 from ish.shell.adapter import get_adapter
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE
 from ish.shell.context import ShellContext
-from ish.shell.engine import InteractiveShell
+from ish.shell.engine import DEFAULT_ENCODING, DEFAULT_SHELL, InteractiveShell
 from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
 from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
 from ish.shell.request import ShellExitRequest, ShellPassRequest
 
 from .ansi import ShellANSI
 from .completer import PromptCompleter
-from .input import HandoffKeyProcessor, NativeKey, ObservedInput, ReplayInput, wire_text
+from .input import (
+    CANONICAL_ENTER,
+    INTERRUPT_KEYS,
+    TERMINAL_ENTER,
+    HandoffKeyProcessor,
+    ObservedInput,
+)
 from .words import native_word_bindings
 
 if TYPE_CHECKING:
@@ -128,14 +135,47 @@ if TYPE_CHECKING:
     from prompt_toolkit.layout.containers import AnyContainer
 
     from ish.plugin.manager import PluginManager
+    from ish.shell.screen import ScreenSnapshot
 
 __all__ = ["Prompt"]
 
 BUILTIN_QUERY_TIMEOUT = 3.0
 BUILTIN_CLEANUP_TIMEOUT = 0.5
+_BUILTIN_STARTUP_VARIABLES = ("BASH_ENV", "ENV")
 _PROMPT_STYLE = "class:prompt"
-_REPLAY_CHUNK_BYTES = 4096
-_INTERRUPT_KEYS = (Keys.ControlC, Keys.ControlD)
+_DEFAULT_EXIT_COMMAND = "ish_exit"
+_RELOAD_COMMAND = "ish_reload"
+_TRACE_INPUT_REJECTED = "input_rejected"
+_TRACE_INPUT_TRANSFERRED = "editor_input_transferred"
+_TOOLBAR_STYLE = "class:bottom-toolbar"
+_TOOLBAR_TEXT_STYLE = "class:bottom-toolbar.text"
+_COMPLETION_MENU_HEIGHT = 16
+_COMPLETION_SCROLL_OFFSET = 1
+_INDENT_WIDTH = 4
+_CONTINUATION_ESCAPE = "\\"
+_CONTINUATION_BYTE = ord(_CONTINUATION_ESCAPE)
+_INDENT_AFTER = ":"
+_HISTORY_CONTROL = re.compile(rb"[\x00-\x1f\x7f]")
+_RC_RUN_NAME = "__main__"
+_RC_PROMPT, _RC_LOGGER, _RC_CONFIG = "prompt", "logger", "config"
+_RC_OPTION, _RC_PLUGIN = "option", "plugin"
+_KEY_TEXT, _KEY_SEQUENCE = "keys", "keys_tuple"
+_KEY_HANDLER_NAME, _KEY_HANDLER = "handler", "handler_func"
+_KEY_FILTER, _KEY_EAGER, _KEY_GLOBAL = "filter", "eager", "is_global"
+_HOME_VARIABLE = "HOME"
+_SUCCESS_TEXT = "0"
+_PTY_NEWLINE = b"\r\n"
+_DISPLAY_NEWLINE = b"\n"
+_TERMINAL_TEXT_ERRORS = "replace"
+
+
+def _format_prompt_bytes(data: bytes, encoding: str) -> ShellANSI:
+    """Decode terminal prompt bytes using the same display policy for prefix and body."""
+    return ShellANSI(
+        data.replace(_PTY_NEWLINE, _DISPLAY_NEWLINE).decode(
+            encoding, _TERMINAL_TEXT_ERRORS
+        )
+    )
 
 
 def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
@@ -149,7 +189,7 @@ def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
         env = os.environ.copy()
         # Bash reads BASH_ENV in noninteractive mode even with --norc.
         # Only the discovery child loses these hooks; the session keeps them.
-        for name in ("BASH_ENV", "ENV"):
+        for name in _BUILTIN_STARTUP_VARIABLES:
             env.pop(name, None)
         process = subprocess.Popen(
             [executable or shell, *adapter.builtins_args, adapter.builtins_command],
@@ -194,7 +234,7 @@ class Prompt(PromptSession):
         self,
         *args: Any,
         shell: Optional[str] = None,
-        encoder: Optional[str] = sys.stdout.encoding or "utf-8",
+        encoder: Optional[str] = DEFAULT_ENCODING,
         input_fd: Optional[int] = None,
         output_fd: Optional[int] = None,
         plugin_manager: Optional[PluginManager] = None,
@@ -208,10 +248,9 @@ class Prompt(PromptSession):
         self.logger = get_logger()
         self.input_observer = InputObserver()
 
-        self.shell: Optional[str] = kwargs.pop("shell", shell)
-        self.encoder: Optional[str] = kwargs.pop("encoder", encoder)
+        self.shell: Optional[str] = shell
+        self.encoder: Optional[str] = encoder
         if input_fd is not None:
-            input_fd = kwargs.pop("input_fd", input_fd)
             from prompt_toolkit.input import create_input
 
             kwargs.update(
@@ -221,7 +260,7 @@ class Prompt(PromptSession):
                             input_fd,
                             mode="r",
                             encoding=self.encoder,
-                            errors="replace",
+                            errors=_TERMINAL_TEXT_ERRORS,
                             closefd=False,
                         )
                     )
@@ -229,7 +268,6 @@ class Prompt(PromptSession):
             )
 
         if output_fd is not None:
-            output_fd = kwargs.pop("output_fd", output_fd)
             from prompt_toolkit.output import create_output
 
             kwargs.update(
@@ -239,7 +277,7 @@ class Prompt(PromptSession):
                             output_fd,
                             mode="w",
                             encoding=self.encoder,
-                            errors="replace",
+                            errors=_TERMINAL_TEXT_ERRORS,
                             closefd=False,
                         )
                     )
@@ -266,7 +304,7 @@ class Prompt(PromptSession):
         self.last_tool_exitcode: Optional[int] = None
 
         self.interactive_shell = InteractiveShell(
-            self.shell or "bash",
+            self.shell or DEFAULT_SHELL,
             prompt=self,
             encoder=self.encoder,
             stdin=sys.stdin.fileno() if input_fd is None else input_fd,
@@ -284,7 +322,7 @@ class Prompt(PromptSession):
             take_input=self.take_typeahead,
             return_input=self.interactive_shell.return_typeahead,
             return_native_input=self.interactive_shell.return_native_input,
-            observe_output=self.interactive_shell.terminal_state.feed,
+            observe_output=self.interactive_shell.observe_tool_output,
         )
         self.interactive_shell.resize_callback = self.runner.resize
 
@@ -317,15 +355,15 @@ class Prompt(PromptSession):
             context=self.completion_context,
             get_home=lambda: self._home,
         )
-        self.exit_command: str = "ish_exit"
+        self.exit_command: str = _DEFAULT_EXIT_COMMAND
         self.internal_commands: Dict[
             str, Tuple[Callable[..., Awaitable[Any]], Tuple, Dict]
         ] = {
-            "ish_reload": (self.load_rc_async, (), {}),
+            _RELOAD_COMMAND: (self.load_rc_async, (), {}),
         }
 
-        self.plugin_manager = kwargs.pop("plugin_manager", plugin_manager)
-        self.option = kwargs.pop("option", option)
+        self.plugin_manager = plugin_manager
+        self.option = option
         self.internal_tools: Dict[str, Callable[..., Any]] = {}
 
         if "auto_suggest" not in kwargs:
@@ -350,7 +388,6 @@ class Prompt(PromptSession):
         self.app.key_processor = HandoffKeyProcessor(
             self.app.key_processor._bindings, native_bindings
         )
-        self._replay_lookahead = b""
         self.multiline = True
         self.color_depth = ColorDepth.TRUE_COLOR
         self.key_bindings = self._create_key_binding()
@@ -376,13 +413,13 @@ class Prompt(PromptSession):
             handler_name = getattr(binding.handler, "__name__", str(binding.handler))
             bindings_info.append(
                 {
-                    "keys": keys_str,
-                    "keys_tuple": binding.keys,
-                    "handler": handler_name,
-                    "handler_func": binding.handler,
-                    "filter": binding.filter,
-                    "eager": binding.eager,
-                    "is_global": binding.is_global,
+                    _KEY_TEXT: keys_str,
+                    _KEY_SEQUENCE: binding.keys,
+                    _KEY_HANDLER_NAME: handler_name,
+                    _KEY_HANDLER: binding.handler,
+                    _KEY_FILTER: binding.filter,
+                    _KEY_EAGER: binding.eager,
+                    _KEY_GLOBAL: binding.is_global,
                 }
             )
         return bindings_info
@@ -435,9 +472,9 @@ class Prompt(PromptSession):
         bottom_toolbar = ConditionalContainer(
             Window(
                 FormattedTextControl(
-                    lambda: self.bottom_toolbar, style="class:bottom-toolbar.text"
+                    lambda: self.bottom_toolbar, style=_TOOLBAR_TEXT_STYLE
                 ),
-                style="class:bottom-toolbar",
+                style=_TOOLBAR_STYLE,
                 dont_extend_height=True,
                 height=Dimension(min=1),
             ),
@@ -533,8 +570,8 @@ class Prompt(PromptSession):
                     ycursor=True,
                     transparent=True,
                     content=CompletionsMenu(
-                        max_height=16,
-                        scroll_offset=1,
+                        max_height=_COMPLETION_MENU_HEIGHT,
+                        scroll_offset=_COMPLETION_SCROLL_OFFSET,
                         extra_filter=has_focus(default_buffer)
                         & ~multi_column_complete_style,
                     ),
@@ -597,11 +634,9 @@ class Prompt(PromptSession):
         if not self._prompt_prefix:
             return fragments
         if self._prefix_fragments is None:
-            prefix = self._prompt_prefix.replace(b"\r\n", b"\n").decode(
-                self._prefix_encoder, errors="replace"
-            )
             self._prefix_fragments = to_formatted_text(
-                ShellANSI(prefix), style=_PROMPT_STYLE
+                _format_prompt_bytes(self._prompt_prefix, self._prefix_encoder),
+                style=_PROMPT_STYLE,
             )
         return self._prefix_fragments + fragments
 
@@ -631,7 +666,7 @@ class Prompt(PromptSession):
                 )
                 buffer.validation_error = rejection
                 buffer.validation_state = ValidationState.INVALID
-                self.input_observer.record("input_rejected", "EDITOR")
+                self.input_observer.record(_TRACE_INPUT_REJECTED, EDITOR)
                 return False
             return original_validate(set_cursor=set_cursor)
 
@@ -641,9 +676,17 @@ class Prompt(PromptSession):
     def _create_key_binding(self) -> KeyBindings:
         """Register submission, indentation, deletion, and completion keys."""
 
-        def get_indentation(line) -> int:
-            """Return the number of leading spaces on a line."""
-            return len(line) - len(line.lstrip(" "))
+        def insert_newline(buffer):
+            """Copy the last line's indentation and add one level after a colon."""
+            indentation = 0
+            cursor = buffer.document.cursor_position
+            if cursor > 0:
+                text = buffer.text
+                last_line = text[text.rfind("\n") + 1 :]
+                indentation = len(last_line) - len(last_line.lstrip(" "))
+                if text[cursor - 1] == _INDENT_AFTER:
+                    indentation += _INDENT_WIDTH
+            buffer.insert_text("\n" + " " * indentation)
 
         kb = KeyBindings()
 
@@ -662,24 +705,8 @@ class Prompt(PromptSession):
                 return
             buffer = event.current_buffer
             text = buffer.text
-            lines = text.split("\n")
-            cursor_position = buffer.document.cursor_position
-            if (len(text) - len(text.rstrip("\\"))) % 2:
-                if cursor_position > 0:
-                    left_char = buffer.document.text[cursor_position - 1]
-                    if left_char == ":":
-                        indentation = get_indentation(lines[-1])
-                        buffer.insert_text("\n" + " " * (indentation + 4))
-                    else:
-                        if lines:
-                            indentation = get_indentation(lines[-1])
-                            buffer.insert_text("\n" + " " * indentation)
-                        else:
-                            event.current_buffer.insert_text("\n")
-
-                else:
-                    event.current_buffer.insert_text("\n")
-
+            if (len(text) - len(text.rstrip(_CONTINUATION_ESCAPE))) % 2:
+                insert_newline(buffer)
             else:
                 event.app.current_buffer.validate_and_handle()
 
@@ -722,23 +749,7 @@ class Prompt(PromptSession):
             """On Control-Space, insert a newline using current indentation and colon
             context.
             """
-            buffer = event.current_buffer
-            code = buffer.text
-            lines = code.split("\n")
-            cursor_position = buffer.document.cursor_position
-            if cursor_position > 0:
-                left_char = buffer.document.text[cursor_position - 1]
-                if left_char == ":":
-                    indentation = get_indentation(lines[-1])
-                    buffer.insert_text("\n" + " " * (indentation + 4))
-                else:
-                    if lines:
-                        indentation = get_indentation(lines[-1])
-                        buffer.insert_text("\n" + " " * indentation)
-                    else:
-                        event.current_buffer.insert_text("\n")
-            else:
-                event.current_buffer.insert_text("\n")
+            insert_newline(event.current_buffer)
 
         return kb
 
@@ -746,15 +757,19 @@ class Prompt(PromptSession):
     def _scan_path(directories: Iterable) -> Set[str]:
         """Collect executable filenames from PATH directories, skipping access errors."""
         all_cmd: Set[str] = set()
-        for directory in directories:
+        for directory in dict.fromkeys(directories):
             if not directory:
                 continue
             try:
                 with os.scandir(directory) as entries:
                     for entry in entries:
-                        if entry.is_file() and os.access(entry.path, os.X_OK):
-                            all_cmd.add(entry.name)
-            except (FileNotFoundError, PermissionError):
+                        try:
+                            if entry.is_file() and os.access(entry.path, os.X_OK):
+                                all_cmd.add(entry.name)
+                        except OSError:
+                            continue
+            except OSError:
+                # PATH can contain regular files, stale mounts or unreadable roots.
                 continue
         return all_cmd
 
@@ -829,7 +844,7 @@ class Prompt(PromptSession):
         generation is current.
         """
         if ENVIRON == category:
-            self._home = data.get("HOME")
+            self._home = data.get(_HOME_VARIABLE)
             self._path_generation += 1
             generation = self._path_generation
             search_path = os.get_exec_path(data)
@@ -851,9 +866,9 @@ class Prompt(PromptSession):
                     asyncio.to_thread(self._scan_path, paths)
                 )
             execs = await asyncio.shield(self._path_scan_task)
-            if (
-                generation == self._path_generation
-                and set(self._completions[category]) != execs
+            current = self._completions[category]
+            if generation == self._path_generation and (
+                len(current) != len(execs) or not execs.issuperset(current)
             ):
                 self._completions[category][:] = execs
                 self._rank()
@@ -900,11 +915,19 @@ class Prompt(PromptSession):
 
         try:
             status = getattr(self.context, EXITCODE, None)
-            if status is not None and str(status).strip() != "0":
+            if status is not None and str(status).strip() != _SUCCESS_TEXT:
                 await self.runner.run(self.fallback_hook)
         except Exception:
             self.logger.exception("fallback hook failed")
             return
+
+    def enable_screen_tracking(self, enabled: bool = True) -> None:
+        """Enable foreground PTY screen snapshots, or disable tracking and release the grid."""
+        self.interactive_shell.enable_screen_tracking(enabled)
+
+    def screen_snapshot(self) -> ScreenSnapshot | None:
+        """Read the tracked text grid from the parent process, or None while disabled."""
+        return self.interactive_shell.screen_snapshot()
 
     def set_tool(
         self,
@@ -1077,10 +1100,7 @@ class Prompt(PromptSession):
         Only _get_prompt selects an optional user override; secondary input keeps
         its native prompt. A new frame invalidates the lazily formatted prefix.
         """
-        cleaned_prompt = (prefix + prompt).replace(b"\r\n", b"\n")
-        self.message = ShellANSI(
-            cleaned_prompt.decode(encoder or self.encoder, errors="replace")
-        )
+        self.message = _format_prompt_bytes(prefix + prompt, encoder or self.encoder)
         self._prompt_prefix = prefix
         self._prefix_encoder = encoder or self.encoder
         self._prefix_fragments = None
@@ -1112,25 +1132,23 @@ class Prompt(PromptSession):
         """
         try:
             init_globals = {
-                "__name__": "__main__",
-                "__file__": str(config.RC_FILE),
-                "prompt": self,
-                "logger": self.logger,
-                "config": config,
-                "option": self.option,
-                "plugin": self.plugin_manager,
+                _RC_PROMPT: self,
+                _RC_LOGGER: self.logger,
+                _RC_CONFIG: config,
+                _RC_OPTION: self.option,
+                _RC_PLUGIN: self.plugin_manager,
             }
             import runpy
 
             runpy.run_path(
-                str(config.RC_FILE), run_name="__main__", init_globals=init_globals
+                str(config.RC_FILE), run_name=_RC_RUN_NAME, init_globals=init_globals
             )
 
         except SystemExit:
             pass
 
         except Exception:
-            self.logger.error(i18n.get("error", error=traceback.format_exc()))
+            self.logger.error(i18n.get(Message.ERROR, error=traceback.format_exc()))
             sys.exit(1)
 
     async def load_rc_async(self) -> None:
@@ -1175,7 +1193,7 @@ class Prompt(PromptSession):
                 )
             self.last_tool_exitcode = status
             # Retain the raw worker status as well as a shell-style display code.
-            self.last_exitcode = 128 - status if status < 0 else status
+            self.last_exitcode = shell_exitcode(status)
             return None
 
         return command
@@ -1183,9 +1201,9 @@ class Prompt(PromptSession):
     def take_typeahead(self) -> bytes:
         """Transfer unread input, including VT and paste framing, to foreground stdin."""
         data, native_prefix = self.interactive_shell.take_pending_input()
-        prefix, self._replay_lookahead = self._replay_lookahead, b""
+        prefix = self.input.replay.take_lookahead()
         data = prefix + data + self.input.take_pending()
-        self.input_observer.record("editor_input_transferred", bytes=len(data))
+        self.input_observer.record(_TRACE_INPUT_TRANSFERRED, bytes=len(data))
         return InputBytes(data, native_prefix + len(prefix))
 
     def feed_typeahead(self, data: bytes) -> None:
@@ -1200,52 +1218,21 @@ class Prompt(PromptSession):
         Keep parsing bounded even when many commands arrived in one PTY read.
         """
         replay = self.input.replay
-        processor = self.app.key_processor
-        offset = 0
-        while offset < len(data) and not self.app.is_done:
-            stop = min(offset + _REPLAY_CHUNK_BYTES, len(data))
-            if native:
-                run = replay.ascii_run(data, offset, stop)
-                if run and processor.can_insert_run(self.default_buffer):
-                    processor.feed(NativeKey(Keys.Any, run[0].decode("ascii")))
-                    processor.process_keys()
-                    offset = run.end()
-                    continue
-            # Most submissions end on a newline. Avoid parsing a following
-            # command's potentially large stdin unless dispatch actually continues.
-            newline = data.find(b"\n", offset, stop)
-            if newline >= 0 and not replay.parser._in_bracketed_paste:
-                stop = newline + 1
-            wire = replay.pending
-            older = len(wire)
-            buffered = processor.key_buffer[:]
-            keys = replay.read(data[offset:stop], native=native)
-            processor.process_replay(keys, self.default_buffer)
-            if self.app.is_done:
-                consumed, previous = processor.accepted_offset(
-                    keys, buffered, self.encoder
-                )
-                replay.take()
-                boundary = offset + consumed - older - len(previous)
-                if boundary < 0:
-                    # A prefix from an earlier replay call resolved to multiple
-                    # keys. The unconsumed part precedes this call's first byte.
-                    self._replay_lookahead = (previous + wire[consumed:older])[
-                        :-boundary
-                    ]
-                return max(0, boundary)
-            offset = stop
-        if replay.pending and self.app.is_running:
-            self.input.schedule_flush(self.app)
-        self.app.invalidate()
-        return offset
+        consumed = replay.dispatch(
+            data, native=native, app=self.app, buffer=self.default_buffer
+        )
+        if not self.app.is_done:
+            if replay.pending and self.app.is_running:
+                self.input.schedule_flush(self.app)
+            self.app.invalidate()
+        return consumed
 
     def start_typeahead(
         self, replay, native: bytes | bytearray, fresh: bytearray
     ) -> None:
         """Run older input before saved and live keys, with history ready for bindings."""
         saved = get_typeahead(self.input)
-        if not (native or fresh or saved or self._replay_lookahead):
+        if not (native or fresh or saved or self.input.replay.has_lookahead):
             replay()
             return
         live = []
@@ -1270,10 +1257,8 @@ class Prompt(PromptSession):
                 loader.remove_done_callback(restore)
                 result.remove_done_callback(restore)
             try:
-                if not self.app.is_done and self._replay_lookahead:
-                    prefix, self._replay_lookahead = self._replay_lookahead, b""
-                    used = self.replay_raw(prefix, native=False)
-                    self._replay_lookahead += prefix[used:]
+                if not self.app.is_done and self.input.replay.has_lookahead:
+                    self.input.replay.resume_lookahead(self.replay_raw)
                 if not self.app.is_done:
                     replay()
                 dispatch(saved)
@@ -1296,16 +1281,18 @@ class Prompt(PromptSession):
             for index, key in enumerate(keys):
                 if key.key == Keys.CPRResponse:
                     replies.append(key)
-                elif key.key in _INTERRUPT_KEYS and self._queued_interrupt(
-                    native, fresh, [*saved, *live], live_key=key
+                elif key.key in INTERRUPT_KEYS and self.input.replay.has_interrupt(
+                    native,
+                    fresh,
+                    [*saved, *live],
+                    self._default_enter_active,
+                    live_key=key,
                 ):
                     # A stalled history backend must remain interruptible.
                     restore()
                     return replies + keys[index:]
                 else:
-                    live_size += max(
-                        1, len(wire_text(key).encode(self.encoder, "surrogateescape"))
-                    )
+                    live_size += max(1, len(self.input.replay.encode_key(key)))
                     if live_size > TYPEAHEAD_LIMIT_BYTES:
                         self.app.exit(
                             exception=BufferError(
@@ -1317,7 +1304,9 @@ class Prompt(PromptSession):
                     live.append(key)
             return replies
 
-        if not self._replay_lookahead and not self._needs_history(native, fresh, saved):
+        if not self.input.replay.has_lookahead and not self._needs_history(
+            native, fresh, saved
+        ):
             restore()
             return
 
@@ -1326,49 +1315,12 @@ class Prompt(PromptSession):
         self.input.hold_keys = hold
         loader.add_done_callback(restore)
         result.add_done_callback(restore)
-        if self._queued_interrupt(native, fresh, saved):
+        if self.input.replay.has_interrupt(
+            native, fresh, saved, self._default_enter_active
+        ):
             # Give a ready history one turn, but never block a queued interrupt
             # on a stalled provider. Actual dispatch still follows wire order.
             asyncio.get_running_loop().call_soon(restore)
-
-    def _queued_interrupt(self, native, fresh, saved, *, live_key=None):
-        """Recognize cancellation before submission, excluding bracketed-paste data."""
-        streams = (self.input.replay.pending, self._replay_lookahead, native, fresh)
-        if live_key is None and not (
-            any(b"\x03" in data or b"\x04" in data for data in streams)
-            or any(key.key in _INTERRUPT_KEYS for key in saved)
-        ):
-            return False
-        probe = ReplayInput(self.encoder)
-        normal_enter = self._default_enter_active()
-        saved_data = "".join(
-            wire_text(key) for key in saved if key.key != Keys.CPRResponse
-        ).encode(self.encoder, "surrogateescape")
-        for data, canonical in (
-            (streams[0], False),
-            (streams[1], False),
-            (native, True),
-            (fresh, False),
-            (saved_data, False),
-        ):
-            for offset in range(0, len(data), _REPLAY_CHUNK_BYTES):
-                events = probe.read(data[offset : offset + _REPLAY_CHUNK_BYTES])
-                if live_key is not None:
-                    continue
-                for key in events:
-                    if key.key in _INTERRUPT_KEYS:
-                        return True
-                    if (canonical or normal_enter) and (
-                        key.key == Keys.Enter or canonical and key.key == Keys.ControlJ
-                    ):
-                        # A following line can be this command's stdin.
-                        return False
-        if live_key is not None:
-            # A new cancellation key can release the wait even after a queued
-            # Enter. Only suppress it if it is data in an ongoing paste.
-            data = wire_text(live_key).encode(self.encoder, "surrogateescape")
-            return any(key.key in _INTERRUPT_KEYS for key in probe.read(data))
-        return False
 
     def _default_enter_active(self):
         """Identify the original Enter binding, including longer user-defined chords."""
@@ -1393,8 +1345,8 @@ class Prompt(PromptSession):
             return True
 
         for data, delimiter, customized in (
-            (native, b"\n", False),
-            (fresh, b"\r", True),
+            (native, CANONICAL_ENTER, False),
+            (fresh, TERMINAL_ENTER, True),
         ):
             end = data.find(delimiter)
             if end >= 0:
@@ -1403,24 +1355,22 @@ class Prompt(PromptSession):
                 if (
                     (customized and not normal_enter)
                     or end
-                    and data[end - 1] == ord("\\")
+                    and data[end - 1] == _CONTINUATION_BYTE
                 ):
                     return True
-                data = data[:end]
-            if any(byte < 32 or byte == 127 for byte in data):
+            else:
+                end = len(data)
+            if _HISTORY_CONTROL.search(data, 0, end):
                 return True
             if customized and printables:
-                text = data.decode(self.encoder, "surrogateescape")
+                text = self.input.replay.decode(data[:end])
                 if any(key in text for key in printables):
                     return True
         return False
 
     def feed_literal_input(self, data: bytes) -> None:
         """Restore already-submitted text without invoking editor bindings again."""
-        decoder = self.input.replay.decoder
-        text = decoder.decode(data)
-        self.default_buffer.insert_text(text)
-        self.input.replay.pending[:] = decoder.getstate()[0]
+        self.default_buffer.insert_text(self.input.replay.read_literal(data))
 
     @property
     def output_active(self) -> bool:

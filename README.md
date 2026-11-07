@@ -747,6 +747,50 @@ it does not avoid the shell's original prompt computation. Shell escapes such as
 evaluated. Dynamic callbacks run during rendering, possibly more than once per
 redraw, so keep them fast and free of side effects. No polling is added.
 
+### Read a running TUI's text screen
+
+Call `prompt.enable_screen_tracking()` in `.ishrc.py` **before** starting Vim or
+another TUI. A plugin in the ish process can then read the current foreground
+PTY text even while the application owns the keyboard. For example, give a
+resident plugin the getter once during setup:
+
+```python
+# .ishrc.py
+prompt.enable_screen_tracking()
+monitor = plugin.get("monitor")
+if monitor is not None:
+    monitor.read_screen = prompt.screen_snapshot
+```
+
+A callback or thread in the plugin can then use its module-level getter:
+
+```python
+# monitor.py
+def current_status():
+    frame = read_screen()  # Set by .ishrc.py after the plugin loads.
+    if frame is not None and frame.alternate:
+        return frame.lines[-1].rstrip(), (frame.cursor_row, frame.cursor_column)
+    return None
+```
+
+Each snapshot is immutable. `lines` contains `rows` strings, including blank
+rows and trailing spaces. Cursor coordinates are zero-based terminal cells;
+a wide character can occupy two columns. The observer follows cursor motion,
+overwrites, erasure, resizing, and the primary/alternate screen switch.
+On leaving the alternate screen the getter returns the primary grid.
+The PTY stream includes foreground Python tools. PTK prompts, toolbars and
+popups are drawn separately. Terminal graphics, styling and off-screen Vim
+buffer contents are outside the text snapshot.
+
+Tracking is off by default and starts with a blank grid. A repeated enable
+keeps the existing content. Use `prompt.enable_screen_tracking(False)` to
+discard it; `screen_snapshot()` returns `None` while tracking is off.
+The build includes pyte, which ish loads on the first enable. The observer
+limits each grid to 262,144 cells and stops tracking if it cannot process a
+screen. Screen updates cost CPU while enabled. Ordinary scrollback
+remains available independently. A `set_tool` function runs in a separate
+process; read snapshots from a resident callback in the parent process.
+
 ### Bottom toolbar, right prompt, and styles
 
 Assign `prompt.bottom_toolbar` to show a bottom toolbar and `prompt.rprompt` to

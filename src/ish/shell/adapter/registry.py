@@ -4,8 +4,11 @@ import os
 import shlex
 import signal
 import termios
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Callable
+
+from ish.config import BuiltinShell
 
 from ..constants import (
     AFTER_CONTINUATION,
@@ -44,6 +47,72 @@ from .parsing import (
     ZSH_PARSING,
     ParsingPolicy,
 )
+
+_CSH_QUOTED_CHARS = "'\"\\$`!;&|()<>*?[]{}~#"
+_POSIX_ALIAS_SEPARATOR = "="
+_CSH_ALIAS_SEPARATOR = "\t"
+_RECOVERY_EXIT_CODE = "_ish_recovery_exit_code"
+_RECOVERY_EXIT_CODE_REF = f'"${_RECOVERY_EXIT_CODE}"'
+_SHELL_EXIT_CODE = "_ish_shell_exit_code"
+INTEGRATION_ARGUMENTS = ("_ish_pipe", "_tty_pipe")
+SHELL_ALIASES = {"bsd-csh": BuiltinShell.CSH.value, "dash": BuiltinShell.SH.value}
+# /bin/csh may be a tcsh symlink, which needs tcsh's integration hooks.
+RESOLVED_SHELL_ALIASES = {
+    (BuiltinShell.CSH.value, BuiltinShell.TCSH.value): BuiltinShell.TCSH.value
+}
+
+_BSD_CSH_BUILTINS = tuple(
+    "alias bg break breaksw case cd chdir continue default dirs echo else end endif endsw "
+    "eval exec exit fg foreach glob goto hashstat history if jobs kill limit login logout "
+    "nice nohup notify onintr popd pushd rehash repeat set setenv shift source stop suspend "
+    "switch time umask unalias unhash unlimit unset unsetenv wait while".split()
+)
+_SH_BUILTINS = tuple(
+    "alias bg break cd command continue eval exec exit export false fc fg getopts hash jobs "
+    "kill printf pwd read readonly return set shift test times trap true type ulimit umask "
+    "unalias unset wait".split()
+)
+
+
+@dataclass(frozen=True)
+class WordMotion:
+    """Stock Emacs word movement for keys recovered from the foreground PTY."""
+
+    extra: str
+    forward_to_start: bool = False
+    control_arrows: bool = False
+
+    def position(self, text: str, cursor: int, count: int) -> int:
+        """Move across words by a signed count, stopping at either buffer boundary."""
+
+        def word(char):
+            return char.isalnum() or char in self.extra
+
+        if count < 0:
+            for _ in range(-count):
+                if cursor == 0:
+                    break
+                while cursor and not word(text[cursor - 1]):
+                    cursor -= 1
+                while cursor and word(text[cursor - 1]):
+                    cursor -= 1
+        else:
+            end = len(text)
+            # ZLE stops at the next word's start, Readline and tcsh at a word's end.
+            first = self.forward_to_start
+            for _ in range(count):
+                if cursor == end:
+                    break
+                while cursor < end and word(text[cursor]) == first:
+                    cursor += 1
+                while cursor < end and word(text[cursor]) != first:
+                    cursor += 1
+        return cursor
+
+
+_BASH_WORD_MOTION = WordMotion("", control_arrows=True)
+_ZSH_WORD_MOTION = WordMotion("*?_-.[]~=/&;!#$%^(){}<>", forward_to_start=True)
+_TCSH_WORD_MOTION = WordMotion("*?_-.[]~=")
 
 # Build and activation choices live here. Native implementations stay in guard.py.
 NATIVE_LIBRARIES = {
@@ -86,12 +155,19 @@ def csh_quote(value: str) -> str:
     if "\n" in value or "\r" in value:
         raise ValueError("C shell integration paths cannot contain newlines")
     return (
-        "".join(
-            "\\" + c if c.isspace() or c in "'\"\\$`!;&|()<>*?[]{}~#" else c
-            for c in value
-        )
+        "".join("\\" + c if c.isspace() or c in _CSH_QUOTED_CHARS else c for c in value)
         or "''"
     )
+
+
+def _alias_map(entries: Iterable[str], separator: str) -> dict[str, str]:
+    """Keep each alias name and its body, including separators inside the body."""
+    aliases = {}
+    for entry in entries:
+        name, found, body = entry.partition(separator)
+        if found:
+            aliases[name] = body
+    return aliases
 
 
 def posix_aliases(text: str) -> dict[str, str]:
@@ -99,12 +175,12 @@ def posix_aliases(text: str) -> dict[str, str]:
     lexer = shlex.shlex(text, posix=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
-    return dict(token.split("=", 1) for token in lexer if "=" in token)
+    return _alias_map(lexer, _POSIX_ALIAS_SEPARATOR)
 
 
 def csh_aliases(text: str) -> dict[str, str]:
     """Extract names and bodies from tab-separated C shell alias output."""
-    return dict(line.split("\t", 1) for line in text.splitlines() if "\t" in line)
+    return _alias_map(text.splitlines(), _CSH_ALIAS_SEPARATOR)
 
 
 @dataclass(frozen=True)
@@ -126,13 +202,12 @@ class ShellSyntax:
 
     def preserve_status(self, command: str) -> str:
         """Wrap a command with syntax that saves and restores the previous exit status."""
-        saved = "_ish_recovery_exit_code"
         return (
-            self.assign(saved, self.exit_status)
+            self.assign(_RECOVERY_EXIT_CODE, self.exit_status)
             + "; "
             + command.rstrip("\n")
             + "; "
-            + self.restore_status.format(value='"$' + saved + '"')
+            + self.restore_status.format(value=_RECOVERY_EXIT_CODE_REF)
             + "\n"
         )
 
@@ -189,41 +264,6 @@ CSH_BEHAVIOR = ShellBehavior(
     preserve_output_line=True,
     batch_input=True,
 )
-INTEGRATION_ARGUMENTS = ("_ish_pipe", "_tty_pipe")
-
-
-@dataclass(frozen=True)
-class WordMotion:
-    """Stock Emacs word movement for keys recovered from the foreground PTY."""
-
-    extra: str
-    forward_to_start: bool = False
-    control_arrows: bool = False
-
-    def position(self, text: str, cursor: int, count: int) -> int:
-        """Move across words by a signed count, stopping at either buffer boundary."""
-
-        def word(char):
-            return char.isalnum() or char in self.extra
-
-        end = len(text)
-        for _ in range(abs(count)):
-            if count < 0:
-                if cursor == 0:
-                    break
-                while cursor and not word(text[cursor - 1]):
-                    cursor -= 1
-                while cursor and word(text[cursor - 1]):
-                    cursor -= 1
-            else:
-                if cursor == end:
-                    break
-                # ZLE's forward-word stops at the next word's beginning.
-                # Readline and tcsh stop at the end of the current/next word.
-                for match_word in (self.forward_to_start, not self.forward_to_start):
-                    while cursor < end and word(text[cursor]) == match_word:
-                        cursor += 1
-        return cursor
 
 
 @dataclass(frozen=True)
@@ -326,7 +366,7 @@ class ShellAdapter:
         command = self.source(directory / self.refresh_script)
         if self.capture_refresh_status:
             command = (
-                self.syntax.assign("_ish_shell_exit_code", self.syntax.exit_status)
+                self.syntax.assign(_SHELL_EXIT_CODE, self.syntax.exit_status)
                 + "; "
                 + command
             )
@@ -376,14 +416,14 @@ class ShellAdapter:
             )
 
 
-ADAPTERS = {
-    "bash": ShellAdapter(
-        "bash",
+_SHELLS = (
+    ShellAdapter(
+        BuiltinShell.BASH.value,
         "posix",
         ("--noediting", "-i"),
         BASH_INTEGRATION_SCRIPT,
         parsing=BASH_PARSING,
-        word_motion=WordMotion("", control_arrows=True),
+        word_motion=_BASH_WORD_MOTION,
         source_command="source",
         buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
@@ -391,13 +431,13 @@ ADAPTERS = {
         template_tokens=(("@BASH_DEFAULT_CONTINUATION@", "> "),),
         long_input=LongInputMode.STAGED_FIRST_LINE,
     ),
-    "zsh": ShellAdapter(
-        "zsh",
+    ShellAdapter(
+        BuiltinShell.ZSH.value,
         "posix",
         ("-i",),
         ZSH_INTEGRATION_SCRIPT,
         parsing=ZSH_PARSING,
-        word_motion=WordMotion("*?_-.[]~=/&;!#$%^(){}<>", forward_to_start=True),
+        word_motion=_ZSH_WORD_MOTION,
         source_command="source",
         buffered_continuation_suffix=BUFFERED_CONTINUATION_HINT,
         builtins_command='printf "%s\\n" ${(k)builtins}',
@@ -410,13 +450,13 @@ ADAPTERS = {
             terminal=(TerminalSignal(signal.SIGINT, termios.VINTR, ZshInterrupt),)
         ),
     ),
-    "tcsh": ShellAdapter(
-        "tcsh",
+    ShellAdapter(
+        BuiltinShell.TCSH.value,
         "csh",
         ("-i",),
         TCSH_INTEGRATION_SCRIPT,
         parsing=CSH_PARSING,
-        word_motion=WordMotion("*?_-.[]~="),
+        word_motion=_TCSH_WORD_MOTION,
         behavior=CSH_BEHAVIOR,
         unhooked_prompt=(CARET_BEFORE_PROMPT, CARET_AFTER_PROMPT),
         native_continuation_signal=NATIVE_CONTINUATION,
@@ -428,8 +468,8 @@ ADAPTERS = {
         builtins_args=("-f", "-c"),
         long_input=LongInputMode.STAGED_FIRST_LINE,
     ),
-    "csh": ShellAdapter(
-        "csh",
+    ShellAdapter(
+        BuiltinShell.CSH.value,
         "csh",
         ("-i",),
         CSH_INTEGRATION_SCRIPT,
@@ -440,15 +480,10 @@ ADAPTERS = {
         capture_refresh_status=True,
         input_handoff=InputHandoffMode.NATIVE,
         long_input=LongInputMode.STAGED_FIRST_LINE,
-        builtins=tuple(
-            "alias bg break breaksw case cd chdir continue default dirs echo else end endif endsw "
-            "eval exec exit fg foreach glob goto hashstat history if jobs kill limit login logout "
-            "nice nohup notify onintr popd pushd rehash repeat set setenv shift source stop suspend "
-            "switch time umask unalias unhash unlimit unset unsetenv wait while".split()
-        ),
+        builtins=_BSD_CSH_BUILTINS,
     ),
-    "sh": ShellAdapter(
-        "sh",
+    ShellAdapter(
+        BuiltinShell.SH.value,
         "posix",
         ("-i",),
         POSIX_INTEGRATION_SCRIPT,
@@ -456,13 +491,13 @@ ADAPTERS = {
         source_args=INTEGRATION_ARGUMENTS,
         # dash can execute a suffix after rejecting an earlier long fragment.
         long_input=LongInputMode.REJECT,
-        builtins=tuple(
-            "alias bg break cd command continue eval exec exit export false fc fg getopts hash jobs "
-            "kill printf pwd read readonly return set shift test times trap true type ulimit umask "
-            "unalias unset wait".split()
-        ),
+        builtins=_SH_BUILTINS,
     ),
-}
+)
+ADAPTERS = {adapter.name: adapter for adapter in _SHELLS}
+# Check the shipped catalog once, before extension code can add session policies.
+if len(_SHELLS) != len(ADAPTERS) or ADAPTERS.keys() != set(BuiltinShell):
+    raise RuntimeError("Every built-in shell requires exactly one adapter")
 
 
 def preload_libraries() -> tuple[NativeLibrary, ...]:
@@ -484,9 +519,6 @@ SHELL_CATEGORIES = {
     )
     for family in SYNTAXES
 }
-SHELL_ALIASES = {"bsd-csh": "csh", "dash": "sh"}
-# /bin/csh may be a tcsh symlink, which needs tcsh's integration hooks.
-RESOLVED_SHELL_ALIASES = {("csh", "tcsh"): "tcsh"}
 
 
 def get_adapter(shell: str, path: str | None = None) -> ShellAdapter:

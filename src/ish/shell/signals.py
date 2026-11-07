@@ -19,15 +19,16 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
-from ish.runtime.process import ProcessGroup
+from ish.runtime.process import ProcessGroup, shell_exitcode
 
-from .input import InputRejected
+from .input import DISABLED_CONTROL, InputRejected, control_character
 
 if TYPE_CHECKING:
     from .engine import InteractiveShell
 
 CHILD_SHUTDOWN_GRACE = 2.0
 CHILD_SHUTDOWN_CHECK_INTERVAL = 0.05
+_UNCATCHABLE_SIGNALS = (signal.SIGKILL, signal.SIGSTOP)
 
 
 class SignalScope(Enum):
@@ -172,7 +173,7 @@ class ShellSignalController:
         self._session_task = None
         self._process = _bindings(DEFAULT_PROCESS_SIGNALS, policy.process)
         for binding in self._process:
-            if binding.signum in (signal.SIGKILL, signal.SIGSTOP):
+            if binding.signum in _UNCATCHABLE_SIGNALS:
                 raise ValueError("SIGKILL and SIGSTOP cannot have process handlers")
         self._terminal = tuple(
             (binding, binding.handler(shell))
@@ -239,7 +240,7 @@ class ShellSignalController:
             finally:
                 self._session_task = None
             if self.shutdown_signal is not None:
-                return 128 + self.shutdown_signal
+                return shell_exitcode(-self.shutdown_signal)
             return status
 
     @staticmethod
@@ -247,9 +248,8 @@ class ShellSignalController:
         """Read the configured signal character only when ISIG enables it."""
         if not attrs[3] & termios.ISIG:
             return None
-        value = attrs[6][index]
-        value = bytes((value,)) if isinstance(value, int) else bytes(value)
-        return value if value != b"\0" else None
+        value = control_character(attrs, index)
+        return value if value != DISABLED_CONTROL else None
 
     def get_terminal_handler(self, signum: int) -> TerminalSignalHandler | None:
         """Return the session's selected handler without mutating adapter defaults."""

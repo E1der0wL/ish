@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pwd
 import shlex
+from posixpath import sep as _PATH_SEPARATOR
 from typing import Callable, Iterable, Mapping, Pattern, Sequence, Union
 
 from prompt_toolkit.completion import Completer, Completion
@@ -12,8 +13,11 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import AnyFormattedText
 
 from ish.parser.completion import CompletionWord, completion_context
+from ish.parser.lexical import TILDE
 
 __all__ = ["PathCompleter", "PromptCompleter"]
+
+_ARGUMENT_END = " "
 
 
 def _default_context(document: Document) -> CompletionWord | None:
@@ -38,7 +42,7 @@ class PathCompleter(Completer):
     ) -> None:
         """Configure the search-path provider, file filter, and shell quoting function."""
         self.only_directories = only_directories
-        self.get_paths = get_paths or (lambda: ["."])
+        self.get_paths = get_paths or (lambda: [os.curdir])
         self.file_filter = file_filter or (lambda _: True)
         self.expanduser = expanduser
         self.quote = quote
@@ -47,7 +51,7 @@ class PathCompleter(Completer):
 
     def _home_directory(self, tilde: str) -> str:
         """Use the shell's HOME for bare tilde and passwd data for named users."""
-        if tilde != "~" or self.get_home is None:
+        if tilde != TILDE or self.get_home is None:
             return os.path.expanduser(tilde)
         home = self.get_home()
         if home is not None:
@@ -72,44 +76,52 @@ class PathCompleter(Completer):
         raw_word = document.text_before_cursor[word.start :]
         text = word.value
         home_prefix = ""
-        if self.expanduser and raw_word.startswith("~"):
-            tilde, separator, relative = word.value.partition("/")
+        if self.expanduser and raw_word.startswith(TILDE):
+            tilde, separator, relative = word.value.partition(_PATH_SEPARATOR)
             # Quoted or escaped tildes/usernames remain literal filesystem names.
-            if raw_word.partition("/")[0] == tilde:
+            if raw_word.partition(_PATH_SEPARATOR)[0] == tilde:
                 home = self._home_directory(tilde)
                 if home != tilde:
                     if not separator:
-                        directory = home or "/"
+                        directory = home or _PATH_SEPARATOR
                         roots = [""] if os.path.isabs(directory) else self.get_paths()
                         for root in roots:
                             path = os.path.join(root, directory)
                             if os.path.isdir(path) and self.file_filter(path):
                                 yield Completion(
-                                    text=tilde + "/",
+                                    text=tilde + _PATH_SEPARATOR,
                                     start_position=word.start
                                     - document.cursor_position,
                                 )
                                 break
                         return
-                    home_prefix = tilde + "/"
-                    text = home.rstrip("/") + "/" + relative
+                    home_prefix = tilde + _PATH_SEPARATOR
+                    text = home.rstrip(_PATH_SEPARATOR) + _PATH_SEPARATOR + relative
         dirname, prefix = os.path.split(text)
         input_dirname = os.path.dirname(word.value)
         try:
             matches = {}
             roots = [""] if os.path.isabs(dirname) else self.get_paths()
             for root in roots:
-                directory = os.path.join(root or ".", dirname)
-                with os.scandir(directory) as entries:
-                    for entry in entries:
-                        if entry.name.startswith(prefix) and self.file_filter(
-                            entry.path
-                        ):
-                            is_dir = entry.is_dir()
+                directory = os.path.join(root or os.curdir, dirname)
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            if not entry.name.startswith(prefix):
+                                continue
+                            try:
+                                if not self.file_filter(entry.path):
+                                    continue
+                                is_dir = entry.is_dir()
+                            except OSError:
+                                continue
                             if is_dir or not self.only_directories:
                                 matches[entry.name] = is_dir
+                except OSError:
+                    continue
             for name, is_dir in sorted(matches.items()):
-                path = os.path.join(input_dirname, name) + ("/" if is_dir else "")
+                suffix = _PATH_SEPARATOR if is_dir else ""
+                path = os.path.join(input_dirname, name) + suffix
                 # Keep the tilde unquoted so the shell expands it when submitted.
                 # Only the remaining path needs the shell's literal quoting.
                 try:
@@ -122,9 +134,9 @@ class PathCompleter(Completer):
                     # Some shell syntaxes cannot represent a filename containing LF.
                     continue
                 yield Completion(
-                    text=quoted + ("" if is_dir else " "),
+                    text=quoted + ("" if is_dir else _ARGUMENT_END),
                     start_position=word.start - document.cursor_position,
-                    display=name + ("/" if is_dir else ""),
+                    display=name + suffix,
                 )
         except (TypeError, OSError):
             return
@@ -165,15 +177,15 @@ class PromptCompleter(Completer):
 
     def get_completions(self, document, complete_event) -> Iterable[Completion]:
         """Provide path candidates and add command names only at command positions."""
-        words = self.words
-        if callable(words):
-            words = words()
-
         word = self.context(document)
         if word is None:
             return
+        command_position = word.command and not word.dynamic
+        words = self.words
+        if command_position and callable(words):
+            words = words()
         yield from self.path_completer.complete(document, word)
-        if not word.command or word.dynamic:
+        if not command_position:
             return
         prefix = word.value.casefold() if self.ignore_case else word.value
         for command in words:
@@ -189,7 +201,7 @@ class PromptCompleter(Completer):
                 except ValueError:
                     continue
                 yield Completion(
-                    text=quoted + " ",
+                    text=quoted + _ARGUMENT_END,
                     start_position=word.start - document.cursor_position,
                     display=self.display_dict.get(command, command),
                     display_meta=self.meta_dict.get(command, ""),

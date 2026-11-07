@@ -15,6 +15,8 @@ dependencies = [
     "prompt-toolkit==3.0.53",
     "psutil==7.2.2",
     "pygments==2.21.0",
+    "pyte==0.8.2",
+    "wcwidth==0.8.3",
 ]
 
 [project.scripts]

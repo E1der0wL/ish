@@ -4,7 +4,7 @@ import asyncio
 import codecs
 import re
 from contextlib import contextmanager
-from itertools import groupby, takewhile
+from itertools import chain, groupby, takewhile
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.filters import (
@@ -13,23 +13,38 @@ from prompt_toolkit.filters import (
     is_searching,
     vi_insert_mode,
 )
+from prompt_toolkit.input.ansi_escape_sequences import REVERSE_ANSI_SEQUENCES
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.key_binding import KeyPress
+from prompt_toolkit.key_binding.key_bindings import Binding
 from prompt_toolkit.key_binding.key_processor import KeyProcessor
 from prompt_toolkit.keys import Keys
 
-from ish.runtime.observer import InputObserver
+from ish.runtime.observer import EDITOR, InputObserver
 from ish.shell.input import PASTE_END, PASTE_START
 from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
 
+_WIRE_ERRORS = "surrogateescape"
+_ASCII_COMPATIBLE = ("ascii", "utf-8")
+_SEARCH_KEYS = (Keys.ControlR, Keys.ControlS)
+INTERRUPT_KEYS = (Keys.ControlC, Keys.ControlD)
+_INTERRUPT_BYTES = tuple(
+    REVERSE_ANSI_SEQUENCES[key].encode("ascii") for key in INTERRUPT_KEYS
+)
+CANONICAL_ENTER = REVERSE_ANSI_SEQUENCES[Keys.ControlJ].encode("ascii")
+TERMINAL_ENTER = REVERSE_ANSI_SEQUENCES[Keys.Enter].encode("ascii")
+_REPLAY_CHUNK_BYTES = 4096
 _PASTE_START = PASTE_START.decode("ascii")
 _PASTE_END = PASTE_END.decode("ascii")
 _ASCII_TEXT = re.compile(rb"[ -~]+")
+_TRACE_FLUSH = "parser_flush"
+_TRACE_ATTACH = "attach"
+_TRACE_KEY_UNIT = "keys"
 
 
-def wire_text(key: KeyPress) -> str:
+def _wire_text(key: KeyPress) -> str:
     """Recover a parsed key's terminal input, including bracketed-paste framing."""
     if key.key == Keys.BracketedPaste:
         return _PASTE_START + key.data + _PASTE_END
@@ -48,6 +63,8 @@ class HandoffKeyProcessor(KeyProcessor):
     def _get_matches(self, key_presses):
         # PTK looks up exact matches before longer prefixes, including on retry.
         # The first key owns the chord even when its last key arrived live.
+        if isinstance(key_presses[0], _LiteralKey):
+            return [_LiteralKey.BINDING]
         self._bindings = (
             self.native_bindings
             if isinstance(key_presses[0], NativeKey)
@@ -89,28 +106,29 @@ class HandoffKeyProcessor(KeyProcessor):
                 self.feed_multiple(group)
                 self.process_keys()
                 continue
-            run = list(group)
-            for index, key in enumerate(run):
+            # Each branch that drains the remainder exits the run immediately.
+            run = iter(group)
+            for key in run:
                 if get_app().is_done:
-                    self.feed_multiple(run[index:])
+                    self.feed_multiple(chain((key,), run))
                     break
                 # A pending Meta chord, repeat count, search or vi operation may
                 # consume the first printable before normal insertion resumes.
                 if self.can_insert_run(buffer):
-                    self.feed(
-                        NativeKey(Keys.Any, "".join(item.data for item in run[index:]))
-                    )
-                    self.process_keys()
+                    self.insert_run("".join(item.data for item in chain((key,), run)))
                     break
                 self.feed(key)
                 self.process_keys()
 
+    def insert_run(self, text):
+        """Apply one stock self-insert after the caller has verified insert mode."""
+        self.feed(NativeKey(Keys.Any, text))
+        self.process_keys()
+
     def _call_handler(self, handler, key_sequence):
         first = key_sequence[0]
         may_start_search = (
-            isinstance(first, NativeKey)
-            and first.key in (Keys.ControlR, Keys.ControlS)
-            and emacs_mode()
+            isinstance(first, NativeKey) and first.key in _SEARCH_KEYS and emacs_mode()
         )
         super()._call_handler(handler, key_sequence)
         if self.native_search or may_start_search:
@@ -121,7 +139,7 @@ class HandoffKeyProcessor(KeyProcessor):
             self.feed_multiple(self.key_buffer[len(key_sequence) :], first=True)
             del self.key_buffer[len(key_sequence) :]
 
-    def accepted_offset(self, keys, buffered, encoding):
+    def accepted_offset(self, keys, buffered, replay):
         """Unqueue replay's remaining events and report their original byte boundary.
 
         Key bindings may also enqueue synthetic input. Keep those events for
@@ -133,15 +151,26 @@ class HandoffKeyProcessor(KeyProcessor):
         self.input_queue.clear()
         self.feed_multiple(retained)
         handled = takewhile(lambda key: id(key) not in unread, keys)
-        consumed = len(
-            "".join(map(wire_text, handled)).encode(encoding, "surrogateescape")
-        )
-        previous = "".join(wire_text(key) for key in buffered if id(key) in unread)
-        return consumed, previous.encode(encoding, "surrogateescape")
+        consumed = len(replay.encode_keys(handled))
+        previous = replay.encode_keys(key for key in buffered if id(key) in unread)
+        return consumed, previous
 
 
 class NativeKey(KeyPress):
     """A key whose first wire byte came back from the foreground PTY."""
+
+    @classmethod
+    def from_event(cls, key):
+        """Restore Enter after a canonical PTY translated CR to LF."""
+        return cls(Keys.Enter if key.key == Keys.ControlJ else key.key, key.data)
+
+
+class _LiteralKey(KeyPress):
+    """Complete submitted text exactly once, independently of editing mode or keymaps."""
+
+    BINDING = Binding(
+        (), lambda event: event.current_buffer.insert_text(event.data), eager=True
+    )
 
 
 class ReplayInput:
@@ -154,12 +183,48 @@ class ReplayInput:
     def __init__(self, encoding: str):
         """Keep incomplete characters, protocol bytes and decoded events together."""
         self.encoding = encoding
-        self.ascii_text = codecs.lookup(encoding).name in ("ascii", "utf-8")
-        self.decoder = codecs.getincrementaldecoder(encoding)(errors="surrogateescape")
+        self.ascii_text = codecs.lookup(encoding).name in _ASCII_COMPATIBLE
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors=_WIRE_ERRORS)
         self.keys = []
         self.parser = Vt100Parser(self.keys.append)
         self.pending = bytearray()
-        self.pending_native = False
+        self._pending_origin = KeyPress
+        self._lookahead = b""
+
+    def encode_keys(self, keys) -> bytes:
+        """Serialize PTK events back to wire bytes, preserving their original framing."""
+        return "".join(map(_wire_text, keys)).encode(self.encoding, _WIRE_ERRORS)
+
+    def encode_key(self, key) -> bytes:
+        """Serialize one event without allocating a sequence for it."""
+        return _wire_text(key).encode(self.encoding, _WIRE_ERRORS)
+
+    def decode(self, data) -> str:
+        """Inspect wire text without advancing the incremental decoder."""
+        return data.decode(self.encoding, _WIRE_ERRORS)
+
+    def read_literal(self, data: bytes) -> str:
+        """Restore submitted text and retain its incomplete character for the next read."""
+        text = self.decoder.decode(data)
+        self.pending[:] = self.decoder.getstate()[0]
+        self._pending_origin = _LiteralKey
+        return text
+
+    @property
+    def has_lookahead(self) -> bool:
+        """Report whether an earlier chord still owns bytes ahead of the queues."""
+        return bool(self._lookahead)
+
+    def take_lookahead(self) -> bytes:
+        """Consume an earlier chord prefix before the engine's newer input."""
+        data, self._lookahead = self._lookahead, b""
+        return data
+
+    def resume_lookahead(self, replay) -> None:
+        """Apply an older chord prefix and retain any suffix after an accepting binding."""
+        prefix = self.take_lookahead()
+        used = replay(prefix, native=False)
+        self._lookahead += prefix[used:]
 
     def ascii_run(self, data, start, stop):
         """Match bytes guaranteed to decode as ordinary text at a VT boundary."""
@@ -171,30 +236,128 @@ class ReplayInput:
         """Return decoded events and retain bytes for the next partial key or paste."""
         older = len(self.pending)
         self.pending.extend(data)
-        self.parser.feed(self.decoder.decode(data))
+        text = self.decoder.decode(data)
+        if older and self._pending_origin is _LiteralKey:
+            # A literal prefix can decode to one character or (for invalid
+            # UTF-8) several escaped bytes. Keep all of them out of VT parsing.
+            pos = size = 0
+            while pos < len(text) and size < older:
+                char = text[pos]
+                self.keys.append(_LiteralKey(Keys.Any, char))
+                size += len(char.encode(self.encoding, _WIRE_ERRORS))
+                pos += 1
+            text = text[pos:]
+        self.parser.feed(text)
         if flush:
             self.parser.flush()
-        keys = self.keys[:]
+        origin = NativeKey if native else KeyPress
+        if not older or self._pending_origin is origin:
+            # A single owner for this batch lets us count the wire bytes in one pass.
+            consumed = len(self.encode_keys(self.keys))
+            keys = (
+                [NativeKey.from_event(key) for key in self.keys]
+                if native
+                else self.keys[:]
+            )
+        else:
+            keys = self.keys[:]
+            consumed = 0
+            owner = self._pending_origin
+            for index, key in enumerate(keys):
+                wire = self.encode_key(key)
+                if wire:
+                    owner = self._pending_origin if consumed < older else origin
+                    consumed += len(wire)
+                if owner is NativeKey:
+                    keys[index] = NativeKey.from_event(key)
         self.keys.clear()
-        consumed = 0
-        owner = self.pending_native if older else native
-        for index, key in enumerate(keys):
-            wire = wire_text(key)
-            if wire:
-                owner = self.pending_native if consumed < older else native
-                consumed += len(wire.encode(self.encoding, "surrogateescape"))
-            if owner:
-                # Linux ICANON may have mapped the original Enter (CR) to LF.
-                keys[index] = NativeKey(
-                    Keys.Enter if key.key == Keys.ControlJ else key.key, key.data
-                )
         if consumed:
             self.pending = self.pending[consumed:]
         if consumed >= older:
-            self.pending_native = native
+            self._pending_origin = origin
         if len(self.pending) > TYPEAHEAD_LIMIT_BYTES:
             raise BufferError("Incomplete terminal input exceeds the typeahead limit")
         return keys
+
+    def dispatch(self, data, *, native, app, buffer) -> int:
+        """Run PTK bindings up to acceptance, leaving the next reader's bytes untouched."""
+        processor = app.key_processor
+        offset = 0
+        while offset < len(data) and not app.is_done:
+            stop = min(offset + _REPLAY_CHUNK_BYTES, len(data))
+            if native:
+                run = self.ascii_run(data, offset, stop)
+                if run and processor.can_insert_run(buffer):
+                    processor.insert_run(run[0].decode("ascii"))
+                    offset = run.end()
+                    continue
+            # Avoid parsing a following command's stdin until the Enter is handled.
+            newline = data.find(CANONICAL_ENTER, offset, stop)
+            if newline >= 0 and not self.parser._in_bracketed_paste:
+                stop = newline + 1
+            wire = self.pending
+            older = len(wire)
+            buffered = processor.key_buffer[:]
+            keys = self.read(data[offset:stop], native=native)
+            processor.process_replay(keys, buffer)
+            if app.is_done:
+                if not processor.input_queue and not self.pending:
+                    # PTK consumed the entire batch without any lookahead.
+                    self.take()
+                    return stop
+                consumed, previous = processor.accepted_offset(keys, buffered, self)
+                self.take()
+                boundary = offset + consumed - older - len(previous)
+                if boundary < 0:
+                    # Unmatched chord bytes from an earlier call precede this batch.
+                    self._lookahead = (previous + wire[consumed:older])[:-boundary]
+                return max(0, boundary)
+            offset = stop
+        return offset
+
+    def has_interrupt(self, native, fresh, saved, default_enter, *, live_key=None):
+        """Probe the same decoder for a cancellation gesture outside paste or later stdin."""
+        streams = (
+            (self.pending, self._pending_origin is NativeKey),
+            (self._lookahead, False),
+            (native, True),
+            (fresh, False),
+        )
+        if live_key is None and not (
+            any(marker in data for data, _ in streams for marker in _INTERRUPT_BYTES)
+            or any(key.key in INTERRUPT_KEYS for key in saved)
+        ):
+            return False
+        probe = ReplayInput(self.encoding)
+        if self._pending_origin is _LiteralKey:
+            probe.read_literal(self.pending)
+            streams = streams[1:]
+        normal_enter = default_enter() if live_key is None else False
+        saved_data = self.encode_keys(
+            key for key in saved if key.key != Keys.CPRResponse
+        )
+        for data, owner in (*streams, (saved_data, False)):
+            for offset in range(0, len(data), _REPLAY_CHUNK_BYTES):
+                events = probe.read(
+                    data[offset : offset + _REPLAY_CHUNK_BYTES], native=owner
+                )
+                if live_key is not None:
+                    continue
+                for key in events:
+                    if key.key in INTERRUPT_KEYS:
+                        return True
+                    if key.key == Keys.Enter and (
+                        isinstance(key, NativeKey) or normal_enter
+                    ):
+                        return False
+        if live_key is not None:
+            # Live cancellation may release the history wait even after an Enter,
+            # unless the key completes a paste started by earlier input.
+            return any(
+                key.key in INTERRUPT_KEYS
+                for key in probe.read(self.encode_key(live_key))
+            )
+        return False
 
     def take(self) -> bytes:
         """Transfer an unfinished character, escape or paste verbatim."""
@@ -202,7 +365,7 @@ class ReplayInput:
         self.pending.clear()
         self.decoder.reset()
         self.parser.reset()
-        self.pending_native = False
+        self._pending_origin = KeyPress
         return pending
 
 
@@ -235,7 +398,7 @@ class ObservedInput(Input):
             self.flush_task = None
         keys = self.source.read_keys()
         token = self._tokens[-1] if self._tokens else None
-        self.observer.read("EDITOR", token, len(keys), unit="keys")
+        self.observer.read(EDITOR, token, len(keys), unit=_TRACE_KEY_UNIT)
         return self.prepare_keys(keys)
 
     def schedule_flush(self, app):
@@ -254,7 +417,7 @@ class ObservedInput(Input):
     def flush_keys(self):
         """Flush ambiguous live and returned VT sequences on PTK's normal timeout."""
         keys = self.source.flush_keys()
-        self.observer.record("parser_flush", "EDITOR", keys=len(keys))
+        self.observer.record(_TRACE_FLUSH, EDITOR, keys=len(keys))
         keys = self.prepare_keys(keys)
         if self.hold_keys is None and self.replay.pending:
             keys.extend(self.replay.read(b"", flush=True))
@@ -273,10 +436,7 @@ class ObservedInput(Input):
             else:
                 # One physical VT sequence can emit two logical keys. Reparse
                 # the wire data as a group so its second event isn't duplicated.
-                data = "".join(map(wire_text, group)).encode(
-                    self.replay.encoding, "surrogateescape"
-                )
-                joined.extend(self.replay.read(data))
+                joined.extend(self.replay.read(self.replay.encode_keys(group)))
         return joined
 
     def take_pending(self) -> bytes:
@@ -285,16 +445,14 @@ class ObservedInput(Input):
         data = self.replay.take()
         keys = get_typeahead(self)
         keys.extend(self.source.flush_keys())
-        data += "".join(
-            wire_text(key) for key in keys if key.key != Keys.CPRResponse
-        ).encode(encoding, "surrogateescape")
+        data += self.replay.encode_keys(
+            key for key in keys if key.key != Keys.CPRResponse
+        )
         parser = getattr(self.source, "vt100_parser", None)
         if parser is not None and parser._in_bracketed_paste:
             # PTK's flush waits for a closing marker. A different stdin owner
             # must instead receive all the bytes already read from the terminal.
-            data += (_PASTE_START + parser._paste_buffer).encode(
-                encoding, "surrogateescape"
-            )
+            data += (_PASTE_START + parser._paste_buffer).encode(encoding, _WIRE_ERRORS)
             parser.reset()
         reader = getattr(self.source, "stdin_reader", None)
         if reader is not None:
@@ -324,7 +482,7 @@ class ObservedInput(Input):
     @contextmanager
     def attach(self, input_ready_callback):
         """Observe actual attachment, including cleanup after an exception."""
-        self._tokens.append(self.observer.begin("EDITOR"))
+        self._tokens.append(self.observer.begin(EDITOR))
         try:
             with self.source.attach(input_ready_callback):
                 if self.observer.enabled:
@@ -332,7 +490,7 @@ class ObservedInput(Input):
                         fd = self.fileno()
                     except (OSError, NotImplementedError):
                         fd = None
-                    self.observer.sample("EDITOR", fd, "attach")
+                    self.observer.sample(EDITOR, fd, _TRACE_ATTACH)
                 yield
         finally:
             self.observer.end(self._tokens.pop())
@@ -350,7 +508,7 @@ class ObservedInput(Input):
                 yield
         finally:
             if suspended:
-                self._tokens[-1] = self.observer.begin("EDITOR")
+                self._tokens[-1] = self.observer.begin(EDITOR)
 
     def close(self):
         """Delegate explicit closure to the original input."""

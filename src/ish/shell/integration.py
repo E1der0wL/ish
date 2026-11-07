@@ -16,7 +16,7 @@ import traceback
 from pathlib import Path
 
 from ish.config import config
-from ish.lang import i18n
+from ish.lang import Message, i18n
 from ish.log import get_logger
 from ish.runtime.distribution import bundled_forward_binary
 
@@ -36,6 +36,7 @@ from .constants import (
     FORWARD_SOURCE,
     INPUT_DONE,
     INPUT_ERROR,
+    NATIVE_COMPILER,
     PROMPT_ID,
     bytes_to_shell_escape,
 )
@@ -68,6 +69,18 @@ __all__ = [
     "build_binary",
     "build_binary_async",
 ]
+
+_SOURCE_ENCODING = "utf-8"
+_SCRIPT_MODE = 0o644
+_BUNDLED_MODE = 0o700
+_COMPILED_MODE = 0o755
+_COMPILER_PREFIX = (NATIVE_COMPILER, "-O3", "-o")
+
+# Literals projected into the C translation unit at import time.
+_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_NATIVE_CHUNK_BYTES = 4096
+_ACK_LINE_CAPACITY = 32
+_ACK_POLL_MILLISECONDS = 5000
 
 
 WIRE_VERSION = VERSION.decode("ascii")
@@ -111,7 +124,7 @@ extern char **environ;
 struct encoder { FILE *out; unsigned char tail[3]; size_t count; };
 static void encode(struct encoder *e, const unsigned char *data, size_t size) {
     static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        "@BASE64_ALPHABET@";
     while (size--) {
         e->tail[e->count++] = *data++;
         if (e->count == 3) {
@@ -129,7 +142,7 @@ static void encode_end(struct encoder *e) {
     unsigned char zero[2] = {0, 0};
     /* Encode the incomplete group directly, with padding instead of zeros. */
     static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        "@BASE64_ALPHABET@";
     memcpy(e->tail + count, zero, 3 - count);
     fputc(alphabet[e->tail[0] >> 2], e->out);
     fputc(alphabet[((e->tail[0] & 3) << 4) | (e->tail[1] >> 4)], e->out);
@@ -148,7 +161,7 @@ static int context(const char *path, const char *status, const char *id) {
     fputs("@SOH@@VERSION@@RS@@EXITCODE@@US@", out);
     encode_string(&e, status);
     fputs("@RS@@ALIAS@@US@", out);
-    unsigned char buf[4096];
+    unsigned char buf[@CHUNK_BYTES@];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) encode(&e, buf, n);
     if (ferror(stdin)) { fclose(out); return 1; }
@@ -196,7 +209,7 @@ static int write_all(int fd, const unsigned char *buf, size_t size) {
  * An interrupted helper may leave an older acknowledgement behind. Read one
  * byte at a time so the next helper's acknowledgement is never consumed here.
  */
-enum { ACK_LINE_CAPACITY = 32 };
+enum { ACK_LINE_CAPACITY = @ACK_CAPACITY@ };
 
 static int acknowledge(int fd, const char *expected, char *line, size_t *used) {
     unsigned char byte;
@@ -272,7 +285,7 @@ int main(int argc, char *argv[]) {
         close(pipe_fd); return 1;
     }
     if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) { result = 1; goto cleanup; }
-    unsigned char buf[4096];
+    unsigned char buf[@CHUNK_BYTES@];
     char ack_line[ACK_LINE_CAPACITY];
     size_t ack_used = 0;
     int acknowledged = ack_fd < 0;
@@ -298,7 +311,7 @@ int main(int argc, char *argv[]) {
                 { .fd = ack_fd, .events = POLLIN }
             };
             int count;
-            do { count = poll(ready, 2, 5000); } while (count < 0 && errno == EINTR && !interrupted);
+            do { count = poll(ready, 2, @ACK_POLL_MS@); } while (count < 0 && errno == EINTR && !interrupted);
             if (count <= 0 || (ready[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
                 (ready[1].revents & (POLLERR | POLLHUP | POLLNVAL))) { result = 1; break; }
         }
@@ -318,6 +331,10 @@ cleanup:
 """)
 
 for _token, _value in {
+    "@BASE64_ALPHABET@": _BASE64_ALPHABET,
+    "@CHUNK_BYTES@": str(_NATIVE_CHUNK_BYTES),
+    "@ACK_CAPACITY@": str(_ACK_LINE_CAPACITY),
+    "@ACK_POLL_MS@": str(_ACK_POLL_MILLISECONDS),
     "@VERSION@": WIRE_VERSION,
     "@SOH@": BIN_SOH,
     "@RS@": BIN_RS,
@@ -372,9 +389,9 @@ def install_scripts(
         input_ack_path=input_ack_path,
     ).items():
         script_path = ish_xdg_home / name
-        with open(script_path, "w", encoding="utf-8", newline="\n") as file:
+        with open(script_path, "w", encoding=_SOURCE_ENCODING, newline="\n") as file:
             file.write(content)
-        os.chmod(script_path, 0o644)
+        os.chmod(script_path, _SCRIPT_MODE)
     return ish_xdg_home
 
 
@@ -388,7 +405,12 @@ def _binary_spec(library: NativeLibrary | None):
             library.compiler_flags,
             library.bundled_path(),
         )
-    return FORWARD_SOURCE, FORWARD_BINARY, TTY_FORWARD, [], bundled_forward_binary()
+    return FORWARD_SOURCE, FORWARD_BINARY, TTY_FORWARD, (), bundled_forward_binary()
+
+
+def _compile_command(binary: Path, source: Path, flags) -> list[str]:
+    """Use the same compiler and flag ordering for synchronous and async builds."""
+    return [*_COMPILER_PREFIX, str(binary), str(source), *flags]
 
 
 def build_binary(*, directory=None, library: NativeLibrary | None = None) -> bool:
@@ -412,25 +434,26 @@ def build_binary(*, directory=None, library: NativeLibrary | None = None) -> boo
     try:
         if bundled is not None:
             shutil.copyfile(bundled, bin_path)
-            os.chmod(bin_path, 0o700)
+            os.chmod(bin_path, _BUNDLED_MODE)
             return True
-        src_path.write_text(source_text, encoding="utf-8")
-        cmd = ["gcc", "-O3", "-o", str(bin_path), str(src_path), *flags]
+        src_path.write_text(source_text, encoding=_SOURCE_ENCODING)
+        cmd = _compile_command(bin_path, src_path, flags)
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
             logger.error(
-                "gcc failed (exit %s): %s",
+                "%s failed (exit %s): %s",
+                NATIVE_COMPILER,
                 result.returncode,
-                result.stderr.decode("utf-8", errors="replace").strip(),
+                result.stderr.decode(_SOURCE_ENCODING, errors="replace").strip(),
             )
             return False
-        os.chmod(bin_path, 0o755)
+        os.chmod(bin_path, _COMPILED_MODE)
         return True
     except FileNotFoundError as exc:
         logger.error("Could not prepare %s: %s", binary_name, exc)
         return False
     except Exception:
-        logger.error(i18n.get("error", error=traceback.format_exc()))
+        logger.error(i18n.get(Message.ERROR, error=traceback.format_exc()))
         return False
     finally:
         src_path.unlink(missing_ok=True)
@@ -455,15 +478,10 @@ async def build_binary_async(
     spawn = None
     completed = False
     try:
-        source.write_text(source_text, encoding="utf-8")
+        source.write_text(source_text, encoding=_SOURCE_ENCODING)
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
-                "gcc",
-                "-O3",
-                "-o",
-                str(binary),
-                str(source),
-                *flags,
+                *_compile_command(binary, source, flags),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -475,12 +493,13 @@ async def build_binary_async(
         completed = True
         if process.returncode:
             get_logger().error(
-                "gcc failed (exit %s): %s",
+                "%s failed (exit %s): %s",
+                NATIVE_COMPILER,
                 process.returncode,
-                error.decode("utf-8", errors="replace").strip(),
+                error.decode(_SOURCE_ENCODING, errors="replace").strip(),
             )
             return False
-        binary.chmod(0o755)
+        binary.chmod(_COMPILED_MODE)
         return True
     except FileNotFoundError as exc:
         get_logger().error("Could not prepare %s: %s", binary_name, exc)

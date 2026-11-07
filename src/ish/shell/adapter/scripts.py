@@ -3,6 +3,9 @@
 import re
 import shlex
 import shutil
+from itertools import chain
+
+from ish.runtime.process import SIGINT_EXITCODE
 
 from ..constants import (
     AFTER_CONTINUATION,
@@ -36,6 +39,9 @@ from ..protocol import (
     CONTEXT_COMMAND,
     EOT,
     FORWARD_COMMAND,
+    READER_FALSE,
+    READER_REPORT_FORMAT,
+    READER_TRUE,
     RS,
     SOH,
     TIME_COMMAND,
@@ -43,6 +49,10 @@ from ..protocol import (
     VERSION,
 )
 from .registry import ADAPTERS, csh_quote
+
+_PRINTF_SEARCH_PATH = "/usr/bin:/bin"
+_PRINTF_FALLBACK = "/usr/bin/printf"
+_PRELOAD_CHECK = "@PRELOAD_CHECK@"
 
 _POSIX_INIT = r"""
 _ish_pipe=$1
@@ -61,102 +71,7 @@ set _ish_cont_after = "`@CSH_PRINTF@ '@CONT_END@'`"
 @PRELOAD_CHECK@
 """
 
-
-def _make_tokens(directory, signals, forward_path, input_ack_path=None):
-    """Quote paths and encode protocol markers for one integration installation."""
-    scope = signals.scope
-    forward_path = forward_path or directory / FORWARD_BINARY
-    # Resolve the few remaining external utilities once, before user commands
-    # can change PATH. The context helper handles encoding and environments.
-    printf_path = shutil.which("printf", path="/usr/bin:/bin") or "/usr/bin/printf"
-    input_ack = str(input_ack_path or "")
-    return {
-        "@CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
-            path='"$_ish_pipe"', status='"$1"', prompt_id='"$_ish_prompt_id"'
-        ),
-        "@CSH_CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
-            path='"$_ish_pipe"',
-            status='"$_ish_shell_exit_code"',
-            prompt_id='"$_ish_prompt_id"',
-        ),
-        "@FORWARD_ARGS@": FORWARD_COMMAND.shell(
-            tty_path='"$_tty_pipe"',
-            ack_path=shlex.quote(input_ack),
-            prompt_id='"$_ish_prompt_id"',
-            context_path='"$_ish_pipe"',
-        ),
-        "@CSH_FORWARD_ARGS@": FORWARD_COMMAND.shell(
-            tty_path='"$_tty_pipe"',
-            ack_path=csh_quote(input_ack),
-            prompt_id='"$_ish_prompt_id"',
-            context_path='"$_ish_pipe"',
-        ),
-        "@TIME_ARGS@": TIME_COMMAND.shell(),
-        "@CLOCK_ARGS@": CLOCK_COMMAND.shell(),
-        "@INPUT_ACK@": shlex.quote(input_ack),
-        "@CSH_INPUT_ACK@": csh_quote(input_ack),
-        "@VERSION@": VERSION.decode("ascii"),
-        "@FORWARD@": shlex.quote(str(forward_path)),
-        "@CSH_FORWARD@": csh_quote(str(forward_path)),
-        "@CSH_PRINTF@": csh_quote(printf_path),
-        "@CSH_UPDATE@": csh_quote(str(directory / CSH_UPDATE_SCRIPT)),
-        "@CSH_HOOK@": csh_quote(str(directory / TCSH_PRECMD_SCRIPT)),
-        "@CSH_BIND@": csh_quote(str(directory / TCSH_BIND_HOOKS_SCRIPT)),
-        "@CSH_WATCH@": csh_quote(str(directory / TCSH_WATCH_HOOKS_SCRIPT)),
-        "@POSIX_UPDATE@": shlex.quote(str(directory / POSIX_UPDATE_SCRIPT)),
-        "@BASH_SELF@": shlex.quote(str(directory / BASH_INTEGRATION_SCRIPT)),
-        "@ZSH_SELF@": shlex.quote(str(directory / ZSH_INTEGRATION_SCRIPT)),
-        "@ZSH_TRAPS@": shlex.quote(str(directory / ZSH_TRAP_SNAPSHOT)),
-        "@POSIX_SELF@": shlex.quote(str(directory / POSIX_INTEGRATION_SCRIPT)),
-        "@CSH_SELF@": csh_quote(str(directory / CSH_INTEGRATION_SCRIPT)),
-        "@SOH@": bytes_to_shell_escape(SOH),
-        "@EOT@": bytes_to_shell_escape(EOT),
-        "@RS@": bytes_to_shell_escape(RS),
-        "@US@": bytes_to_shell_escape(US),
-        "@START@": bytes_to_shell_escape(scope(BEFORE_PROMPT)),
-        "@END@": bytes_to_shell_escape(scope(AFTER_PROMPT)),
-        "@CONT_START@": bytes_to_shell_escape(scope(BEFORE_CONTINUATION)),
-        "@BUFFERED_CONT_START@": bytes_to_shell_escape(
-            scope(BEFORE_BUFFERED_CONTINUATION)
-        ),
-        "@CONT_END@": bytes_to_shell_escape(scope(AFTER_CONTINUATION)),
-        "@BUFFERED_CONT_HINT@": bytes_to_shell_escape(
-            scope(BUFFERED_CONTINUATION_HINT)
-        ),
-        "@PROMPT_ID@": bytes_to_shell_escape(
-            scope(PROMPT_ID_PREFIX) + b"%s" + OSC_TERMINATOR
-        ),
-        "@LINE_READY@": bytes_to_shell_escape(
-            scope(LINE_READER_READY_PREFIX) + b"%s;%s" + OSC_TERMINATOR
-        ),
-        "@LINE_INTERRUPT@": bytes_to_shell_escape(
-            scope(LINE_INTERRUPT_ACK_PREFIX) + b"%s;%s" + OSC_TERMINATOR
-        ),
-        # csh checks only the OSC body so both raw and caret prompts match.
-        "@CSH_NATIVE_CONTINUATION@": bytes_to_shell_escape(scope(NATIVE_CONTINUATION)),
-        "@CSH_START_PATTERN@": csh_quote(
-            scope(BEFORE_PROMPT)[2 : -len(OSC_TERMINATOR)].decode("ascii")
-        ),
-    }
-
-
-def _preload_checks(adapter):
-    """Collect native startup checks, honoring an explicitly selected adapter."""
-    checks = {entry.script: entry.preload_check() for entry in ADAPTERS.values()}
-    if adapter is not None:
-        checks[adapter.script] = adapter.preload_check()
-    return checks
-
-
-def _render_script(template, tokens, preload_check, pattern):
-    """Substitute complete values once, without interpreting inserted literal text."""
-    values = {**tokens, "@PRELOAD_CHECK@": preload_check}
-    return pattern.sub(lambda match: values[match.group()], template).lstrip("\n")
-
-
-def _posix_update(*, alias_command="alias", printf_command="command printf"):
-    """Build shared state functions with explicit shell command spellings."""
-    template = r"""
+_SHARED_FUNCTIONS = r"""
 _ish_update() {
     _ish_prompt_id=$((_ish_prompt_id + 1))
     @UPDATE_ALIAS@ | @FORWARD@ @CONTEXT_ARGS@
@@ -165,17 +80,18 @@ _ish_forward() { @FORWARD@ @FORWARD_ARGS@; }
 _ish_status() { return "$1"; }
 _ish_mark_prompt() { @UPDATE_PRINTF@ '@PROMPT_ID@' "$_ish_prompt_id"; }
 """
-    return template.replace("@UPDATE_ALIAS@", alias_command).replace(
-        "@UPDATE_PRINTF@", printf_command
-    )
 
+_POSIX_FUNCTIONS = _SHARED_FUNCTIONS.replace("@UPDATE_ALIAS@", "alias").replace(
+    "@UPDATE_PRINTF@", "command printf"
+)
+_ZSH_FUNCTIONS = _SHARED_FUNCTIONS.replace("@UPDATE_ALIAS@", "builtin alias").replace(
+    "@UPDATE_PRINTF@", "builtin printf"
+)
 
-def _bash_template():
-    """Assemble Bash hooks without changing shell execution boundaries."""
-    return (
-        _POSIX_INIT
-        + _posix_update()
-        + r"""
+_BASH_TEMPLATE = (
+    _POSIX_INIT
+    + _POSIX_FUNCTIONS
+    + r"""
 ish_recover() {
     local _ish_recover_status=$?
     source @BASH_SELF@ "$_ish_pipe" "$_tty_pipe"
@@ -220,15 +136,12 @@ if [[ "${PROMPT_COMMAND[0]:-}" != _ish_capture_status ]]; then
     PROMPT_COMMAND=(_ish_capture_status "${PROMPT_COMMAND[@]}" _ish_precmd)
 fi
 """
-    )
+)
 
-
-def _zsh_template():
-    """Assemble Zsh hooks with builtin-only shared state functions."""
-    return (
-        _POSIX_INIT
-        + _posix_update(alias_command="builtin alias", printf_command="builtin printf")
-        + r"""
+_ZSH_TEMPLATE = (
+    _POSIX_INIT
+    + _ZSH_FUNCTIONS
+    + r"""
 ish_recover() { source @ZSH_SELF@ "$_ish_pipe" "$_tty_pipe"; }
 unsetopt zle notify promptcr promptsp
 # Startup and explicit recovery restore prompt expansion. The next prompt also
@@ -271,13 +184,13 @@ if (( ! ${+functions[TRAPINT]} )) && builtin trap >| @ZSH_TRAPS@; then
         TRAPINT() {
             if (( ZSH_SUBSHELL == 0 )); then
                 _ish_interrupt_pending=1
-                local _ish_reading=0
+                local _ish_reading=@READER_FALSE@
                 if (( ${_ish_reading_command:-0} )) && [[ ${functions[preexec]-} == "${_ish_line_preexec_body-}" ]]; then
-                    _ish_reading=1
+                    _ish_reading=@READER_TRUE@
                 fi
                 builtin printf '@LINE_INTERRUPT@' "$_ish_prompt_id" "$_ish_reading"
             fi
-            return 130
+            return @INTERRUPT_STATUS@
         }
         _ish_line_interrupt_body=${functions[TRAPINT]}
     fi
@@ -294,7 +207,7 @@ _ish_precmd() {
                 local _ish_saved_status=$?
                 # Revoke reader ownership before any user hook or command runs.
                 _ish_reading_command=0
-                builtin printf '@LINE_READY@' "$_ish_prompt_id" 0
+                builtin printf '@LINE_READY@' "$_ish_prompt_id" @READER_FALSE@
                 _ish_status "$_ish_saved_status"
                 _ish_original_preexec "$@"
             }
@@ -307,9 +220,9 @@ _ish_precmd() {
     _ish_wrap_continuation
     _ish_update "$1"
     _ish_forward
-    local _ish_line_ready=0
+    local _ish_line_ready=@READER_FALSE@
     if [[ -n ${_ish_line_interrupt_body-} && ${functions[TRAPINT]-} == "$_ish_line_interrupt_body" && -n ${_ish_line_preexec_body-} && ${functions[preexec]-} == "$_ish_line_preexec_body" ]]; then
-        _ish_line_ready=1
+        _ish_line_ready=@READER_TRUE@
     fi
     _ish_reading_command=1
     builtin printf '@LINE_READY@' "$_ish_prompt_id" "$_ish_line_ready"
@@ -347,16 +260,15 @@ if [[ ${functions[precmd]-} != *'_ish_precmd '* ]]; then
         return "$_ish_saved_status"
     }
 fi
-"""
-    )
+""".replace("@READER_FALSE@", READER_FALSE.decode("ascii"))
+    .replace("@READER_TRUE@", READER_TRUE.decode("ascii"))
+    .replace("@INTERRUPT_STATUS@", str(SIGINT_EXITCODE))
+)
 
-
-def _posix_templates():
-    """Build POSIX integration and its prompt-refresh companion."""
-    posix = (
-        "_ish_prompt_id=${_ish_prompt_id:-0}\n@PRELOAD_CHECK@\n"
-        + _posix_update()
-        + r"""
+_POSIX_TEMPLATE = (
+    "_ish_prompt_id=${_ish_prompt_id:-0}\n@PRELOAD_CHECK@\n"
+    + _POSIX_FUNCTIONS
+    + r"""
 ish_recover() {
     _ish_recover_status=$?
     . @POSIX_SELF@
@@ -381,23 +293,16 @@ _ish_posix_prompt() {
 }
 . @POSIX_UPDATE@
 """
-    )
-    posix_refresh = r"""
+)
+_POSIX_REFRESH = r"""
 _ish_posix_prompt
 """
-    return {
-        POSIX_INTEGRATION_SCRIPT: posix,
-        POSIX_UPDATE_SCRIPT: posix_refresh,
-    }
 
-
-def _csh_templates():
-    """Keep C shell aliases and sourced hook boundaries intact."""
-    # BSD csh has no precmd. Only explicit ish_recover sources this update.
-    csh_refresh = r"""
+# BSD csh has no precmd. Only explicit ish_recover sources this update.
+_CSH_REFRESH = r"""
 source @CSH_HOOK@
 """
-    csh_hook = r"""
+_CSH_HOOK = r"""
 if ("$prompt" !~ *@CSH_START_PATTERN@*) set prompt = "$_ish_before$prompt$_ish_after"
 if ($?tcsh) then
     # ish edits the primary prompt. Preserve the user's editor setting for
@@ -418,16 +323,17 @@ alias | @CSH_FORWARD@ @CSH_CONTEXT_ARGS@
 @CSH_PRINTF@ '@PROMPT_ID@' "$_ish_prompt_id"
 set status = $_ish_shell_exit_code
 """
-    csh = (
-        _CSH_INIT
-        + r"""
+_CSH_TEMPLATE = (
+    _CSH_INIT
+    + r"""
 set _ish_recover_path = @CSH_SELF@
 alias ish_recover 'set _ish_shell_exit_code = $status; source "$_ish_recover_path"'
 if (! $?_ish_shell_exit_code) set _ish_shell_exit_code = 0
 source @CSH_UPDATE@
 """
-    )
-    tcsh_bind = r"""
+)
+
+_TCSH_BIND = r"""
 # postcmd is suspended by the caller; its current definition is snapshotted.
 if ("`alias precmd`" != "_ish_precmd") alias _ish_original_precmd "`alias precmd`"
 if ("`alias _ish_current_postcmd`" != "_ish_postcmd") alias _ish_original_postcmd "`alias _ish_current_postcmd`"
@@ -444,7 +350,7 @@ alias precmd _ish_precmd
 alias periodic _ish_periodic
 set tperiod = 0
 """
-    tcsh_watch = r"""
+_TCSH_WATCH = r"""
 # periodic runs at a primary-prompt boundary, never while reading a loop body.
 # Preserve the existing periodic callback's interval while checking hooks at
 # every primary prompt. Only consult the clock when there is a user callback.
@@ -461,10 +367,10 @@ endif
 _ish_periodic_dispatch
 source @CSH_BIND@
 """
-    tcsh = (
-        'set _ish_pipe = "$1"\nset _tty_pipe = "$2"\n'
-        + _CSH_INIT
-        + r"""
+_TCSH_TEMPLATE = (
+    'set _ish_pipe = "$1"\nset _tty_pipe = "$2"\n'
+    + _CSH_INIT
+    + r"""
 # Rebind installed wrappers without resetting saved editor/periodic state.
 alias ish_recover 'if (1) glob; alias _ish_current_postcmd "`alias postcmd`"; unalias postcmd; source "$_ish_bind_path"; alias postcmd _ish_postcmd'
 unset notify
@@ -507,26 +413,110 @@ if (! $?_ish_tcsh_installed) then
     alias postcmd _ish_postcmd
 endif
 """
-    )
-    return {
-        CSH_INTEGRATION_SCRIPT: csh,
-        TCSH_INTEGRATION_SCRIPT: tcsh,
-        CSH_UPDATE_SCRIPT: csh_refresh,
-        TCSH_PRECMD_SCRIPT: csh_hook,
-        TCSH_BIND_HOOKS_SCRIPT: tcsh_bind,
-        TCSH_WATCH_HOOKS_SCRIPT: tcsh_watch,
-    }
+)
 
 
-# Register each integration entry point with the builder for its complete bundle.
-# Shared builders run once per installation, even when several adapters use them.
+# Every builder returns a fresh mapping; immutable shell bodies are assembled once.
+_CSH_BUILDER = {
+    CSH_INTEGRATION_SCRIPT: _CSH_TEMPLATE,
+    TCSH_INTEGRATION_SCRIPT: _TCSH_TEMPLATE,
+    CSH_UPDATE_SCRIPT: _CSH_REFRESH,
+    TCSH_PRECMD_SCRIPT: _CSH_HOOK,
+    TCSH_BIND_HOOKS_SCRIPT: _TCSH_BIND,
+    TCSH_WATCH_HOOKS_SCRIPT: _TCSH_WATCH,
+}.copy
 SCRIPT_BUILDERS = {
-    BASH_INTEGRATION_SCRIPT: lambda: {BASH_INTEGRATION_SCRIPT: _bash_template()},
-    ZSH_INTEGRATION_SCRIPT: lambda: {ZSH_INTEGRATION_SCRIPT: _zsh_template()},
-    CSH_INTEGRATION_SCRIPT: _csh_templates,
-    TCSH_INTEGRATION_SCRIPT: _csh_templates,
-    POSIX_INTEGRATION_SCRIPT: _posix_templates,
+    BASH_INTEGRATION_SCRIPT: {BASH_INTEGRATION_SCRIPT: _BASH_TEMPLATE}.copy,
+    ZSH_INTEGRATION_SCRIPT: {ZSH_INTEGRATION_SCRIPT: _ZSH_TEMPLATE}.copy,
+    CSH_INTEGRATION_SCRIPT: _CSH_BUILDER,
+    TCSH_INTEGRATION_SCRIPT: _CSH_BUILDER,
+    POSIX_INTEGRATION_SCRIPT: {
+        POSIX_INTEGRATION_SCRIPT: _POSIX_TEMPLATE,
+        POSIX_UPDATE_SCRIPT: _POSIX_REFRESH,
+    }.copy,
 }
+
+_STATIC_TOKENS = {
+    "@CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
+        path='"$_ish_pipe"', status='"$1"', prompt_id='"$_ish_prompt_id"'
+    ),
+    "@CSH_CONTEXT_ARGS@": CONTEXT_COMMAND.shell(
+        path='"$_ish_pipe"',
+        status='"$_ish_shell_exit_code"',
+        prompt_id='"$_ish_prompt_id"',
+    ),
+    "@TIME_ARGS@": TIME_COMMAND.shell(),
+    "@CLOCK_ARGS@": CLOCK_COMMAND.shell(),
+    "@VERSION@": VERSION.decode("ascii"),
+    "@SOH@": bytes_to_shell_escape(SOH),
+    "@EOT@": bytes_to_shell_escape(EOT),
+    "@RS@": bytes_to_shell_escape(RS),
+    "@US@": bytes_to_shell_escape(US),
+}
+
+
+def _make_tokens(directory, signals, forward_path, input_ack_path=None):
+    """Quote paths and encode protocol markers for one integration installation."""
+    scope = signals.scope
+    forward_path = forward_path or directory / FORWARD_BINARY
+    # Resolve the few remaining external utilities once, before user commands
+    # can change PATH. The context helper handles encoding and environments.
+    printf_path = shutil.which("printf", path=_PRINTF_SEARCH_PATH) or _PRINTF_FALLBACK
+    input_ack = str(input_ack_path or "")
+    return {
+        **_STATIC_TOKENS,
+        "@FORWARD_ARGS@": FORWARD_COMMAND.shell(
+            tty_path='"$_tty_pipe"',
+            ack_path=shlex.quote(input_ack),
+            prompt_id='"$_ish_prompt_id"',
+            context_path='"$_ish_pipe"',
+        ),
+        "@CSH_FORWARD_ARGS@": FORWARD_COMMAND.shell(
+            tty_path='"$_tty_pipe"',
+            ack_path=csh_quote(input_ack),
+            prompt_id='"$_ish_prompt_id"',
+            context_path='"$_ish_pipe"',
+        ),
+        "@INPUT_ACK@": shlex.quote(input_ack),
+        "@CSH_INPUT_ACK@": csh_quote(input_ack),
+        "@FORWARD@": shlex.quote(str(forward_path)),
+        "@CSH_FORWARD@": csh_quote(str(forward_path)),
+        "@CSH_PRINTF@": csh_quote(printf_path),
+        "@CSH_UPDATE@": csh_quote(str(directory / CSH_UPDATE_SCRIPT)),
+        "@CSH_HOOK@": csh_quote(str(directory / TCSH_PRECMD_SCRIPT)),
+        "@CSH_BIND@": csh_quote(str(directory / TCSH_BIND_HOOKS_SCRIPT)),
+        "@CSH_WATCH@": csh_quote(str(directory / TCSH_WATCH_HOOKS_SCRIPT)),
+        "@POSIX_UPDATE@": shlex.quote(str(directory / POSIX_UPDATE_SCRIPT)),
+        "@BASH_SELF@": shlex.quote(str(directory / BASH_INTEGRATION_SCRIPT)),
+        "@ZSH_SELF@": shlex.quote(str(directory / ZSH_INTEGRATION_SCRIPT)),
+        "@ZSH_TRAPS@": shlex.quote(str(directory / ZSH_TRAP_SNAPSHOT)),
+        "@POSIX_SELF@": shlex.quote(str(directory / POSIX_INTEGRATION_SCRIPT)),
+        "@CSH_SELF@": csh_quote(str(directory / CSH_INTEGRATION_SCRIPT)),
+        "@START@": bytes_to_shell_escape(scope(BEFORE_PROMPT)),
+        "@END@": bytes_to_shell_escape(scope(AFTER_PROMPT)),
+        "@CONT_START@": bytes_to_shell_escape(scope(BEFORE_CONTINUATION)),
+        "@BUFFERED_CONT_START@": bytes_to_shell_escape(
+            scope(BEFORE_BUFFERED_CONTINUATION)
+        ),
+        "@CONT_END@": bytes_to_shell_escape(scope(AFTER_CONTINUATION)),
+        "@BUFFERED_CONT_HINT@": bytes_to_shell_escape(
+            scope(BUFFERED_CONTINUATION_HINT)
+        ),
+        "@PROMPT_ID@": bytes_to_shell_escape(
+            scope(PROMPT_ID_PREFIX) + b"%s" + OSC_TERMINATOR
+        ),
+        "@LINE_READY@": bytes_to_shell_escape(
+            scope(LINE_READER_READY_PREFIX) + READER_REPORT_FORMAT + OSC_TERMINATOR
+        ),
+        "@LINE_INTERRUPT@": bytes_to_shell_escape(
+            scope(LINE_INTERRUPT_ACK_PREFIX) + READER_REPORT_FORMAT + OSC_TERMINATOR
+        ),
+        # csh checks only the OSC body so both raw and caret prompts match.
+        "@CSH_NATIVE_CONTINUATION@": bytes_to_shell_escape(scope(NATIVE_CONTINUATION)),
+        "@CSH_START_PATTERN@": csh_quote(
+            scope(BEFORE_PROMPT)[2 : -len(OSC_TERMINATOR)].decode("ascii")
+        ),
+    }
 
 
 def render_scripts(
@@ -544,15 +534,16 @@ def render_scripts(
     adding a shell does not require another entry in this assembly function.
     """
     tokens = _make_tokens(directory, signals, forward_path, input_ack_path)
-    checks = _preload_checks(adapter)
-    entries = {entry.script: entry for entry in ADAPTERS.values()}
-    if adapter is not None:
-        entries[adapter.script] = adapter
+    entries = {}
+    checks = {}
+    for entry in chain(ADAPTERS.values(), (adapter,) if adapter is not None else ()):
+        entries[entry.script] = entry
+        checks[entry.script] = entry.preload_check()
     templates = {}
     built = set()
     for entry in entries.values():
         for key, value in entry.template_tokens:
-            if key == "@PRELOAD_CHECK@" or (key in tokens and tokens[key] != value):
+            if key == _PRELOAD_CHECK or (key in tokens and tokens[key] != value):
                 raise ValueError(f"Conflicting integration token: {key}")
             tokens[key] = value
         try:
@@ -569,10 +560,13 @@ def render_scripts(
             built.add(builder)
         if entry.script not in templates:
             raise ValueError(f"Integration builder did not provide {entry.script}")
-    pattern = re.compile(
-        "|".join(re.escape(key) for key in (*tokens, "@PRELOAD_CHECK@"))
-    )
-    return {
-        name: _render_script(body, tokens, checks.get(name, ""), pattern)
-        for name, body in templates.items()
-    }
+    pattern = re.compile("|".join(re.escape(key) for key in (*tokens, _PRELOAD_CHECK)))
+
+    def replacement(match):
+        return tokens[match.group()]
+
+    rendered = {}
+    for name, template in templates.items():
+        tokens[_PRELOAD_CHECK] = checks.get(name, "")
+        rendered[name] = pattern.sub(replacement, template).lstrip("\n")
+    return rendered

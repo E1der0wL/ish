@@ -11,17 +11,26 @@ from typing import Optional
 
 from ish import __version__
 from ish.config import config
-from ish.lang import i18n
+from ish.lang import Message, i18n
 
 __all__ = ["ArgumentParser"]
+
+_PROGRAM = "ish"
+_SWITCH = {"action": "store_true"}
+_OPTIONS = (
+    (("-h", "--help"), Message.CLI_HELP_OPTION_HELP, _SWITCH),
+    (("shell",), Message.CLI_SHELL_OPTION_HELP, {"nargs": argparse.OPTIONAL}),
+    (("-l", "--lang"), Message.CLI_LANG_OPTION_HELP, {"type": str}),
+    (("--version",), Message.CLI_VERSION_OPTION_HELP, _SWITCH),
+    (("--no-rc",), Message.CLI_NO_RC_OPTION_HELP, _SWITCH),
+    (("--no-plugins",), Message.CLI_NO_PLUGINS_OPTION_HELP, _SWITCH),
+    (("--home",), Message.CLI_HOME_OPTION_HELP, {"type": Path, "metavar": "DIR"}),
+    (("--diagnose",), Message.CLI_DIAGNOSE_OPTION_HELP, _SWITCH),
+)
 
 
 class AltArgumentParser(argparse.ArgumentParser):
     """ArgumentParser extension providing ish's help output behavior."""
-
-    def __init__(self, *args, **kwargs):
-        """Pass caller-supplied argparse options to the base parser."""
-        super().__init__(*args, **kwargs)
 
     def print_help(self, file=None):
         """Print formatted help to the supplied stream or standard output."""
@@ -32,23 +41,13 @@ class AltArgumentParser(argparse.ArgumentParser):
 class Formatter(argparse.RawTextHelpFormatter):
     """Formatter preserving description line breaks and omitting the default usage line."""
 
-    def __init__(self, *args, **kwargs):
-        """Forward initialization arguments to RawTextHelpFormatter."""
-        super().__init__(*args, **kwargs)
-
     def _format_usage(self, usage, actions, groups, prefix):
-        """Compute the default usage text but omit the rendered usage block."""
-        super()._format_usage(usage, actions, groups, prefix)
+        """Omit the default usage block."""
         return None
 
     def _format_text(self, text):
         """Preserve whitespace and line breaks in the description."""
         return text
-
-    def _format_action(self, action):
-        """Use argparse's default formatting for individual option descriptions."""
-        help_message = super()._format_action(action)
-        return help_message
 
 
 class StoreValue(argparse.Action):
@@ -56,10 +55,7 @@ class StoreValue(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         """Store the original option value in its destination attribute."""
-        if not values:
-            setattr(namespace, self.dest, values)
-        else:
-            setattr(namespace, self.dest, values)
+        setattr(namespace, self.dest, values)
 
 
 class ArgumentParser:
@@ -76,57 +72,31 @@ class ArgumentParser:
         """Refresh translations and cached help after the home or language changes."""
         i18n.base_path = config.LANG_DIR
         i18n.load(lang, create=False)
-        self._description = i18n.get("cli_description")
+        self._description = i18n.get(Message.CLI_DESCRIPTION)
         self.__dict__.pop("parser", None)
 
     @cached_property
     def parser(self) -> AltArgumentParser:
         """Create a parser whose information flags are handled after settings resolve."""
         parser = AltArgumentParser(
-            prog="ish",
+            prog=_PROGRAM,
             description=self._description,
             epilog="\n".join(
-                (i18n.get("cli_shell_support"), i18n.get("cli_zsh_module_help"))
+                (
+                    i18n.get(Message.CLI_SHELL_SUPPORT),
+                    i18n.get(Message.CLI_ZSH_MODULE_HELP),
+                )
             ),
             formatter_class=Formatter,
             add_help=False,
             allow_abbrev=False,
         )
-        parser._positionals.title = i18n.get("cli_arguments_title")
-        parser._optionals.title = i18n.get("cli_options_title")
+        parser._positionals.title = i18n.get(Message.CLI_ARGUMENTS_TITLE)
+        parser._optionals.title = i18n.get(Message.CLI_OPTIONS_TITLE)
         # Defer help/version so --home and --lang work in any argument order.
-        parser.add_argument(
-            "-h", "--help", action="store_true", help=i18n.get("cli_help_option_help")
-        )
-        parser.add_argument(
-            "shell",
-            nargs="?",
-            default=self.login_shell,
-            help=i18n.get("cli_shell_option_help"),
-        )
-        parser.add_argument(
-            "-l",
-            "--lang",
-            type=str,
-            help=i18n.get("cli_lang_option_help"),
-        )
-        parser.add_argument(
-            "--version", action="store_true", help=i18n.get("cli_version_option_help")
-        )
-        parser.add_argument(
-            "--no-rc", action="store_true", help=i18n.get("cli_no_rc_option_help")
-        )
-        parser.add_argument(
-            "--no-plugins",
-            action="store_true",
-            help=i18n.get("cli_no_plugins_option_help"),
-        )
-        parser.add_argument(
-            "--home", type=Path, metavar="DIR", help=i18n.get("cli_home_option_help")
-        )
-        parser.add_argument(
-            "--diagnose", action="store_true", help=i18n.get("cli_diagnose_option_help")
-        )
+        for names, help_key, options in _OPTIONS:
+            parser.add_argument(*names, help=i18n.get(help_key), **options)
+        parser.set_defaults(shell=self.login_shell)
         return parser
 
     def parse(self, args: Optional[list] = None) -> argparse.Namespace:
@@ -137,7 +107,7 @@ class ArgumentParser:
                 option.home = option.home.expanduser().resolve()
             except (OSError, RuntimeError) as exc:
                 self.parser.error(
-                    i18n.get("cli_home_error", path=str(option.home), error=exc)
+                    i18n.get(Message.CLI_HOME_ERROR, path=str(option.home), error=exc)
                 )
             config.ISH_HOME = option.home
         self._load_messages(option.lang)
@@ -146,7 +116,7 @@ class ArgumentParser:
             self.help()
             self.parser.exit()
         if option.version:
-            print(i18n.get("cli_version", version=__version__))
+            print(i18n.get(Message.CLI_VERSION, version=__version__))
             self.parser.exit()
         if option.diagnose:
             from ish.runtime.diagnostics import print_diagnostics
@@ -157,7 +127,7 @@ class ArgumentParser:
         config.ensure_directories()
         from ish.log import register_logger
 
-        register_logger(name="global")
+        register_logger()
 
         # Preserve default translation-file generation for interactive startup only.
         i18n.load(option.lang)

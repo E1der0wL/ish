@@ -9,7 +9,35 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Optional, Tuple
 
+from .constants import (
+    BEL,
+    CANCEL_BYTES,
+    CSI,
+    DEL_BYTE,
+    ESC,
+    LF_BYTE,
+    OSC,
+    SPACE_BYTE,
+    ST,
+)
+
 __all__ = ["Sequencer"]
+
+_DEFAULT_SEQUENCE_BYTES = 64 * 1024
+_MIN_SEQUENCE_BYTES = 64
+_BULK_MIN_BYTES = 64
+# Built-in adapters have at most one non-ESC introducer. Bound the number
+# of whole-chunk searches if an extension registers many different literals.
+_BULK_LITERAL_START_LIMIT = 4
+_TRUNCATED = b" [prompt truncated] "
+_ESC = ESC[0]
+_BEL = BEL[0]
+_CSI_START = CSI[-1]
+_OSC_START = OSC[-1]
+_ST_FINAL = ST[-1]
+_LAST_INTERMEDIATE = 0x2F
+_LAST_PARAMETER = 0x3F
+_STRING_STARTS = (ord("P"), ord("X"), _OSC_START, ord("^"), ord("_"))
 
 
 class Sequencer:
@@ -56,14 +84,16 @@ class Sequencer:
         self,
         encoder: str = "utf-8",
         errors: str = "replace",
-        max_sequence_bytes: int = 65536,
+        max_sequence_bytes: int = _DEFAULT_SEQUENCE_BYTES,
         *,
         output_callback: Optional[Callable[[bytes], None]] = None,
         control_callback: Optional[Callable[[bytes], None]] = None,
     ):
         """Prepare control-sequence limits, callback stores, and partial receive state."""
-        if max_sequence_bytes < 64:
-            raise ValueError("Sequence limit must be at least 64 bytes")
+        if max_sequence_bytes < _MIN_SEQUENCE_BYTES:
+            raise ValueError(
+                f"Sequence limit must be at least {_MIN_SEQUENCE_BYTES} bytes"
+            )
         self.max_sequence_bytes = max_sequence_bytes
         self._between_tail = bytearray()
         self.between_truncated = False
@@ -124,7 +154,7 @@ class Sequencer:
         Replacement bytes are emitted in stream order when remove_seq is true.
         """
         self.between_callbacks[start_seq] = (end_seq, callback, remove_seq)
-        if start_seq and start_seq[0] != 0x1B:
+        if start_seq and start_seq[0] != _ESC:
             self.literal_starts.setdefault(start_seq[0], set()).add(start_seq)
 
     def mask(self, byte: bytes) -> None:
@@ -159,7 +189,7 @@ class Sequencer:
 
     def _observe_capture(self, data) -> None:
         """Observe controls only when retained bytes are released to the terminal."""
-        if self.control_callback is not None and b"\x1b" in data:
+        if self.control_callback is not None and ESC in data:
             # Reuse the lexer without session callbacks: released captures must
             # update terminal modes without replaying prompt or identity hooks.
             observer = Sequencer(
@@ -176,7 +206,7 @@ class Sequencer:
             offset = len(buffer)
             buffer.extend(self.between_buffer)
             if self.between_truncated:
-                buffer.extend(b" [prompt truncated] ")
+                buffer.extend(_TRUNCATED)
             buffer.extend(self._between_tail)
             self._observe_capture(buffer[offset:])
         self.between_buffer.clear()
@@ -185,7 +215,7 @@ class Sequencer:
         self.active_between = None
         self._notify_output(buffer)
 
-    def _notify_output(self, buffer: bytearray) -> None:
+    def _notify_output(self, buffer: bytes | bytearray) -> None:
         """Observe emitted bytes before protocol callbacks, in stream order."""
         if self.output_callback is not None and len(buffer) > self._notified_output:
             self.output_callback(bytes(buffer[self._notified_output :]))
@@ -207,7 +237,7 @@ class Sequencer:
                 self._notify_output(buffer)
                 accepted = callback(
                     data[len(prefix) : -2]
-                    if data.endswith(b"\x1b\\")
+                    if data.endswith(ST)
                     else data[len(prefix) : -1]
                 )
                 if accepted is False:
@@ -266,7 +296,7 @@ class Sequencer:
         if self._between_tail == end_seq:
             payload = bytes(self.between_buffer)
             if self.between_truncated:
-                payload += b" [prompt truncated] "
+                payload += _TRUNCATED
             self._notify_output(buffer)
             replacement = callback(payload)
             if remove_seq and replacement is False:
@@ -347,7 +377,7 @@ class Sequencer:
                 output.extend(self._between_tail)
         output.extend(self.buffer)
         if self.state == self.OSC and self._string_escape:
-            output.append(0x1B)
+            output.append(_ESC)
         output.extend(self.masking_buffer)
         self._observe_capture(output)
         self.buffer.clear()
@@ -365,28 +395,46 @@ class Sequencer:
 
     def feed(self, data: bytes):
         """Process a chunk into display bytes and retain partial state for the next call."""
-        output = bytearray()
         self._notified_output = 0
+        if (
+            self.state == self.GROUND
+            and type(data) is bytes
+            and len(data) >= _BULK_MIN_BYTES
+            and not self.buffer
+            and self.active_between is None
+            and not self.masking_bytes
+            and len(self.literal_starts) <= _BULK_LITERAL_START_LIMIT
+            and _ESC not in data
+            and not any(start in data for start in self.literal_starts)
+        ):
+            # In ground state LF can re-enable masking even with no echo left.
+            # Deliver output only after that transition, as on the byte path.
+            if self.masking_disabled and LF_BYTE in data:
+                self.masking_disabled = False
+            self._notify_output(data)
+            return data
+
+        output = bytearray()
         for byte in data:
-            if self.state == self.OSC and self._string_escape and byte != 0x5C:
+            if self.state == self.OSC and self._string_escape and byte != _ST_FINAL:
                 # A fresh ESC cancels an unterminated control string. Hold it
                 # until we know whether it belongs to ST or a new sequence.
                 self._flush_text(output)
                 self._passthrough = False
                 self._string_escape = False
-                self.buffer.append(0x1B)
+                self.buffer.append(_ESC)
                 self.state = self.ESC
             if self.state == self.GROUND:
                 if byte in self.literal_starts:
                     self._flush_text(output)
                     self.buffer.append(byte)
                     self.state = self.CARET
-                elif byte == 0x1B:
+                elif byte == _ESC:
                     self._flush_text(output)
                     self.buffer.append(byte)
                     self.state = self.ESC
                 else:
-                    if byte == 0x0A and self.masking_disabled:
+                    if byte == LF_BYTE and self.masking_disabled:
                         self.masking_disabled = False
                     if (
                         self.masking_bytes
@@ -408,67 +456,67 @@ class Sequencer:
                 if bytes(self.buffer) in candidates:
                     self._dispatch(output)
                 elif not any(seq.startswith(self.buffer) for seq in candidates):
-                    if byte in self.literal_starts or byte == 0x1B:
+                    if byte in self.literal_starts or byte == _ESC:
                         output.extend(self.buffer[:-1])
                         self.buffer[:] = bytes([byte])
-                        self.state = self.ESC if byte == 0x1B else self.CARET
+                        self.state = self.ESC if byte == _ESC else self.CARET
                     else:
                         self._flush_text(output)
                         self.state = self.GROUND
 
             elif self.state in (self.ESC, self.ESC_INTERMEDIATE, self.CSI):
-                if byte == 0x1B:
+                if byte == _ESC:
                     self._flush_text(output)
                     self._passthrough = False
                     self.buffer.append(byte)
                     self.state = self.ESC
                     continue
                 self._control_byte(byte, output)
-                if byte in (0x18, 0x1A):  # CAN/SUB cancel the current control.
+                if byte in CANCEL_BYTES:
                     self._flush_text(output)
                     self._passthrough = False
                     self._resume_text()
-                elif byte < 0x20 or byte == 0x7F:
+                elif byte < SPACE_BYTE or byte == DEL_BYTE:
                     continue  # C0/DEL do not terminate an escape or CSI.
                 elif self.state == self.ESC:
-                    if byte == 0x5B:
+                    if byte == _CSI_START:
                         self.state = self.CSI
-                    elif byte in (0x50, 0x58, 0x5D, 0x5E, 0x5F):
-                        self._string_bel = byte == 0x5D
+                    elif byte in _STRING_STARTS:
+                        self._string_bel = byte == _OSC_START
                         self._string_escape = False
                         self.state = self.OSC
-                    elif 0x20 <= byte <= 0x2F:
+                    elif SPACE_BYTE <= byte <= _LAST_INTERMEDIATE:
                         self.state = self.ESC_INTERMEDIATE
                     else:
                         # Includes RIS (ESC c) and other valid 0x30..0x7e finals.
                         self._end_control(output)
                 elif self.state == self.ESC_INTERMEDIATE:
-                    if not 0x20 <= byte <= 0x2F:
+                    if not SPACE_BYTE <= byte <= _LAST_INTERMEDIATE:
                         self._end_control(output)
-                elif not 0x20 <= byte <= 0x3F:
+                elif not SPACE_BYTE <= byte <= _LAST_PARAMETER:
                     self._end_control(output)
 
             elif self.state == self.OSC:
-                if byte == 0x1B:
+                if byte == _ESC:
                     self._string_escape = True
                     continue
                 if self._string_escape:
-                    self._control_byte(0x1B, output)
+                    self._control_byte(_ESC, output)
                 self._control_byte(byte, output)
-                if byte in (0x18, 0x1A):
+                if byte in CANCEL_BYTES:
                     self._flush_text(output)
                     self._passthrough = False
                     self._string_escape = False
                     self._resume_text()
-                elif (self._string_bel and byte == 0x07) or (
-                    self._string_escape and byte == 0x5C
+                elif (self._string_bel and byte == _BEL) or (
+                    self._string_escape and byte == _ST_FINAL
                 ):
                     self._end_control(output)
                 else:
-                    self._string_escape = byte == 0x1B
+                    self._string_escape = byte == _ESC
 
             elif self.state == self.BETWEEN:
-                if byte == 0x1B:
+                if byte == _ESC:
                     # Reuse the normal ANSI lexer so session controls remain
                     # visible while prompt text is being collected.
                     self.buffer.append(byte)
@@ -477,7 +525,7 @@ class Sequencer:
                     self._between(byte, output)
 
             elif self.state == self.MASKING:
-                if byte == 0x1B:
+                if byte == _ESC:
                     self._cancel_masking()
                     self._flush_text(output)
                     self.buffer.append(byte)

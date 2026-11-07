@@ -3,50 +3,62 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional
+from threading import RLock
+from typing import Iterable
 
 from ish.config import config
 
 __all__ = ["register_logger", "get_logger"]
 
+DEFAULT_LOGGER_NAME = "global"
+_CONFIGURED = "_is_configured"
+_CONSOLE = "console"
+_FILE = "file"
+_DEFAULT_HANDLERS = (_CONSOLE,)
+_FILE_ENCODING = "utf-8"
+_CONSOLE_FORMAT = "[%(levelname)s] %(message)s"
+_FILE_FORMAT = "[%(asctime)s] %(levelname)-8s  | %(message)s"
+_REGISTRATION_LOCK = RLock()
+
 
 def register_logger(
-    name: str = "global",
+    name: str = DEFAULT_LOGGER_NAME,
     level: int = logging.ERROR,
-    handler: Iterable[str] = ("console",),
+    handler: Iterable[str] = _DEFAULT_HANDLERS,
 ) -> None:
     """Register each requested console or file handler only once."""
     logger = logging.getLogger(name)
-    if getattr(logger, "_is_configured", False):
-        return None
+    with _REGISTRATION_LOCK:
+        if getattr(logger, _CONFIGURED, False):
+            return
+        pending = []
+        try:
+            for target in dict.fromkeys(handler):
+                sink: logging.Handler
+                if target == _FILE:
+                    sink = logging.FileHandler(config.LOG_FILE, encoding=_FILE_ENCODING)
+                    pattern = _FILE_FORMAT
+                elif target == _CONSOLE:
+                    sink = logging.StreamHandler()
+                    pattern = _CONSOLE_FORMAT
+                else:
+                    continue
+                pending.append(sink)
+                sink.setFormatter(logging.Formatter(pattern))
+            logger.setLevel(level)
+            for sink in pending:
+                logger.addHandler(sink)
+            setattr(logger, _CONFIGURED, True)
+        except BaseException:
+            for sink in pending:
+                logger.removeHandler(sink)
+                sink.close()
+            raise
 
-    logger.setLevel(level)
 
-    for h in handler:
-        if h == "file":
-            file_handler = logging.FileHandler(str(config.LOG_FILE), encoding="utf-8")
-            file_handler.setFormatter(
-                logging.Formatter("[%(asctime)s] %(levelname)-8s  | %(message)s")
-            )
-            logger.addHandler(file_handler)
-
-        elif h == "console":
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(
-                logging.Formatter("[%(levelname)s] %(message)s")
-            )
-            logger.addHandler(console_handler)
-
-        else:
-            pass
-
-    logger._is_configured = True
-    return None
-
-
-def get_logger(name: str = "global") -> Optional[logging.Logger]:
+def get_logger(name: str = DEFAULT_LOGGER_NAME) -> logging.Logger:
     """Return the named logger and create default handlers if needed."""
     logger = logging.getLogger(name)
-    if not getattr(logger, "_is_configured", False):
+    if not getattr(logger, _CONFIGURED, False):
         register_logger(name, logging.DEBUG)
     return logger
