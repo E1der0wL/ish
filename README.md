@@ -890,6 +890,32 @@ Do not share a virtual environment between Windows Python and Linux Python.
 GCC is needed for the native helpers when running from source. The lockfile records the
 application and build dependencies.
 
+### Editor requests on this branch
+
+The session grants one editor reply at an acknowledged primary prompt. An
+`EditRequest.id` identifies the local editing attempt; `EditRequest.boundary`
+refers to the existing shell prompt identity. Ctrl+C or a completed Python tool
+can start a new attempt at the same shell boundary. An old, cancelled, or already
+consumed request cannot authorize another reply. The session checks that the
+boundary and input-return acknowledgement still agree before accepting text.
+
+The session now calls `Prompt.prompt_async()` for text and admits command
+dispatch separately. `Prompt.read_and_dispatch()` remains callable for existing
+integrations, but overriding it no longer changes the live session. Custom
+editors should return text from `prompt_async()` without dispatching it. The
+pre-execution, post-execution, and fallback hook order is unchanged.
+
+This is primary editing admission, not a new shell continuation protocol. All
+adapters retain native continuation; program stdin and Python `input()` retain
+their existing input paths. Continuation support requires separately verified
+wire requests and input handoff before it can be enabled.
+
+The tracked request and dispatch tests run with:
+
+```sh
+PYTHONPATH=src:tests uv run python -m unittest test_edit_dispatch test_edit_requests test_native_cursor_keys test_p2_shells
+```
+
 ## Support scope
 
 ish is intended for interactive Linux terminal use, including multiline commands,

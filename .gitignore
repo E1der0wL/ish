@@ -23,6 +23,9 @@ wheels/
 share/python-wheels/
 /tests/*
 !/tests/test_edit_dispatch.py
+!/tests/test_edit_requests.py
+!/tests/test_native_cursor_keys.py
+!/tests/test_p2_shells.py
 /dev/
 /docs/
 /.codex-remote-attachments/

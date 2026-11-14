@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import psutil
 
+from ish.app.dispatch import dispatch
 from ish.config import BuiltinShell, config
 from ish.log import get_logger
 from ish.runtime.fdio import FDWriter, InputBytes
@@ -44,6 +45,7 @@ from .constants import (
     TTY_FIFO,
     SessionSignals,
 )
+from .edit import EditRequest, EditState
 from .guard import spawn_environment
 from .input import (
     PASTE_END,
@@ -221,6 +223,7 @@ class InteractiveShell:
         "_input_return_id",
         "_handoff_task",
         "input_ack_pipe",
+        "_edits",
     )
 
     # ==============================================================================================
@@ -300,6 +303,7 @@ class InteractiveShell:
         self._paste_tail = 0
         self._input_return_id = 0
         self._handoff_task = None
+        self._edits = EditState()
         self.terminal_state = TerminalState()
         self._screen: TerminalScreen | None = None
         self._screen_lock = Lock()
@@ -893,6 +897,7 @@ class InteractiveShell:
         writer = self._writers.get(self.master_fd)
         if writer is not None and writer.pending_bytes:
             raise RuntimeError("Cannot accept a prompt with pending PTY writes")
+        self._edits.revoke()
         self.signal_controller.reset()
         if self.loop is not None and self.input_reader_fd is not None:
             self.loop.remove_reader(self.input_reader_fd)
@@ -1077,6 +1082,7 @@ class InteractiveShell:
         if isinstance(data, str):
             data = data.encode(self.encoder)
         prefix = self.validate_submission(data)
+        self._edits.revoke()
         self.prompt_event.clear()
         self.command_start_event.set()
         self.command_done_event.clear()
@@ -1170,6 +1176,60 @@ class InteractiveShell:
             self._input_observation = None
             self._deferred_input.clear()
 
+    @property
+    def edit_request(self) -> EditRequest | None:
+        """Return the current editor grant, separately from the shell's wire ID."""
+        return self._edits.current
+
+    def begin_edit(self) -> EditRequest:
+        """Grant command editing only at the existing acknowledged primary boundary."""
+        if not self._can_edit(self._accepted_prompt_id):
+            raise RuntimeError("Command editing requires a confirmed shell boundary")
+        return self._edits.grant(self._accepted_prompt_id, commands=True)
+
+    def _can_edit(self, boundary: int) -> bool:
+        """Keep grant and reply admission on the same acknowledged boundary checks."""
+        writer = self._writers.get(self.master_fd)
+        return (
+            self.input_open
+            and not self._initializing
+            and not self._native_input_active
+            and self._primary_confirmed()
+            and boundary == self._accepted_prompt_id
+            and self._input_return_complete(boundary)
+            and (writer is None or not writer.pending_bytes)
+        )
+
+    def accept_edit(self, request: EditRequest) -> bool:
+        """Accept one current reply only while its shell boundary remains valid."""
+        return self._edits.take(request) and self._can_edit(request.boundary)
+
+    async def _read_edit(self, **options) -> str | None:
+        """Read text and admit dispatch through a session-owned editor grant."""
+        if self._closing_output:
+            # PTY EOF may arrive before the child watcher. Wait for its actual
+            # result so failed admission cannot replace the native exit status.
+            await self.proc.wait()
+            return None
+        if self._has_exited():
+            return None
+        request = self.begin_edit()
+        try:
+            try:
+                command = await self.editor.prompt_async(**options)
+            except (termios.error, OSError):
+                command = None
+            if not self.accept_edit(request):
+                return None
+            if command is None:
+                return ""
+            if request.commands:
+                return await dispatch(self.editor, command)
+            return command
+        finally:
+            # A delayed completion must not cancel a newer grant.
+            self._edits.take(request)
+
     async def _prompt(self) -> None:
         """Inject typeahead into the editor and process submissions in pre-hook, execution,
         post-hook order.
@@ -1219,7 +1279,7 @@ class InteractiveShell:
                 if retry_command is not None:
                     options["default"] = retry_command
                     retry_command = None
-                command = await self.editor.read_and_dispatch(**options)
+                command = await self._read_edit(**options)
                 await self._drain_output()
                 if self._has_exited():
                     return
@@ -1265,6 +1325,7 @@ class InteractiveShell:
     async def _shell(self) -> int:
         """Return the child status after draining final output and control sequences."""
         status = await self.proc.wait()
+        self._edits.revoke()
         self._native_input_active = False
         if self.input_reader_fd is not None:
             self.loop.remove_reader(self.input_reader_fd)
@@ -1530,7 +1591,8 @@ class InteractiveShell:
         self.typeahead.clear()
 
     def invalidate_input(self) -> None:
-        """Revoke native input and the current sender before shutdown cancellation."""
+        """Revoke the editor grant, native input, and sender before shutdown cancellation."""
+        self._edits.revoke()
         self._native_input_active = False
         self._send_generation += 1
 
