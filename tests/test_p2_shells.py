@@ -22,6 +22,7 @@ class Session:
 
     output_active = False
     observe_resize = Prompt.observe_resize
+    set_syntax_prompt = Prompt.set_syntax_prompt
     exit_command = "ish_exit"
 
     def __init__(self, commands):

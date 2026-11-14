@@ -7,6 +7,8 @@ Ctrl+C or a Python tool can use the same wire boundary with a new request ID.
 
 from dataclasses import dataclass
 
+from .handoff import InputRequest
+
 
 @dataclass(frozen=True)
 class EditRequest:
@@ -15,6 +17,7 @@ class EditRequest:
     id: int
     boundary: int
     commands: bool
+    wire: InputRequest | None = None
 
 
 class EditState:
@@ -30,14 +33,16 @@ class EditState:
         """Expose the immutable grant without allowing another owner to replace it."""
         return self._current
 
-    def grant(self, boundary: int, *, commands: bool) -> EditRequest:
+    def grant(
+        self, boundary: int, *, commands: bool, wire: InputRequest | None = None
+    ) -> EditRequest:
         """Issue one grant after the session has confirmed the supplied boundary."""
         if boundary <= 0:
             raise ValueError("An editor grant requires a confirmed boundary")
         if self._current is not None:
             raise RuntimeError("An editor request is already active")
         self._serial += 1
-        self._current = EditRequest(self._serial, boundary, commands)
+        self._current = EditRequest(self._serial, boundary, commands, wire)
         return self._current
 
     def take(self, request: EditRequest) -> bool:

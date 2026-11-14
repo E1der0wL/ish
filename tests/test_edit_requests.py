@@ -366,6 +366,27 @@ class EditCLITests(unittest.TestCase):
                 self.assertIn(b"FINAL_TEXT\r\n", self.output)
                 self.assertNotIn(EDIT_ON, self.output)
 
+    def test_primary_eof_is_an_editor_exit(self):
+        """Ctrl+D at the primary PTK editor closes the session successfully."""
+        for shell in ("bash", "zsh", "tcsh", "dash"):
+            with self.subTest(shell=shell), self.session(shell):
+                self.output.clear()
+                os.write(self.fd, b"\x04")
+                observed = None
+
+                def exited():
+                    nonlocal observed
+                    observed = os.waitid(
+                        os.P_PID, self.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
+                    )
+                    return observed is not None
+
+                self.require(exited)
+                self.assertEqual(
+                    (observed.si_code, observed.si_status), (os.CLD_EXITED, 0)
+                )
+                self.assertNotIn(b"Traceback", self.output)
+
 
 if __name__ == "__main__":
     unittest.main()

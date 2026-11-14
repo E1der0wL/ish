@@ -526,6 +526,7 @@ def render_scripts(
     forward_path=None,
     adapter=None,
     input_ack_path=None,
+    submission_path=None,
 ):
     """Return the existing script names and sources for one integration session.
 
@@ -569,4 +570,10 @@ def render_scripts(
     for name, template in templates.items():
         tokens[_PRELOAD_CHECK] = checks.get(name, "")
         rendered[name] = pattern.sub(replacement, template).lstrip("\n")
+    if adapter is not None and adapter.edit_protocol is not None and submission_path:
+        rendered[adapter.script] = adapter.edit_protocol(
+            rendered[adapter.script],
+            submission_path=submission_path,
+            token=signals.token,
+        )
     return rendered

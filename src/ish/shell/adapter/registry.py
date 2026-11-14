@@ -39,6 +39,7 @@ from ..guard import (
 )
 from ..input import InputHandoffMode, LongInputMode
 from ..signals import SignalPolicy, TerminalSignal
+from .bash_edit import install as install_bash_edit
 from .handlers import ZshInterrupt
 from .parsing import (
     BASH_PARSING,
@@ -47,6 +48,7 @@ from .parsing import (
     ZSH_PARSING,
     ParsingPolicy,
 )
+from .zsh_edit import install as install_zsh_edit
 
 _CSH_QUOTED_CHARS = "'\"\\$`!;&|()<>*?[]{}~#"
 _POSIX_ALIAS_SEPARATOR = "="
@@ -297,6 +299,8 @@ class ShellAdapter:
     # Trusted literals in the corresponding template's shell quoting context.
     template_tokens: tuple[tuple[str, str], ...] = ()
     word_motion: WordMotion | None = None
+    # Enabled only after this adapter's live handoff path has been verified.
+    edit_protocol: Callable | None = None
 
     @property
     def syntax(self) -> ShellSyntax:
@@ -427,6 +431,7 @@ _SHELLS = (
         source_command="source",
         buffered_continuation=(BEFORE_BUFFERED_CONTINUATION, AFTER_CONTINUATION),
         builtins_command="compgen -b",
+        edit_protocol=install_bash_edit,
         builtins_args=("--noprofile", "--norc", "-c"),
         template_tokens=(("@BASH_DEFAULT_CONTINUATION@", "> "),),
         long_input=LongInputMode.STAGED_FIRST_LINE,
@@ -441,6 +446,7 @@ _SHELLS = (
         source_command="source",
         buffered_continuation_suffix=BUFFERED_CONTINUATION_HINT,
         builtins_command='printf "%s\\n" ${(k)builtins}',
+        edit_protocol=install_zsh_edit,
         # -f skips user rc files; zsh always reads its system zshenv.
         builtins_args=("-f", "-c"),
         template_tokens=(("@ZSH_DEFAULT_CONTINUATION@", "%_> "),),

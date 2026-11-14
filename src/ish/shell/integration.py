@@ -372,6 +372,7 @@ def install_scripts(
     forward_path=None,
     adapter=None,
     input_ack_path=None,
+    submission_path=None,
 ) -> Path:
     """Write integration scripts with session identifiers and forwarding paths.
 
@@ -387,6 +388,7 @@ def install_scripts(
         forward_path=forward_path or Path(ISH_FORWARD),
         adapter=adapter,
         input_ack_path=input_ack_path,
+        submission_path=submission_path,
     ).items():
         script_path = ish_xdg_home / name
         with open(script_path, "w", encoding=_SOURCE_ENCODING, newline="\n") as file:

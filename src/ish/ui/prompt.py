@@ -143,6 +143,7 @@ BUILTIN_QUERY_TIMEOUT = 3.0
 BUILTIN_CLEANUP_TIMEOUT = 0.5
 _BUILTIN_STARTUP_VARIABLES = ("BASH_ENV", "ENV")
 _PROMPT_STYLE = "class:prompt"
+SYNTAX_PROMPT = b"> "
 _DEFAULT_EXIT_COMMAND = "ish_exit"
 _RELOAD_COMMAND = "ish_reload"
 _TRACE_INPUT_REJECTED = "input_rejected"
@@ -812,7 +813,8 @@ class Prompt(PromptSession):
             raise InputRejected(
                 "Not sent: input cannot be encoded for this shell."
             ) from exc
-        if len(data) > CANONICAL_LINE_BYTES:
+        request = self.interactive_shell.edit_request
+        if len(data) > CANONICAL_LINE_BYTES and (request is None or request.commands):
             key = command.strip()
             if key == self.exit_command or key in self.internal_commands:
                 return
@@ -1105,6 +1107,10 @@ class Prompt(PromptSession):
         self._prefix_encoder = encoder or self.encoder
         self._prefix_fragments = None
         self._primary_prompt = primary
+
+    def set_syntax_prompt(self) -> None:
+        """Display PTK's syntax editor independently of shell prompt output."""
+        self.set_prompt(SYNTAX_PROMPT, primary=False)
 
     async def write_output(self, write) -> None:
         # Reader callbacks run outside prompt_async's context. Select this app

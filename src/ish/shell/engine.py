@@ -47,6 +47,16 @@ from .constants import (
 )
 from .edit import EditRequest, EditState
 from .guard import spawn_environment
+from .handoff import (
+    EDIT,
+    IDENTITY_FILE,
+    MODE,
+    Handoff,
+    InputOwner,
+    InputRequest,
+    decode_mode,
+    decode_request,
+)
 from .input import (
     PASTE_END,
     ForegroundPaste,
@@ -224,6 +234,11 @@ class InteractiveShell:
         "_handoff_task",
         "input_ack_pipe",
         "_edits",
+        "_handoff",
+        "_edit_mode",
+        "_semantic_enabled",
+        "_semantic_event",
+        "_submission_path",
     )
 
     # ==============================================================================================
@@ -304,6 +319,11 @@ class InteractiveShell:
         self._input_return_id = 0
         self._handoff_task = None
         self._edits = EditState()
+        self._handoff = Handoff()
+        self._edit_mode = (0, False)
+        self._semantic_enabled = False
+        self._semantic_event = asyncio.Event()
+        self._submission_path: Path | None = None
         self.terminal_state = TerminalState()
         self._screen: TerminalScreen | None = None
         self._screen_lock = Lock()
@@ -513,10 +533,22 @@ class InteractiveShell:
         self.shell_temp_buffer.extend(data)
         del self.shell_temp_buffer[:-DIAGNOSTIC_TAIL_BYTES]
         try:
-            if self.signal_controller.consume_input(data):
+            raw = self._semantic_enabled and self._handoff.owner in (
+                InputOwner.RELEASE,
+                InputOwner.RAW,
+            )
+            # A correlated native grant supersedes older line-reader hints.
+            # Program control keys belong to its PTY, including after exec().
+            if not raw and self.signal_controller.consume_input(data):
                 return
             sending = self._send_task is not None and not self._send_task.done()
-            if sending or self._handoff_pending:
+            if (
+                sending
+                or self._handoff_pending
+                or (
+                    self._semantic_enabled and self._handoff.owner is not InputOwner.RAW
+                )
+            ):
                 if len(self._deferred_input) + len(data) > TYPEAHEAD_LIMIT_BYTES:
                     phase = "submission" if sending else "handoff"
                     raise BufferError(
@@ -747,13 +779,32 @@ class InteractiveShell:
             if not chunk:
                 return
             for category, body in self._frame_decoder.feed(chunk):
-                if category == PROMPT_ID:
+                if category == EDIT:
+                    request = decode_request(body, self.signals.token)
+                    if (
+                        self._semantic_enabled
+                        and request
+                        and self._handoff.receive(request)
+                    ):
+                        self._semantic_event.set()
+                elif category == MODE:
+                    mode = decode_mode(body, self.signals.token)
+                    if (
+                        self.adapter.edit_protocol is not None
+                        and mode
+                        and mode[0] > self._accepted_prompt_id
+                    ):
+                        self._edit_mode = mode
+                elif category == PROMPT_ID:
                     value = parse_prompt_id(body)
                     if value is not None:
                         previous_context = self._context_id
                         self._context_id = max(self._context_id, value)
                         if self._context_id > self._accepted_prompt_id:
                             self._handoff_pending = True
+                            if self._semantic_enabled:
+                                self._handoff.reclaim()
+                                self._semantic_event.set()
                             if (
                                 self.input_ack_pipe is not None
                                 and self._context_id > previous_context
@@ -836,6 +887,7 @@ class InteractiveShell:
         if not self._initializing:
             self._prompt_prefix = self._native_output_line.prefix
         self.prompt_event.set()
+        self._semantic_event.set()
         self._context_event.set()
         if self._initializing:
             self._init_event.set()
@@ -850,6 +902,9 @@ class InteractiveShell:
         """Keep continuation input with the shell or pass it to the editor per adapter
         policy.
         """
+        if self._semantic_enabled:
+            # Display markers cannot authorize input or change its provenance.
+            return None
         self.continuation_active.set()
         if self.adapter.input_handoff is InputHandoffMode.PROMPT_ACK:
             # Bytes returned after native continuation input already passed
@@ -912,6 +967,8 @@ class InteractiveShell:
                 pass
             self._send_interrupted = False
         self._accepted_prompt_id = self._pending_prompt_id
+        self._handoff.primary()
+        self._semantic_enabled = self._edit_mode == (self._accepted_prompt_id, True)
         # The helper forwarded older PTY input before emitting this prompt.
         # Read that FIFO before appending newer input held during the handoff.
         while self.tty_pipe is not None and self._collect_typeahead(self.tty_pipe):
@@ -1053,7 +1110,10 @@ class InteractiveShell:
         )
         try:
             while True:
-                await self._exec_once(data)
+                if self._semantic_enabled:
+                    await self._exec_semantic(data)
+                else:
+                    await self._exec_once(data)
                 if not self._submitted_input.active or self._has_exited():
                     return
                 returned = self._submitted_input.take()
@@ -1176,33 +1236,243 @@ class InteractiveShell:
             self._input_observation = None
             self._deferred_input.clear()
 
+    def _hold_edit_keys(self) -> None:
+        """Retain editor lookahead with its native/fresh provenance at a barrier."""
+        if hasattr(self.editor, "take_typeahead"):
+            pending = self.editor.take_typeahead()
+            native = InputBytes.native_size(pending)
+        else:
+            pending, native = self.take_pending_input()
+        if (
+            len(self._returned_input) + native > TYPEAHEAD_LIMIT_BYTES
+            or len(self._deferred_input) + len(pending) - native > TYPEAHEAD_LIMIT_BYTES
+        ):
+            raise BufferError("Pending editor input exceeds the input limit")
+        self._returned_input.extend(pending[:native])
+        self._deferred_input.extend(pending[native:])
+
+    def _attach_native(self) -> None:
+        """Collect terminal input under the current session permission."""
+        self.loop.add_reader(
+            self.input_reader_fd,
+            self._forward_input,
+            self.input_reader_fd,
+            self._input_epoch,
+        )
+        self._native_input_active = True
+        if self._input_observation is None:
+            self._input_observation = self.input_observer.begin(SHELL)
+
+    async def _send_syntax(self, line: bytes, prefix: int | None = None) -> None:
+        """Send one already authorized physical line, preserving transport checks."""
+        if prefix is None:
+            prefix = self.validate_submission(line)
+        attrs = termios.tcgetattr(self.master_fd)
+        self.sequencer.mask(submission_echo(line, attrs))
+        generation = self._send_generation
+        self._send_task = asyncio.create_task(
+            self._send_staged(line, prefix, generation)
+            if prefix
+            else self._send(line, generation)
+        )
+        try:
+            await self._send_task
+        except asyncio.CancelledError:
+            if (
+                generation == self._send_generation
+                or asyncio.current_task().cancelling()
+            ):
+                raise
+        finally:
+            self._send_task = None
+
+    async def _exec_semantic(self, data: bytes) -> None:
+        """Deliver syntax lines only on requests and preserve native program stdin.
+
+        A pasted block is already accepted shell text. Unsent lines remain here
+        until C authorizes a syntax line or R authorizes native input. Fresh
+        terminal keys stay separate so C can feed them through real PTK bindings.
+        """
+        prefix = self.validate_submission(data)
+        self._edits.revoke()
+        identity = self._handoff.begin()
+        temporary = self._submission_path.with_suffix(".next")
+        temporary.write_text(f"{identity}\n", encoding="ascii")
+        temporary.replace(self._submission_path)
+        self.prompt_event.clear()
+        self.command_start_event.set()
+        self.command_done_event.clear()
+        self._semantic_event.clear()
+        self._send_interrupted = False
+        self._handoff_pending = False
+        self._send_generation += 1
+        self._input_epoch += 1
+        self._foreground_paste.reset()
+        generation = self._send_generation
+        literal_size, paste_tail = len(self._literal_input), self._paste_tail
+        self._hold_edit_keys()
+        self._attach_native()
+        pending = bytearray(data)
+        retry = None
+
+        def line():
+            end = pending.find(b"\n") + 1 or len(pending)
+            result = bytes(pending[:end])
+            del pending[:end]
+            return result
+
+        try:
+            try:
+                await self._send_syntax(line(), prefix)
+            except InputRejected:
+                # The final lease check rejected before transmitting a byte.
+                # Keep the acknowledged boundary and original editor key order.
+                self._handoff.primary()
+                self.command_start_event.clear()
+                self.command_done_event.set()
+                self.prompt_event.set()
+                self._literal_input.extend(self._returned_input[:literal_size])
+                del self._returned_input[:literal_size]
+                self._paste_tail = paste_tail
+                self._offered_literal = False
+                self.return_typeahead(bytes(self._deferred_input))
+                self._deferred_input.clear()
+                raise
+            while not self._has_exited():
+                if generation != self._send_generation or self._send_interrupted:
+                    pending.clear()
+                if self.prompt_event.is_set():
+                    await self._synchronize_prompt()
+                    if pending:
+                        self._submitted_input.active = True
+                        self._submitted_input.append(bytes(pending))
+                    await self._drain_output()
+                    return
+                owner = self._handoff.owner
+                if owner is InputOwner.EDITOR:
+                    request = self._handoff.request
+                    if pending:
+                        if self._handoff.reply(request):
+                            await self._send_syntax(line())
+                        continue
+                    self.loop.remove_reader(self.input_reader_fd)
+                    self._native_input_active = False
+                    self.input_observer.end(self._input_observation)
+                    self._input_observation = None
+                    self.return_typeahead(bytes(self._deferred_input))
+                    self._deferred_input.clear()
+                    self.continuation_active.set()
+                    self.editor.set_syntax_prompt()
+                    await self._drain_output()
+                    try:
+                        options = self._edit_options()
+                        if retry is not None:
+                            options["default"], retry = retry, None
+                        command = await self._read_edit(**options)
+                    except KeyboardInterrupt:
+                        # The adapter's existing interrupt acknowledgement owns
+                        # any release byte. The common editor never invents one.
+                        control = control_character(
+                            termios.tcgetattr(self.master_fd), termios.VINTR
+                        )
+                        trailing = self.editor.take_typeahead()
+                        if not self.signal_controller.consume_input(control):
+                            self.cancel_handoff(control, b"")
+                        self._handoff.reclaim()
+                        native = InputBytes.native_size(trailing)
+                        self.return_native_input(trailing[:native])
+                        self.return_typeahead(trailing[native:])
+                        pending.clear()
+                    except EOFError:
+                        if self._handoff.reply(request):
+                            self._write(
+                                self.master_fd,
+                                control_character(
+                                    termios.tcgetattr(self.master_fd), termios.VEOF
+                                ),
+                            )
+                            self._hold_edit_keys()
+                    else:
+                        if command is not None:
+                            reply = (command + "\n").encode(self.encoder)
+                            try:
+                                self.validate_submission(reply)
+                            except InputRejected as exc:
+                                retry = command
+                                self._write(
+                                    self.stdout_fd,
+                                    (str(exc) + "\r\n").encode(self.encoder),
+                                )
+                                continue
+                            if self._handoff.reply(request):
+                                pending.extend(reply)
+                                self._hold_edit_keys()
+                    self._attach_native()
+                    if pending:
+                        await self._send_syntax(line())
+                    continue
+                if owner is InputOwner.RELEASE:
+                    request = self._handoff.request
+                    if pending:
+                        self._submitted_input.active = True
+                    native = bytes(pending) + bytes(self._returned_input)
+                    pending.clear()
+                    self._returned_input.clear()
+                    data = native + bytes(self._deferred_input)
+                    self._deferred_input.clear()
+                    self._write(self.master_fd, data)
+                    self._foreground_paste.observe(data)
+                    self._handoff.release(request)
+                    await self.prompt_event.wait()
+                    continue
+                self._semantic_event.clear()
+                await self._semantic_event.wait()
+        finally:
+            self.loop.remove_reader(self.input_reader_fd)
+            self._native_input_active = False
+            self.input_observer.end(self._input_observation)
+            self._input_observation = None
+            self._edits.revoke()
+
     @property
     def edit_request(self) -> EditRequest | None:
         """Return the current editor grant, separately from the shell's wire ID."""
         return self._edits.current
 
     def begin_edit(self) -> EditRequest:
-        """Grant command editing only at the existing acknowledged primary boundary."""
-        if not self._can_edit(self._accepted_prompt_id):
+        """Grant primary or syntax editing only at its verified input boundary."""
+        wire = (
+            self._handoff.request if self._handoff.owner is InputOwner.EDITOR else None
+        )
+        if not self._can_edit(self._accepted_prompt_id, wire):
             raise RuntimeError("Command editing requires a confirmed shell boundary")
-        return self._edits.grant(self._accepted_prompt_id, commands=True)
+        return self._edits.grant(
+            self._accepted_prompt_id, commands=wire is None, wire=wire
+        )
 
-    def _can_edit(self, boundary: int) -> bool:
+    def _can_edit(self, boundary: int, wire: InputRequest | None = None) -> bool:
         """Keep grant and reply admission on the same acknowledged boundary checks."""
         writer = self._writers.get(self.master_fd)
         return (
             self.input_open
             and not self._initializing
             and not self._native_input_active
-            and self._primary_confirmed()
+            and self._input_mode_lease is None
+            and (self._send_task is None or self._send_task.done())
             and boundary == self._accepted_prompt_id
-            and self._input_return_complete(boundary)
             and (writer is None or not writer.pending_bytes)
+            and (
+                self._semantic_enabled and self._handoff.owns(wire)
+                if wire is not None
+                else self._primary_confirmed() and self._input_return_complete(boundary)
+            )
         )
 
     def accept_edit(self, request: EditRequest) -> bool:
         """Accept one current reply only while its shell boundary remains valid."""
-        return self._edits.take(request) and self._can_edit(request.boundary)
+        return self._edits.take(request) and self._can_edit(
+            request.boundary, request.wire
+        )
 
     async def _read_edit(self, **options) -> str | None:
         """Read text and admit dispatch through a session-owned editor grant."""
@@ -1230,10 +1500,8 @@ class InteractiveShell:
             # A delayed completion must not cancel a newer grant.
             self._edits.take(request)
 
-    async def _prompt(self) -> None:
-        """Inject typeahead into the editor and process submissions in pre-hook, execution,
-        post-hook order.
-        """
+    def _edit_options(self) -> dict:
+        """Replay older native input before fresh keys in any authorized editor."""
 
         def inject_typeahead():
             """Give PTK the confirmed reader's bytes until a binding accepts."""
@@ -1264,6 +1532,10 @@ class InteractiveShell:
                 inject_typeahead, self._returned_input, self.typeahead
             )
 
+        return {"pre_run": start_typeahead}
+
+    async def _prompt(self) -> None:
+        """Process primary submissions in pre-hook, execution, post-hook order."""
         retry_command = None
         while True:
             if self._has_exited():
@@ -1275,7 +1547,7 @@ class InteractiveShell:
             try:
                 self._write(self.stdout_fd, _CLEAR_PROMPT_LINE)
                 await self._drain_output()
-                options = {"pre_run": start_typeahead}
+                options = self._edit_options()
                 if retry_command is not None:
                     options["default"] = retry_command
                     retry_command = None
@@ -1297,6 +1569,10 @@ class InteractiveShell:
                 await req.callback(*req.args, **req.kwargs)
                 continue
             except ShellExitRequest:
+                return
+            except EOFError:
+                # EOF at a primary editor closes ish; syntax EOF is handled by
+                # the session's current request and delivered to the shell PTY.
                 return
 
             try:
@@ -1442,6 +1718,8 @@ class InteractiveShell:
                     tempfile.TemporaryDirectory(prefix=_SESSION_PREFIX, dir=cache_dir)
                 )
                 runtime = Path(pipe_dir) / _INTEGRATION_DIRECTORY
+                self._submission_path = Path(pipe_dir) / IDENTITY_FILE
+                self._submission_path.write_text("0\n", encoding="ascii")
                 if not await build_binary_async(directory=runtime):
                     raise RuntimeError(
                         "Failed to prepare ish_forward. Check the error above."
@@ -1484,6 +1762,7 @@ class InteractiveShell:
                     forward_path=runtime / FORWARD_BINARY,
                     adapter=self.adapter,
                     input_ack_path=input_ack_path,
+                    submission_path=self._submission_path,
                 )
                 self.shell_integration = str(self.xdg_home / self.adapter.script)
                 self.init_command = self.adapter.source(
@@ -1593,6 +1872,8 @@ class InteractiveShell:
     def invalidate_input(self) -> None:
         """Revoke the editor grant, native input, and sender before shutdown cancellation."""
         self._edits.revoke()
+        self._handoff.reclaim()
+        self._semantic_event.set()
         self._native_input_active = False
         self._send_generation += 1
 
@@ -1602,6 +1883,11 @@ class InteractiveShell:
 
     def cancel_handoff(self, control: bytes, remaining: bytes) -> None:
         """Cancel an input handoff and retain only post-control typeahead."""
+        if self._semantic_enabled:
+            self._handoff.reclaim()
+            self._edits.revoke()
+            self._semantic_event.set()
+            self._send_generation += 1
         discard_submitted = self._handoff_pending and self._submitted_input.active
         self._discard_queued_input()
         # A helper may already have written cancelled bytes to the FIFO before
@@ -1632,6 +1918,10 @@ class InteractiveShell:
         The signal policy has already restored any TTY lease. Queue ownership,
         cancellation generations, and post-control byte ordering remain here.
         """
+        if self._semantic_enabled:
+            self._handoff.reclaim()
+            self._edits.revoke()
+            self._semantic_event.set()
         self._send_generation += 1
         self._send_interrupted = True
         self._handoff_pending = False
