@@ -40,8 +40,8 @@ class EditImportTests(unittest.TestCase):
     """Verify contracts and the public runner work in independent cold processes."""
 
     def test_import_order_preserves_the_public_runner(self):
-        """Contract, dispatch, and UI entry points must not depend on prior imports."""
-        for module in ("ish.shell.request", "ish.app.dispatch", "ish.ui.prompt"):
+        """Contract and UI entry points must not depend on prior imports."""
+        for module in ("ish.shell.edit", "ish.shell.handoff", "ish.ui.prompt"):
             with self.subTest(module=module):
                 result = subprocess.run(
                     [
@@ -68,9 +68,9 @@ class EditStateTests(unittest.TestCase):
     def test_replies_are_single_use_and_session_local(self):
         """Copies, foreign requests, and duplicates cannot release a grant."""
         state, other = EditState(), EditState()
-        request = state.grant(7, commands=True)
-        foreign = other.grant(7, commands=True)
-        self.assertEqual((request.id, request.boundary, request.commands), (1, 7, True))
+        request = state.grant(7)
+        foreign = other.grant(7)
+        self.assertEqual((request.id, request.boundary, request.wire), (1, 7, None))
         self.assertFalse(state.take(replace(request)))
         self.assertFalse(state.take(foreign))
         self.assertIs(state.current, request)
@@ -81,27 +81,27 @@ class EditStateTests(unittest.TestCase):
     def test_cancelled_reply_cannot_consume_next_attempt_at_same_boundary(self):
         """A cancelled editor attempt differs from another attempt at the same prompt."""
         state = EditState()
-        old = state.grant(7, commands=False)
+        old = state.grant(7)
         state.revoke()
-        current = state.grant(7, commands=False)
+        current = state.grant(7)
         self.assertGreater(current.id, old.id)
         self.assertEqual(current.boundary, old.boundary)
         self.assertFalse(state.take(old))
         self.assertIs(state.current, current)
         self.assertTrue(state.take(current))
 
-    def test_admission_and_policy_are_immutable(self):
-        """No invalid boundary, overlapping editor, or mutated dispatch policy is admitted."""
+    def test_admission_and_boundary_are_immutable(self):
+        """No invalid boundary, overlapping editor, or changed boundary is admitted."""
         state = EditState()
         for boundary in (0, -1):
             with self.assertRaises(ValueError):
-                state.grant(boundary, commands=True)
-        request = state.grant(1, commands=False)
+                state.grant(boundary)
+        request = state.grant(1)
         with self.assertRaises(RuntimeError):
-            state.grant(2, commands=True)
+            state.grant(2)
         with self.assertRaises(FrozenInstanceError):
-            request.commands = True
-        self.assertFalse(request.commands)
+            request.boundary = 2
+        self.assertEqual(request.boundary, 1)
 
 
 class EditAdmissionTests(unittest.IsolatedAsyncioTestCase):
@@ -126,8 +126,8 @@ class EditAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.shell._read_edit(), "  echo text  ")
         self.assertIsNone(self.shell.edit_request)
 
-    async def test_invalidated_reply_cannot_dispatch(self):
-        """A reply arriving after input revocation cannot execute an internal command."""
+    async def test_invalidated_reply_cannot_submit(self):
+        """A reply arriving after input revocation cannot become shell input."""
 
         def revoke():
             self.shell.invalidate_input()
@@ -240,7 +240,7 @@ class EditCLITests(unittest.TestCase):
                 "    request = prompt.interactive_shell.edit_request\n"
                 "    saved.append(request)\n"
                 "    with open('requests', 'a') as output:\n"
-                "        print(json.dumps([request.id, request.boundary, request.commands]), file=output)\n"
+                "        print(json.dumps([request.id, request.boundary, request.wire is None]), file=output)\n"
                 "def stale(event):\n"
                 "    accepted = prompt.interactive_shell.accept_edit(saved[0])\n"
                 "    Path('stale').write_text(str(accepted))\n"

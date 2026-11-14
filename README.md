@@ -1,7 +1,7 @@
 # ish
 
 ish is an interactive command editor for Linux shells. It adds multiline editing,
-syntax highlighting, completion, and Python extensions
+syntax highlighting, completion, and Python UI extensions
 through prompt-toolkit while your selected shell executes commands.
 
 Use ish on Linux or inside WSL on Windows. Native Windows and macOS execution are
@@ -24,8 +24,9 @@ bindings. Shell-specific Readline, ZLE, and tcsh keymaps belong to their
 respective native editors. For example, some native keymaps leave Ctrl+Left
 unbound while ish uses it for word motion.
 
-When Enter submits a command, subsequent bytes stay available for that
-command or Python tool to read. Complete bracketed pastes keep their
+Enter submits the current command line. If the shell requests another syntax
+line, ish opens the supported continuation editor. Subsequent bytes stay available
+for the command to read. Complete bracketed pastes keep their
 contents together, and already-submitted command blocks retain their text.
 The terminal can erase or transform bytes before ish gets them back. For
 example, in canonical mode, Ctrl+V can quote a literal Backspace. If that
@@ -33,8 +34,8 @@ byte is forwarded to another command's canonical terminal, it can act as
 Backspace there because the original quoting has already been consumed.
 On eligible Bash and zsh sessions, ish holds input after Enter until a correlated
 shell request identifies its consumer: PTK continuation editing, native stdin,
-or the next confirmed primary editor. Programs such as Vim and Python tools
-using `input()` retain their native input paths. tcsh, BSD csh, sh/dash, and
+or the next confirmed primary editor. Programs such as Vim and ordinary Python
+programs using `input()` retain their native input paths. tcsh, BSD csh, sh/dash, and
 sessions using a fallback configuration retain native continuation.
 
 ## Supported shells
@@ -67,8 +68,9 @@ PTK continuation is selected at each confirmed primary boundary:
 
 In this mode, PS2 emits a request through the private control FIFO and contributes
 no visible prompt. PTK displays its own `> ` continuation prompt. Continuation
-and heredoc replies are shell text, including registered Python tool names and
-`ish_exit`; they never enter ish's command dispatcher. Primary display retains
+and heredoc replies are shell text. Primary submissions also go directly to the
+selected shell: ish has no text-based internal command or Python tool dispatcher.
+Primary display retains
 the existing shell prompt compatibility and optional `prompt_text` override.
 Prompt appearance does not determine input ownership.
 
@@ -319,8 +321,9 @@ glibc 2.28 and checks every bundled ELF file before publishing a candidate archi
 Edit `~/ish/.ishrc.py` for your settings. With `--home DIR`, use
 `DIR/.ishrc.py` instead. Interactive startup creates an empty file if it is missing
 and preserves existing files. This file receives `prompt`, `config`, `logger`, `option`,
-and `plugin` objects. Enter `ish_reload` to reload the rc file in a running session;
-restart ish after changing plugin source files.
+and `plugin` objects. Restart ish to reload settings, or bind an explicit key
+callback to `prompt.load_rc_async()` as shown below. Restart ish after changing
+plugin source files.
 
 `--no-rc` skips creating and loading this startup file. `--no-plugins` skips automatic plugin loading.
 Neither option skips the selected shell's own startup files. `--home` changes
@@ -330,17 +333,17 @@ The following objects are available directly in `.ishrc.py`, without importing t
 
 | Object | Purpose |
 | --- | --- |
-| `prompt` | The active ish `Prompt` instance. Configure hooks, tools, key bindings, completion, toolbar, right prompt, and styles. |
+| `prompt` | The active ish `Prompt` instance. Configure key bindings, completion, toolbar, right prompt, and styles. |
 | `config` | The current configuration and resolved paths, such as `config.ISH_HOME`, `config.RC_FILE`, and `config.CACHE_DIR`. |
 | `logger` | The session logger. Use methods such as `logger.info(...)` and `logger.warning(...)` for configuration diagnostics. |
 | `option` | Parsed command-line options, including `option.shell`, `option.lang`, `option.home`, and `option.no_plugins`. |
-| `plugin` | The plugin manager. `plugin.get("my_tools")` retrieves an already loaded plugin module, or returns `None` if it is unavailable. |
+| `plugin` | The plugin manager. `plugin.get("my_ui")` retrieves an already loaded plugin module, or returns `None` if it is unavailable. |
 
 ### Plugin metadata: PLUGIN_META
 
 Place each plugin in its own directory under `~/ish/plugin/script/`. For example,
-`my_tools` can use `my_tools/__init__.py` or `my_tools/my_tools.py` as its entry
-point. If both exist, `my_tools.py` takes precedence. With `--home DIR`, the base
+`my_ui` can use `my_ui/__init__.py` or `my_ui/my_ui.py` as its entry
+point. If both exist, `my_ui.py` takes precedence. With `--home DIR`, the base
 directory is `DIR/plugin/script/`.
 
 Define `PLUGIN_META` as a top-level dictionary literal in the entry point.
@@ -376,128 +379,76 @@ ish logs the failure and skips that plugin. Align the dependency requirements an
 restart ish before retrying a version change. Dotted import names, such as
 `"distribution|namespace.package"`, are supported.
 
-Plugins normally load before `.ishrc.py` runs. `plugin.get("my_tools")` looks up
+Plugins normally load before `.ishrc.py` runs. `plugin.get("my_ui")` looks up
 the registered module; it does not import an arbitrary file or trigger loading.
 Check for `None`, particularly when starting with `--no-plugins` or after a plugin
 fails to load.
 
-### pre_hook, post_hook, and fallback_hook
+### Command execution and API compatibility
 
-Hooks run for shell submissions made through the ish editor. The normal order is
-`pre_hook`, shell execution, `post_hook`, and then `fallback_hook` when a nonempty
-submission reports a nonzero shell exit status. Post/fallback hooks run after
-control returns from the shell; they are not shutdown callbacks. Internal Python
-tools do not trigger these shell hooks.
+Every submitted string goes to the selected shell, including `ish_exit`,
+`ish_reload`, and names previously registered as Python tools. These names have
+ordinary shell meaning; without a matching shell command, the shell reports
+command not found. Exit with Ctrl+D in an empty primary editor or the shell's
+`exit` command.
 
-Each hook is a synchronous function called **without arguments** in a separate
-Python worker. Hooks do not receive `prompt`, command text, or exit status, and
-their return values are ignored. Changing worker globals does not update the UI
-or the parent shell. Keep hooks short, since ish waits for them to finish.
+This is a breaking change for configurations using the removed Python execution
+API: `set_tool`, `internal_tools`, `internal_commands`, `exit_command`, `runner`,
+`last_tool_exitcode`, `read_and_dispatch`, `pre_hook`, `post_hook`, and
+`fallback_hook`, together with the `pre_exec`, `post_exec`, and `fallback`
+execution methods. Remove those registrations and calls from existing rc files
+and plugins.
+Calls to removed methods fail; assigning an obsolete hook attribute may still
+succeed as a Python assignment, but ish will not execute that hook.
+Run Python programs through the shell, for example `python3 script.py`.
+The shell's own `preexec`/`precmd` hooks remain part of shell integration.
 
-Define hooks and tools in an importable module. For example, create
-`~/ish/plugin/script/my_tools/__init__.py` with:
+Python configuration and plugins still customize the UI. Key callbacks,
+completion, toolbar functions, `prompt.cmd()`, and explicit rc loading remain
+available. `prompt.last_exitcode` exposes the latest received shell status as an
+integer (`None` before the first result):
+
+```python
+prompt.bottom_toolbar = lambda: f"Exit: {prompt.last_exitcode}"
+```
+
+To reload settings explicitly from a key callback:
+
+```python
+async def reload_settings(event):
+    await prompt.load_rc_async()
+    event.app.invalidate()
+
+
+prompt.set_key("f5", handler=reload_settings)
+```
+
+Reloading re-executes the rc file; it does not undo old registrations that are
+absent from the new file or reload imported plugin modules.
+
+### UI plugins
+
+For example, create `~/ish/plugin/script/my_ui/__init__.py` with:
 
 ```python
 PLUGIN_META = {
-    "name": "my_tools",
+    "name": "my_ui",
     "version": "1.0.0",
-    "description": "Shell hooks and greeting commands for ish.",
+    "description": "Status text for the ish toolbar.",
     "author": "Your Name",
     "requirements": [],
     "dependencies": [],
 }
 
 
-def before_command():
-    """Announce a shell submission."""
-    print("Starting command...", flush=True)
-
-
-def after_command():
-    """Announce return from a shell submission."""
-    print("Command finished.", flush=True)
-
-
-def on_failure():
-    """Report a nonzero shell exit status."""
-    print("The command reported a failure.", flush=True)
-
-
-def greet(name="world"):
-    """Print a greeting from an internal Python tool."""
-    print(f"Hello, {name}!", flush=True)
+def status_text(exitcode):
+    """Format the shell status without executing a command."""
+    return f"Exit: {exitcode}"
 ```
 
-For a custom home, place the module under `DIR/plugin/script/my_tools/`.
-Then connect the hooks in `.ishrc.py`:
-
-```python
-from my_tools import after_command, before_command, on_failure
-
-prompt.pre_hook = before_command
-prompt.post_hook = after_command
-prompt.fallback_hook = on_failure
-
-# Set any hook to None to disable it.
-# prompt.pre_hook = None
-```
-
-Functions used as hooks or tools must be importable and pickleable. Avoid lambdas,
-nested functions, or functions defined only in `.ishrc.py` for these workers.
-Key handlers and completers can be defined directly in `.ishrc.py`.
-
-### set_tool
-
-Register a Python callable under an internal command name in `.ishrc.py`:
-
-```python
-from my_tools import greet
-
-prompt.set_tool("greet", function=greet)
-prompt.set_tool("say", function=print)
-
-# Alternatively, resolve a function from an already loaded plugin.
-prompt.set_tool("greet", plugin_name="my_tools", function_name="greet")
-
-# Remove a registration by omitting the function source.
-# prompt.set_tool("greet")
-```
-
-Enter `greet Alice` or `greet "Ada Lovelace"` at the ish prompt. Arguments are
-passed as positional strings. A repeated registration replaces the existing
-callable. Supply either `function` or the pair `plugin_name` and `function_name`.
-
-Tools run in Python workers. Shell operators, substitutions, and redirections
-such as `greet Alice | cat` are handed to the shell, which needs an actual external
-command or shell function of that name.
-
-Each tool receives the exported environment from the latest confirmed shell
-context, including variables changed or removed since ish started. Its working
-directory comes from the live shell process, so an unset or modified `PWD` does
-not redirect the tool. Both are applied in the worker before importing the tool
-module. Worker changes do not affect ish or the shell. Shell-local variables,
-aliases, and interpreter startup settings such as Python's import path are not
-synchronized. If the context or directory is unavailable, the tool fails instead
-of using ish's startup directory.
-
-`prompt.last_exitcode` exposes the latest received shell status or completed tool
-status as an integer (`None` before the first result). Normal tool returns,
-including a returned integer, mean success (`0`); use `raise SystemExit(7)` to
-report status `7`. Unhandled exceptions report `1`, and an unhandled Ctrl+C
-reports `130`. Signal termination is displayed as `128 + signal_number`.
-`prompt.last_tool_exitcode` retains the raw worker result (negative for signal
-termination) until the next tool starts. Unavailable shell context reports `1`.
-Worker startup or I/O failures still follow the session's existing error cleanup.
-
-For example, display the latest result in `.ishrc.py`:
-
-```python
-prompt.bottom_toolbar = lambda: f"Exit: {prompt.last_exitcode}"
-```
-
-Python tools do not change the native shell's `$?` or `$status`.
-`prompt.context.exitcode` continues to contain the shell's reported status, and
-Python tools do not invoke `pre_hook`, `post_hook`, or `fallback_hook`.
+For a custom home, use `DIR/plugin/script/my_ui/`. UI callbacks execute in ish's
+process and can be defined directly in `.ishrc.py`; they do not require a Python
+worker or pickleable functions. Keep rendering and key callbacks quick.
 
 ### set_key
 
@@ -531,9 +482,10 @@ conditional variants. Keyword options such as `filter` and `eager` are forwarded
 to prompt-toolkit's `KeyBindings.add`. Keep handlers short to avoid blocking input.
 
 `event.app.exit("pwd")` ends the current prompt-toolkit input operation and returns
-`"pwd"` to ish for command dispatch. It does not itself close ish. The supplied
-string is submitted immediately instead of the current editor text. It can also
-name a registered internal tool, for example `event.app.exit("greet Alice")`.
+`"pwd"` as shell text. It does not itself close ish. `prompt.cmd("pwd")` provides
+the same submission behavior. The supplied string replaces the current editor
+text; in a continuation editor it answers that syntax request. These APIs do not
+turn continuation text into a separate primary command.
 
 ### Optional paired-character editing
 
@@ -593,11 +545,11 @@ Only symmetric pairs (quotes and backticks) skip an existing closer; closing
 parentheses, braces, and brackets still insert normally. Backspace deletes any
 matching adjacent pair, including one inserted manually or by paste.
 
-These handlers apply to keys typed in the primary editor. Text that comes
+These handlers apply to keys typed in the active PTK editor. Text that comes
 back from a foreground program, bracketed paste contents, and previously
 submitted commands keep their original quotes and parentheses.
 The handlers replace only their own key sequences, leaving Enter, Tab, and other
-bindings intact. Repeating the example with `ish_reload` does not add duplicate
+bindings intact. Reloading the rc file does not add duplicate
 bindings. Removing lines or pair entries from `.ishrc.py` does not undo
 registrations in an already-running session; restart ish or explicitly remove
 the previously configured keys and restore the default behavior:
@@ -639,7 +591,7 @@ Pass a single `Completer` instance or an iterable of instances:
 ```python
 from prompt_toolkit.completion import WordCompleter
 
-prompt.set_completer(WordCompleter(["greet", "say"], ignore_case=True))
+prompt.set_completer(WordCompleter(["pwd", "git"], ignore_case=True))
 
 # Multiple sources can be supplied as a list, tuple, or generator.
 # prompt.set_completer([first_completer, second_completer])
@@ -686,13 +638,12 @@ prompt.set_completer(ProjectCompleter())
 
 Additional completers keep control of their own insertion text; ish does not
 re-quote or filter their results through its default parsing policy.
-Default completion and direct Python-tool arguments use the selected shell's
-literal syntax. They do not evaluate variables, command substitutions, or globs.
-Uncertain syntax remains with the shell, so a Python-only tool name is not
-automatically available in a pipeline or expansion. In particular, C shell quoted
-backslashes, zsh adjacent single quotes, and zsh double-quoted `\!` are left native
-because their behavior depends on untracked shell options. These helpers do not
-mirror arbitrary custom history characters, aliases, or all live shell options.
+Default completion uses the selected shell's lexical rules without evaluating
+variables, command substitutions, or globs. It can decline a context it cannot
+interpret safely. Completion does not decide whether a command is complete or
+whether to open a continuation editor; the shell supplies that boundary. These
+helpers do not mirror arbitrary custom history characters, aliases, or all live
+shell options.
 
 ### Auto suggestions
 
@@ -720,7 +671,7 @@ prompt.auto_suggest = CommandSuggest()
 
 Return only the text to append in `Suggestion`, or `None` for no suggestion.
 This controls the inline suggestion, independently of `set_completer()` and its
-completion menu. The assignment also takes effect after `ish_reload`.
+completion menu. The assignment also takes effect after reloading the rc file.
 
 ```python
 # Disable inline suggestions.
@@ -802,8 +753,8 @@ rows and trailing spaces. Cursor coordinates are zero-based terminal cells;
 a wide character can occupy two columns. The observer follows cursor motion,
 overwrites, erasure, resizing, and the primary/alternate screen switch.
 On leaving the alternate screen the getter returns the primary grid.
-The PTY stream includes foreground Python tools. PTK prompts, toolbars and
-popups are drawn separately. Terminal graphics, styling and off-screen Vim
+The PTY stream includes Python programs launched by the shell. PTK prompts,
+toolbars and popups are drawn separately. Terminal graphics, styling and off-screen Vim
 buffer contents are outside the text snapshot.
 
 Tracking is off by default and starts with a blank grid. A repeated enable
@@ -812,8 +763,8 @@ discard it; `screen_snapshot()` returns `None` while tracking is off.
 The build includes pyte, which ish loads on the first enable. The observer
 limits each grid to 262,144 cells and stops tracking if it cannot process a
 screen. Screen updates cost CPU while enabled. Ordinary scrollback
-remains available independently. A `set_tool` function runs in a separate
-process; read snapshots from a resident callback in the parent process.
+remains available independently. Read snapshots from a resident UI callback in
+ish's process.
 
 ### Bottom toolbar, right prompt, and styles
 
@@ -833,9 +784,9 @@ For additional formatting options, see the
 
 ### Complete .ishrc.py example
 
-After creating the `my_tools` plugin shown above, save the following as
+After creating the `my_ui` plugin shown above, save the following as
 `~/ish/.ishrc.py` (or `DIR/.ishrc.py` with `--home DIR`). It configures the UI,
-retrieves the plugin module, registers its hooks and tool, and binds commands
+retrieves the plugin module, and binds shell submissions
 to function keys.
 
 ```python
@@ -860,34 +811,26 @@ prompt.style = Style.from_dict({
 
 
 def run_pwd(event):
-    """Submit pwd through ish's command dispatcher."""
+    """Return pwd as the editor's shell submission."""
     event.app.exit("pwd")
 
 
 prompt.set_key("f2", handler=run_pwd)
 
 # The lookup name is the plugin directory name, without a .py suffix.
-my_tools = plugin.get("my_tools")
-if my_tools is not None:
-    prompt.pre_hook = my_tools.before_command
-    prompt.post_hook = my_tools.after_command
-    prompt.fallback_hook = my_tools.on_failure
-    prompt.set_tool("greet", function=my_tools.greet)
-    prompt.set_completer(WordCompleter(["greet"], ignore_case=True))
-
-    def run_greeting(event):
-        """Run the registered Python tool with a fixed argument."""
-        event.app.exit("greet Alice")
-
-    prompt.set_key("f3", handler=run_greeting)
-    prompt.bottom_toolbar += "| F3: greet "
+my_ui = plugin.get("my_ui")
+if my_ui is not None:
+    prompt.bottom_toolbar = lambda: (
+        " F2: pwd | " + my_ui.status_text(prompt.last_exitcode)
+    )
 else:
-    logger.warning("my_tools is unavailable; check plugin loading or --no-plugins.")
+    logger.warning("my_ui is unavailable; check plugin loading or --no-plugins.")
+
+prompt.set_completer(WordCompleter(["pwd", "git"], ignore_case=True))
 ```
 
-F2 immediately submits `pwd` to the selected shell. When `my_tools` is loaded,
-F3 dispatches `greet Alice` to its Python worker. The rc file's key handlers stay
-in the UI process, while the plugin's importable hooks and tool run in workers.
+At a primary editor, F2 immediately submits `pwd` to the selected shell.
+The plugin formats the toolbar in the UI process without registering a command.
 
 ## Development environment
 
@@ -923,11 +866,12 @@ Cancelled, duplicate, foreign, and out-of-order requests cannot authorize input.
 The common session holds trailing bytes until their consumer is known and uses
 the existing primary ACK boundary to recover unread native input.
 
-The session now calls `Prompt.prompt_async()` for text and admits command
-dispatch separately. `Prompt.read_and_dispatch()` remains callable for existing
-integrations, but overriding it no longer changes the live session. Custom
-editors should return text from `prompt_async()` without dispatching it. The
-pre-execution, post-execution, and fallback hook order is unchanged.
+The session calls `Prompt.prompt_async()` for text and sends each accepted reply
+to the shell. Custom editors must return text. Text-based internal commands,
+Python workers, and the old dispatch and Python execution-hook APIs are removed;
+see the compatibility notes above. Shell integration hooks remain in place.
+The existing private control FIFO still carries shell state and semantic events.
+The separate tcsh syntax-FIFO experiment is not part of the live session path.
 
 The Bash and zsh adapters implement the same contract using their own shell
 boundaries. tcsh, BSD csh, and sh/dash continuation remains native because the
@@ -941,15 +885,16 @@ The tracked contract and live continuation tests run with:
 
 ```sh
 PYTHONPATH=src:tests uv run python -B -m unittest \
-  test_handoff_protocol test_edit_dispatch test_edit_requests \
+  test_handoff_protocol test_edit_requests test_shell_editing \
   test_bash_edit_protocol test_semantic_edit_cli \
-  test_zsh_semantic test_zsh_edit_cli test_semantic_races
+  test_zsh_semantic test_zsh_edit_cli test_semantic_races \
+  test_shell_submission_cli
 ```
 
 ## Support scope
 
 ish is intended for interactive Linux terminal use, including multiline commands,
-input-waiting programs, typeahead, paste, Ctrl+C, Python tools, and return from
+input-waiting programs, typeahead, paste, Ctrl+C, Python programs, and return from
 programs such as Vim and man. Linux kernel 4.13 or newer is required for the PTY
 input handling used by ish.
 

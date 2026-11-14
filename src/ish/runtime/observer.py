@@ -15,7 +15,6 @@ from time import monotonic_ns
 # Stable labels exposed by trace snapshots. They do not grant input ownership.
 EDITOR = "EDITOR"
 SHELL = "SHELL"
-TOOL = "TOOL"
 PROCESS_EXIT = "process_exit"
 _DEFAULT_CAPACITY = 4096
 _DEFAULT_UNIT = "bytes"

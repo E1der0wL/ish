@@ -17,9 +17,9 @@ _RESUME_DIVISOR = 4
 
 
 class InputBytes(bytes):
-    """Carry a native-text prefix through a worker without changing its byte API.
+    """Carry a native-text prefix through a shell send without changing its byte API.
 
-    The prefix has already passed through a previous PTY. If a worker exits
+    The prefix has already passed through a previous PTY. If a send is rejected
     before writing all of it, that unsent part must retain its text provenance.
     Bytes after the prefix are fresh key input.
     """

@@ -2,8 +2,14 @@
 
 이 브랜치는 셸이 확인한 입력 경계를 공통 session 계약으로 연결한다. 현재 Bash와
 zsh는 지원 조건이 충족되면 primary와 continuation 명령 편집을 PTK로 제공한다.
-실제 경로를 검증한 버전은 **Bash 5.3.9와 zsh 5.9**다. 프로그램의 stdin과 Python
-도구의 `input()`은 기존 native 입력 경로를 유지한다.
+실제 경로를 검증한 버전은 **Bash 5.3.9와 zsh 5.9**다. Enter로 현재 입력을 제출하고,
+셸이 다음 구문 줄을 요청하면 continuation 편집을 연다. 셸에서 실행한 프로그램의
+stdin과 Python 프로그램의 `input()`은 기존 native 입력 경로를 유지한다.
+
+primary와 continuation의 제출 텍스트는 모두 셸로 전달한다. 텍스트 이름으로
+Python 도구나 ish 내부 명령을 실행하던 경로는 제거했다. 전체 블록을 파일로 실행하는
+worker나 tcsh source FIFO를 production 경로에 도입한 변경은 아니다.
+기존 private control FIFO를 통한 셸 상태·semantic 이벤트 교환은 계속 사용한다.
 
 tcsh, BSD csh, sh/dash의 continuation은 아직 native다. 해당 셸의 관찰 결과와
 부족한 보장은 [HANDOFF_LIMITS.md](HANDOFF_LIMITS.md)에 기록했다. 이 문서는
@@ -34,8 +40,8 @@ production의 deadline은 전송·동기화 실패를 처리하기 위한 것이
 | `EditRequest.boundary` | session이 확인한 primary 경계 | 해당 편집 시도가 시작된 primary identity다. continuation에서도 마지막으로 확인한 primary를 가리킨다. |
 | `EditRequest.wire` | session이 수락한 `InputRequest` | continuation 편집을 승인한 실제 `sid/seq/C` 요청이다. primary 편집에서는 `None`이다. |
 
-같은 primary에서 Ctrl+C로 다시 편집하거나 Python 도구 실행 후 돌아오면
-`prompt_id`는 같아도 로컬 편집 ID가 달라진다. 검증 실패로 같은 syntax 요청을
+같은 primary에서 Ctrl+C로 다시 편집하면 `prompt_id`는 같아도 로컬 편집 ID가
+달라진다. 검증 실패로 같은 syntax 요청을
 다시 편집하는 경우에도 wire 요청과 로컬 편집 시도를 구별한다. 로컬 응답은 현재
 발급한 객체 한 번만 소비할 수 있으며, 복사본·취소된 시도·늦은 응답은 새 시도를
 해제하지 못한다.
@@ -57,7 +63,7 @@ request 종류를 먼저 검증한다. 현재 제출의 정확히 다음 sequenc
 수락하며, 다른 세션·제출, 중복, 오래된 값, 순서가 맞지 않는 요청은 거부한다.
 
 - **C / SYNTAX:** 셸 parser가 대화형 명령 구문의 다음 줄을 받을 경계다. PTK
-  편집 또는 이미 제출된 구문 한 줄을 허용한다. ish 명령 dispatch 권한은 없다.
+  편집 또는 이미 제출된 구문 한 줄을 허용한다.
 - **R / RAW:** native 입력 소비를 허용하는 경계다. 명령 실행이 이미 시작됐거나
   끝났다는 보고가 아니다. 셸 hook, expansion, builtin, 외부 프로그램의 stdin도
   이 권한 아래에서 소비될 수 있다.
@@ -90,8 +96,8 @@ stateDiagram-v2
    PTY에서 회수한 입력, PTY에 전달하지 않은 새 키를 구별한다. Python에서 셸
    문법을 분석해 C/R을 추측하지 않는다.
 2. **EDITOR:** C 하나는 구문 한 줄의 응답을 허용한다. 추가 편집이 필요하면 실제
-   `Prompt.prompt_async()`를 실행한다. `EditRequest.commands=False`이므로
-   `probe`, `ish_exit` 같은 이름이나 heredoc 본문도 문자 그대로 셸로 전달한다.
+   `Prompt.prompt_async()`를 실행한다. primary와 마찬가지로 `probe`, `ish_exit`
+   같은 이름이나 heredoc 본문도 문자 그대로 셸로 전달한다.
    응답 검증이 끝난 뒤 요청을 소비하고 다음 `BARRIER`로 돌아간다.
 3. **RELEASE:** R을 수락한 직후에도 새로운 native 키를 먼저 보내지 않는다. 기존에
    보류한 입력을 원래 순서로 writer에 넣은 뒤 **RAW**를 열어 새 입력이 앞서지
@@ -155,11 +161,26 @@ zsh는 기존 preexec/precmd hook과 종료 상태 전달을 유지한다. 사�
 - PTY EOF가 자식 종료 통지보다 빠르면 실제 프로세스 결과를 기다린다. 실패한
   편집 요청으로 native 종료 코드나 마지막 출력을 덮어쓰지 않는다.
 
-session은 `Prompt.prompt_async()`로 텍스트를 받은 뒤 승인된 primary 제출만
-dispatch한다. `Prompt.read_and_dispatch()`는 기존 호출자를 위해 남아 있지만
-이를 override해도 live session 경로는 바뀌지 않는다. custom editor는
-`prompt_async()`에서 직접 dispatch하지 않고 텍스트를 반환해야 한다. 기존
-pre-execution → execution → post-execution → fallback 순서는 유지한다.
+session은 `Prompt.prompt_async()`로 텍스트를 받아 현재 편집 요청을 한 번 소비한 뒤
+셸에 전달한다. custom editor도 텍스트를 반환해야 한다. 편집 요청은 입력 수명을
+관리하며, 별도 실행 대상을 고르는 `EditRequest.commands` 필드는 제거했다.
+
+다음 Python 실행 API는 호환성을 유지하지 않고 제거했다: `set_tool`,
+`internal_tools`, `internal_commands`, `exit_command`, `runner`,
+`last_tool_exitcode`, `read_and_dispatch`, `pre_hook`, `post_hook`, `fallback_hook`.
+이 Python hook을 실행하던 `pre_exec`, `post_exec`, `fallback` 메서드도 제거했다.
+기존 rc/plugin에서 해당 호출과 등록을 제거해야 한다. Python 코드는 셸의 일반
+프로그램으로 실행하며, 사용자 셸의 `preexec`·`precmd` hook은 유지한다.
+제거된 메서드 호출은 실패한다. 이전 hook 이름에 동적 속성을 할당하는 Python
+코드는 실행될 수 있지만, 그 callback을 ish가 호출하지는 않는다.
+
+`ish_exit`와 `ish_reload`는 더 이상 가로채지 않는다. 셸에 정의된 명령이 없다면
+셸의 command-not-found 결과를 받는다. 종료는 빈 primary의 Ctrl+D 또는 셸의
+`exit`를 사용한다. 설정을 다시 읽으려면 명시적 키 callback에서
+`await prompt.load_rc_async()`를 호출할 수 있다. rc/plugin UI 기능과 PTK 키
+callback, completion, toolbar, `Prompt.cmd()`는 유지한다. `Prompt.cmd(text)`도
+현재 편집기의 응답으로 텍스트를 반환하므로 continuation에서 primary 명령 실행으로
+전환하지 않는다. 예제는 [README](../README.md#customizing-ish)에 있다.
 
 공통 확장은 [engine.py](../src/ish/shell/engine.py)의 session과 입력 계약에 있다.
 PTK Application이나 공통 입력 처리에 Bash/zsh 이름별 분기를 추가하지 않았다.
@@ -173,9 +194,9 @@ preexec/LI 같은 구현 차이는 adapter/session 경계 안에서 처리한다
 zsh 5.9다. 아래 테스트는 wire 관찰, 계약 검증, 실제 PTK 경로를 구분한다.
 
 ```sh
-# 공통 wire/state 계약, 로컬 편집 시도, dispatch
+# 공통 wire/state 계약, 로컬 편집 시도와 실제 PTK 입력 계약
 PYTHONPATH=src:tests uv run python -B -m unittest \
-  test_handoff_protocol test_edit_requests test_edit_dispatch
+  test_handoff_protocol test_edit_requests test_shell_editing
 
 # 실제 셸 PTY에서 C/R ordering, native stdin 및 회수 경계 관찰
 PYTHONPATH=src:tests uv run python -B -m unittest \
@@ -183,7 +204,8 @@ PYTHONPATH=src:tests uv run python -B -m unittest \
 
 # 실제 ish CLI + PTK에서 편집 소유권, 최종 소비자와 파일 결과 확인
 PYTHONPATH=src:tests uv run python -B -m unittest \
-  test_semantic_edit_cli test_zsh_edit_cli test_semantic_races
+  test_semantic_edit_cli test_zsh_edit_cli test_semantic_races \
+  test_shell_submission_cli
 
 # 기존 키 입력 및 hook/status 회귀
 PYTHONPATH=src:tests uv run python -B -m unittest \
@@ -191,15 +213,22 @@ PYTHONPATH=src:tests uv run python -B -m unittest \
 ```
 
 검증 항목은 fast typeahead의 C/R/primary 분기, multiline paste, heredoc의
-공백·Unicode·도구 이름, builtin read, 외부 stdin, Python input(), source 및
-명령 치환, Ctrl+C/D, 지연·중복·취소된 wire 요청과 ACK, 늦은 R 처리 및 primary
+공백·Unicode·과거 내부 명령 이름, builtin read, 외부 stdin, Python 프로그램의
+input(), source 및 명령 치환, Ctrl+C/D, 지연·중복·취소된 wire 요청과 ACK, 늦은 R 처리 및 primary
 입력 회수를 포함한다. 실제 PTK 테스트는 key binding의 활성 편집 요청과 buffer를
 관찰하고 파일 결과를 함께 확인한다. 관찰용 문자열이나 실패 deadline을 production
 readiness로 사용하지 않는다. 세부 testcase는 각 파일이 확인하는 보장의 범위다.
 
+Python 실행 경로를 제거한 뒤 위 추적 테스트 **120개**와 기존 자동완성·builtin 탐색·
+TUI 복귀 테스트 **23개**, 총 **143개**가 통과했다. 제거된 내부 종료 명령을 쓰던
+키 입력 테스트는 실제 primary Ctrl+D로 종료하도록 갱신했다. 지연 history 검증은
+앞선 제출을 관찰한 뒤 EOF를 보내며, 기대 입력과 timeout은 유지했다.
+배포 smoke와 release CI의 Python worker 검증도 UI plugin callback 검증으로
+전환했다. 이번 작업에서 새 배포 번들 생성이나 전체 release CI 실행은 하지 않았다.
+
 | 단계 | 현재 상태 |
 | --- | --- |
-| 1. 작업 분리·규칙·편집과 dispatch 분리 | 완료 |
+| 1. 작업 분리·규칙·실행 경로 단순화 | 입력은 셸 실행으로 통일; Python 도구와 텍스트 기반 내부 명령 경로 제거 |
 | 2. primary 편집 요청 수명 관리 | 완료 |
 | 3. 공통 wire 계약·보류/회수·PTK syntax UI 연결 | Bash/zsh 실제 경로에서 구현·검증 완료; primary 표시 호환성 유지 |
 | 4. Bash PTK continuation | 위 지원 조건과 시나리오에서 구현·검증 완료 |

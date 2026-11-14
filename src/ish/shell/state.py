@@ -1,7 +1,6 @@
 """Track terminal mode state that may need cleanup after interrupted TUIs."""
 
 from .constants import ALTERNATE_SCREENS, CSI, ESC
-from .sequencer import Sequencer
 
 _PRIVATE_MODE = CSI + b"?"
 _SET = b"h"
@@ -41,11 +40,10 @@ class TerminalState:
     }
 
     def __init__(self):
-        """Prepare bounded mode state and a parser for otherwise unparsed tool output."""
+        """Prepare bounded state for controls parsed by the shell sequencer."""
         self.modes = {}
         self.keypad = False
         self.styled = False
-        self.parser = Sequencer(control_callback=self.observe)
 
     def observe(self, sequence: bytes) -> None:
         """Observe complete controls already parsed by the shell's sequencer."""
@@ -71,11 +69,6 @@ class TerminalState:
             self.keypad = sequence == _KEYPAD_APPLICATION
         elif sequence.startswith(CSI) and sequence.endswith(_SGR):
             self.styled = sequence not in _SGR_RESETS
-
-    def feed(self, data: bytes) -> None:
-        """Inspect raw tool output, skipping Python parsing for plain text chunks."""
-        if self.parser.state != Sequencer.GROUND or ESC in data:
-            self.parser.feed(data)
 
     def restore(self) -> bytes:
         """Return minimal common-mode resets for a terminating session."""

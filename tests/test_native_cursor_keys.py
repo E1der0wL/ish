@@ -16,6 +16,8 @@ from prompt_toolkit.output import DummyOutput
 from ish.shell.engine import InteractiveShell
 from ish.ui.prompt import Prompt
 
+PRIMARY_EOF = b"\x04"
+
 
 class DelayedHistory(InMemoryHistory):
     """Pause history loading until the test releases it."""
@@ -47,7 +49,6 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
             output=DummyOutput(),
             history=InMemoryHistory(["first", "most recent"]),
         )
-        self.prompt.exit_command = "finish"
         self.shell = self.prompt.interactive_shell
         self.shell.continuation_active = asyncio.Event()
         self.shell.command_done_event = asyncio.Event()
@@ -61,6 +62,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(InteractiveShell, "_write"))
         self.enterContext(patch.object(InteractiveShell, "_drain_output"))
         self.submissions = []
+        self.eof_after_submission = False
         self.enterContext(
             patch.object(InteractiveShell, "_exec", self.record_submission)
         )
@@ -68,9 +70,23 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
     async def record_submission(self, command):
         """Record the command and the remaining native bytes at the handoff."""
         self.submissions.append((command, bytes(self.shell._returned_input)))
+        if self.eof_after_submission:
+            self.eof_after_submission = False
+            self.source.send_bytes(PRIMARY_EOF)
 
-    async def run_editor(self, *, native=b"", fresh=b"", saved=(), live=b"finish\r"):
-        """Run until the live input's exit command follows all pending commands."""
+    async def run_editor(
+        self,
+        *,
+        native=b"",
+        fresh=b"",
+        saved=(),
+        live=PRIMARY_EOF,
+        eof_after_submission=False,
+    ):
+        """Run until primary Ctrl+D follows all pending commands."""
+        # A queued EOF deliberately interrupts pending history. Tests of history
+        # completion send it only after observing the preceding submission.
+        self.eof_after_submission = eof_after_submission
         self.shell._returned_input.extend(native)
         self.shell.typeahead.extend(fresh)
         store_typeahead(self.source, list(saved))
@@ -91,7 +107,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_enter_can_finish_a_returned_search(self):
         """Keep a native-started search usable across the editor handoff."""
-        commands = await self.run_editor(native=b"\x12fir", live=b"s\rfinish\r")
+        commands = await self.run_editor(native=b"\x12fir", live=b"s\r" + PRIMARY_EOF)
         self.assertEqual(commands, [b"first\n"])
 
     async def test_saved_up_and_enter(self):
@@ -105,7 +121,9 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         self.prompt.default_buffer.history = ThreadedHistory(
             InMemoryHistory(["threaded"])
         )
-        commands = await self.run_editor(native=b"\x1b[A\n")
+        commands = await self.run_editor(
+            native=b"\x1b[A\n", live=b"", eof_after_submission=True
+        )
         self.assertEqual(commands, [b"threaded\n"])
 
     async def test_slow_history_keeps_native_saved_and_live_order(self):
@@ -124,7 +142,10 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.source, "read_keys", read_keys):
             task = asyncio.create_task(
                 self.run_editor(
-                    native=b"\x1b[A", saved=[KeyPress("S")], live=b"L\rfinish\r"
+                    native=b"\x1b[A",
+                    saved=[KeyPress("S")],
+                    live=b"L\r",
+                    eof_after_submission=True,
                 )
             )
             try:
@@ -172,7 +193,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         def finish_character(buffer):
             """Send the remaining bytes after the older literal suffix is restored."""
             if buffer.text.endswith("!"):
-                self.source.send_bytes(b"\x98\x83\rfinish\r")
+                self.source.send_bytes(b"\x98\x83\r" + PRIMARY_EOF)
 
         buffer.on_text_changed += finish_character
         with patch.object(self.source, "read_keys", read_keys):
@@ -180,9 +201,9 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands, ["delayed!☃\n".encode()])
 
     async def test_interrupt_does_not_wait_for_history(self):
-        """Cancel the pending navigation and give post-interrupt text to the next prompt."""
+        """Cancel pending navigation and accept EOF at the next primary prompt."""
         self.prompt.default_buffer.history = DelayedHistory()
-        commands = await self.run_editor(native=b"\x1b[A", live=b"\x03finish\r")
+        commands = await self.run_editor(native=b"\x1b[A", live=b"\x03" + PRIMARY_EOF)
         self.assertEqual(commands, [])
 
     async def test_printable_input_does_not_wait_for_history(self):
@@ -254,13 +275,15 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         self.prompt.set_key(
             "up", handler=lambda event: event.current_buffer.insert_text("<live>")
         )
-        commands = await self.run_editor(native=b"\x1b[", live=b"A\r\x1b[A\rfinish\r")
+        commands = await self.run_editor(
+            native=b"\x1b[", live=b"A\r\x1b[A\r" + PRIMARY_EOF
+        )
         self.assertEqual(commands, [b"most recent\n", b"<live>\n"])
 
     async def test_native_enter_accepts_without_a_live_shortcut(self):
         """Use the default submission for previously unconsumed canonical Enter."""
         self.prompt.set_key(
-            "enter", handler=lambda event: event.app.exit(result="finish")
+            "enter", handler=lambda event: event.app.exit(exception=EOFError())
         )
         commands = await self.run_editor(native=b"one\n", live=b"\r")
         self.assertEqual(commands, [b"one\n"])
@@ -268,7 +291,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
     async def test_emacs_repeat_argument_applies_to_one_character(self):
         """Resume bulk insertion only after Meta-3 repeats its following key."""
         keys = b"\x1b3xy"
-        live = await self.run_editor(live=keys + b"\rfinish\r")
+        live = await self.run_editor(live=keys + b"\r" + PRIMARY_EOF)
         self.submissions.clear()
         queued = await self.run_editor(native=keys + b"\n")
         self.assertEqual(live, [b"xxxy\n"])
@@ -278,7 +301,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         """Interpret vi navigation, replace-one and append between printable runs."""
         self.prompt.editing_mode = EditingMode.VI
         keys = b"abcdef\x1b0rXAend"
-        live = await self.run_editor(live=keys + b"\rfinish\r")
+        live = await self.run_editor(live=keys + b"\r" + PRIMARY_EOF)
         self.submissions.clear()
         queued = await self.run_editor(native=keys + b"\n")
         self.assertEqual(live, [b"Xbcdefend\n"])
@@ -289,7 +312,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
         self.prompt.set_key("x", handler=lambda e: e.current_buffer.insert_text("X"))
         literal = b"xx\x1b[A"
         self.shell._literal_input.extend(literal)
-        commands = await self.run_editor(live=b"\rfinish\r")
+        commands = await self.run_editor(live=b"\r" + PRIMARY_EOF)
         self.assertEqual(commands, [literal + b"\n"])
 
     async def test_partial_submitted_unicode_remains_literal(self):
@@ -299,7 +322,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
             "한", handler=lambda e: e.current_buffer.insert_text("HOTKEY")
         )
         self.shell._literal_input.extend(b"echo " + scalar[:1])
-        commands = await self.run_editor(live=scalar[1:] + b"\rfinish\r")
+        commands = await self.run_editor(live=scalar[1:] + b"\r" + PRIMARY_EOF)
         self.assertEqual(commands, [b"echo " + scalar + b"\n"])
 
     async def test_partial_submitted_unicode_in_vi_navigation(self):
@@ -328,7 +351,7 @@ class NativeCursorKeyTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_sequence_uses_ordinary_ptk_fallback(self):
         """Compare even an unmapped escape with the running editor's interpretation."""
         sequence = b"abc\x1b[99~\x1b[DX"
-        ordinary = await self.run_editor(live=sequence + b"\rfinish\r")
+        ordinary = await self.run_editor(live=sequence + b"\r" + PRIMARY_EOF)
         self.submissions.clear()
         returned = await self.run_editor(native=sequence + b"\n")
         self.assertTrue(ordinary)

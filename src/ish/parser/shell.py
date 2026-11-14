@@ -1,4 +1,4 @@
-"""Parse shell state bytes and literal internal-tool arguments without side effects."""
+"""Parse shell state bytes without evaluating shell code."""
 
 from __future__ import annotations
 
@@ -9,14 +9,11 @@ from ish.config import BuiltinShell
 from ish.shell.adapter import get_adapter
 from ish.shell.protocol import ENV_RECORD_SEPARATOR
 
-from .command import literal_argv
-
 __all__ = [
     "str_parser",
     "dict_parser",
     "environ_parser",
     "alias_parser",
-    "simple_command",
 ]
 
 _LEGACY_RECORD_SEPARATOR = "\n"
@@ -74,8 +71,3 @@ def alias_parser(
     """Decode shell-produced aliases without evaluating their expansion text."""
     text = raw_data.decode(encoder, errors=_ALIAS_ERRORS)
     return get_adapter(shell).syntax.parse_aliases(text)
-
-
-def simple_command(text: str) -> Optional[list[str]]:
-    """Keep the legacy POSIX literal helper; dispatch uses the active adapter policy."""
-    return literal_argv(text)

@@ -308,6 +308,7 @@ jobs:
           cat > "$RUNNER_TEMP/smoke.py" <<'PY'
           import errno
           import fcntl
+          import json
           import os
           import pty
           import select
@@ -334,7 +335,7 @@ jobs:
                   tool.chmod(0o755)
               env["PATH"] = str(blocked) + ":" + env["PATH"]
               args = [binary, "--lang", "en", "--home", str(home / "state")]
-              # Unrelated host Python settings must not poison ish or its workers.
+              # Unrelated host Python settings must not poison ish or its UI plugins.
               env["PYTHONHOME"] = str(home / "missing-python")
               env["PYTHONPATH"] = str(home / "unrelated-python")
               runtime = str(Path(binary).resolve().parent / "python" / "bin" / "python3")
@@ -350,14 +351,17 @@ jobs:
               plugin.mkdir(parents=True)
               (plugin / "__init__.py").write_text(
                   "PLUGIN_META = {'name': 'smoke_plugin'}\n"
-                  "import sys, subprocess, sqlite3\n"
+                  "import json, sys, sqlite3\n"
                   "from pathlib import Path\n"
-                  "def report():\n"
+                  "def report(event):\n"
                   "    assert sqlite3.connect(':memory:').execute('select 42').fetchone() == (42,)\n"
-                  "    assert subprocess.check_output([sys.executable, '-I', '-c', 'print(42)']).strip() == b'42'\n"
-                  "    Path('worker-executable').write_text(sys.executable)\n"
+                  "    report = Path('plugin-report.next')\n"
+                  "    report.write_text(json.dumps({\n"
+                  "        'executable': sys.executable, 'running': event.app.is_running,\n"
+                  "        'text': event.app.current_buffer.text}))\n"
+                  "    report.replace('plugin-report')\n"
               )
-              (home / "state" / ".ishrc.py").write_text("prompt.set_tool('runtime_probe', function=plugin.get('smoke_plugin').report)\n")
+              (home / "state" / ".ishrc.py").write_text("prompt.set_key('f8', handler=plugin.get('smoke_plugin').report)\n")
 
               pid, master = pty.fork()
               if pid == 0:
@@ -368,7 +372,7 @@ jobs:
               output = bytearray()
               try:
                   sent = False
-                  worker_sent = False
+                  probe_sent = False
                   deadline = time.monotonic() + 45
                   while time.monotonic() < deadline:
                       if select.select([master], [], [], 0.1)[0]:
@@ -382,14 +386,14 @@ jobs:
                           if b"\x1b[6n" in output:
                               os.write(master, b"\x1b[1;1R")
                               output = output.replace(b"\x1b[6n", b"")
-                          # prompt-toolkit can style the final space separately.
-                          if not worker_sent and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
-                              os.write(master, b"runtime_probe\r")
-                              worker_sent = True
-                              output.clear()
-                          elif worker_sent and not sent and (home / "worker-executable").exists() and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
-                              os.write(master, b"printf 'ISH_%s\\n' OK > answer; exit 7\r")
-                              sent = True
+                      # A UI callback can finish without producing terminal output.
+                      # prompt-toolkit can style the final space separately.
+                      if not probe_sent and b"ISH_CI>" in output and b"\x1b[?2004h" in output:
+                          os.write(master, b"\x1b[19~")
+                          probe_sent = True
+                      elif probe_sent and not sent and (home / "plugin-report").exists():
+                          os.write(master, b"printf 'ISH_%s\\n' OK > answer; exit 7\r")
+                          sent = True
                       ended, status = os.waitpid(pid, os.WNOHANG)
                       if ended:
                           reaped = True
@@ -400,8 +404,11 @@ jobs:
                       raise RuntimeError("Timed out waiting for the Bash session")
                   if (home / "answer").read_text() != "ISH_OK\n":
                       raise RuntimeError("The command did not execute correctly")
-                  if Path((home / "worker-executable").read_text()).resolve() != Path(runtime).resolve():
-                      raise RuntimeError("The plugin worker used a different Python")
+                  report = json.loads((home / "plugin-report").read_text())
+                  if Path(report["executable"]).resolve() != Path(runtime).resolve():
+                      raise RuntimeError("The UI plugin used a different Python")
+                  if not report["running"] or report["text"] != "":
+                      raise RuntimeError("The UI plugin did not run in the primary editor")
                   if list((home / "state" / ".cache").glob("session-*")):
                       raise RuntimeError("Session files survived normal exit")
                   if (home / "forbidden-tools").exists():
@@ -414,7 +421,7 @@ jobs:
                       os.kill(pid, signal.SIGKILL)
                       os.waitpid(pid, 0)
                   os.close(master)
-          print("Runtime, stdlib, plugin spawn, CLI, Bash command, exit status, and session cleanup passed.")
+          print("Runtime, stdlib, UI plugin, CLI, Bash command, exit status, and session cleanup passed.")
           PY
 
       - name: Run outside the source tree and build environment

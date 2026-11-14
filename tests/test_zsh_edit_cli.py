@@ -26,14 +26,12 @@ PASTE_START, PASTE_END = b"\x1b[200~", b"\x1b[201~"
 
 RC = """import json
 from pathlib import Path
-from witnesses import probe, inputtool
 shell = prompt.interactive_shell
-prompt.set_tool('probe', function=probe)
-prompt.set_tool('inputtool', function=inputtool)
 def snapshot(event):
     request = shell.edit_request
+    # Test metadata only; primary and continuation both send literal shell text.
     with open('snapshots', 'a') as output:
-        print(json.dumps({'commands': request.commands, 'id': request.id, 'boundary': request.boundary,
+        print(json.dumps({'primary': request.wire is None, 'id': request.id, 'boundary': request.boundary,
             'text': prompt.default_buffer.text, 'semantic': shell._semantic_enabled}), file=output)
 prompt.set_key('f8', handler=snapshot)
 """
@@ -121,14 +119,11 @@ class ZshEditCLITests(unittest.TestCase):
             self.skipTest("zsh is not installed")
         with tempfile.TemporaryDirectory(prefix="ish-zsh-edit-") as directory:
             root = Path(directory)
-            (root / ".zshrc").write_text("PS1='READY> '\n" + extra_rc)
-            (root / "ish").mkdir()
-            (root / "witnesses.py").write_text(
-                "from pathlib import Path\ndef probe(*args):\n"
-                "    Path('tool-executed').write_text('unexpected')\n"
-                "def inputtool():\n"
-                "    Path('python-reply').write_text(input() + '\\n')\n"
+            (root / ".zshrc").write_text(
+                "PS1='READY> '\nprobe() { print -r -- unexpected > probe-executed; }\n"
+                + extra_rc
             )
+            (root / "ish").mkdir()
             (root / "ish/.ishrc.py").write_text(
                 RC
                 + (DELAY_RAW if delay_raw else "")
@@ -214,7 +209,7 @@ class ZshEditCLITests(unittest.TestCase):
         return EDIT_ON in self.output
 
     def snapshot(self, root):
-        """Read the live PTK buffer and dispatch policy through a registered key."""
+        """Read the live PTK buffer and request metadata through a registered key."""
         self.snapshots += 1
         self.send(SNAPSHOT)
         path = root / "snapshots"
@@ -230,23 +225,23 @@ class ZshEditCLITests(unittest.TestCase):
         self.output.clear()
         self.send(text + "\r")
 
-    def test_fast_continuation_input_uses_real_ptk_and_cannot_dispatch_a_tool(self):
+    def test_fast_continuation_input_uses_real_ptk_and_keeps_literal_data(self):
         """Enter plus immediate body text reaches the continuation editor once."""
         with self.session() as root:
             self.output.clear()
             self.send("cat > result <<'END'\rprobe")
             self.require(self.editor)
             state = self.snapshot(root)
-            self.assertFalse(state["commands"])
+            self.assertFalse(state["primary"])
             self.assertEqual(state["text"], "probe")
             self.output.clear()
             self.send(" 한 글\r")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit("END")
             self.require(lambda: (root / "result").exists() and self.primary())
             self.assertEqual((root / "result").read_text(), "probe 한 글\n")
-            self.assertFalse((root / "tool-executed").exists())
+            self.assertFalse((root / "probe-executed").exists())
 
     def test_fast_raw_and_immediate_primary_input_keep_their_consumers(self):
         """A waiting builtin consumes raw input, whereas blank/error returns use PTK."""
@@ -276,7 +271,7 @@ class ZshEditCLITests(unittest.TestCase):
             self.require(lambda: (root / "result").exists() and self.primary())
             self.assertEqual((root / "body").read_text(), "  probe 한 글  \n")
             self.assertEqual((root / "result").read_text(), "after\n")
-            self.assertFalse((root / "tool-executed").exists())
+            self.assertFalse((root / "probe-executed").exists())
 
     def test_continuation_cancel_and_eof_return_to_confirmed_primary(self):
         """Real PTK cancellation and EOF retain the shell's LI and parser behavior."""
@@ -285,11 +280,11 @@ class ZshEditCLITests(unittest.TestCase):
                 with self.subTest(control=control):
                     self.submit("for value in A B; do")
                     self.require(self.editor)
-                    self.assertFalse(self.snapshot(root)["commands"])
+                    self.assertFalse(self.snapshot(root)["primary"])
                     self.output.clear()
                     self.send(control)
                     self.require(self.primary)
-                    self.assertTrue(self.snapshot(root)["commands"])
+                    self.assertTrue(self.snapshot(root)["primary"])
             self.submit("print intact > result")
             self.require(lambda: (root / "result").exists() and self.primary())
             self.assertEqual((root / "result").read_text(), "intact\n")
@@ -313,7 +308,7 @@ class ZshEditCLITests(unittest.TestCase):
                 for line in (root / "snapshots").read_text().splitlines()
             ]
             self.assertEqual(len(records), 2)
-            self.assertTrue(current["commands"])
+            self.assertTrue(current["primary"])
             self.assertGreater(current["id"], records[0]["id"])
             self.assertEqual((root / "result").read_text(), "safe\n")
 
@@ -331,28 +326,34 @@ class ZshEditCLITests(unittest.TestCase):
             self.require(self.primary)
             self.assertTrue(self.snapshot(root)["semantic"])
 
-    def test_loop_body_uses_the_shell_even_when_a_python_tool_has_the_same_name(self):
-        """A continuation reply bypasses the Python dispatcher and runs as shell syntax."""
+    def test_loop_body_executes_shell_function_after_continuation_editing(self):
+        """Each continuation reply reaches the parser and executes as shell syntax."""
         with self.session(extra_rc="probe() { print shell >> result; }\n") as root:
             self.submit("for value in once; do")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit("probe")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit("done")
             self.require(lambda: (root / "result").exists() and self.primary())
             self.assertEqual((root / "result").read_text(), "shell\n")
-            self.assertFalse((root / "tool-executed").exists())
+            self.assertFalse((root / "probe-executed").exists())
 
-    def test_python_input_retains_its_native_worker_pty(self):
-        """Primary tool dispatch consumes immediate input in its existing Python PTY."""
+    def test_external_python_input_retains_native_pty_stdin(self):
+        """Python input() consumes immediate terminal input through the shell's PTY."""
         with self.session() as root:
+            (root / "input-reader.py").write_text(
+                "import os\nfrom pathlib import Path\nassert os.isatty(0)\n"
+                "Path('python-reply').write_text(input() + '\\n')\n"
+            )
             self.output.clear()
-            self.send("inputtool\r  Python 한 글  \r")
+            self.send(
+                f"{shlex.quote(sys.executable)} input-reader.py\r  Python 한 글  \r"
+            )
             self.require(lambda: (root / "python-reply").exists() and self.primary())
             self.assertEqual((root / "python-reply").read_text(), "  Python 한 글  \n")
-            self.assertTrue(self.snapshot(root)["commands"])
+            self.assertTrue(self.snapshot(root)["primary"])
 
     def test_external_program_receives_fast_input_and_eof(self):
         """The external program receives typeahead and Ctrl+D through its native PTY."""
@@ -361,7 +362,7 @@ class ZshEditCLITests(unittest.TestCase):
             self.send("cat > result\r  external 한 글  \r".encode() + b"\x04")
             self.require(lambda: (root / "result").exists() and self.primary())
             self.assertEqual((root / "result").read_text(), "  external 한 글  \n")
-            self.assertTrue(self.snapshot(root)["commands"])
+            self.assertTrue(self.snapshot(root)["primary"])
 
     def test_raw_permission_overrides_stale_reader_hint_after_exec(self):
         """A same-process-group exec receives Ctrl+C and stdin despite delayed LR(false)."""
@@ -369,10 +370,10 @@ class ZshEditCLITests(unittest.TestCase):
             (root / "shell-exec.py").write_text(SIGINT_READER)
             self.submit("if true; then")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit(f"exec {shlex.quote(sys.executable)} shell-exec.py")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit("fi")
             self.require(
                 lambda: (
@@ -410,7 +411,7 @@ class ZshEditCLITests(unittest.TestCase):
         with self.session() as root:
             self.submit("print -r -- one \\")
             state = self.snapshot(root)
-            self.assertTrue(state["commands"])
+            self.assertTrue(state["primary"])
             self.assertEqual(state["text"], "print -r -- one \\\n")
             self.submit("two > result")
             self.require(lambda: (root / "result").exists() and self.primary())
@@ -418,7 +419,7 @@ class ZshEditCLITests(unittest.TestCase):
             self.output.clear()
             self.send(PASTE_START + b'print -r -- "first' + PASTE_END + b"\r")
             self.require(self.editor)
-            self.assertFalse(self.snapshot(root)["commands"])
+            self.assertFalse(self.snapshot(root)["primary"])
             self.submit('probe" >> result')
             self.require(
                 lambda: (
@@ -426,7 +427,7 @@ class ZshEditCLITests(unittest.TestCase):
                     and self.primary()
                 )
             )
-            self.assertFalse((root / "tool-executed").exists())
+            self.assertFalse((root / "probe-executed").exists())
 
     def test_delayed_duplicate_and_old_li_acknowledgements_release_only_one_reader(
         self,
@@ -438,7 +439,7 @@ class ZshEditCLITests(unittest.TestCase):
             for index in range(2):
                 self.submit("for value in once; do")
                 self.require(self.editor)
-                self.assertFalse(self.snapshot(root)["commands"])
+                self.assertFalse(self.snapshot(root)["primary"])
                 (root / "ack-held").unlink(missing_ok=True)
                 self.output.clear()
                 self.send(b"\x03")
@@ -454,7 +455,7 @@ class ZshEditCLITests(unittest.TestCase):
                     )
                 )
                 current = self.snapshot(root)
-                self.assertTrue(current["commands"])
+                self.assertTrue(current["primary"])
                 self.assertEqual(current["boundary"], boundary + 2)
                 boundary = current["boundary"]
 

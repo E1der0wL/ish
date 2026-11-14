@@ -13,26 +13,23 @@ from unittest.mock import patch
 
 from ish.parser.shell import alias_parser, dict_parser
 from ish.shell.engine import InteractiveShell
-from ish.shell.request import ShellExitRequest
 from ish.ui.prompt import Prompt
 
 
 class Session:
-    """Fake UI returning scripted commands and recording prompt, state, and hook ordering."""
+    """Fake UI returning scripted commands and recording shell prompts and state."""
 
     output_active = False
     observe_resize = Prompt.observe_resize
     set_syntax_prompt = Prompt.set_syntax_prompt
-    exit_command = "ish_exit"
 
     def __init__(self, commands):
-        """Prepare scripted commands and stores for prompt, state, and hook observations."""
+        """Prepare scripted commands and stores for prompt and shell-state observations."""
         self.commands = iter(commands)
         self.app = SimpleNamespace(_on_resize=lambda: None)
         self.context = {}
         self.prompts = []
-        self.events = []
-        self.internal_commands = {}
+        self.statuses = []
 
     def set_prompt(self, data, encoder, *, prefix=b"", primary=True):
         """Record prompt bytes received by the fake UI."""
@@ -41,29 +38,15 @@ class Session:
     def update_context(self, category, body):
         """Record the most recently received state for each category."""
         self.context[category] = body
+        if category == "exitcode":
+            self.statuses.append(body)
 
     async def prompt_async(self, **kwargs):
         """Return the next scripted command or request session exit when exhausted."""
         try:
             return next(self.commands)
         except StopIteration:
-            raise ShellExitRequest from None
-
-    def _tool_argv(self, command):
-        """Keep scripted shell tests free of registered Python tools."""
-        return None
-
-    async def pre_exec(self):
-        """Record where the pre-command hook is called."""
-        self.events.append(("pre", None))
-
-    async def post_exec(self):
-        """Record the exit status received by the post-command hook."""
-        self.events.append(("post", self.context.get("exitcode")))
-
-    async def fallback(self):
-        """Record the stored exit status when fallback is called."""
-        self.events.append(("fallback", self.context.get("exitcode")))
+            raise EOFError from None
 
 
 class NativeShellTests(unittest.IsolatedAsyncioTestCase):
@@ -142,25 +125,13 @@ class NativeShellTests(unittest.IsolatedAsyncioTestCase):
                     except TimeoutError:
                         output.seek(0)
                         self.fail(
-                            f"{name} timed out; init={bytes(shell._init_output)!r}; output={output.read()!r}; events={session.events!r}"
+                            f"{name} timed out; init={bytes(shell._init_output)!r}; output={output.read()!r}; statuses={session.statuses!r}"
                         )
                     output.seek(0)
                     received = output.read()
                     self.assertIn(os.getcwd().encode(), received)
-                    self.assertEqual(
-                        session.events,
-                        [
-                            ("pre", None),
-                            ("post", b"1"),
-                            ("fallback", b"1"),
-                            ("pre", None),
-                            ("post", b"0"),
-                            ("fallback", b"0"),
-                            ("pre", None),
-                            ("post", b"0"),
-                            ("fallback", b"0"),
-                        ],
-                    )
+                    self.assertIn(b"1", session.statuses)
+                    self.assertEqual(session.statuses[-1], b"0")
                     self.assertEqual(
                         dict_parser(session.context["environ"], "utf-8", "=", "\0")[
                             "PWD"

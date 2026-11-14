@@ -1,9 +1,9 @@
-"""Lexical rules shared by completion and literal Python-tool arguments."""
+"""Lexical rules used by completion without evaluating shell code."""
 
 import re
 from types import MappingProxyType
 
-# Both public parser families apply the same preset for the selected shell.
+# Completion applies the selected shell's preset.
 BASH_OPTIONS = MappingProxyType({"history": True})
 ZSH_OPTIONS = MappingProxyType({"history": True, "zsh": True})
 CSH_OPTIONS = MappingProxyType({"history": True, "csh": True})

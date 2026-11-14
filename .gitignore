@@ -22,7 +22,7 @@ var/
 wheels/
 share/python-wheels/
 /tests/*
-!/tests/test_edit_dispatch.py
+!/tests/test_shell_editing.py
 !/tests/test_edit_requests.py
 !/tests/test_native_cursor_keys.py
 !/tests/test_p2_shells.py
@@ -33,6 +33,7 @@ share/python-wheels/
 !/tests/test_zsh_edit_cli.py
 !/tests/test_shell_handoff_boundaries.py
 !/tests/test_semantic_races.py
+!/tests/test_shell_submission_cli.py
 !/tests/tcsh_channel.py
 !/tests/test_tcsh_channel.py
 !/tests/channel_gate.c

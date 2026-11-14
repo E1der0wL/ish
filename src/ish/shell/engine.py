@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import psutil
 
-from ish.app.dispatch import dispatch
 from ish.config import BuiltinShell, config
 from ish.log import get_logger
 from ish.runtime.fdio import FDWriter, InputBytes
@@ -85,7 +84,6 @@ from .limits import (
 )
 from .prefix import OutputLine
 from .protocol import FrameDecoder, parse_prompt_id
-from .request import ShellExitRequest, ShellPassRequest
 from .scrollback import Scrollback
 from .sequencer import Sequencer
 from .signals import InputPhase, ShellSignalController, SignalScope
@@ -206,7 +204,6 @@ class InteractiveShell:
         "_output_task",
         "_output_paused",
         "_closing_output",
-        "resize_callback",
         "_accepted_prompt_id",
         "_pending_prompt_id",
         "_send_task",
@@ -298,7 +295,6 @@ class InteractiveShell:
         self._output_task = None
         self._output_paused = False
         self._closing_output = False
-        self.resize_callback: Optional[Callable[[], None]] = None
         self._context_id = self._prompt_id = 0
         self._accepted_prompt_id = self._pending_prompt_id = 0
         self._send_task = None
@@ -713,12 +709,6 @@ class InteractiveShell:
                 screen.feed(data)
             except Exception:
                 self._disable_failed_screen(screen)
-
-    def observe_tool_output(self, data: bytes) -> None:
-        """Record terminal modes and, if enabled, mirror a Python worker's PTY."""
-        self.terminal_state.feed(data)
-        if self._screen is not None:
-            self._feed_screen(data)
 
     def _track_output_line(self, data: bytes) -> None:
         """Track only linear output outside initialization as a candidate prompt prefix."""
@@ -1153,7 +1143,7 @@ class InteractiveShell:
         self._input_epoch += 1
         # Older native typeahead can include the next program's stdin. Offer
         # it to the native consumer; the next primary boundary returns any
-        # unused suffix for normal editor/tool dispatch.
+        # unused suffix for the next editor.
         literal_size = len(self._literal_input)
         paste_tail = self._paste_tail
         self._foreground_paste.reset()
@@ -1446,9 +1436,7 @@ class InteractiveShell:
         )
         if not self._can_edit(self._accepted_prompt_id, wire):
             raise RuntimeError("Command editing requires a confirmed shell boundary")
-        return self._edits.grant(
-            self._accepted_prompt_id, commands=wire is None, wire=wire
-        )
+        return self._edits.grant(self._accepted_prompt_id, wire=wire)
 
     def _can_edit(self, boundary: int, wire: InputRequest | None = None) -> bool:
         """Keep grant and reply admission on the same acknowledged boundary checks."""
@@ -1475,7 +1463,7 @@ class InteractiveShell:
         )
 
     async def _read_edit(self, **options) -> str | None:
-        """Read text and admit dispatch through a session-owned editor grant."""
+        """Return literal shell text through a session-owned editor grant."""
         if self._closing_output:
             # PTY EOF may arrive before the child watcher. Wait for its actual
             # result so failed admission cannot replace the native exit status.
@@ -1493,8 +1481,6 @@ class InteractiveShell:
                 return None
             if command is None:
                 return ""
-            if request.commands:
-                return await dispatch(self.editor, command)
             return command
         finally:
             # A delayed completion must not cancel a newer grant.
@@ -1535,7 +1521,7 @@ class InteractiveShell:
         return {"pre_run": start_typeahead}
 
     async def _prompt(self) -> None:
-        """Process primary submissions in pre-hook, execution, post-hook order."""
+        """Send accepted primary submissions directly to the shell."""
         retry_command = None
         while True:
             if self._has_exited():
@@ -1556,8 +1542,7 @@ class InteractiveShell:
                 if self._has_exited():
                     return
                 if command is None:
-                    # Internal tools already completed without running a shell
-                    # command. Their unread input belongs to the next editor.
+                    # A revoked edit never submits its stale text to the shell.
                     continue
             except KeyboardInterrupt:
                 # PTK consumed the interrupt. Bytes following it still belong
@@ -1565,11 +1550,6 @@ class InteractiveShell:
                 if self.continuation_active.is_set():
                     await self._exec(control_character(self.exec_attrs, termios.VINTR))
                 continue
-            except ShellPassRequest as req:
-                await req.callback(*req.args, **req.kwargs)
-                continue
-            except ShellExitRequest:
-                return
             except EOFError:
                 # EOF at a primary editor closes ish; syntax EOF is handled by
                 # the session's current request and delivered to the shell PTY.
@@ -1582,21 +1562,13 @@ class InteractiveShell:
                 for cmd in lines:
                     self.last_command = cmd
                     self.validate_submission((cmd + "\n").encode(self.encoder))
-                    await self.editor.pre_exec()
-
                     await self._exec((cmd + "\n").encode(self.encoder))
-
-                    await self.editor.post_exec()
-                    await self.editor.fallback()
 
             except InputRejected as exc:
                 # The UI normally rejects before accepting Enter. Revalidate
                 # here for custom sessions or hooks that changed terminal modes.
                 retry_command = command
                 self._write(self.stdout_fd, (str(exc) + "\r\n").encode(self.encoder))
-            except ShellExitRequest:
-                if command.strip():
-                    return
 
     async def _shell(self) -> int:
         """Return the child status after draining final output and control sequences."""
@@ -1964,7 +1936,7 @@ class InteractiveShell:
         return rows, columns
 
     def resize(self) -> None:
-        """Apply the same terminal dimensions to the shell, screen observer and tool."""
+        """Apply the same terminal dimensions to the shell and screen observer."""
         if self.master_fd is None:
             return
         rows, columns = self._terminal_dimensions()
@@ -1977,8 +1949,6 @@ class InteractiveShell:
                 screen.resize(rows, columns)
             except Exception:
                 self._disable_failed_screen(screen)
-        if self.resize_callback is not None:
-            self.resize_callback()
 
     def fail_io(self, exc: Exception) -> None:
         """Wake the main session waiter with the first I/O error."""
@@ -1986,7 +1956,7 @@ class InteractiveShell:
             self._fatal_error.set_result(exc)
 
     # ==============================================================================================
-    # [Session API] Exchange context and input with the editor and Python tool runner.
+    # [Session API] Exchange context and input with the editor.
     # ==============================================================================================
 
     def working_directory(self) -> str:
@@ -1997,26 +1967,6 @@ class InteractiveShell:
         if not cwd or not os.path.isabs(cwd):
             raise RuntimeError("Shell working directory is unavailable")
         return cwd
-
-    def tool_context(self) -> tuple[str, dict[str, str]]:
-        """Snapshot exported state at a confirmed primary prompt for a Python tool.
-
-        FIFO updates populate editor.context synchronously, independently of
-        completion scans. Read the actual shell cwd once per tool because PWD may
-        be unset or modified. Never fall back to the ish parent's startup state.
-        """
-        if (
-            self._has_exited()
-            or self._stopping
-            or self._closing_output
-            or self._initializing
-            or not self._primary_confirmed()
-        ):
-            raise RuntimeError("Python tools require a confirmed primary shell prompt")
-        environ = self.editor.context.environ
-        if environ is None:
-            raise RuntimeError("Shell environment is unavailable for the Python tool")
-        return self.working_directory(), dict(environ)
 
     def return_typeahead(self, data: bytes) -> None:
         """Append unread input returned by the previous consumer within the byte limit."""
@@ -2042,7 +1992,7 @@ class InteractiveShell:
         return data, native_prefix
 
     def return_native_input(self, data: bytes) -> None:
-        """Return unread worker input, preserving an offered submitted fragment."""
+        """Restore native input after a rejected send, retaining its text provenance."""
         if (
             len(self._literal_input) + len(self._returned_input) + len(data)
             > TYPEAHEAD_LIMIT_BYTES
@@ -2051,7 +2001,7 @@ class InteractiveShell:
         if self._offered_literal:
             # Reads and termios edits obscure where the submitted fragment
             # ended in a mixed PTY return. Keep this ambiguous batch as text;
-            # the worker returns provably unwritten fresh keys separately.
+            # the sender returns provably unwritten fresh keys separately.
             self._literal_input.extend(data)
             self._offered_literal = False
         else:

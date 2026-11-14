@@ -1,7 +1,7 @@
-"""Connect the prompt-toolkit editor to shell state, completion, and Python tools.
+"""Connect the prompt-toolkit editor to shell state and completion.
 
-The editor owns input at the primary prompt. Suspend rendering while displaying shell
-output, and prevent stale asynchronous PATH scans from overwriting newer state.
+The editor runs when the shell grants command editing. Suspend rendering while
+displaying shell output, and prevent stale PATH scans from overwriting newer state.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import re
 import signal
 import subprocess
 import sys
-import termios
 import threading
 import traceback
 from collections import Counter
@@ -21,14 +20,11 @@ from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
     Dict,
     Iterable,
     List,
     Optional,
     Set,
-    Tuple,
     Union,
 )
 
@@ -98,8 +94,6 @@ from prompt_toolkit.widgets.toolbars import (
 )
 from pygments.lexers import get_lexer_by_name
 
-from ish.app.dispatch import dispatch
-from ish.app.pytool import Runner
 from ish.config import config
 from ish.lang import Message, i18n
 from ish.log import get_logger
@@ -112,7 +106,7 @@ from ish.shell.adapter import get_adapter
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE
 from ish.shell.context import ShellContext
 from ish.shell.engine import DEFAULT_ENCODING, DEFAULT_SHELL, InteractiveShell
-from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
+from ish.shell.input import InputRejected
 from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
 
 from .ansi import ShellANSI
@@ -144,8 +138,6 @@ BUILTIN_CLEANUP_TIMEOUT = 0.5
 _BUILTIN_STARTUP_VARIABLES = ("BASH_ENV", "ENV")
 _PROMPT_STYLE = "class:prompt"
 SYNTAX_PROMPT = b"> "
-_DEFAULT_EXIT_COMMAND = "ish_exit"
-_RELOAD_COMMAND = "ish_reload"
 _TRACE_INPUT_REJECTED = "input_rejected"
 _TRACE_INPUT_TRANSFERRED = "editor_input_transferred"
 _TOOLBAR_STYLE = "class:bottom-toolbar"
@@ -164,7 +156,6 @@ _KEY_TEXT, _KEY_SEQUENCE = "keys", "keys_tuple"
 _KEY_HANDLER_NAME, _KEY_HANDLER = "handler", "handler_func"
 _KEY_FILTER, _KEY_EAGER, _KEY_GLOBAL = "filter", "eager", "is_global"
 _HOME_VARIABLE = "HOME"
-_SUCCESS_TEXT = "0"
 _PTY_NEWLINE = b"\r\n"
 _DISPLAY_NEWLINE = b"\n"
 _TERMINAL_TEXT_ERRORS = "replace"
@@ -226,8 +217,8 @@ def get_builtins(shell: str, executable: Optional[str] = None) -> List[str]:
 class Prompt(PromptSession):
     """Multiline editor and user extension interface connected to shell state.
 
-    Prompt-toolkit handles primary-prompt editing and completion; InteractiveShell
-    handles commands and continuation input. The caller retains ownership of supplied
+    Prompt-toolkit handles shell-authorized editing and completion; InteractiveShell
+    owns input handoffs and command execution. The caller retains ownership of supplied
     I/O descriptors.
     """
 
@@ -243,9 +234,7 @@ class Prompt(PromptSession):
         prompt_text: AnyFormattedText = None,
         **kwargs,
     ) -> None:
-        """Configure the shell runner, state parsers, Python worker, UI layout, and key
-        bindings.
-        """
+        """Configure the shell session, state parsers, UI layout, and key bindings."""
         self.logger = get_logger()
         self.input_observer = InputObserver()
 
@@ -302,7 +291,6 @@ class Prompt(PromptSession):
             EXITCODE, lambda data: str_parser(data, encoder=self.encoder)
         )
         self.last_exitcode: Optional[int] = None
-        self.last_tool_exitcode: Optional[int] = None
 
         self.interactive_shell = InteractiveShell(
             self.shell or DEFAULT_SHELL,
@@ -313,23 +301,6 @@ class Prompt(PromptSession):
             input_observer=self.input_observer,
         )
         self.shell = self.interactive_shell.shell
-
-        self.runner: Runner = Runner(
-            encoder=self.encoder,
-            stdin=input_fd,
-            stdout=output_fd,
-            get_terminal_fd=lambda: self.interactive_shell.master_fd,
-            input_observer=self.input_observer,
-            take_input=self.take_typeahead,
-            return_input=self.interactive_shell.return_typeahead,
-            return_native_input=self.interactive_shell.return_native_input,
-            observe_output=self.interactive_shell.observe_tool_output,
-        )
-        self.interactive_shell.resize_callback = self.runner.resize
-
-        self.pre_hook: Optional[Callable[..., Any]] = None
-        self.post_hook: Optional[Callable[..., Any]] = None
-        self.fallback_hook: Optional[Callable[..., Any]] = None
 
         self.floats: List[Float] = []
 
@@ -356,16 +327,8 @@ class Prompt(PromptSession):
             context=self.completion_context,
             get_home=lambda: self._home,
         )
-        self.exit_command: str = _DEFAULT_EXIT_COMMAND
-        self.internal_commands: Dict[
-            str, Tuple[Callable[..., Awaitable[Any]], Tuple, Dict]
-        ] = {
-            _RELOAD_COMMAND: (self.load_rc_async, (), {}),
-        }
-
         self.plugin_manager = plugin_manager
         self.option = option
-        self.internal_tools: Dict[str, Callable[..., Any]] = {}
 
         if "auto_suggest" not in kwargs:
             kwargs["auto_suggest"] = AutoSuggestFromHistory()
@@ -798,32 +761,18 @@ class Prompt(PromptSession):
         cwd = self._completion_directory()
         return [cwd] if cwd is not None else []
 
-    def _tool_argv(self, command: str) -> list[str] | None:
-        """Resolve a registered tool only through the active shell's literal policy."""
-        if not self.internal_tools:
-            return None
-        argv = self.interactive_shell.adapter.parsing.tool_argv(command)
-        return argv if argv and argv[0] in self.internal_tools else None
-
     def _validate_editor_submission(self, command: str) -> None:
-        """Apply shell transport limits without restricting directly dispatched tools."""
+        """Apply shell transport limits to every editor submission."""
         try:
             data = (command + "\n").encode(self.encoder)
         except UnicodeEncodeError as exc:
             raise InputRejected(
                 "Not sent: input cannot be encoded for this shell."
             ) from exc
-        request = self.interactive_shell.edit_request
-        if len(data) > CANONICAL_LINE_BYTES and (request is None or request.commands):
-            key = command.strip()
-            if key == self.exit_command or key in self.internal_commands:
-                return
-            if self._tool_argv(command) is not None:
-                return
         self.interactive_shell.validate_submission(data)
 
     def _relayout(self) -> None:
-        """Rebuild the layout after float or tool changes and request a redraw."""
+        """Rebuild the layout after float changes and request a redraw."""
         if hasattr(self, "app") and self.app is not None:
             self.app.layout = self._create_layout()
             self.app.invalidate()
@@ -885,44 +834,6 @@ class Prompt(PromptSession):
         """Exit the current editor and return the specified command as its submission."""
         self.app.exit(result=cmd)
 
-    async def post_exec(self) -> None:
-        """Run the registered Python hook after command execution and log failures."""
-        if self.post_hook is None:
-            return
-
-        try:
-            await self.runner.run(self.post_hook)
-        except Exception:
-            self.logger.exception("post hook failed")
-            return
-
-    async def pre_exec(self) -> None:
-        """Run the registered Python hook before sending a command to the shell."""
-        if self.pre_hook is None:
-            return
-
-        try:
-            await self.runner.run(self.pre_hook)
-        except Exception:
-            self.logger.exception("pre hook failed")
-            return
-
-    async def fallback(self) -> None:
-        """Run the fallback hook only when the last shell exit status indicates failure."""
-        if (
-            not self.interactive_shell.last_command.strip()
-            or self.fallback_hook is None
-        ):
-            return
-
-        try:
-            status = getattr(self.context, EXITCODE, None)
-            if status is not None and str(status).strip() != _SUCCESS_TEXT:
-                await self.runner.run(self.fallback_hook)
-        except Exception:
-            self.logger.exception("fallback hook failed")
-            return
-
     def enable_screen_tracking(self, enabled: bool = True) -> None:
         """Enable foreground PTY screen snapshots, or disable tracking and release the grid."""
         self.interactive_shell.enable_screen_tracking(enabled)
@@ -930,38 +841,6 @@ class Prompt(PromptSession):
     def screen_snapshot(self) -> ScreenSnapshot | None:
         """Read the tracked text grid from the parent process, or None while disabled."""
         return self.interactive_shell.screen_snapshot()
-
-    def set_tool(
-        self,
-        cmd: str,
-        plugin_name: Optional[str] = None,
-        function_name: Optional[str] = None,
-        function: Optional[Callable[..., Any]] = None,
-    ) -> None:
-        """Set an internal tool, or remove it when no function source is supplied.
-
-        Supply either function or both plugin_name and function_name. Setting an
-        existing command replaces its callable. Invalid sources raise an error
-        without replacing the current tool; removing an unknown command is a no-op.
-        """
-        if plugin_name is not None or function_name is not None:
-            if not plugin_name or not function_name or function is not None:
-                raise ValueError(
-                    "Supply either function or both plugin_name and function_name"
-                )
-            if self.plugin_manager is None:
-                raise ValueError("No plugin manager is configured")
-            plugin = self.plugin_manager.get(plugin_name)
-            if plugin is None:
-                raise ValueError(f"Plugin is not loaded: {plugin_name}")
-            function = getattr(plugin, function_name, None)
-        elif function is None:
-            self.internal_tools.pop(cmd, None)
-            return
-
-        if not callable(function):
-            raise TypeError("The internal tool must be callable")
-        self.internal_tools[cmd] = function
 
     def set_key(
         self,
@@ -1160,21 +1039,6 @@ class Prompt(PromptSession):
     async def load_rc_async(self) -> None:
         """Run the user initialization script in a separate thread."""
         await asyncio.to_thread(self.load_rc)
-
-    async def read_and_dispatch(self, **kwargs) -> Optional[str]:
-        """Keep the existing command-entry API for session-authorized submissions.
-
-        For text-only editing, use prompt_async without dispatch. In particular,
-        shell syntax replies and heredoc data must not pass through this API.
-        """
-        try:
-            command = await self.prompt_async(**kwargs)
-            if command is None:
-                return ""
-        except (termios.error, OSError):
-            return ""
-
-        return await dispatch(self, command)
 
     def take_typeahead(self) -> bytes:
         """Transfer unread input, including VT and paste framing, to foreground stdin."""

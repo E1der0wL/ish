@@ -86,7 +86,7 @@ class Terminal:
 
     def finish(self) -> None:
         """Exit normally and verify terminal restoration before closing the test PTY."""
-        self.submit("ish_exit")
+        self.send(b"\x04")
         self.wait_exit(0)
 
     def wait_exit(self, expected: int) -> None:
@@ -152,18 +152,19 @@ def prepare(root: Path) -> dict[str, str]:
     plugin.mkdir(parents=True)
     (plugin / "__init__.py").write_text(
         'PLUGIN_META = {"name": "smoke_plugin", "dependencies": ["runtime-dependency==1.0|runtime_dependency"]}\n'
-        "import sys, subprocess, sqlite3, lzma, xml.etree.ElementTree\n"
+        "import json, os, sys, sqlite3, lzma, xml.etree.ElementTree\n"
         "import importlib.resources, runtime_dependency\n"
         "from pathlib import Path\n"
-        "def report(path):\n"
+        "def report(event):\n"
         "    assert runtime_dependency.VALUE == 42\n"
         "    assert importlib.resources.files(runtime_dependency).joinpath('data.txt').read_text() == 'package-data\\n'\n"
         "    assert sqlite3.connect(':memory:').execute('select 42').fetchone() == (42,)\n"
-        "    assert lzma.decompress(lzma.compress(b'worker')) == b'worker'\n"
-        "    assert subprocess.check_output([sys.executable, '-I', '-c', 'print(42)']).strip() == b'42'\n"
-        "    Path(path).write_text('WORKER_OK')\n"
-        "    Path(path + '.exe').write_text(sys.executable)\n"
-        "    print('WORKER_OK', flush=True)\n"
+        "    assert lzma.decompress(lzma.compress(b'plugin')) == b'plugin'\n"
+        "    report = Path('plugin-report.next')\n"
+        "    report.write_text(json.dumps({\n"
+        "        'executable': sys.executable, 'pid': os.getpid(),\n"
+        "        'running': event.app.is_running, 'text': event.app.current_buffer.text}))\n"
+        "    report.replace('plugin-report')\n"
     )
     (root / "ish" / ".ishrc.py").write_text(
         "from pathlib import Path\n"
@@ -171,8 +172,7 @@ def prepare(root: Path) -> dict[str, str]:
         "from ish.runtime.distribution import bundled_forward_binary\n"
         "from smoke_plugin import report\n"
         f"config.ISH_HOME = Path({str(root / 'custom state')!r})\n"
-        "prompt.set_tool('worker', function=report)\n"
-        "prompt.set_tool('say', function=print)\n"
+        "prompt.set_key('f8', handler=report)\n"
         f"Path({str(root / 'module-location')!r}).write_text(integration.__file__)\n"
         f"Path({str(root / 'helper-location')!r}).write_text(str(bundled_forward_binary()))\n"
     )
@@ -196,7 +196,7 @@ def prepare(root: Path) -> dict[str, str]:
         "ZDOTDIR": str(root),
         "XDG_DATA_HOME": str(root / "data"),
         # The launcher must isolate Python startup without removing these from
-        # the shell environment or making worker spawn depend on host settings.
+        # the shell environment or making UI plugins depend on host settings.
         "PYTHONHOME": str(root / "nonexistent-python"),
         "PYTHONPATH": str(root / "unrelated-python"),
         "PIP_NO_INDEX": "1",
@@ -206,7 +206,7 @@ def prepare(root: Path) -> dict[str, str]:
 
 
 def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
-    """Check shell I/O, worker spawn, concurrent caches, tmp cleanup, and TUI return."""
+    """Check shell I/O, UI plugins, concurrent caches, tmp cleanup, and TUI return."""
     bundle = binary.resolve(strict=True).parent
     env = prepare(root)
     executable = os.environ.get("ISH_TEST_" + shell.upper()) or shutil.which(shell)
@@ -256,6 +256,7 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
                 "import signal, sys, time; signal.signal(signal.SIGINT, lambda *_: sys.exit(130)); print('INTERRUPT_READY', flush=True); time.sleep(30)",
             ]
         )
+        plugin_pids = set()
         for index, terminal in enumerate(terminals):
             terminal.submit(interrupt_command)
             terminal.until(lambda t=terminal: b"INTERRUPT_READY\r\n" in t.output)
@@ -269,19 +270,22 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
             assert (root / f"shell-{index}").read_text().strip() == "CACHE_OK"
             terminal.submit("ish_recover")
             terminal.until(terminal.ready)
-            terminal.submit(f"worker worker-{index}")
-            terminal.until(
-                lambda t=terminal, i=index: (
-                    (root / f"worker-{i}").exists() and t.ready()
-                ),
-                30,
+            report_path = root / "plugin-report"
+            report_path.unlink(missing_ok=True)
+            marker = f"plugin-{index}"
+            terminal.send(marker.encode() + b"\x1b[19~")
+            terminal.until(report_path.exists, 30)
+            report = json.loads(report_path.read_text())
+            plugin_exe = Path(report["executable"])
+            assert plugin_exe.resolve() == (bundle / "python/bin/python3").resolve(), (
+                plugin_exe
             )
-            assert (root / f"worker-{index}").read_text() == "WORKER_OK"
-            worker_exe = Path((root / f"worker-{index}.exe").read_text())
-            assert worker_exe.resolve() == (bundle / "python/bin/python3").resolve(), (
-                worker_exe
-            )
-            assert b"WORKER_OK\r\n" in terminal.output
+            assert report["running"] and report["text"] == marker, report
+            plugin_pids.add(report["pid"])
+            terminal.output.clear()
+            terminal.send(b"\x03")
+            terminal.until(terminal.ready)
+        assert len(plugin_pids) == len(terminals), "UI sessions shared a plugin process"
         # The reader must receive only its value, even after an input wait.
         read_command = (
             'set answer = "$<"; printf "%s" "$answer" > read-result'
@@ -338,8 +342,9 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
         assert not original.exists(), "ended session was not cleaned"
         assert len(list(cache.glob("session-*"))) == 1, "peer session was removed"
         assert second_helper.is_file(), "installed helper was removed"
-        second.submit("say SURVIVOR_OK")
-        second.until(lambda: b"SURVIVOR_OK\r\n" in second.output and second.ready(), 30)
+        second.submit("echo SURVIVOR_OK > survivor" + suffix)
+        second.until(lambda: (root / "survivor").exists() and second.ready(), 30)
+        assert (root / "survivor").read_text() == "SURVIVOR_OK\n"
         second.finish()
         assert not list(cache.glob("session-*")), (
             "session files leaked after normal exit"
@@ -369,6 +374,7 @@ def exercise(binary: Path, shell: str, root: Path, idle_seconds: float) -> dict:
             "idle_seconds": idle_seconds,
             "explicit_reconnect": reconnect,
             "native_read": "passed",
+            "ui_plugin_runtime": "passed",
             "ordered_typeahead": "passed",
             "vim_man": "passed"
             if all(shutil.which(tool) for tool in ("vim", "man", "less"))

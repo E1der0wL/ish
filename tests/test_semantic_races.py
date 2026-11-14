@@ -19,7 +19,6 @@ from ish.runtime.observer import InputObserver
 observer = InputObserver(enabled=True)
 prompt.input_observer = observer
 prompt.interactive_shell.input_observer = observer
-prompt.runner.input_observer = observer
 prompt.app.input.observer = observer
 def trace_input(event):
     with open('input-traces', 'a') as output:
@@ -170,12 +169,12 @@ class SemanticRaceTests(unittest.TestCase):
             terminal.result("lease-rejected", b"before-write")
             self.assertEqual(
                 terminal.witness(sent=True),
-                {"running": True, "commands": True, "text": LONG_COMMAND},
+                {"running": True, "primary": True, "text": LONG_COMMAND},
             )
             self.assertFalse((root / "first-result").exists())
             terminal.send(b"\r")
             terminal.result("first-result", b"x" * 5000)
-            self.assertTrue(terminal.witness()["commands"])
+            self.assertTrue(terminal.witness()["primary"])
             self.assertEqual((root / "first-result").read_bytes(), b"x" * 5000)
 
     def test_sender_cancel_rejects_delayed_request_and_drops_paste_suffix(self):
@@ -192,12 +191,12 @@ class SemanticRaceTests(unittest.TestCase):
             terminal.result("stale-processed", b"received")
             with (root / "release-primary").open("w") as release:
                 release.write("resume\n")
-            self.assertTrue(terminal.witness()["commands"])
+            self.assertTrue(terminal.witness()["primary"])
             terminal.send(
                 'IFS= read -r value; printf "%s" "$value" > after-input\rkept\r'
             )
             terminal.result("after-input", b"kept")
-            self.assertTrue(terminal.witness()["commands"])
+            self.assertTrue(terminal.witness()["primary"])
             self.assertFalse((root / "first-result").exists())
             self.assertFalse((root / "cancelled-result").exists())
             self.assertFalse((root / "suffix-sent").exists())
@@ -218,29 +217,29 @@ class SemanticRaceTests(unittest.TestCase):
             terminal.result("lease-rejected", b"before-write")
             self.assertEqual(
                 terminal.witness(sent=True),
-                {"running": True, "commands": True, "text": LONG_COMMAND},
+                {"running": True, "primary": True, "text": LONG_COMMAND},
             )
             terminal.send(b"\r")
             terminal.result("first-result", b"x" * 5000)
-            self.assertTrue(terminal.witness()["commands"])
+            self.assertTrue(terminal.witness()["primary"])
             self.assertEqual((root / "first-result").read_bytes(), b"x" * 5000)
 
-    def test_rejected_syntax_reply_keeps_text_and_does_not_dispatch(self):
-        """Retry one C response in PTK and deliver its body once without tool dispatch."""
+    def test_rejected_syntax_reply_keeps_text_and_delivers_body_once(self):
+        """Retry one C response in PTK and deliver its literal body exactly once."""
         with self.session(REJECT_SYNTAX_REPLY) as (root, terminal):
             terminal.send(b"cat <<'END' > body\r" + semantic.WITNESS)
-            self.assertFalse(terminal.witness(sent=True)["commands"])
+            self.assertFalse(terminal.witness(sent=True)["primary"])
             body = "  probe 한 글  "
             terminal.send(body.encode() + b"\r" + semantic.WITNESS)
             terminal.result("reply-rejected", b"before-reply")
             self.assertEqual(
                 terminal.witness(sent=True),
-                {"running": True, "commands": False, "text": body},
+                {"running": True, "primary": False, "text": body},
             )
             terminal.send(b"\rEND\r")
             terminal.result("body", (body + "\n").encode())
-            self.assertTrue(terminal.witness()["commands"])
-            self.assertFalse((root / "tool-ran").exists())
+            self.assertTrue(terminal.witness()["primary"])
+            self.assertFalse((root / "probe-executed").exists())
 
     def test_repeated_continuation_and_raw_return_have_one_observed_reader(self):
         """Observe one PTK reader at each edit and preserve the native read result."""
@@ -265,10 +264,10 @@ class SemanticRaceTests(unittest.TestCase):
                 self.assertEqual(trace["issues"], {})
                 self.assertEqual(trace["active"], ["EDITOR"])
                 terminal.send(semantic.WITNESS)
-                self.assertFalse(terminal.witness(sent=True)["commands"])
+                self.assertFalse(terminal.witness(sent=True)["primary"])
             terminal.send(b"fi\rraw payload\r")
             terminal.result("observed-result", b"raw payload")
-            self.assertTrue(terminal.witness()["commands"])
+            self.assertTrue(terminal.witness()["primary"])
             terminal.send(TRACE_KEY)
             terminal.require(lambda: len(traces.read_text().splitlines()) == 4)
             trace = json.loads(traces.read_text().splitlines()[-1])

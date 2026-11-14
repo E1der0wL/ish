@@ -111,7 +111,7 @@ def shutdown(controller: ShellSignalController, signum: int) -> None:
 
 
 def resize(controller: ShellSignalController, signum: int) -> None:
-    """Update the PTY and active Python tool after a window-size signal."""
+    """Update the shell PTY after a window-size signal."""
     controller.shell.resize()
 
 

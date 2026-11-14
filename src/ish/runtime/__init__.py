@@ -1,1 +1,1 @@
-"""Shared I/O and observation infrastructure for shell, UI, and Python tools."""
+"""Shared I/O and observation infrastructure for the shell and UI."""
