@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 ish = "ish.main:main"
+ish-vt = "ish.terminal.__main__:main"
 
 [dependency-groups]
 build = [

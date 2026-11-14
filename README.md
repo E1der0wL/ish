@@ -1,5 +1,11 @@
 # ish
 
+This branch also contains an isolated **libghostty-vt + prompt-toolkit terminal
+experiment**. The `ish-vt` entry point leaves command editing with the native
+shell and composes its screen with a status bar and popup. The existing `ish`
+entry point keeps its previous behavior. See
+[the experiment and its validation scope](docs/TERMINAL_EXPERIMENT.md).
+
 ish is an interactive command editor for Linux shells. It adds multiline editing,
 syntax highlighting, completion, and Python UI extensions
 through prompt-toolkit while your selected shell executes commands.

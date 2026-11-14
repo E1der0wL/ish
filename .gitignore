@@ -34,6 +34,9 @@ share/python-wheels/
 !/tests/test_shell_handoff_boundaries.py
 !/tests/test_semantic_races.py
 !/tests/test_shell_submission_cli.py
+!/tests/test_terminal_cli.py
+!/tests/test_terminal_vt.py
+!/tests/test_terminal_session.py
 !/tests/tcsh_channel.py
 !/tests/test_tcsh_channel.py
 !/tests/channel_gate.c
@@ -43,6 +46,7 @@ share/python-wheels/
 !/docs/HANDOFF_LIMITS.md
 !/docs/EDITING.md
 !/docs/CHANNEL_EXPERIMENT.md
+!/docs/TERMINAL_EXPERIMENT.md
 /.codex-remote-attachments/
 *.egg-info/
 .installed.cfg
