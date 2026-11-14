@@ -31,8 +31,11 @@ The terminal can erase or transform bytes before ish gets them back. For
 example, in canonical mode, Ctrl+V can quote a literal Backspace. If that
 byte is forwarded to another command's canonical terminal, it can act as
 Backspace there because the original quoting has already been consumed.
-Native continuation prompts and programs such as Vim still receive their
-own input.
+On eligible Bash and zsh sessions, ish holds input after Enter until a correlated
+shell request identifies its consumer: PTK continuation editing, native stdin,
+or the next confirmed primary editor. Programs such as Vim and Python tools
+using `input()` retain their native input paths. tcsh, BSD csh, sh/dash, and
+sessions using a fallback configuration retain native continuation.
 
 ## Supported shells
 
@@ -42,26 +45,44 @@ selects the login shell by name.
 
 | Shell | Minimum supported version | Argument | Support notes |
 | --- | --- | --- | --- |
-| Bash | 5.3.9 | `bash` | Uses ish editing with native Readline disabled. PS2 uses current-shell command substitution to avoid a subshell per continuation line. |
-| zsh | 5.5.1 | `zsh` | Uses ish editing at the primary prompt with native ZLE disabled. ish enables `PROMPT_SUBST` at startup and on `ish_recover`; hiding queued continuation prompts also requires `zsh/zselect`. |
-| tcsh | 6.21.00 | `tcsh` | Supports prompt hooks and return to the ish editor. |
+| Bash | 5.3.9 | `bash` | PTK primary and continuation editing when the conditions below hold; verified on 5.3.9. Native Readline stays disabled. |
+| zsh | 5.5.1 | `zsh` | PTK primary and conditional continuation editing with native ZLE disabled. The semantic continuation path was verified on 5.9. |
+| tcsh | 6.21.00 | `tcsh` | Supports primary prompt hooks and return to the ish editor; continuation remains native. |
 | BSD csh | Not specified | `csh` or `bsd-csh` | After a command, run `ish_recover` at the native prompt to resume ish editing. |
 | dash / sh | Not specified | `dash` or `sh` | The sh integration is exercised with dash. Input lines over 4,095 encoded bytes are rejected. |
 
 A `csh` executable that resolves to tcsh uses tcsh integration. Other implementations
 named `sh` are not automatically covered by dash support.
 
-ish enforces the default continuation prompt for Bash (`> `), zsh (`%_> `,
-such as `for> `), and tcsh (`%R? `, such as `foreach? `). At each primary prompt,
-including after `ish_recover`, integration replaces custom `PS2` / `prompt2`
-values with these defaults and its control markers. Custom continuation colors,
-text, and command substitutions are not retained; a `read` inside a custom PS2
-therefore cannot consume submitted input during prompt expansion. Primary prompt
-customization remains available.
+PTK continuation is selected at each confirmed primary boundary:
+
+- Bash requires 5.3.9 or newer, `promptvars`, and ish's integration hook as the
+  final `PROMPT_COMMAND` entry. User PS0 output, existing hooks, and their exit
+  status are preserved. A later prompt hook or `shopt -u promptvars` selects
+  native continuation for subsequent submissions.
+- zsh requires `PROMPT_SUBST`, native ZLE disabled, and the installed ish
+  `preexec` and interrupt acknowledgement hooks intact. A custom `TRAPINT` is
+  preserved and selects native continuation. User `preexec`/`precmd` hooks and
+  their status retain the existing integration behavior.
+
+In this mode, PS2 emits a request through the private control FIFO and contributes
+no visible prompt. PTK displays its own `> ` continuation prompt. Continuation
+and heredoc replies are shell text, including registered Python tool names and
+`ish_exit`; they never enter ish's command dispatcher. Primary display retains
+the existing shell prompt compatibility and optional `prompt_text` override.
+Prompt appearance does not determine input ownership.
+
+Native fallback retains Bash's `> `, zsh's `%_> ` (such as `for> `), and tcsh's
+`%R? ` (such as `foreach? `). At primary prompts, including after `ish_recover`,
+integration rebuilds the applicable PS2/prompt2 and its markers. Custom
+continuation colors, text, and command substitutions are not retained. See
+[the input contract](docs/EDITING.md) for identities, synchronization, and the
+[remaining shell boundaries](docs/HANDOFF_LIMITS.md) for unimplemented support.
 
 ish enables **`PROMPT_SUBST` when starting zsh and when running `ish_recover`**.
 It automatically loads the `zsh/zselect` module when available to hide repeated
-continuation prompts during multiline paste. No `.zshrc` changes are needed.
+native continuation prompts during multiline paste. The semantic PTK path does
+not require this module. No `.zshrc` changes are needed.
 To load the module and enable its builtin inside the zsh selected for ish:
 
 ```zsh
@@ -79,13 +100,15 @@ PS1='\$(date +%%H:%%M) > '
 You can run `unsetopt PROMPT_SUBST` during the session to disable expansion;
 ordinary prompt updates preserve that choice. Running `ish_recover` re-enables
 the option and retries loading `zsh/zselect`. Recovery cannot provide a module
-that is not installed or supported by the selected zsh build. If the option is
-disabled or the module is unavailable, commands still run with native
-continuation prompts, which can repeat during multiline paste.
+that is not installed or supported by the selected zsh build. Disabling
+`PROMPT_SUBST` selects native continuation. In a native fallback configuration,
+missing `zselect` can leave repeated continuation prompts visible during paste.
 
-These versions define the supported range. ish does not automatically query,
-compare, or enforce shell versions; select a supported version yourself. The same
-version guidance is available through `ish --help`. Older versions may fail to
+These minimum versions define the existing supported baseline. Select a supported
+shell yourself; shell selection does not reject every older binary. Separately,
+the Bash semantic capability checks its minimum version before activation.
+That fallback does not establish general compatibility with older Bash releases.
+Version guidance is also available through `ish --help`. Older versions may fail to
 initialize or process commands incorrectly, including older tcsh releases affected
 by `postcmd` loop-handling defects.
 
@@ -741,8 +764,9 @@ is preserved before the replacement prompt. A multiline value uses the existing
 prompt-toolkit layout, including the right prompt and completion menu.
 
 This setting controls the primary prompt's display. Shell prompt hooks, context
-updates, input handoff, and native continuation prompts keep running normally;
-it does not avoid the shell's original prompt computation. Shell escapes such as
+updates, and input handoff keep running normally; continuation follows its
+configured semantic or native path. The setting does not avoid the shell's
+original primary prompt computation. Shell escapes such as
 `\u`, `%n`, `$PWD`, or `$(date)` in a string are displayed literally rather than
 evaluated. Dynamic callbacks run during rendering, possibly more than once per
 redraw, so keep them fast and free of side effects. No polling is added.
@@ -892,12 +916,12 @@ application and build dependencies.
 
 ### Editor requests on this branch
 
-The session grants one editor reply at an acknowledged primary prompt. An
-`EditRequest.id` identifies the local editing attempt; `EditRequest.boundary`
-refers to the existing shell prompt identity. Ctrl+C or a completed Python tool
-can start a new attempt at the same shell boundary. An old, cancelled, or already
-consumed request cannot authorize another reply. The session checks that the
-boundary and input-return acknowledgement still agree before accepting text.
+The session grants one editor reply at an acknowledged primary prompt or a valid
+shell syntax request. Submission IDs, per-submission request sequences, primary
+prompt identities, and local `EditRequest.id` values have separate roles.
+Cancelled, duplicate, foreign, and out-of-order requests cannot authorize input.
+The common session holds trailing bytes until their consumer is known and uses
+the existing primary ACK boundary to recover unread native input.
 
 The session now calls `Prompt.prompt_async()` for text and admits command
 dispatch separately. `Prompt.read_and_dispatch()` remains callable for existing
@@ -905,15 +929,21 @@ integrations, but overriding it no longer changes the live session. Custom
 editors should return text from `prompt_async()` without dispatching it. The
 pre-execution, post-execution, and fallback hook order is unchanged.
 
-This is primary editing admission, not a new shell continuation protocol. All
-adapters retain native continuation; program stdin and Python `input()` retain
-their existing input paths. Continuation support requires separately verified
-wire requests and input handoff before it can be enabled.
+The Bash and zsh adapters implement the same contract using their own shell
+boundaries. tcsh, BSD csh, and sh/dash continuation remains native because the
+necessary guarantees have not been established. The goal of PTK continuation
+for every supported shell is still incomplete. [EDITING.md](docs/EDITING.md)
+records the architecture, verified configurations, test commands, and stage
+status; [HANDOFF_LIMITS.md](docs/HANDOFF_LIMITS.md) records the remaining evidence
+and required native cooperation.
 
-The tracked request and dispatch tests run with:
+The tracked contract and live continuation tests run with:
 
 ```sh
-PYTHONPATH=src:tests uv run python -m unittest test_edit_dispatch test_edit_requests test_native_cursor_keys test_p2_shells
+PYTHONPATH=src:tests uv run python -B -m unittest \
+  test_handoff_protocol test_edit_dispatch test_edit_requests \
+  test_bash_edit_protocol test_semantic_edit_cli \
+  test_zsh_semantic test_zsh_edit_cli test_semantic_races
 ```
 
 ## Support scope
@@ -925,12 +955,18 @@ input handling used by ish.
 
 - The primary prompt uses prompt-toolkit editing. Native Readline/ZLE bindings,
   native editor widgets, and every aspect of shell prompt rendering are not
-  reproduced. At this prompt, Ctrl+C cancels editing without changing shell status.
-- In zsh, queued continuation prompts are hidden when `PROMPT_SUBST` is enabled
-  and the `zsh/zselect` module is available. ish enables the option at startup
-  and on explicit `ish_recover`; ordinary prompt updates preserve user changes.
-  If either condition is unmet, ish displays native continuation prompts.
-  The readiness check does not consume input or change TTY settings.
+  reproduced. At this prompt, Ctrl+C cancels editing without changing shell status;
+  Ctrl+D on an empty editor exits ish successfully. At a semantic continuation,
+  Ctrl+C follows the adapter's interrupt protocol and Ctrl+D sends the PTY's
+  configured EOF character to the waiting shell parser.
+- Bash and zsh continuation editing uses PTK when the supported configuration
+  above is active. It does not replace program stdin or Python `input()`.
+- In zsh's native fallback, queued continuation prompts are hidden when
+  `PROMPT_SUBST` is enabled and the `zsh/zselect` module is available. ish enables
+  the option at startup and on explicit `ish_recover`; ordinary prompt updates
+  preserve user changes.
+  If either condition is unmet, native continuation prompts remain visible.
+  This display hint does not authorize input or change TTY settings.
   With noncanonical input (such as `stty -icanon`), an incomplete queued line can
   hide a prompt that is still waiting for more input.
 - If integration hooks are replaced or removed, confirm the shell is waiting for
