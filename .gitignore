@@ -33,10 +33,15 @@ share/python-wheels/
 !/tests/test_zsh_edit_cli.py
 !/tests/test_shell_handoff_boundaries.py
 !/tests/test_semantic_races.py
+!/tests/tcsh_channel.py
+!/tests/test_tcsh_channel.py
+!/tests/channel_gate.c
+!/tests/test_tcsh_channel_gate.py
 /dev/
 /docs/*
 !/docs/HANDOFF_LIMITS.md
 !/docs/EDITING.md
+!/docs/CHANNEL_EXPERIMENT.md
 /.codex-remote-attachments/
 *.egg-info/
 .installed.cfg

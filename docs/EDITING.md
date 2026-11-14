@@ -204,7 +204,7 @@ readiness로 사용하지 않는다. 세부 testcase는 각 파일이 확인하�
 | 3. 공통 wire 계약·보류/회수·PTK syntax UI 연결 | Bash/zsh 실제 경로에서 구현·검증 완료; primary 표시 호환성 유지 |
 | 4. Bash PTK continuation | 위 지원 조건과 시나리오에서 구현·검증 완료 |
 | 5. zsh PTK continuation | 위 지원 조건과 시나리오에서 구현·검증 완료 |
-| 6. tcsh handoff 및 continuation | 경계 관찰과 최소 재현 확보. 새 native 협력 및 live PTK 전환 미구현 |
+| 6. tcsh handoff 및 continuation | 경계 재현 및 별도 [FIFO/PTY 분리 실험](CHANNEL_EXPERIMENT.md) 확보. 실험용 read gate와 제한된 회수 검증; production 연결과 live PTK 전환 미구현 |
 | 7. BSD csh·sh/dash 적용 | 제약 조사 완료. live PTK continuation 비활성 |
 | 8. 기존 처리 정리·전체 회귀·지원 문서 | 구현한 범위의 정리·회귀·문서 완료. 6~7단계가 남아 있어 전체 8단계 완료가 아님 |
 

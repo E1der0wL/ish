@@ -182,6 +182,9 @@ native heredoc 파일에 도구 이름이 남았다는 사실은 PTK dispatcher 
 
 현재 바로 활성화할 수 있는 최소 범위는 기존에 검증한 primary 편집뿐이다.
 셸 문법을 Python에서 추측하지 않고 특정 continuation만 고르려면 해당 셸이 실제로
-요청하는 시점의 문맥을 먼저 제공해야 한다. 다음 단계는 별도 native 협력 실험으로
-구문 TTY refill을 차단하고 identity와 reclaim을 검증하는 것이다. 그 검증 전에는
+요청하는 시점의 문맥을 먼저 제공해야 한다. 이후 별도 [채널 분리 실험](CHANNEL_EXPERIMENT.md)에서
+수정하지 않은 tcsh의 source FIFO 읽기를 테스트용 shim으로 차단하고, 요청 identity와
+제한된 조건의 PTY 회수를 검증했다. 이는 TTY parser 문맥을 알아낸 구현이 아니라
+구문 원천 자체를 분리한 실험이며, interactive 실행 시점·hook·history·취소 의미가
+달라졌다. 기존 live 경로는 유지한다. source 수명과 오류·취소 복귀를 포함한 검증 전에는
 6~7단계의 live PTK continuation과 모든 지원 셸 목표를 완료로 표시하지 않는다.
