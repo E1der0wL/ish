@@ -21,7 +21,8 @@ sdist/
 var/
 wheels/
 share/python-wheels/
-/tests/
+/tests/*
+!/tests/test_edit_dispatch.py
 /dev/
 /docs/
 /.codex-remote-attachments/

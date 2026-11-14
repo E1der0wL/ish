@@ -98,6 +98,7 @@ from prompt_toolkit.widgets.toolbars import (
 )
 from pygments.lexers import get_lexer_by_name
 
+from ish.app.dispatch import dispatch
 from ish.app.pytool import Runner
 from ish.config import config
 from ish.lang import Message, i18n
@@ -106,14 +107,13 @@ from ish.parser.completion import CompletionWord
 from ish.parser.shell import alias_parser, environ_parser, str_parser
 from ish.runtime.fdio import InputBytes
 from ish.runtime.observer import EDITOR, InputObserver
-from ish.runtime.process import ProcessGroup, shell_exitcode
+from ish.runtime.process import ProcessGroup
 from ish.shell.adapter import get_adapter
 from ish.shell.constants import ALIAS, BUILTIN, ENVIRON, EXITCODE
 from ish.shell.context import ShellContext
 from ish.shell.engine import DEFAULT_ENCODING, DEFAULT_SHELL, InteractiveShell
 from ish.shell.input import CANONICAL_LINE_BYTES, InputRejected
 from ish.shell.limits import TYPEAHEAD_LIMIT_BYTES
-from ish.shell.request import ShellExitRequest, ShellPassRequest
 
 from .ansi import ShellANSI
 from .completer import PromptCompleter
@@ -1156,11 +1156,10 @@ class Prompt(PromptSession):
         await asyncio.to_thread(self.load_rc)
 
     async def read_and_dispatch(self, **kwargs) -> Optional[str]:
-        """Read edited input and dispatch exit requests, internal commands, or Python
-        tools.
+        """Keep the existing command-entry API for session-authorized submissions.
 
-        Preserve trailing whitespace in shell commands and leave compound syntax
-        requiring expansion to the shell.
+        For text-only editing, use prompt_async without dispatch. In particular,
+        shell syntax replies and heredoc data must not pass through this API.
         """
         try:
             command = await self.prompt_async(**kwargs)
@@ -1169,34 +1168,7 @@ class Prompt(PromptSession):
         except (termios.error, OSError):
             return ""
 
-        key = command.strip()
-        if key == self.exit_command:
-            raise ShellExitRequest
-
-        if key in self.internal_commands:
-            handler, args, kwargs = self.internal_commands[key]
-            raise ShellPassRequest(handler, command, *args, **kwargs)
-
-        argv = self._tool_argv(command)
-        if argv is not None:
-            self.last_tool_exitcode = None
-            try:
-                cwd, environ = self.interactive_shell.tool_context()
-            except Exception:
-                self.logger.exception("Python tool context unavailable: %s", argv[0])
-                status = 1
-            else:
-                # Transport failures and application cancellation must still reach
-                # session cleanup; they are not ordinary tool exit statuses.
-                status = await self.runner.run_in_context(
-                    self.internal_tools[argv[0]], cwd, environ, *argv[1:]
-                )
-            self.last_tool_exitcode = status
-            # Retain the raw worker status as well as a shell-style display code.
-            self.last_exitcode = shell_exitcode(status)
-            return None
-
-        return command
+        return await dispatch(self, command)
 
     def take_typeahead(self) -> bytes:
         """Transfer unread input, including VT and paste framing, to foreground stdin."""
