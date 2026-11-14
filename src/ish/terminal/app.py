@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -12,12 +13,16 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout, Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 
+from .mouse import decode_mouse
 from .session import Session
 from .vt import ALT, CTRL, SHIFT, SPECIAL_KEYS, Terminal
 
 DEFAULT_SIZE = (80, 24)
 FRAME_INTERVAL = 1 / 60
 INPUT_TIMEOUT = 0.05
+WHEEL_ROWS = 3
+COPY_LIMIT = 1024 * 1024
+WHEEL_BUTTONS = frozenset(("wheelup", "wheeldown", "wheelleft", "wheelright"))
 SKIP_KEYS = frozenset(
     (
         Keys.Any,
@@ -44,6 +49,9 @@ class TerminalControl(UIControl):
             if key not in SKIP_KEYS:
                 self.bindings.add(key, eager=True)(self._key)
         self.bindings.add(Keys.BracketedPaste, eager=True)(self._paste)
+        self.bindings.add(Keys.Vt100MouseEvent, eager=True)(self._mouse)
+        self.bindings.add("s-pageup", eager=True)(self._page)
+        self.bindings.add("s-pagedown", eager=True)(self._page)
 
     def is_focusable(self):
         """The native terminal is the sole input target in the base application."""
@@ -56,13 +64,36 @@ class TerminalControl(UIControl):
     def _paste(self, event):
         """Encode paste using the child terminal's current bracketed-paste mode."""
         try:
-            self.owner.session.send(self.owner.vt.encode_paste(event.data))
+            self.owner.paste(event.data)
+        except Exception as exc:
+            self.owner._failed(exc)
+
+    def _mouse(self, event):
+        """Decode host cell coordinates before PTK can fold wide glyph columns."""
+        try:
+            mouse = decode_mouse(event.data)
+            if mouse is not None:
+                self.owner.mouse(mouse)
+        except Exception as exc:
+            self.owner._failed(exc)
+        # Scroll/selection changes invalidate explicitly. Hover must not redraw.
+        return NotImplemented
+
+    def _page(self, event):
+        """Browse primary history; alternate-screen programs retain these keys."""
+        try:
+            if self.owner.vt.alternate:
+                self._key(event)
+            else:
+                direction = -1 if event.key_sequence[-1].key == Keys.ShiftPageUp else 1
+                self.owner.scroll(direction * max(1, self.owner.size[1] - 1))
         except Exception as exc:
             self.owner._failed(exc)
 
     def _key(self, event):
         """Forward control/text bytes and encode special keys for the child modes."""
         try:
+            self.owner.live()
             self.owner.session.send(self._key_bytes(event))
         except Exception as exc:
             self.owner._failed(exc)
@@ -111,6 +142,11 @@ class TerminalApp:
         """Create one full-size terminal pane with no built-in overlays."""
         self.dump_state = dump_state
         self.size = DEFAULT_SIZE
+        self.drag_origin = None
+        self.dragged = False
+        self.pressed_buttons = []
+        self.native_buttons = {}
+        self.pending_copy = None
         self.session = Session(
             [shell, "-i"], str(cwd), self._output, self._exited, self._failed
         )
@@ -120,11 +156,146 @@ class TerminalApp:
         self.app = Application(
             layout=Layout(self.window),
             full_screen=True,
-            mouse_support=False,
+            mouse_support=True,
             min_redraw_interval=FRAME_INTERVAL,
             after_render=self._after_render,
         )
         self.app.ttimeoutlen = INPUT_TIMEOUT
+
+    def live(self):
+        """Return to live input without replaying any history or selection text."""
+        self.vt.scroll_bottom()
+        self.vt.clear_selection()
+        self.drag_origin = None
+        self.dragged = False
+        self.app.invalidate()
+
+    def paste(self, text):
+        """Paste through the same native encoding after returning to live output."""
+        self.live()
+        self.session.send(self.vt.encode_paste(text))
+
+    def scroll(self, rows):
+        """Move the native VT viewport without changing the child input stream."""
+        self._release_mouse()
+        self.vt.scroll(rows)
+        if self.drag_origin is not None:
+            self.dragged = True
+        self.app.invalidate()
+
+    def _release_mouse(self):
+        """Finish delivered presses before leaving the application's live view."""
+        for button, (x, y, modifiers) in tuple(self.native_buttons.items()):
+            self.session.send(self.vt.encode_mouse("release", button, x, y, modifiers))
+        self.native_buttons.clear()
+
+    def _send_mouse(self, action, button, x, y, modifiers):
+        """Remember only presses actually delivered to the native consumer."""
+        data = self.vt.encode_mouse(action, button, x, y, modifiers)
+        if data:
+            self.session.send(data)
+            if action == "press" and button not in WHEEL_BUTTONS:
+                self.native_buttons[button] = (x, y, modifiers)
+            elif action == "move":
+                for held in self.native_buttons:
+                    self.native_buttons[held] = (x, y, modifiers)
+        if action == "release":
+            self.native_buttons.pop(button, None)
+
+    def mouse(self, event):
+        """Route mouse input using VT modes and the visible viewport, never shell state."""
+        x, y = event.x, event.y
+        if x >= self.size[0] or y >= self.size[1]:
+            if event.action == "press" or (
+                self.drag_origin is None and not self.pressed_buttons
+            ):
+                return
+            # Finish a captured drag even when its release is beyond the pane.
+            x, y = min(x, self.size[0] - 1), min(y, self.size[1] - 1)
+        button = event.button
+        if event.action == "press" and button not in WHEEL_BUTTONS:
+            if button not in self.pressed_buttons:
+                self.pressed_buttons.append(button)
+        if event.action == "release" and button is None:
+            button = self.pressed_buttons[-1] if self.pressed_buttons else None
+        if event.action == "release" and button in self.pressed_buttons:
+            self.pressed_buttons.remove(button)
+
+        # Modifier changes cannot move an in-progress drag to another consumer.
+        if event.action in ("move", "release") and button in self.native_buttons:
+            self._send_mouse(event.action, button, x, y, event.modifiers)
+            return
+        if event.action == "release" and self.drag_origin is None:
+            return
+
+        # A local drag remains local if output changes the application's modes.
+        if self.drag_origin is not None and button not in WHEEL_BUTTONS:
+            if button in ("left", None) and event.action in ("move", "release"):
+                self.dragged |= (x, y) != self.drag_origin
+                if self.dragged:
+                    self.vt.update_selection(x, y)
+                    self.app.invalidate()
+                if event.action == "release":
+                    if self.dragged:
+                        self.copy_selection()
+                    else:
+                        self.vt.clear_selection()
+                    self.drag_origin = None
+                    self.dragged = False
+            return
+
+        native = (
+            self.drag_origin is None
+            and self.vt.viewport_active
+            and self.vt.mouse_reporting
+            and not event.modifiers & SHIFT
+        )
+        if native:
+            if (
+                event.action == "move"
+                and button is not None
+                and button not in self.native_buttons
+            ):
+                return
+            self._send_mouse(event.action, button, x, y, event.modifiers)
+            return
+        if button in WHEEL_BUTTONS:
+            if event.action != "press" or button in ("wheelleft", "wheelright"):
+                return
+            direction = -1 if button == "wheelup" else 1
+            if (
+                self.vt.alternate
+                and self.vt.alternate_scroll
+                and not event.modifiers & SHIFT
+            ):
+                self.live()
+                key = "up" if direction < 0 else "down"
+                self.session.send(self.vt.encode_key(key) * WHEEL_ROWS)
+            else:
+                self.scroll(direction * WHEEL_ROWS)
+            return
+        if event.action == "press" and button == "left":
+            self._release_mouse()
+            self.vt.begin_selection(x, y)
+            self.drag_origin = (x, y)
+            self.dragged = False
+            self.app.invalidate()
+        elif event.action == "press" and button == "middle":
+            text = self.app.clipboard.get_data().text
+            if text:
+                self.paste(text)
+
+    def copy_selection(self):
+        """Copy a user-selected native range without reconstructing wrapped text."""
+        text = self.vt.selection_text()
+        if not text:
+            return
+        self.app.clipboard.set_text(text)
+        encoded = text.encode("utf-8")
+        self.pending_copy = None
+        if len(encoded) <= COPY_LIMIT:
+            self.pending_copy = base64.b64encode(encoded).decode("ascii")
+        self.app.invalidate()
 
     def resize(self, cols, rows):
         """Keep the emulated grid and controlling PTY on the same pane dimensions."""
@@ -135,7 +306,15 @@ class TerminalApp:
 
     def _output(self, data):
         """Only the VT receives child output; PTK remains the sole outer renderer."""
+        alternate = self.vt.alternate
         self.vt.feed(data)
+        if self.vt.alternate != alternate:
+            self.drag_origin = None
+            self.dragged = False
+            self.pressed_buttons.clear()
+            self.native_buttons.clear()
+        elif not self.vt.mouse_reporting:
+            self.native_buttons.clear()
         self.app.invalidate()
 
     def _exited(self, returncode):
@@ -150,6 +329,11 @@ class TerminalApp:
 
     def _after_render(self, app):
         """Publish optional diagnostic state after composition, never for readiness."""
+        if self.pending_copy is not None:
+            # Use PTK's output queue after rendering. Child output never bypasses VT.
+            app.output.write_raw(f"\x1b]52;c;{self.pending_copy}\x07")
+            app.output.flush()
+            self.pending_copy = None
         frame = self.control.frame
         if self.dump_state is None or frame is None:
             return
@@ -159,6 +343,10 @@ class TerminalApp:
             "lines": ["".join(text for _, text in line) for line in frame.lines],
             "cursor": [frame.cursor_x, frame.cursor_y],
             "alternate": frame.alternate,
+            "viewport_active": frame.viewport_active,
+            "viewport_offset": frame.viewport_offset,
+            "scrollback_rows": frame.scrollback_rows,
+            "mouse_reporting": self.vt.mouse_reporting,
             "child_pid": self.session.pid,
         }
         temporary = self.dump_state.with_name(self.dump_state.name + ".next")

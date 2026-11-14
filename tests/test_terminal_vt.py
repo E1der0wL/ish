@@ -4,7 +4,7 @@ import unittest
 
 from prompt_toolkit.styles import Style
 
-from ish.terminal.vt import CTRL, Terminal, TerminalError
+from ish.terminal.vt import ALT, CTRL, SHIFT, Terminal, TerminalError
 
 
 def text(frame, row=0):
@@ -257,6 +257,194 @@ class TerminalVTTests(unittest.TestCase):
             terminal.feed(b"\x1b]4;1;#123456\x07\x1b[31;41mA")
             attrs = attributes(terminal.frame(), "A")
             self.assertEqual((attrs.color, attrs.bgcolor), ("123456", "123456"))
+
+    def test_history_scroll_stays_anchored_while_output_arrives(self):
+        """Native viewport navigation preserves old content during new output."""
+        with Terminal(12, 3, lambda _: None) as terminal:
+            terminal.feed(b"\r\n".join(f"row{index:02}".encode() for index in range(8)))
+            live = terminal.frame()
+            self.assertTrue(live.viewport_active)
+            self.assertEqual((live.scrollback_rows, live.viewport_offset), (5, 5))
+            self.assertEqual(
+                [text(live, row) for row in range(3)], ["row05", "row06", "row07"]
+            )
+            terminal.scroll(-2)
+            old = terminal.frame()
+            self.assertFalse(terminal.viewport_active)
+            self.assertFalse(old.cursor_visible)
+            self.assertEqual(old.viewport_offset, 3)
+            self.assertEqual(
+                [text(old, row) for row in range(3)], ["row03", "row04", "row05"]
+            )
+            terminal.feed(b"\r\nrow08\r\nrow09")
+            anchored = terminal.frame()
+            self.assertEqual(anchored.lines, old.lines)
+            self.assertEqual(
+                (anchored.scrollback_rows, anchored.viewport_offset), (7, 3)
+            )
+            terminal.scroll_top()
+            self.assertEqual(text(terminal.frame()), "row00")
+            terminal.scroll_bottom()
+            self.assertTrue(terminal.viewport_active)
+            self.assertEqual(text(terminal.frame()), "row07")
+            terminal.scroll(-10000)
+            self.assertEqual(terminal.frame().viewport_offset, 0)
+            terminal.scroll(10000)
+            self.assertTrue(terminal.viewport_active)
+
+    def test_alternate_screen_does_not_borrow_primary_history(self):
+        """An alternate screen has no history and never exposes primary rows."""
+        with Terminal(12, 3, lambda _: None) as terminal:
+            terminal.feed(b"one\r\ntwo\r\nthree\r\nfour")
+            terminal.scroll_top()
+            terminal.feed(b"\x1b[?1049h\x1b[Halt0\r\nalt1\r\nalt2\r\nalt3")
+            self.assertTrue(terminal.alternate)
+            terminal.scroll_top()
+            alternate = terminal.frame()
+            self.assertTrue(alternate.viewport_active)
+            self.assertEqual(alternate.scrollback_rows, 0)
+            self.assertEqual(text(alternate), "alt1")
+            terminal.feed(b"\x1b[?1007h")
+            self.assertTrue(terminal.alternate_scroll)
+            terminal.feed(b"\x1b[?1007l\x1b[?1049l")
+            self.assertFalse(terminal.alternate_scroll)
+            self.assertFalse(terminal.alternate)
+            terminal.scroll_top()
+            self.assertEqual(text(terminal.frame()), "one")
+
+    def test_zero_byte_limit_erases_and_disables_native_history(self):
+        """The public native byte limit bounds storage without a Python copy."""
+        with Terminal(12, 3, lambda _: None) as terminal:
+            terminal.feed(b"one\r\ntwo\r\nthree\r\nfour")
+            self.assertGreater(terminal.frame().scrollback_rows, 0)
+            terminal.set_scrollback_limit(10, 0)
+            terminal.scroll_top()
+            self.assertEqual(terminal.frame().scrollback_rows, 0)
+            self.assertTrue(terminal.viewport_active)
+            terminal.feed(b"\r\nfive\r\nsix")
+            self.assertEqual(terminal.frame().scrollback_rows, 0)
+            terminal.set_scrollback_limit(100, 1024 * 1024)
+            terminal.feed(b"\r\nseven")
+            self.assertGreater(terminal.frame().scrollback_rows, 0)
+
+    def test_mouse_sgr_modes_wheels_and_modifiers_use_native_encoding(self):
+        """SGR button/motion mode and wheel directions have independent wire expectations."""
+        with Terminal(20, 8, lambda _: None) as terminal:
+            self.assertFalse(terminal.mouse_reporting)
+            self.assertEqual(terminal.encode_mouse("press", "left", 4, 2), b"")
+            terminal.feed(b"\x1b[?1000h\x1b[?1006h")
+            self.assertTrue(terminal.mouse_reporting)
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 4, 2), b"\x1b[<0;5;3M"
+            )
+            self.assertEqual(
+                terminal.encode_mouse("release", "left", 4, 2), b"\x1b[<0;5;3m"
+            )
+            self.assertEqual(terminal.encode_mouse("move", None, 4, 2), b"")
+            for button, wire in (
+                ("wheelup", 64),
+                ("wheeldown", 65),
+                ("wheelleft", 66),
+                ("wheelright", 67),
+            ):
+                with self.subTest(button=button):
+                    self.assertEqual(
+                        terminal.encode_mouse("press", button, 4, 2),
+                        f"\x1b[<{wire};5;3M".encode(),
+                    )
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 4, 2, SHIFT | ALT | CTRL),
+                b"\x1b[<28;5;3M",
+            )
+            terminal.feed(b"\x1b[?1000l\x1b[?1002h")
+            self.assertEqual(terminal.encode_mouse("move", None, 5, 3), b"")
+            self.assertEqual(
+                terminal.encode_mouse("move", "left", 5, 3), b"\x1b[<32;6;4M"
+            )
+            terminal.feed(b"\x1b[?1002l\x1b[?1003h")
+            self.assertEqual(
+                terminal.encode_mouse("move", None, 5, 3), b"\x1b[<35;6;4M"
+            )
+            terminal.feed(b"\x1b[?1003l")
+            self.assertFalse(terminal.mouse_reporting)
+            self.assertEqual(terminal.encode_mouse("press", "left", 4, 2), b"")
+
+    def test_mouse_legacy_utf8_urxvt_and_pixel_limit(self):
+        """Negotiated formats are native; missing physical pixels never get invented."""
+        with Terminal(300, 8, lambda _: None) as terminal:
+            terminal.feed(b"\x1b[?1000h")
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 4, 2), b"\x1b[M %\x23"
+            )
+            self.assertEqual(
+                terminal.encode_mouse("release", "left", 4, 2), b"\x1b[M#%\x23"
+            )
+            terminal.feed(b"\x1b[?1005h")
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 250, 2),
+                b"\x1b[M " + chr(283).encode() + b"#",
+            )
+            terminal.feed(b"\x1b[?1005l\x1b[?1015h")
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 4, 2), b"\x1b[32;5;3M"
+            )
+            terminal.feed(b"\x1b[?1015l\x1b[?1016h")
+            self.assertEqual(terminal.encode_mouse("press", "left", 4, 2), b"")
+            terminal.feed(b"\x1b[?1016l\x1b[?1006h")
+            self.assertEqual(
+                terminal.encode_mouse("press", "left", 4, 2), b"\x1b[<0;5;3M"
+            )
+
+    def test_selection_copies_unicode_from_native_cells_and_highlights(self):
+        """Inclusive selection copies full graphemes and only selected cells invert."""
+        with Terminal(20, 4, lambda _: None) as terminal:
+            terminal.feed("ab 한e\u0301 Z".encode())
+            terminal.begin_selection(3, 0)
+            self.assertEqual(terminal.selection_text(), "")
+            terminal.update_selection(5, 0)
+            self.assertEqual(terminal.selection_text(), "한e\u0301")
+            frame = terminal.frame()
+            self.assertTrue(attributes(frame, "한").reverse)
+            self.assertTrue(attributes(frame, "e").reverse)
+            self.assertFalse(attributes(frame, "Z").reverse)
+            terminal.clear_selection()
+            self.assertEqual(terminal.selection_text(), "")
+            self.assertFalse(attributes(terminal.frame(), "한").reverse)
+
+    def test_selection_anchor_follows_output_and_reflow(self):
+        """Tracked native cells survive scrolling and changing physical wrap rows."""
+        with Terminal(12, 3, lambda _: None) as terminal:
+            terminal.feed(b"first\r\nsecond\r\nthird")
+            terminal.begin_selection(0, 0)
+            terminal.feed(b"\r\nfourth")
+            terminal.scroll_top()
+            terminal.update_selection(4, 0)
+            self.assertEqual(terminal.selection_text(), "first")
+        with Terminal(8, 4, lambda _: None) as terminal:
+            terminal.feed(b"abcdefghijklmnop")
+            terminal.begin_selection(0, 0)
+            terminal.resize(5, 5)
+            terminal.update_selection(0, 3)
+            self.assertEqual(terminal.selection_text(), "abcdefghijklmnop")
+            terminal.resize(16, 4)
+            self.assertEqual(terminal.selection_text(), "abcdefghijklmnop")
+
+    def test_selection_never_uses_anchors_from_another_screen_or_reset(self):
+        """Screen changes and reset cannot reuse an invalid untracked pointer."""
+        with Terminal(12, 3, lambda _: None) as terminal:
+            terminal.feed(b"primary")
+            terminal.begin_selection(0, 0)
+            terminal.update_selection(6, 0)
+            self.assertEqual(terminal.selection_text(), "primary")
+            terminal.feed(b"\x1b[?1049h\x1b[Halt")
+            self.assertEqual(terminal.selection_text(), "")
+            terminal.update_selection(2, 0)
+            self.assertEqual(terminal.selection_text(), "")
+            terminal.feed(b"\x1b[?1049l")
+            terminal.begin_selection(0, 0)
+            terminal.feed(b"\x1bcnew")
+            terminal.update_selection(2, 0)
+            self.assertEqual(terminal.selection_text(), "")
 
     def test_closed_terminal_rejects_further_use(self):
         """Repeated cleanup is safe and cannot access freed native state."""

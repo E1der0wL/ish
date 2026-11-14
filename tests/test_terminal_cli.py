@@ -25,6 +25,7 @@ DEADLINE = 15
 STARTUP_DEADLINE = 45
 ROWS, COLS = 24, 100
 F2, F10 = b"\x1bOQ", b"\x1b[21~"
+PAGE_UP, PAGE_DOWN = b"\x1b[5;2~", b"\x1b[6;2~"
 PASTE_START, PASTE_END = b"\x1b[200~", b"\x1b[201~"
 TCSH = shutil.which("tcsh")
 
@@ -74,6 +75,61 @@ signal.signal(signal.SIGINT, interrupted)
 Path('interrupt-ready').write_text('waiting')
 while True:
     time.sleep(1)
+"""
+
+
+HISTORY_WRITER = """for number in range(100):
+    print(f'HIST:{number:03d}', flush=True)
+"""
+
+HISTORY_READER = """import os
+import sys
+import time
+from pathlib import Path
+
+for number in range(80):
+    print(f'HIST:{number:03d}', flush=True)
+Path('history-ready').write_text('80')
+while not Path('append-history').exists():
+    time.sleep(0.01)
+for number in range(80, 92):
+    print(f'HIST:{number:03d}', flush=True)
+Path('history-appended').write_text('92')
+Path('history-input').write_text(sys.stdin.readline())
+size = os.get_terminal_size(0)
+Path('history-size').write_text(f'{size.lines} {size.columns}')
+"""
+
+MOUSE_READER = r"""import os
+import sys
+import termios
+import tty
+from pathlib import Path
+
+mode, encoding = sys.argv[1:]
+saved = termios.tcgetattr(0)
+data = bytearray()
+try:
+    tty.setraw(0)
+    for number in range(80):
+        os.write(1, f'MOUSE_HISTORY:{number:03d}\r\n'.encode())
+    os.write(1, f'\x1b[?{mode}h\x1b[?1006{encoding}\x1b[2J\x1b[HMOUSE_READY_{mode}_{encoding}'.encode())
+    Path('mouse-ready').write_text(f'{mode}:{encoding}')
+    while not data.endswith(b'|done|'):
+        data.extend(os.read(0, 1024))
+finally:
+    os.write(1, b'\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\r\n')
+    termios.tcsetattr(0, termios.TCSANOW, saved)
+Path('mouse-result').write_bytes(data)
+"""
+
+SELECTION_READER = r"""import sys
+from pathlib import Path
+
+sys.stdout.write('\x1b[2J\x1b[HCOPY_ME\r\nSELECTION_READY\r\n')
+sys.stdout.flush()
+Path('selection-ready').write_text('waiting')
+Path('selection-input').write_text(sys.stdin.readline())
 """
 
 
@@ -459,6 +515,269 @@ class TerminalCLITests(unittest.TestCase):
         self.require_full_screen()
         terminal.submit("stty size > returned-size")
         terminal.result("returned-size", b"33 110\n")
+
+    def test_shell_history_navigation_and_paste_return_to_live_input(self):
+        """History keys and wheels scroll output; pasted text edits the live shell."""
+        terminal = self.terminal
+        (self.root / "history-writer.py").write_text(HISTORY_WRITER)
+        terminal.submit(f"{shlex.quote(sys.executable)} history-writer.py")
+        terminal.require(terminal.at_prompt)
+        terminal.require(
+            lambda: (
+                terminal.frame_has("HIST:099")
+                and terminal.screen.display[-1].rstrip() == "READY>"
+            )
+        )
+        live_top = int(terminal.screen.display[0].strip().removeprefix("HIST:"))
+        terminal.send(PAGE_UP)
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is False
+                and terminal.screen.display[0].strip()
+                == f"HIST:{live_top - ROWS + 1:03d}"
+            )
+        )
+        terminal.send(b"\x1b[<64;5;5M")
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is False
+                and terminal.screen.display[0].strip()
+                == f"HIST:{live_top - ROWS - 2:03d}"
+            )
+        )
+        terminal.send(b"\x1b[<65;5;5M" + PAGE_DOWN)
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is True
+                and terminal.screen.display[0].strip() == f"HIST:{live_top:03d}"
+            )
+        )
+        terminal.send(PAGE_UP)
+        terminal.require(lambda: terminal.state().get("viewport_active") is False)
+        command = "printf '%s' 'history paste 한 글' > history-shell"
+        terminal.send(PASTE_START + command.encode() + PASTE_END)
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is True
+                and terminal.frame_has("history-shell")
+            )
+        )
+        self.assertFalse((self.root / "history-shell").exists())
+        terminal.send(b"\r")
+        terminal.result("history-shell", "history paste 한 글".encode())
+        terminal.require(terminal.at_prompt)
+        self.require_full_screen()
+
+    def test_scrolled_output_keeps_anchor_until_native_input_and_resize(self):
+        """New output preserves historical cells; typing returns to current stdin."""
+        terminal = self.terminal
+        (self.root / "history-reader.py").write_text(HISTORY_READER)
+        terminal.submit(f"{shlex.quote(sys.executable)} history-reader.py")
+        terminal.result("history-ready", b"80")
+        terminal.require(lambda: terminal.frame_has("HIST:079"))
+        terminal.send(PAGE_UP)
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is False
+                and not terminal.frame_has("HIST:079")
+            )
+        )
+        before = tuple(terminal.screen.display)
+        old_state = terminal.state()
+        self.assertTrue(before[0].startswith("HIST:"))
+        (self.root / "append-history").write_text("append")
+        terminal.result("history-appended", b"92")
+        terminal.require(
+            lambda: (
+                terminal.state().get("scrollback_rows")
+                == old_state["scrollback_rows"] + 12
+            )
+        )
+        self.assertEqual(
+            terminal.state()["viewport_offset"], old_state["viewport_offset"]
+        )
+        self.assertEqual(tuple(terminal.screen.display), before)
+        terminal.resize(29, 110)
+        terminal.require(
+            lambda: (
+                (terminal.state().get("rows"), terminal.state().get("cols"))
+                == (29, 110)
+                and terminal.screen.display[0].rstrip() == before[0].rstrip()
+            )
+        )
+        self.assertFalse(terminal.state()["viewport_active"])
+        terminal.send("typed ")
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is True
+                and terminal.frame_has("HIST:091")
+                and terminal.frame_has("typed ")
+            )
+        )
+        terminal.send(PASTE_START + "한 글".encode() + PASTE_END + b"\r")
+        terminal.result("history-input", "typed 한 글\n".encode())
+        terminal.result("history-size", b"29 110")
+        terminal.require(terminal.at_prompt)
+        self.require_full_screen()
+
+    def test_native_mouse_modes_receive_only_the_requested_wire_events(self):
+        """A raw consumer records exact SGR and legacy coordinates and filtering."""
+        terminal = self.terminal
+        (self.root / "mouse-reader.py").write_text(MOUSE_READER)
+        press = b"\x1b[<0;7;5M"
+        drag = b"\x1b[<32;8;6M"
+        release = b"\x1b[<0;8;6m"
+        motion = b"\x1b[<35;9;7M"
+        wheels = b"\x1b[<64;10;8M\x1b[<65;10;8M"
+        shift_move = b"\x1b[<36;8;6M"
+        captured = press + shift_move + b"\x1b[<4;7;5m\x1b[<0;99;23M\x1b[<0;130;40m"
+        scrolled = b"\x1b[<0;11;10M" + PAGE_UP + b"\x1b[<0;12;11m"
+        sent = (
+            press + drag + release + motion + wheels + captured + scrolled + b"|done|"
+        )
+        captured_sgr = (
+            b"\x1b[<4;7;5m\x1b[<0;99;23M\x1b[<0;100;24m\x1b[<0;11;10M\x1b[<0;11;10m"
+        )
+        captured_legacy = (
+            b"\x1b[M"
+            + bytes((32, 39, 37))
+            + b"\x1b[M"
+            + bytes((39, 39, 37))
+            + b"\x1b[M"
+            + bytes((32, 131, 55))
+            + b"\x1b[M"
+            + bytes((35, 132, 56))
+            + b"\x1b[M"
+            + bytes((32, 43, 42))
+            + b"\x1b[M"
+            + bytes((35, 43, 42))
+        )
+        legacy = (
+            b"\x1b[M"
+            + bytes((32, 39, 37))
+            + b"\x1b[M"
+            + bytes((35, 40, 38))
+            + b"\x1b[M"
+            + bytes((96, 42, 40))
+            + b"\x1b[M"
+            + bytes((97, 42, 40))
+        )
+        for mode, encoding, expected in (
+            (1000, "h", press + release + wheels + press + captured_sgr),
+            (
+                1002,
+                "h",
+                press + drag + release + wheels + press + shift_move + captured_sgr,
+            ),
+            (
+                1003,
+                "h",
+                press
+                + drag
+                + release
+                + motion
+                + wheels
+                + press
+                + shift_move
+                + captured_sgr,
+            ),
+            (1000, "l", legacy + captured_legacy),
+        ):
+            with self.subTest(mode=mode, encoding=encoding):
+                for name in ("mouse-ready", "mouse-result"):
+                    (self.root / name).unlink(missing_ok=True)
+                terminal.submit(
+                    f"{shlex.quote(sys.executable)} mouse-reader.py {mode} {encoding}"
+                )
+                terminal.result("mouse-ready", f"{mode}:{encoding}".encode())
+                terminal.require(
+                    lambda marker=f"MOUSE_READY_{mode}_{encoding}": terminal.frame_has(
+                        marker
+                    )
+                )
+                self.assertGreater(terminal.state()["scrollback_rows"], 0)
+                terminal.send(sent)
+                terminal.result("mouse-result", expected + b"|done|")
+                terminal.require(terminal.at_prompt)
+        self.require_full_screen()
+
+    def test_native_selection_copies_and_middle_click_pastes_into_stdin(self):
+        """A drag selects native cells and requests OSC52 without adding UI."""
+        terminal = self.terminal
+        (self.root / "selection-reader.py").write_text(SELECTION_READER)
+        terminal.submit(f"{shlex.quote(sys.executable)} selection-reader.py")
+        terminal.result("selection-ready", b"waiting")
+        terminal.require(lambda: terminal.screen.display[0].startswith("COPY_ME"))
+        previous = len(terminal.output)
+        terminal.send(b"\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<2;3;1M\x1b[<2;3;1m\x1b[<32;4;1M")
+        terminal.require(lambda: terminal.screen.buffer[0][3].reverse)
+        self.assertNotIn(b"\x1b]52;", terminal.output[previous:])
+        terminal.send(b"\x1b[<32;7;1M\x1b[<0;7;1m")
+        terminal.require(
+            lambda: b"\x1b]52;c;Q09QWV9NRQ==" in terminal.output[previous:]
+        )
+        self.assertEqual(terminal.output[previous:].count(b"\x1b]52;"), 1)
+        terminal.send(b"\x1b[<1;5;5M\x1b[<1;5;5m\r")
+        terminal.result("selection-input", b"COPY_ME\n")
+        terminal.require(terminal.at_prompt)
+        self.require_full_screen()
+
+    @unittest.skipUnless(shutil.which("vim"), "vim is required")
+    def test_vim_mouse_changes_cursor_and_keeps_primary_history_separate(self):
+        """Real Vim consumes mouse events while alternate output stays out of history."""
+        terminal = self.terminal
+        (self.root / "history-writer.py").write_text(HISTORY_WRITER)
+        (self.root / "mouse-lines").write_text(
+            "".join(f"VIMROW_{number:03d}\n" for number in range(1, 101))
+        )
+        terminal.submit(f"{shlex.quote(sys.executable)} history-writer.py")
+        terminal.require(terminal.at_prompt)
+        terminal.require(
+            lambda: (
+                terminal.frame_has("HIST:099")
+                and terminal.screen.display[-1].rstrip() == "READY>"
+            )
+        )
+        terminal.submit("vim -Nu NONE -n -i NONE mouse-lines")
+        terminal.require(lambda: terminal.state().get("alternate") is True)
+        terminal.require(lambda: terminal.frame_has("VIMROW_001"))
+        terminal.send(
+            ":set mouse=a ttymouse=sgr nonumber norelativenumber nowrap\r"
+            ":call writefile(['ready'], 'vim-mouse-ready')\r"
+        )
+        terminal.result("vim-mouse-ready", b"ready\n")
+        terminal.send(PAGE_UP + b"gg")
+        terminal.require(lambda: terminal.frame_has("VIMROW_001"))
+        self.assertTrue(terminal.state().get("viewport_active"))
+        self.assertFalse(terminal.frame_has("HIST:"))
+        terminal.send(b"\x1b[<0;5;4M\x1b[<0;5;4m")
+        terminal.send(
+            ":call writefile([string(line('.')), string(col('.'))], 'vim-click')\r"
+        )
+        terminal.result("vim-click", b"4\n5\n")
+        terminal.send(b"\x1b[<65;5;4M" * 5)
+        terminal.send(":call writefile([string(line('w0'))], 'vim-wheel')\r")
+        wheel_result = self.root / "vim-wheel"
+        terminal.require(
+            lambda: wheel_result.exists() and wheel_result.read_text().endswith("\n")
+        )
+        self.assertGreater(int(wheel_result.read_text()), 1)
+        terminal.require(lambda: not terminal.frame_has("VIMROW_001"))
+        self.assertFalse(terminal.frame_has("HIST:"))
+        terminal.send(":q\r")
+        terminal.require(terminal.at_prompt)
+        terminal.send(PAGE_UP)
+        terminal.require(
+            lambda: (
+                terminal.state().get("viewport_active") is False
+                and terminal.frame_has("HIST:")
+            )
+        )
+        self.assertFalse(terminal.frame_has("VIMROW_"))
+        terminal.send(PAGE_DOWN)
+        terminal.require(lambda: terminal.state().get("viewport_active") is True)
+        terminal.require(terminal.at_prompt)
+        self.require_full_screen()
 
     def test_native_interrupt_eof_and_outer_terminal_restoration(self):
         """Ctrl+C reaches the running program; Ctrl+D reaches cat and then native tcsh."""

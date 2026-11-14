@@ -8,6 +8,10 @@ plugins. The existing `ish`
 entry point keeps its previous behavior. See
 [the experiment and its validation scope](docs/TERMINAL_EXPERIMENT.md).
 
+The terminal experiment includes native scrollback browsing, mouse forwarding
+for applications such as Vim, and drag selection with an OSC 52 clipboard copy
+request. It keeps the full terminal area free of built-in overlays.
+
 ish is an interactive command editor for Linux shells. It adds multiline editing,
 syntax highlighting, completion, and Python UI extensions
 through prompt-toolkit while your selected shell executes commands.

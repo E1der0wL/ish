@@ -20,11 +20,24 @@ CTRL = 2
 ALT = 4
 MAX_CELLS = 262_144
 MAX_BUFFER = 32 * 1024 * 1024
+DEFAULT_SCROLLBACK_LINES = 10_000
+DEFAULT_SCROLLBACK_BYTES = 32 * 1024 * 1024
+MOUSE_ACTIONS = {"press": 0, "release": 1, "move": 2}
+MOUSE_BUTTONS = {
+    None: 0,
+    "left": 1,
+    "middle": 2,
+    "right": 3,
+    "wheelup": 4,
+    "wheeldown": 5,
+    "wheelright": 7,
+    "wheelleft": 6,
+}
 LIBRARY_ENV = "ISH_GHOSTTY_LIB"
 DEFAULT_LIBRARY = (
     Path(__file__).resolve().parents[3] / ".cache/ghostty-vt/install/lib/libish_vt.so"
 )
-HEADER = struct.Struct("<6I")
+HEADER = struct.Struct("<7I2Q")
 # The native snapshot carries color presence separately from RGB values.
 CELL = struct.Struct("<HB6BI")
 COLOR_FG = 1
@@ -71,6 +84,9 @@ class Frame:
     alternate: bool
     cols: int
     rows: int
+    viewport_active: bool = True
+    scrollback_rows: int = 0
+    viewport_offset: int = 0
 
 
 class TerminalError(RuntimeError):
@@ -143,6 +159,28 @@ def _load() -> ctypes.CDLL:
             ctypes.c_int,
         ),
         "ish_vt_paste": ([pointer, ctypes.c_char_p, size, *output], ctypes.c_int),
+        "ish_vt_state": ([pointer, ctypes.POINTER(ctypes.c_uint64)], ctypes.c_int),
+        "ish_vt_scrollback_limit": (
+            [pointer, ctypes.c_uint64, ctypes.c_uint64],
+            ctypes.c_int,
+        ),
+        "ish_vt_scroll": ([pointer, unsigned, ctypes.c_int64], ctypes.c_int),
+        "ish_vt_mouse": (
+            [
+                pointer,
+                unsigned,
+                unsigned,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                unsigned,
+                *output,
+            ],
+            ctypes.c_int,
+        ),
+        "ish_vt_begin_selection": ([pointer, unsigned, unsigned], ctypes.c_int),
+        "ish_vt_update_selection": ([pointer, unsigned, unsigned], ctypes.c_int),
+        "ish_vt_clear_selection": ([pointer], ctypes.c_int),
+        "ish_vt_selection_text": ([pointer, *output], ctypes.c_int),
     }
     for name, (arguments, result) in signatures.items():
         function = getattr(library, name)
@@ -154,7 +192,15 @@ def _load() -> ctypes.CDLL:
 class Terminal:
     """Own one libghostty-vt terminal; close explicitly when its PTY closes."""
 
-    def __init__(self, cols: int, rows: int, reply: Callable[[bytes], None]):
+    def __init__(
+        self,
+        cols: int,
+        rows: int,
+        reply: Callable[[bytes], None],
+        *,
+        scrollback_lines: int = DEFAULT_SCROLLBACK_LINES,
+        scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES,
+    ):
         """Create a grid and a receiver for terminal-generated PTY responses."""
         _dimensions(cols, rows)
         self._library = _load()
@@ -164,6 +210,11 @@ class Terminal:
         self._reply = reply
         self.cols = cols
         self.rows = rows
+        try:
+            self.set_scrollback_limit(scrollback_lines, scrollback_bytes)
+        except Exception:
+            self.close()
+            raise
 
     def _open(self) -> int:
         if not self._handle:
@@ -202,7 +253,17 @@ class Terminal:
     def frame(self) -> Frame:
         """Copy the visible grid once and coalesce equal styles for PTK."""
         data = self._bytes("ish_vt_frame")
-        cols, rows, cursor_x, cursor_y, visible, alternate = HEADER.unpack_from(data)
+        (
+            cols,
+            rows,
+            cursor_x,
+            cursor_y,
+            visible,
+            alternate,
+            active,
+            history,
+            offset_top,
+        ) = HEADER.unpack_from(data)
         _dimensions(cols, rows)
         offset = HEADER.size
         lines = []
@@ -234,8 +295,111 @@ class Terminal:
         if offset != len(data):
             raise TerminalError("Unexpected native frame data")
         return Frame(
-            lines, cursor_x, cursor_y, bool(visible), bool(alternate), cols, rows
+            lines,
+            cursor_x,
+            cursor_y,
+            bool(visible),
+            bool(alternate),
+            cols,
+            rows,
+            bool(active),
+            history,
+            offset_top,
         )
+
+    def _state(self) -> ctypes.Array:
+        values = (ctypes.c_uint64 * 6)()
+        _check(self._library.ish_vt_state(self._open(), values))
+        return values
+
+    @property
+    def viewport_active(self) -> bool:
+        """Whether the native viewport is following the active terminal area."""
+        return bool(self._state()[0])
+
+    @property
+    def alternate(self) -> bool:
+        """Whether the native alternate screen is active."""
+        return bool(self._state()[1])
+
+    @property
+    def alternate_scroll(self) -> bool:
+        """Whether the child enabled alternate-scroll mode 1007."""
+        return bool(self._state()[2])
+
+    @property
+    def mouse_reporting(self) -> bool:
+        """Whether the child enabled a native mouse tracking mode."""
+        return bool(self._state()[3])
+
+    def set_scrollback_limit(
+        self, lines: int, max_bytes: int = DEFAULT_SCROLLBACK_BYTES
+    ) -> None:
+        """Set native approximate page-based limits; zero bytes erases history."""
+        if not 0 <= lines < 2**63 or not 0 <= max_bytes < 2**63:
+            raise ValueError(
+                "Scrollback limits must be nonnegative signed 64-bit values"
+            )
+        _check(self._library.ish_vt_scrollback_limit(self._open(), lines, max_bytes))
+
+    def scroll(self, rows: int) -> None:
+        """Move the native viewport by physical rows; negative values move up."""
+        if not -(2**63) <= rows < 2**63:
+            raise ValueError("Scroll delta exceeds signed 64-bit range")
+        _check(self._library.ish_vt_scroll(self._open(), 2, rows))
+
+    def scroll_top(self) -> None:
+        """Show the oldest retained native history."""
+        _check(self._library.ish_vt_scroll(self._open(), 0, 0))
+
+    def scroll_bottom(self) -> None:
+        """Follow the active terminal area without modifying terminal content."""
+        _check(self._library.ish_vt_scroll(self._open(), 1, 0))
+
+    def encode_mouse(
+        self, action: str, button: str | None, x: int, y: int, modifiers: int = 0
+    ) -> bytes:
+        """Encode zero-based cell events using current native tracking and format.
+
+        Pixel reporting (1016) is unsupported because the frontend has no pixel
+        coordinates. Such events produce no bytes, as do disabled mouse events.
+        """
+        if action not in MOUSE_ACTIONS or button not in MOUSE_BUTTONS:
+            raise ValueError("Unknown mouse action or button")
+        if modifiers & ~(SHIFT | CTRL | ALT):
+            raise ValueError("Unsupported mouse modifiers")
+        if not -(2**31) <= x < 2**31 or not -(2**31) <= y < 2**31:
+            raise ValueError("Mouse coordinates exceed signed 32-bit range")
+        return self._bytes(
+            "ish_vt_mouse",
+            MOUSE_ACTIONS[action],
+            MOUSE_BUTTONS[button],
+            x,
+            y,
+            modifiers,
+        )
+
+    def _selection_point(self, x: int, y: int) -> None:
+        if not 0 <= x < self.cols or not 0 <= y < self.rows:
+            raise ValueError("Selection point is outside the viewport")
+
+    def begin_selection(self, x: int, y: int) -> None:
+        """Track a native viewport cell as an anchor; no selection exists yet."""
+        self._selection_point(x, y)
+        _check(self._library.ish_vt_begin_selection(self._open(), x, y))
+
+    def update_selection(self, x: int, y: int) -> None:
+        """Select inclusively from the live native anchor to a viewport cell."""
+        self._selection_point(x, y)
+        _check(self._library.ish_vt_update_selection(self._open(), x, y))
+
+    def clear_selection(self) -> None:
+        """Clear the active native selection and release its tracked anchor."""
+        _check(self._library.ish_vt_clear_selection(self._open()))
+
+    def selection_text(self) -> str:
+        """Copy current selected text using native unwrap/format semantics."""
+        return self._bytes("ish_vt_selection_text").decode("utf-8")
 
     def encode_key(self, key: str, modifiers: int = 0) -> bytes:
         """Encode a named key or text with the terminal's current input modes.

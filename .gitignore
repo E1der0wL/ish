@@ -37,6 +37,7 @@ share/python-wheels/
 !/tests/test_terminal_cli.py
 !/tests/test_terminal_vt.py
 !/tests/test_terminal_session.py
+!/tests/test_terminal_mouse.py
 !/tests/tcsh_channel.py
 !/tests/test_tcsh_channel.py
 !/tests/channel_gate.c

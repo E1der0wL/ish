@@ -12,6 +12,15 @@
 #define ISH_COLOR_BG 2u
 #define CHECK(call) do { int status = (call); if (status != GHOSTTY_SUCCESS) return status; } while (0)
 
+static const GhosttyMouseAction MOUSE_ACTIONS[] = {
+    GHOSTTY_MOUSE_ACTION_PRESS, GHOSTTY_MOUSE_ACTION_RELEASE, GHOSTTY_MOUSE_ACTION_MOTION
+};
+static const GhosttyMouseButton MOUSE_BUTTONS[] = {
+    GHOSTTY_MOUSE_BUTTON_UNKNOWN, GHOSTTY_MOUSE_BUTTON_LEFT, GHOSTTY_MOUSE_BUTTON_MIDDLE,
+    GHOSTTY_MOUSE_BUTTON_RIGHT, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE,
+    GHOSTTY_MOUSE_BUTTON_SIX, GHOSTTY_MOUSE_BUTTON_SEVEN
+};
+
 typedef struct { uint8_t *data; size_t len, cap; int error; } Buffer;
 typedef struct {
     GhosttyTerminal terminal;
@@ -20,6 +29,11 @@ typedef struct {
     GhosttyRenderStateRowCells cells;
     GhosttyKeyEncoder encoder;
     GhosttyKeyEvent event;
+    GhosttyMouseEncoder mouse_encoder;
+    GhosttyMouseEvent mouse_event;
+    GhosttyFormatter formatter;
+    GhosttyTrackedGridRef anchor;
+    GhosttyTerminalScreen anchor_screen;
     Buffer output, replies, grapheme;
     uint16_t cols, height;
 } Terminal;
@@ -72,6 +86,10 @@ static int dimensions(unsigned cols, unsigned rows) {
 }
 void ish_vt_free(Terminal *state) {
     if (!state) return;
+    ghostty_tracked_grid_ref_free(state->anchor);
+    ghostty_formatter_free(state->formatter);
+    ghostty_mouse_event_free(state->mouse_event);
+    ghostty_mouse_encoder_free(state->mouse_encoder);
     ghostty_key_event_free(state->event);
     ghostty_key_encoder_free(state->encoder);
     ghostty_render_state_row_cells_free(state->cells);
@@ -92,10 +110,18 @@ Terminal *ish_vt_new(unsigned cols, unsigned rows) {
         ghostty_render_state_row_cells_new(NULL, &state->cells) ||
         ghostty_key_encoder_new(NULL, &state->encoder) ||
         ghostty_key_event_new(NULL, &state->event) ||
+        ghostty_mouse_encoder_new(NULL, &state->mouse_encoder) ||
+        ghostty_mouse_event_new(NULL, &state->mouse_event) ||
+        ghostty_formatter_terminal_new(NULL, &state->formatter, state->terminal) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_USERDATA, state) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)write_pty) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SIZE, (const void *)report_size) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, (const void *)device_attributes)) {
+        ish_vt_free(state); return NULL;
+    }
+    bool unwrap = true, trim = false;
+    if (ghostty_formatter_set(state->formatter, GHOSTTY_FORMATTER_OPT_UNWRAP, &unwrap) ||
+        ghostty_formatter_set(state->formatter, GHOSTTY_FORMATTER_OPT_TRIM, &trim)) {
         ish_vt_free(state); return NULL;
     }
     return state;
@@ -122,12 +148,51 @@ int ish_vt_replies(Terminal *state, const uint8_t **out, size_t *len) {
     return error;
 }
 
+/* Live state is queried from the VT, never reconstructed from output text. */
+int ish_vt_state(Terminal *state, uint64_t *out) {
+    if (!state || !out) return ISH_LIMIT;
+    bool viewport_active, mouse_tracking;
+    GhosttyTerminalScreen screen;
+    GhosttyTerminalModeConfig alternate_scroll = {.mode = GHOSTTY_MODE_MOUSE_ALTERNATE_SCROLL};
+    GhosttyTerminalScrollbar scrollbar;
+    size_t history;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &viewport_active));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MODE, &alternate_scroll));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &history));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar));
+    out[0] = viewport_active; out[1] = screen; out[2] = alternate_scroll.value;
+    out[3] = mouse_tracking; out[4] = history; out[5] = scrollbar.offset;
+    return 0;
+}
+int ish_vt_scrollback_limit(Terminal *state, uint64_t lines, uint64_t bytes) {
+    if (!state || lines > SIZE_MAX || bytes > SIZE_MAX) return ISH_LIMIT;
+    size_t line_limit = (size_t)lines, byte_limit = (size_t)bytes;
+    CHECK(ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &byte_limit));
+    return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &line_limit);
+}
+int ish_vt_scroll(Terminal *state, unsigned kind, int64_t rows) {
+    if (!state || kind > 2 || rows > INTPTR_MAX || rows < INTPTR_MIN) return ISH_LIMIT;
+    GhosttyTerminalScrollViewport behavior = {0};
+    behavior.tag = kind == 0 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_TOP :
+        kind == 1 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM : GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA;
+    behavior.value.delta = (intptr_t)rows;
+    return ghostty_terminal_scroll_viewport(state->terminal, behavior);
+}
+static int number64(Buffer *buffer, uint64_t value) {
+    uint8_t bytes[8];
+    for (unsigned i = 0; i < 8; i++) bytes[i] = (uint8_t)(value >> (8 * i));
+    return append(buffer, bytes, sizeof(bytes));
+}
+
 static void swap_colors(GhosttyColorRgb *fg, int *fg_result, GhosttyColorRgb *bg, int *bg_result) {
     GhosttyColorRgb color = *fg; *fg = *bg; *bg = color;
     int result = *fg_result; *fg_result = *bg_result; *bg_result = result;
 }
 
-/* Little-endian bulk snapshot: six u32 header values, then for each row a
+/* Little-endian bulk snapshot: six u32 header values, u32 viewport-active,
+ * u64 scrollback rows and u64 viewport offset, then for each row a
  * u32 record count. Each record has u16 flags, u8 color presence (FG=1,
  * BG=2), RGB fg, RGB bg, u32 UTF-8
  * length, and that many bytes. Wide tails have no record; spacer heads are
@@ -155,7 +220,9 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
     Buffer *buffer = &state->output; buffer->len = 0;
     CHECK(number(buffer, state->cols)); CHECK(number(buffer, state->height));
     CHECK(number(buffer, cursor.viewport_has_value ? cursor.viewport_x : 0)); CHECK(number(buffer, cursor.viewport_has_value ? cursor.viewport_y : 0));
-    CHECK(number(buffer, cursor.visible && cursor.viewport_has_value)); CHECK(number(buffer, screen));
+    uint64_t live[6]; CHECK(ish_vt_state(state, live));
+    CHECK(number(buffer, cursor.visible && cursor.viewport_has_value && live[0])); CHECK(number(buffer, screen));
+    CHECK(number(buffer, live[0])); CHECK(number64(buffer, live[4])); CHECK(number64(buffer, live[5]));
     while (ghostty_render_state_row_iterator_next(state->rows)) {
         size_t count_offset = buffer->len; uint32_t count = 0;
         CHECK(number(buffer, 0));
@@ -180,6 +247,9 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
                 swap_colors(&fg, &fg_result, &bg, &bg_result);
                 style.flags ^= GHOSTTY_STYLE_FLAG_INVERSE;
             }
+            bool selected = false;
+            CHECK(ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected));
+            if (selected) style.flags ^= GHOSTTY_STYLE_FLAG_INVERSE;
             uint8_t colors = (fg_result == GHOSTTY_SUCCESS ? ISH_COLOR_FG : 0) |
                 (bg_result == GHOSTTY_SUCCESS ? ISH_COLOR_BG : 0);
             GhosttyBuffer text = {.ptr = state->grapheme.data, .cap = state->grapheme.cap};
@@ -271,4 +341,83 @@ int ish_vt_paste(Terminal *state, const uint8_t *data, size_t len, const uint8_t
     paste.allow_unsafe = true;
     CHECK(ghostty_terminal_paste(state->terminal, &paste, NULL));
     return ish_vt_replies(state, out, out_len);
+}
+
+int ish_vt_mouse(Terminal *state, unsigned action, unsigned button, int32_t x, int32_t y,
+                 unsigned modifiers, const uint8_t **out, size_t *len) {
+    if (!state || !out || !len || action > 2 || button > 7 || modifiers > 7) return ISH_LIMIT;
+    *out = NULL; *len = 0;
+    GhosttyTerminalModeConfig pixels = {.mode = GHOSTTY_MODE_MOUSE_FORMAT_SGR_PIXELS};
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MODE, &pixels));
+    /* PTK supplies cells, not physical pixels. Never fabricate SGR-Pixels. */
+    if (pixels.value) return 0;
+    CHECK(ghostty_mouse_encoder_set_from_terminal(state->mouse_encoder, state->terminal));
+    GhosttyMouseEncoderSize size = GHOSTTY_INIT_SIZED(GhosttyMouseEncoderSize);
+    size.screen_width = state->cols; size.screen_height = state->height;
+    size.cell_width = 1; size.cell_height = 1;
+    CHECK(ghostty_mouse_encoder_set(state->mouse_encoder, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size));
+    bool pressed = button >= 1 && button <= 3 && action != 1;
+    CHECK(ghostty_mouse_encoder_set(state->mouse_encoder, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &pressed));
+
+    CHECK(ghostty_mouse_event_set_action(state->mouse_event, MOUSE_ACTIONS[action]));
+    if (button) { CHECK(ghostty_mouse_event_set_button(state->mouse_event, MOUSE_BUTTONS[button])); }
+    else { CHECK(ghostty_mouse_event_clear_button(state->mouse_event)); }
+    CHECK(ghostty_mouse_event_set_mods(state->mouse_event, modifiers));
+    CHECK(ghostty_mouse_event_set_position(state->mouse_event, (GhosttyMousePosition){.x = x + 0.5f, .y = y + 0.5f}));
+    Buffer *buffer = &state->output; buffer->len = 0;
+    CHECK(reserve(buffer, 256));
+    CHECK(ghostty_mouse_encoder_encode(state->mouse_encoder, state->mouse_event, buffer->data, buffer->cap, &buffer->len));
+    *out = buffer->data; *len = buffer->len;
+    return 0;
+}
+
+int ish_vt_clear_selection(Terminal *state) {
+    if (!state) return ISH_LIMIT;
+    ghostty_tracked_grid_ref_free(state->anchor); state->anchor = NULL;
+    return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+}
+int ish_vt_begin_selection(Terminal *state, unsigned x, unsigned y) {
+    if (!state || x >= state->cols || y >= state->height) return ISH_LIMIT;
+    CHECK(ish_vt_clear_selection(state));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &state->anchor_screen));
+    GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value = {.coordinate = {.x = x, .y = y}}};
+    return ghostty_terminal_grid_ref_track(state->terminal, point, &state->anchor);
+}
+int ish_vt_update_selection(Terminal *state, unsigned x, unsigned y) {
+    if (!state || x >= state->cols || y >= state->height) return ISH_LIMIT;
+    if (!state->anchor) return 0;
+    GhosttyTerminalScreen screen;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen));
+    if (screen != state->anchor_screen) {
+        ghostty_tracked_grid_ref_free(state->anchor); state->anchor = NULL;
+        return 0;
+    }
+    GhosttySelection selection = {0};
+    int result = ghostty_tracked_grid_ref_snapshot(state->anchor, &selection.start);
+    if (result == GHOSTTY_NO_VALUE) return ish_vt_clear_selection(state);
+    CHECK(result);
+    GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value = {.coordinate = {.x = x, .y = y}}};
+    CHECK(ghostty_terminal_grid_ref(state->terminal, point, &selection.end));
+    return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
+}
+static bool write_selection(void *userdata, const uint8_t *data, size_t len) {
+    Buffer *buffer = userdata;
+    buffer->error = append(buffer, data, len);
+    return buffer->error == 0;
+}
+int ish_vt_selection_text(Terminal *state, const uint8_t **out, size_t *len) {
+    if (!state || !out || !len) return ISH_LIMIT;
+    *out = NULL; *len = 0;
+    GhosttySelection selection = {0};
+    int result = ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_SELECTION, &selection);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    CHECK(result);
+    CHECK(ghostty_formatter_set(state->formatter, GHOSTTY_FORMATTER_OPT_SELECTION, &selection));
+    Buffer *buffer = &state->output; buffer->len = 0; buffer->error = 0;
+    result = ghostty_formatter_format(state->formatter, (GhosttyWriter){.write = write_selection, .userdata = buffer});
+    /* Never keep formatter-owned snapshots across a terminal mutation. */
+    int cleared = ghostty_formatter_set(state->formatter, GHOSTTY_FORMATTER_OPT_SELECTION, NULL);
+    CHECK(result); CHECK(cleared); CHECK(buffer->error);
+    *out = buffer->data; *len = buffer->len;
+    return 0;
 }
