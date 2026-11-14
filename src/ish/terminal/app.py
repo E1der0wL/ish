@@ -1,4 +1,4 @@
-"""Compose a libghostty terminal pane and focused popups with one PTK renderer."""
+"""Render the native shell's full terminal with one PTK renderer."""
 
 from __future__ import annotations
 
@@ -7,29 +7,17 @@ from pathlib import Path
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import (
-    ConditionalContainer,
-    Float,
-    FloatContainer,
-    HSplit,
-    Layout,
-    Window,
-)
-from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
-from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Button, Frame, Label, TextArea
+from prompt_toolkit.layout import Layout, Window
+from prompt_toolkit.layout.controls import UIContent, UIControl
 
 from .session import Session
 from .vt import ALT, CTRL, SHIFT, SPECIAL_KEYS, Terminal
 
-BAR_ROWS = 1
+DEFAULT_SIZE = (80, 24)
 FRAME_INTERVAL = 1 / 60
-KEY_TIMEOUT = 0.25
-POPUP_TITLE = "ish-vt popup"
-POPUP_DESCRIPTION = "This input stays in the popup."
+INPUT_TIMEOUT = 0.05
 SKIP_KEYS = frozenset(
     (
         Keys.Any,
@@ -38,27 +26,16 @@ SKIP_KEYS = frozenset(
         Keys.WindowsMouseEvent,
         Keys.Ignore,
         Keys.BracketedPaste,
-        Keys.F2,
-        Keys.F10,
     )
 )
 MODIFIERS = {"c": CTRL, "s": SHIFT, "a": ALT}
-STYLE = Style.from_dict(
-    {
-        "status": "bg:#243447 #ffffff",
-        "frame.border": "#82aaff",
-        "frame.label": "bg:#243447 #ffffff bold",
-        "text-area": "bg:#17212f #ffffff",
-        "button.focused": "bg:#82aaff #000000",
-    }
-)
 
 
 class TerminalControl(UIControl):
     """Render VT cells without a shadow command-line buffer or shell parsing."""
 
     def __init__(self, owner: TerminalApp):
-        """Bind all terminal keys locally; popup buffers retain normal PTK editing."""
+        """Bind terminal input without reserving application shortcut keys."""
         self.owner = owner
         self.frame = None
         self.bindings = KeyBindings()
@@ -69,11 +46,11 @@ class TerminalControl(UIControl):
         self.bindings.add(Keys.BracketedPaste, eager=True)(self._paste)
 
     def is_focusable(self):
-        """The terminal pane consumes input whenever no popup owns focus."""
-        return not self.owner.popup_open
+        """The native terminal is the sole input target in the base application."""
+        return True
 
     def get_key_bindings(self):
-        """Return pane-only bindings, excluding the explicit application shortcuts."""
+        """Return bindings that forward input to the native terminal."""
         return self.bindings
 
     def _paste(self, event):
@@ -128,96 +105,26 @@ class TerminalControl(UIControl):
 
 
 class TerminalApp:
-    """Own screen composition and input focus while the shell owns command editing."""
+    """Display the native terminal while the shell owns command editing."""
 
     def __init__(self, shell: str, cwd: Path, *, dump_state: Path | None = None):
-        """Create a terminal pane, persistent bar, and one independently editable popup."""
-        self.shell = shell
+        """Create one full-size terminal pane with no built-in overlays."""
         self.dump_state = dump_state
-        self.popup_open = False
-        self.size = (80, 23)
+        self.size = DEFAULT_SIZE
         self.session = Session(
             [shell, "-i"], str(cwd), self._output, self._exited, self._failed
         )
         self.vt = Terminal(*self.size, reply=self.session.send)
         self.control = TerminalControl(self)
         self.window = Window(self.control, wrap_lines=False)
-        self.popup_input = TextArea(multiline=True, height=3)
-        self.popup_button = Button("Close", handler=self.hide_popup)
-        popup = Frame(
-            HSplit([Label(POPUP_DESCRIPTION), self.popup_input, self.popup_button]),
-            title=POPUP_TITLE,
-        )
-        status = Window(
-            FormattedTextControl(self._status), height=BAR_ROWS, style="class:status"
-        )
-        body = FloatContainer(
-            HSplit([self.window, status]),
-            floats=[
-                Float(
-                    ConditionalContainer(popup, Condition(lambda: self.popup_open)),
-                    width=54,
-                    height=8,
-                )
-            ],
-        )
-        bindings = KeyBindings()
-        bindings.add("f2", eager=True)(lambda event: self.toggle_popup())
-        bindings.add("f10", eager=True)(lambda event: event.app.exit(result=0))
-        popup_visible = Condition(lambda: self.popup_open)
-        bindings.add("escape", filter=popup_visible)(lambda event: self.hide_popup())
-        # Legacy terminals encode Alt+x as Escape followed by x. Consume that
-        # combination inside the popup instead of closing it and leaking x.
-        bindings.add("escape", Keys.Any, filter=popup_visible)(lambda event: None)
-        bindings.add("c-c", filter=popup_visible, eager=True)(
-            lambda event: self.hide_popup()
-        )
-        bindings.add("tab", filter=popup_visible)(self._popup_focus)
-        bindings.add("s-tab", filter=popup_visible)(self._popup_focus)
         self.app = Application(
-            layout=Layout(body, focused_element=self.window),
-            key_bindings=bindings,
-            style=STYLE,
+            layout=Layout(self.window),
             full_screen=True,
             mouse_support=False,
             min_redraw_interval=FRAME_INTERVAL,
             after_render=self._after_render,
         )
-        self.app.ttimeoutlen = 0.05
-        self.app.timeoutlen = KEY_TIMEOUT
-
-    def _status(self):
-        """Show UI state without guessing whether the shell is executing or editing."""
-        focus = "popup" if self.popup_open else "terminal"
-        return f" ish-vt | {Path(self.shell).name} | F2 popup | F10 quit | {focus} "
-
-    def show_popup(self):
-        """Move input focus to the popup while terminal output continues normally."""
-        self.popup_open = True
-        self.app.layout.focus(self.popup_input)
-        self.app.invalidate()
-
-    def hide_popup(self):
-        """Return focus without replaying any popup input into the shell."""
-        self.popup_open = False
-        self.app.layout.focus(self.window)
-        self.app.invalidate()
-
-    def toggle_popup(self):
-        """Toggle the single demonstration popup from either focus context."""
-        if self.popup_open:
-            self.hide_popup()
-        else:
-            self.show_popup()
-
-    def _popup_focus(self, event):
-        """Cycle inside the modal popup without exposing the terminal behind it."""
-        target = (
-            self.popup_button
-            if self.app.layout.has_focus(self.popup_input)
-            else self.popup_input
-        )
-        self.app.layout.focus(target)
+        self.app.ttimeoutlen = INPUT_TIMEOUT
 
     def resize(self, cols, rows):
         """Keep the emulated grid and controlling PTY on the same pane dimensions."""
@@ -252,8 +159,6 @@ class TerminalApp:
             "lines": ["".join(text for _, text in line) for line in frame.lines],
             "cursor": [frame.cursor_x, frame.cursor_y],
             "alternate": frame.alternate,
-            "popup": self.popup_open,
-            "popup_text": self.popup_input.text,
             "child_pid": self.session.pid,
         }
         temporary = self.dump_state.with_name(self.dump_state.name + ".next")
@@ -263,7 +168,7 @@ class TerminalApp:
     async def run(self) -> int:
         """Run the full-screen UI and restore the host terminal on every exit path."""
         size = self.app.output.get_size()
-        self.resize(max(1, size.columns), max(1, size.rows - BAR_ROWS))
+        self.resize(max(1, size.columns), max(1, size.rows))
         try:
             return await self.app.run_async(
                 pre_run=lambda: self.session.start(*self.size),

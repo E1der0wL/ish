@@ -2,7 +2,7 @@
 
 이 문서는 `libghostty-vt`의 화면 상태를 PTK 전체 화면에 표시하고, 실제 명령줄 편집은 셸에 맡기는 별도 실험의 범위와 자동완성 조사 결과를 기록한다. 조사 기준일은 2026-11-14다. 이전 `refactor/editor-request` 브랜치의 PTK primary/continuation 편집 경로는 별도 구현으로 보존한다.
 
-## 첫 실험의 계약
+## 기본형의 계약
 
 입력과 출력은 다음 경로를 사용한다.
 
@@ -10,17 +10,21 @@
 외부 터미널 입력
         ↓
 하나의 PTK Application
-        ├─ terminal 포커스 → PTY → native 셸 또는 foreground 프로그램
-        └─ popup 포커스   → PTK popup
+        ↓
+       PTY → native 셸 또는 foreground 프로그램
 
 셸/프로그램 출력 → PTY → libghostty-vt 화면 상태
                                ↓
-                   PTK 화면 합성 + 하단 한 줄 bar
+                    PTK 전체 터미널 화면
                                ↓
                           외부 터미널
 ```
 
-PTK가 외부 입력과 최종 화면 출력을 소유하고, 셸이 명령줄 버퍼와 continuation을 소유한다. 셸의 출력을 외부 터미널에 직접 쓰는 우회 경로는 만들지 않는다. PTK의 팝업을 닫아도 셸의 편집 버퍼를 다시 만들거나 제출하지 않는다.
+PTK가 외부 입력과 최종 화면 출력을 소유하고, 셸이 명령줄 버퍼와 continuation을 소유한다. 셸의 출력을 외부 터미널에 직접 쓰는 우회 경로는 만들지 않는다. 기본형에는 하단 바, 추가 우측 프롬프트, 팝업 또는 전용 단축키가 없다. 셸과 프로그램이 전체 행·열을 사용한다. 추가 UI는 향후 플러그인 범위이며 현재 플러그인 API를 새로 제공하지 않는다.
+
+기본 전경·배경은 외부 터미널의 기본색을 사용한다. 여기서 투명 배경은 고정 검정색을 칠하지 않고 외부 터미널의 배경 설정에 맡긴다는 의미다. 창 자체의 투명도는 외부 터미널이 결정한다. 셸이나 프로그램이 명시한 배경색은 보존하며, 색상이 검정이라는 이유로 기본색으로 치환하지 않는다.
+
+프로그램이 OSC 10/11로 바꾼 기본 전경·배경은 명시된 색으로 유지하고 OSC 110/111로 초기화하면 외부 기본색으로 돌아간다. ANSI 팔레트 색상은 현재 libghostty-vt가 해석한 RGB를 사용한다. 외부 터미널의 사용자 팔레트까지 완전히 동기화하는 기능은 아직 없으므로 모든 테마 색상이 동일하다고 보장하지 않는다.
 
 첫 대상은 Linux x86_64/WSL의 tcsh다. 새 worktree에는 독립적인 `.venv`와 실제로 빌드한 native library가 준비되어 있다. WSL에서 다음과 같이 실행한다.
 
@@ -39,19 +43,17 @@ python3.12 -m venv .venv
 
 `--cache-dir`는 다운로드·빌드 작업 위치다. 결과는 checkout의 `.cache/ghostty-vt/install/lib`에 설치한다. WSL에서는 Linux 파일시스템의 캐시를 권장한다. `ISH_GHOSTTY_LIB`를 지정할 경우 raw libghostty가 아니라 이 실험의 C bridge인 `libish_vt.so` 경로를 전달한다. 기본값은 checkout에 빌드한 bridge다. `.venv`와 `.cache`는 Git에 넣지 않는다. 공식 라이브러리의 역할은 [libghostty-vt 문서](https://lib.ghostty.org/vt/index.html)를 참고한다.
 
-| 조작 | 첫 실험의 의미 |
-| --- | --- |
-| 일반 문자·Enter·방향키 | terminal 포커스에서 PTY로 전달한다. 명령 편집과 제출은 셸이 처리한다. |
-| Tab | terminal 포커스에서 native 셸에 전달한다. 셸의 기존 키 설정과 completion 동작을 사용한다. |
-| F2 | PTK 팝업을 열거나 닫는다. 첫 팝업은 화면 합성과 포커스 분리를 검증하는 UI다. |
-| Esc | 팝업이 열려 있으면 닫고 terminal 포커스로 돌아온다. |
-| 팝업의 Tab / Shift+Tab | 팝업 입력란과 Close 버튼 사이에서만 포커스를 이동한다. |
-| Ctrl+C / Ctrl+D | terminal 포커스에서 PTY로 전달한다. 취소·EOF의 의미는 셸, 프로그램, PTY 설정이 결정한다. |
-| 팝업의 Ctrl+C | 팝업을 닫는다. 실행 중 프로그램에 SIGINT를 보내지 않는다. |
-| F10 | 실험 UI를 종료하고 해당 세션을 정리한다. |
-| 하단 한 줄 bar | PTK가 터미널 영역과 별도로 표시한다. 표시 자체가 셸 입력 readiness를 증명하지 않는다. |
+기본색을 보존하기 위해 C bridge의 화면 레코드에 색상 지정 여부가 추가되었다. 이전 실험에서 빌드한 `.so`를 사용하는 checkout은 위 build 명령을 다시 실행해야 한다. 현재 작업 폴더의 라이브러리는 변경된 코드에 맞춰 재빌드했다.
 
-F2와 F10은 실험용 UI 단축키로 예약된다. 따라서 해당 키를 사용하는 셸 또는 TUI와의 충돌은 명시적인 제한이다. 팝업에 입력한 문자가 닫힌 뒤 셸로 재전달되어서는 안 된다. 팝업을 연 동안 셸의 출력은 계속 VT 상태에 반영하지만, 출력 발생만으로 포커스가 셸로 돌아가지는 않는다. 팝업에서 Alt 조합은 소비하고, 단독 Esc는 닫기로 처리한다. 키 시퀀스 구분에 쓰는 PTK timeout은 셸 readiness 판단과 무관하다.
+| 조작 | 기본형의 의미 |
+| --- | --- |
+| 일반 문자·Enter·방향키 | PTY로 전달한다. 명령 편집과 제출은 셸이 처리한다. |
+| Tab | native 셸에 전달한다. 셸의 기존 키 설정과 completion 동작을 사용한다. |
+| F2 / F10 / Esc | 다른 키와 마찬가지로 셸이나 foreground 프로그램에 전달한다. ish UI 단축키로 예약하지 않는다. |
+| Ctrl+C / Ctrl+D | PTY로 전달한다. 취소·EOF의 의미는 셸, 프로그램, PTY 설정이 결정한다. |
+| 종료 | 셸의 `exit` 또는 셸이 허용하는 Ctrl+D로 종료한다. |
+
+키 시퀀스 구분에 쓰는 PTK timeout은 셸 readiness 판단과 무관하다. 이전 커밋 `1d0e605`의 바·팝업 실험은 Git 이력에 남아 있으며 기본 실행에서는 제거했다.
 
 이 실험은 primary/continuation을 판정하여 편집기를 교체하지 않는다. tcsh의 보조 프롬프트도 native 편집 경로에서 처리한다. 그러므로 이는 모든 셸의 continuation을 PTK 편집기로 대체했다는 결과가 아니다. `$<`, 외부 프로그램의 stdin, Python 프로그램의 `input()`도 같은 native PTY 경로에 남는다. 새 source FIFO 실행 경로나 Python 도구 dispatch는 도입하지 않는다.
 
@@ -61,7 +63,7 @@ native Tab 지원은 Tab을 셸로 보내고 셸이 그린 결과를 정상 표�
 
 PTK 자동완성 dropdown은 후보를 구조적으로 받아 표시하고, 사용자의 선택을 현재 셸 편집 요청에 안전하게 적용하는 기능이다. VT 화면의 문자와 화면 커서는 논리적인 명령줄 버퍼·편집 커서·후보 목록과 같은 계약이 아니다. 화면 문자열을 역파싱하거나, 현재 줄 길이를 추정해 Backspace와 문자열을 보내는 방식으로 이 차이를 메우지 않는다.
 
-첫 실험의 F2 팝업에는 후보 조회나 셸 버퍼 수정 기능이 없다. native Tab의 성공과 팝업 표시의 성공을 합쳐서 PTK dropdown 자동완성이 구현되었다고 보고하지 않는다.
+기본형에는 PTK dropdown이 없다. native Tab의 성공을 PTK dropdown 자동완성 구현으로 보고하지 않는다. 아래 Warp와 셸별 API 조사는 후속 플러그인 설계의 참고 자료다.
 
 ## Warp 공식 자료에서 확인한 범위
 
@@ -114,17 +116,17 @@ tcsh 6.24.13의 `complete`는 외부 명령의 출력을 후보로 사용할 수
 
 ## 실제 구현과 검증 결과
 
-실제 libghostty-vt 1.0.1 공유 라이브러리를 빌드하고 C bridge와 Python ctypes binding으로 연결했다. 다른 VT 구현으로 대체하지 않았다. PTY 출력은 libghostty-vt의 화면 상태로만 들어가며, PTK가 terminal pane·하단 바·팝업을 함께 렌더링한다. 기존 `ish` 진입점과 semantic submission 경로는 수정하지 않았다.
+실제 libghostty-vt 1.0.1 공유 라이브러리를 빌드하고 C bridge와 Python ctypes binding으로 연결했다. 다른 VT 구현으로 대체하지 않았다. PTY 출력은 libghostty-vt의 화면 상태로만 들어가며, PTK가 terminal pane 하나를 전체 화면에 렌더링한다. 기존 `ish` 진입점과 semantic submission 경로는 수정하지 않았다.
 
-WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도의 pyte 화면으로 PTK가 출력한 바·팝업·Vim 화면을 확인하고, 입력의 최종 소비자가 만든 파일을 독립적인 기대값과 비교했다. `--dump-state PATH`는 테스트를 위한 명시적 진단 옵션이며 화면과 팝업 텍스트를 기록한다. 이 값이나 prompt 문자열을 production 입력 권한 판단에 사용하지 않는다.
+WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도의 pyte 화면으로 PTK가 출력한 셸·Vim 화면과 셀 색상을 확인하고, 입력의 최종 소비자가 만든 파일을 독립적인 기대값과 비교한다. `--dump-state PATH`는 테스트를 위한 명시적 진단 옵션이며 화면 텍스트를 기록한다. 이 값이나 prompt 문자열을 production 입력 권한 판단에 사용하지 않는다.
 
-총 20개 테스트가 통과했다.
+기본형 전환에서는 VT 14개와 실제 CLI 11개 테스트가 통과했다. 마지막 전체 역상 모드 보완 후에는 영향받는 색상 테스트 7개와 실제 CLI 배경색 테스트 1개를 재확인했다. session 3개는 이전 실험에서 통과한 변경 없는 검증이다. Ruff 검사와 C bridge의 `-Wall -Wextra -Werror` 빌드도 통과했다.
 
-| 파일 | 개수 | 확인한 결과 |
-| --- | ---: | --- |
-| `tests/test_terminal_vt.py` | 7 | UTF-8 분할·한글·결합 문자, 커서 이동·지우기·색상, alternate screen 복귀, 가상 커서 DSR 응답, 키·bracketed paste 모드, resize, 종료 후 접근 거부 |
-| `tests/test_terminal_session.py` | 3 | 실제 PTY 입력과 마지막 출력, 다른 slave FD가 열려 있어도 직접 자식 종료 감지, 쓰기 큐 초과의 오류 전달 |
-| `tests/test_terminal_cli.py` | 10 | 실제 tcsh 보조 입력·중첩 구문·heredoc·Tab·stdin, 팝업 격리, 붙여넣기, Vim 저장·resize·복귀, Ctrl+C/D 및 외부 termios 복원 |
+| 파일 | 검증 범위 |
+| --- | --- |
+| `tests/test_terminal_vt.py` | UTF-8 분할·한글·결합 문자, 커서 이동·지우기·색상, 기본색과 명시적 색상 구분, alternate screen 복귀, 가상 커서 DSR 응답, 키·bracketed paste 모드, resize, 종료 후 접근 거부 |
+| `tests/test_terminal_session.py` | 실제 PTY 입력과 마지막 출력, 다른 slave FD가 열려 있어도 직접 자식 종료 감지, 쓰기 큐 초과의 오류 전달 |
+| `tests/test_terminal_cli.py` | 실제 tcsh 보조 입력·중첩 구문·heredoc·Tab·stdin, 기본색 화면, F2/F10 전달, 붙여넣기, Vim 저장·전체 크기 resize·복귀, Ctrl+C/D 및 외부 termios 복원 |
 
 실제 사용자 경로에서 확인한 결과는 다음과 같다.
 
@@ -132,12 +134,13 @@ WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도�
 - heredoc의 공백·한글·emoji와 이전 ish 명령처럼 보이는 이름이 데이터로 보존되었다. 빠른 Enter 입력은 실제 CR 바이트로 검증했다.
 - `$<`의 명령과 stdin을 빠르게 연속 전달해 공백·한글이 정확히 소비되는 것을 확인했다. 별도 Python 프로그램의 `sys.stdin.readline()`에도 실제 입력이 전달되었다.
 - tcsh native Tab이 파일 이름을 완성했고, 완성된 경로를 읽은 파일 결과가 일치했다. PTK 자동완성 dropdown을 구현한 결과는 아니다.
-- F2·Esc·Close 버튼으로 팝업을 열고 닫았다. 반복 Tab, Alt 조합, 팝업 Ctrl+C 및 여러 줄 붙여넣기가 셸이나 실행 중 프로그램에 새지 않았다. 팝업이 열린 동안 자식 출력도 화면에 반영되었다.
-- 셸의 한 줄 bracketed paste가 Enter 전에 실행되지 않았다. Vim에 여러 줄·한글을 붙여넣어 정확히 저장했고, Vim 위 팝업 입력이 파일을 바꾸지 않았다.
-- 외부 창을 33행 × 110열로 바꾸자 Vim은 하단 바를 제외한 32행 × 110열을 받았다. Vim 종료 후 native 셸도 같은 크기를 받았고 바가 유지되었다.
+- F2/F10은 실제 foreground 프로그램의 stdin으로 전달된다. 기본형에 팝업이나 종료 단축키로 남기지 않는다.
+- 실제 외부 화면 셀에서 기본 배경 → 명시적 검정 배경 → 기본 배경 복원을 확인했다. 색상 초기화·지우기·SGR 역상과 OSC 기본색 변경도 구별한다. DECSCNM 전체 역상과 OSC 기본색 조합은 수정 전 실패를 재현한 뒤, 기본색만 교환하고 셀 명시색을 보존하도록 수정했다.
+- 셸의 한 줄 bracketed paste가 Enter 전에 실행되지 않았다. Vim에 여러 줄·한글을 붙여넣어 정확히 저장했다.
+- 초기 24행 × 100열, 변경 후 33행 × 110열을 Vim과 셸에 그대로 전달했다. 하단 UI를 위한 한 줄을 빼지 않는다.
 - 실행 중 프로그램의 Ctrl+C, `cat`과 셸의 Ctrl+D, 종료 후 외부 터미널 속성 복원을 확인했다.
 
-검증 중 팝업 Tab이 뒤쪽 terminal pane으로 이동할 수 있는 문제, Alt 조합의 뒤쪽 문자가 셸에 전달될 수 있는 문제를 수정했다. 직접 자식이 종료했는데 다른 slave FD 때문에 EOF를 기다리는 경우와 쓰기 큐 오류 전달도 보완했다. VT 테스트는 alternate screen 전환 자체가 커서를 원점으로 옮긴다는 잘못된 기대를 제거하고 명시적 커서 이동을 사용했다. Ctrl+C 뒤 `^C`가 prompt 앞에 남는 테스트 관찰도 수정했다.
+이전 바·팝업 구현의 검증 기록은 `1d0e605`에 보존한다. 현재 테스트는 기본형의 전체 화면과 native 입력 계약을 확인한다.
 
 테스트 재실행 명령은 다음과 같다.
 
@@ -151,7 +154,8 @@ PYTHONPATH=src:tests PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m unittest \
 ## 남은 범위
 
 - 빌드·실행 검증은 Linux x86_64/WSL에 한정된다. native Windows·macOS 지원이나 성능 동등성은 검증하지 않았다. 현재 native 빌드는 SIMD를 비활성화한다.
-- 오른쪽 프롬프트의 셸 줄 연결, PTK 자동완성 dropdown, 기존 ish 설정·플러그인 API 이식은 이번 최소 실험에 포함하지 않았다. 팝업은 독립 편집 가능한 예제 하나다.
+- 하단 바·오른쪽 프롬프트·팝업, PTK 자동완성 dropdown, 기존 ish 설정·플러그인 API 이식은 후속 플러그인 범위다. 기본형에는 추가 UI가 없다.
 - native history·사용자 keymap 전체, continuation/heredoc 도중 Ctrl+C/D, 모든 background job·disown 종료 조합은 아직 별도 검증하지 않았다. 세션 종료는 직접 자식과 현재 foreground process group을 정리하며 전체 프로세스 트리 관리를 보장하지 않는다.
 - 기본 화면·색상·커서·alternate screen은 연결했지만 scrollback UI, 이미지, 하이퍼링크, 클립보드, 마우스, 모든 확장 키보드 프로토콜은 지원 완료 범위가 아니다. 복잡한 emoji 조합의 폭과 외부 터미널별 Unicode 차이도 추가 검증이 필요하다.
+- PTK는 외부 대체 화면을 사용하므로 일반 셸의 외부 scrollback과 같지 않다. 자식의 `TERM`·`COLORTERM`·`TERM_PROGRAM`은 가상 터미널에 맞게 설정하며, 커서 위치·표시는 전달하지만 커서 모양은 아직 전달하지 않는다. 기본 UI를 없앤 결과가 모든 터미널 동작의 완전한 동등성을 뜻하지는 않는다.
 - 첫 실험에서 입증한 것은 native tcsh 편집과 PTK 화면 합성의 공존이다. 모든 셸 자동완성, 모든 VT 기능, 기존 PTK 명령 편집 API와의 동등 호환성 또는 제품 완성도를 선언하지 않는다.

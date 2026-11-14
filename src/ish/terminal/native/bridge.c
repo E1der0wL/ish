@@ -8,6 +8,8 @@
 #define ISH_MAX_BUFFER (32u * 1024u * 1024u)
 #define ISH_LIMIT (-100)
 #define ISH_MEMORY (-101)
+#define ISH_COLOR_FG 1u
+#define ISH_COLOR_BG 2u
 #define CHECK(call) do { int status = (call); if (status != GHOSTTY_SUCCESS) return status; } while (0)
 
 typedef struct { uint8_t *data; size_t len, cap; int error; } Buffer;
@@ -120,18 +122,34 @@ int ish_vt_replies(Terminal *state, const uint8_t **out, size_t *len) {
     return error;
 }
 
+static void swap_colors(GhosttyColorRgb *fg, int *fg_result, GhosttyColorRgb *bg, int *bg_result) {
+    GhosttyColorRgb color = *fg; *fg = *bg; *bg = color;
+    int result = *fg_result; *fg_result = *bg_result; *bg_result = result;
+}
+
 /* Little-endian bulk snapshot: six u32 header values, then for each row a
- * u32 record count. Each record has u16 flags, RGB fg, RGB bg, u32 UTF-8
+ * u32 record count. Each record has u16 flags, u8 color presence (FG=1,
+ * BG=2), RGB fg, RGB bg, u32 UTF-8
  * length, and that many bytes. Wide tails have no record; spacer heads are
  * spaces. The buffer is borrowed until the next frame/key/paste call. */
 int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
     if (!state || !out || !len) return ISH_LIMIT;
     CHECK(ghostty_render_state_update(state->render, state->terminal));
     GhosttyRenderStateCursor cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
-    GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    GhosttyTerminalModeConfig reverse = {.mode = GHOSTTY_MODE_REVERSE_COLORS};
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MODE, &reverse));
+    /* Cell NO_VALUE means inherit the terminal default. A terminal default
+     * can itself be unset (host default) or set by an OSC 10/11 override.
+     * Render-state fallback RGBs discard that distinction, so do not use them. */
+    GhosttyColorRgb default_fg = {0}, default_bg = {0};
+    int default_fg_result = ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND, &default_fg);
+    int default_bg_result = ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND, &default_bg);
+    if (default_fg_result != GHOSTTY_SUCCESS && default_fg_result != GHOSTTY_NO_VALUE) return default_fg_result;
+    if (default_bg_result != GHOSTTY_SUCCESS && default_bg_result != GHOSTTY_NO_VALUE) return default_bg_result;
+    /* DECSCNM exchanges only terminal defaults, not explicit cell colors. */
+    if (reverse.value) swap_colors(&default_fg, &default_fg_result, &default_bg, &default_bg_result);
     GhosttyTerminalScreen screen;
     CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor));
-    CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors));
     CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen));
     CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &state->rows));
     Buffer *buffer = &state->output; buffer->len = 0;
@@ -148,13 +166,22 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
             CHECK(ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide));
             if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
             CHECK(ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style));
-            GhosttyColorRgb fg = colors.foreground, bg = colors.background;
+            GhosttyColorRgb fg = {0}, bg = {0};
             int fg_result = ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
             int bg_result = ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
             if (fg_result != GHOSTTY_SUCCESS && fg_result != GHOSTTY_NO_VALUE) return fg_result;
             if (bg_result != GHOSTTY_SUCCESS && bg_result != GHOSTTY_NO_VALUE) return bg_result;
-            if (fg_result == GHOSTTY_NO_VALUE) fg = colors.foreground;
-            if (bg_result == GHOSTTY_NO_VALUE) bg = colors.background;
+            if (fg_result == GHOSTTY_NO_VALUE) { fg = default_fg; fg_result = default_fg_result; }
+            if (bg_result == GHOSTTY_NO_VALUE) { bg = default_bg; bg_result = default_bg_result; }
+            if (reverse.value) {
+                /* PTK's unset FG/BG refer to distinct host defaults. Move each
+                 * inherited channel to its host slot, then reverse the rendered
+                 * pair. Explicit RGBs cancel this swap; SGR inverse composes by XOR. */
+                swap_colors(&fg, &fg_result, &bg, &bg_result);
+                style.flags ^= GHOSTTY_STYLE_FLAG_INVERSE;
+            }
+            uint8_t colors = (fg_result == GHOSTTY_SUCCESS ? ISH_COLOR_FG : 0) |
+                (bg_result == GHOSTTY_SUCCESS ? ISH_COLOR_BG : 0);
             GhosttyBuffer text = {.ptr = state->grapheme.data, .cap = state->grapheme.cap};
             int result = ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &text);
             if (result == GHOSTTY_OUT_OF_SPACE) {
@@ -164,7 +191,7 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
             }
             CHECK(result);
             if (!text.len || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) { text.ptr = (uint8_t *)" "; text.len = 1; }
-            uint8_t metadata[8] = {(uint8_t)style.flags, (uint8_t)(style.flags >> 8), fg.r, fg.g, fg.b, bg.r, bg.g, bg.b};
+            uint8_t metadata[9] = {(uint8_t)style.flags, (uint8_t)(style.flags >> 8), colors, fg.r, fg.g, fg.b, bg.r, bg.g, bg.b};
             CHECK(append(buffer, metadata, sizeof(metadata))); CHECK(number(buffer, (uint32_t)text.len));
             CHECK(append(buffer, text.ptr, text.len)); count++;
         }

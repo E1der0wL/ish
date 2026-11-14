@@ -2,7 +2,9 @@
 
 This branch also contains an isolated **libghostty-vt + prompt-toolkit terminal
 experiment**. The `ish-vt` entry point leaves command editing with the native
-shell and composes its screen with a status bar and popup. The existing `ish`
+shell and displays its full terminal without built-in bars or popups. Default
+colors use the host terminal's colors. Additional UI is reserved for future
+plugins. The existing `ish`
 entry point keeps its previous behavior. See
 [the experiment and its validation scope](docs/TERMINAL_EXPERIMENT.md).
 

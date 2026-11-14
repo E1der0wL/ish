@@ -25,7 +25,10 @@ DEFAULT_LIBRARY = (
     Path(__file__).resolve().parents[3] / ".cache/ghostty-vt/install/lib/libish_vt.so"
 )
 HEADER = struct.Struct("<6I")
-CELL = struct.Struct("<H6BI")
+# The native snapshot carries color presence separately from RGB values.
+CELL = struct.Struct("<HB6BI")
+COLOR_FG = 1
+COLOR_BG = 2
 COUNT = struct.Struct("<I")
 STYLE_FLAGS = (
     (1, "bold"),
@@ -87,6 +90,7 @@ def _check(status: int) -> None:
 @lru_cache(maxsize=4096)
 def _style(
     flags: int,
+    colors: int,
     red: int,
     green: int,
     blue: int,
@@ -95,8 +99,10 @@ def _style(
     bg_blue: int,
 ) -> str:
     parts = [
-        f"fg:#{red:02x}{green:02x}{blue:02x}",
-        f"bg:#{bg_red:02x}{bg_green:02x}{bg_blue:02x}",
+        f"fg:#{red:02x}{green:02x}{blue:02x}" if colors & COLOR_FG else "fg:default",
+        f"bg:#{bg_red:02x}{bg_green:02x}{bg_blue:02x}"
+        if colors & COLOR_BG
+        else "bg:default",
     ]
     parts.extend(name for bit, name in STYLE_FLAGS if flags & bit)
     if flags & 0x700:

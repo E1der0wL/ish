@@ -24,27 +24,42 @@ ROOT = Path(__file__).resolve().parents[1]
 DEADLINE = 15
 STARTUP_DEADLINE = 45
 ROWS, COLS = 24, 100
-F2 = b"\x1bOQ"
+F2, F10 = b"\x1bOQ", b"\x1b[21~"
 PASTE_START, PASTE_END = b"\x1b[200~", b"\x1b[201~"
-POPUP_TITLE = "ish-vt popup"
-BAR = "ish-vt | tcsh | F2 popup | F10 quit"
 TCSH = shutil.which("tcsh")
 
-OUTPUT_READER = """import signal
-import sys
-import time
+OUTPUT_READER = """import sys
 from pathlib import Path
 
-def interrupted(signum, frame):
-    Path('unexpected-signal').write_text(str(signum))
-    raise SystemExit(130)
-
-signal.signal(signal.SIGINT, interrupted)
 Path('program-ready').write_text('waiting')
-while not Path('release-output').exists():
-    time.sleep(0.005)
-print('CHILD_OUTPUT_WHILE_POPUP', flush=True)
+print('LIVE_NATIVE_OUTPUT', flush=True)
 Path('native-result').write_text(sys.stdin.readline())
+"""
+
+KEY_READER = """import os
+import termios
+import tty
+from pathlib import Path
+
+saved = termios.tcgetattr(0)
+data = bytearray()
+try:
+    tty.setraw(0)
+    Path('keys-ready').write_text('raw')
+    while not data.endswith(b'|done|'):
+        data.extend(os.read(0, 128))
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, saved)
+Path('key-result').write_bytes(data)
+"""
+
+COLOR_READER = """import sys
+from pathlib import Path
+
+sys.stdout.write('\\x1b[0m\\x1b[2J\\x1b[HDEFAULT \\x1b[48;2;0;0;0mBLACK \\x1b[49mRESET')
+sys.stdout.flush()
+Path('color-ready').write_text('waiting')
+sys.stdin.readline()
 """
 
 INTERRUPT_READER = """import signal
@@ -172,7 +187,7 @@ class Terminal:
     def at_prompt(self, continuation=False):
         """Observe the current child cursor line solely to synchronize the test."""
         state = self.state()
-        if state.get("popup") or state.get("alternate") or "cursor" not in state:
+        if state.get("alternate") or "cursor" not in state:
             return False
         lines = state.get("lines", [])
         row = state["cursor"][1]
@@ -210,7 +225,7 @@ class Terminal:
         self.require(lambda: path.exists() and path.read_bytes() == expected)
 
     def resize(self, rows, cols):
-        """Resize the outer terminal; the child pane must reserve exactly one row."""
+        """Resize the outer terminal and expect the native child to use all of it."""
         self.rows, self.cols = rows, cols
         self.screen.resize(lines=rows, columns=cols)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -265,51 +280,32 @@ def pty_open(rows, cols):
 
 @unittest.skipUnless(TCSH, "tcsh is required")
 class TerminalCLITests(unittest.TestCase):
-    """Check native shell behavior, actual rendered UI, and final input consumers."""
+    """Check native shell behavior, actual rendered cells, and final input consumers."""
 
     def setUp(self):
-        """Start one independent terminal and observe its native prompt and PTK bar."""
+        """Start an isolated shell occupying the entire outer terminal."""
         directory = self.enterContext(tempfile.TemporaryDirectory(prefix="ish-vt-cli-"))
         self.root = Path(directory)
         self.terminal = Terminal(self.root)
         self.addCleanup(self.terminal.close)
         self.terminal.require(self.terminal.at_prompt, STARTUP_DEADLINE)
-        self.require_bar()
+        self.require_full_screen()
 
-    def require_bar(self):
-        """Verify the visible one-row bar is outside the child's terminal height."""
+    def require_full_screen(self):
+        """Confirm native terminal dimensions without any reserved UI rows."""
         terminal = self.terminal
-        terminal.require(lambda: BAR in terminal.screen.display[-1])
-        self.assertEqual(sum(BAR in line for line in terminal.screen.display), 1)
+        terminal.require(
+            lambda: terminal.frame_has("READY>") or terminal.state()["alternate"]
+        )
         state = terminal.state()
-        self.assertEqual(
-            (state["rows"], state["cols"]), (terminal.rows - 1, terminal.cols)
-        )
-
-    def open_popup(self):
-        """Require both popup focus diagnostics and the independently rendered frame."""
-        terminal = self.terminal
-        terminal.send(F2)
-        terminal.require(
-            lambda: terminal.state().get("popup") and terminal.frame_has(POPUP_TITLE)
-        )
-        self.assertTrue(terminal.frame_has("This input stays in the popup."))
-        self.assertTrue(terminal.frame_has("Close"))
-        self.require_bar()
-
-    def require_popup_closed(self):
-        """Wait until both the focus state and visible popup have been removed."""
-        terminal = self.terminal
-        terminal.require(
-            lambda: (
-                not terminal.state().get("popup")
-                and not terminal.frame_has(POPUP_TITLE)
-            )
-        )
-        self.require_bar()
+        self.assertEqual((state["rows"], state["cols"]), (terminal.rows, terminal.cols))
+        self.assertNotIn("popup", state)
+        self.assertNotIn("popup_text", state)
+        self.assertFalse(terminal.frame_has("ish-vt |"))
+        self.assertFalse(terminal.frame_has("ish-vt popup"))
 
     def test_native_backslash_continuation_keeps_both_lines(self):
-        """Native tcsh collects continuation while PTK only supplies the terminal UI."""
+        """Native tcsh collects continuation while PTK supplies only terminal rendering."""
         terminal = self.terminal
         terminal.submit("printf '%s\\n' one \\")
         terminal.require(lambda: terminal.at_prompt(continuation=True))
@@ -317,7 +313,7 @@ class TerminalCLITests(unittest.TestCase):
         terminal.submit("two > backslash")
         terminal.result("backslash", b"one\ntwo\n")
         terminal.require(terminal.at_prompt)
-        self.require_bar()
+        self.require_full_screen()
 
     def test_nested_foreach_and_while_preread_then_execute(self):
         """The actual native parser waits for both end markers before side effects."""
@@ -343,7 +339,7 @@ class TerminalCLITests(unittest.TestCase):
         terminal.send("cat << END > heredoc\r" + payload.replace("\n", "\r") + "END\r")
         terminal.result("heredoc", payload.encode())
         terminal.require(terminal.at_prompt)
-        self.require_bar()
+        self.require_full_screen()
 
     def test_dollar_input_consumes_native_data(self):
         """The shell's ordinary stdin consumer receives an exact fast Enter batch."""
@@ -356,75 +352,26 @@ class TerminalCLITests(unittest.TestCase):
         terminal.require(terminal.at_prompt)
 
     def test_native_tab_completes_a_filename(self):
-        """Tab is forwarded to the native tcsh editor rather than consumed by PTK."""
+        """Tab reaches the native tcsh editor instead of triggering a PTK widget."""
         terminal = self.terminal
         (self.root / "uniquely-completed-file").write_text("native completion\n")
         terminal.send("cat uniquely-comp\t > completed\r")
         terminal.result("completed", b"native completion\n")
         terminal.require(terminal.at_prompt)
 
-    def test_popup_toggle_escape_and_close_button_keep_input_local(self):
-        """F2, Escape, and the actual Close button return focus without shell input."""
-        terminal = self.terminal
-        self.open_popup()
-        terminal.send("button-only")
-        terminal.require(
-            lambda: "button-only" in terminal.state().get("popup_text", "")
-        )
-        terminal.require(lambda: terminal.frame_has("button-only"))
-        # Two Tabs must cycle back to the popup textarea, never the terminal.
-        terminal.send(b"\t\t\rpopup-after-two-tabs")
-        terminal.require(
-            lambda: "popup-after-two-tabs" in terminal.state().get("popup_text", "")
-        )
-        self.assertTrue(terminal.state()["popup"])
-        terminal.send(b"\x1bxafter-alt")
-        terminal.require(lambda: "after-alt" in terminal.state().get("popup_text", ""))
-        self.assertTrue(terminal.state()["popup"])
-        self.assertTrue(terminal.frame_has(POPUP_TITLE))
-        # Three further Tabs focus Close. Unbound text must not reach the shell.
-        terminal.send(b"\t\t\techo>popup-leak\r")
-        self.require_popup_closed()
-        self.open_popup()
-        terminal.send(b"\x1b")
-        self.require_popup_closed()
-        self.open_popup()
-        terminal.send(F2)
-        self.require_popup_closed()
-        terminal.submit("printf isolated > popup-result")
-        terminal.result("popup-result", b"isolated")
-        terminal.require(terminal.at_prompt)
-        self.assertFalse((self.root / "popup-leak").exists())
-
-    def test_popup_during_execution_keeps_output_live_and_stdin_separate(self):
-        """Child output updates under the popup while popup text and Ctrl+C stay local."""
+    def test_external_program_stdin_and_output_remain_native(self):
+        """Program output is rendered while its ordinary stdin receives exact data."""
         terminal = self.terminal
         (self.root / "output-reader.py").write_text(OUTPUT_READER)
         terminal.submit(f"{shlex.quote(sys.executable)} output-reader.py")
         terminal.result("program-ready", b"waiting")
-        self.open_popup()
-        terminal.send("echo POPUP_ONLY > leaked\r")
-        terminal.require(lambda: "POPUP_ONLY" in terminal.state().get("popup_text", ""))
-        terminal.require(lambda: terminal.frame_has("POPUP_ONLY"))
-        (self.root / "release-output").touch()
-        terminal.require(
-            lambda: any(
-                "CHILD_OUTPUT_WHILE_POPUP" in line
-                for line in terminal.state().get("lines", [])
-            )
-        )
-        terminal.require(lambda: terminal.frame_has("CHILD_OUTPUT_WHILE_POPUP"))
-        self.assertTrue(terminal.state()["popup"])
-        terminal.send(b"\x03")
-        self.require_popup_closed()
+        terminal.require(lambda: terminal.frame_has("LIVE_NATIVE_OUTPUT"))
         terminal.send("  real stdin 한 글  \r")
         terminal.result("native-result", "  real stdin 한 글  \n".encode())
         terminal.require(terminal.at_prompt)
-        self.assertFalse((self.root / "leaked").exists())
-        self.assertFalse((self.root / "unexpected-signal").exists())
 
-    def test_bracketed_paste_uses_native_terminal_or_popup_focus(self):
-        """The implemented paste path respects native Enter and popup text ownership."""
+    def test_bracketed_paste_waits_for_native_enter(self):
+        """A shell paste remains editable until native Enter submits the command."""
         terminal = self.terminal
         command = "printf '%s' 'shell paste 한 글' > pasted-shell"
         terminal.send(PASTE_START + command.encode() + PASTE_END)
@@ -437,30 +384,52 @@ class TerminalCLITests(unittest.TestCase):
         terminal.send(b"\r")
         terminal.result("pasted-shell", "shell paste 한 글".encode())
         terminal.require(terminal.at_prompt)
-        self.open_popup()
-        text = "echo leaked > paste-leak\n  popup 한 글  "
-        terminal.send(PASTE_START + text.encode() + PASTE_END)
-        terminal.require(lambda: terminal.state().get("popup_text") == text)
-        terminal.require(lambda: terminal.frame_has("popup 한 글"))
-        self.assertTrue(terminal.state()["popup"])
-        terminal.send(b"\x1b")
-        self.require_popup_closed()
-        terminal.submit("printf returned > paste-return")
-        terminal.result("paste-return", b"returned")
+
+    def test_f2_and_f10_reach_the_native_stdin_consumer(self):
+        """Former application shortcuts are ordinary native xterm function keys."""
+        terminal = self.terminal
+        (self.root / "key-reader.py").write_text(KEY_READER)
+        terminal.submit(f"{shlex.quote(sys.executable)} key-reader.py")
+        terminal.result("keys-ready", b"raw")
+        terminal.send(F2 + F10 + b"|done|")
+        terminal.result("key-result", b"\x1bOQ\x1b[21~|done|")
         terminal.require(terminal.at_prompt)
-        self.assertFalse((self.root / "paste-leak").exists())
+        terminal.submit("printf alive > after-keys")
+        terminal.result("after-keys", b"alive")
+        terminal.require(terminal.at_prompt)
+        self.require_full_screen()
+
+    def test_default_background_and_explicit_black_are_distinct_in_outer_cells(self):
+        """Default colors inherit the host while an explicit RGB black stays black."""
+        terminal = self.terminal
+        (self.root / "color-reader.py").write_text(COLOR_READER)
+        terminal.submit(f"{shlex.quote(sys.executable)} color-reader.py")
+        terminal.result("color-ready", b"waiting")
+        terminal.require(
+            lambda: terminal.screen.display[0].startswith("DEFAULT BLACK RESET")
+        )
+        row = terminal.screen.buffer[0]
+        self.assertEqual(row[0].bg, "default")
+        self.assertIn(row[8].bg, {"black", "000000"})
+        self.assertEqual(row[14].bg, "default")
+        self.assertEqual(
+            terminal.screen.buffer[terminal.rows - 1][terminal.cols - 1].bg,
+            "default",
+        )
+        terminal.send(b"\r")
+        terminal.require(terminal.at_prompt)
 
     @unittest.skipUnless(shutil.which("vim"), "vim is required")
-    def test_vim_save_resize_and_return_preserve_the_bar_and_pane_size(self):
-        """A real alternate-screen editor receives pane geometry and saves native input."""
+    def test_vim_save_resize_and_return_use_the_full_terminal_size(self):
+        """A real alternate-screen editor uses every row and preserves pasted Unicode."""
         terminal = self.terminal
         terminal.submit("stty size > initial-size")
-        terminal.result("initial-size", f"{ROWS - 1} {COLS}\n".encode())
+        terminal.result("initial-size", f"{ROWS} {COLS}\n".encode())
         terminal.require(terminal.at_prompt)
         terminal.submit("vim -Nu NONE -n -i NONE edited.txt")
         terminal.require(lambda: terminal.state().get("alternate") is True)
         terminal.require(lambda: terminal.frame_has("edited.txt"))
-        self.require_bar()
+        self.require_full_screen()
         terminal.send(
             b"i"
             + PASTE_START
@@ -471,36 +440,25 @@ class TerminalCLITests(unittest.TestCase):
         expected = "Vim 한 글\nsecond line\n".encode()
         terminal.result("edited.txt", expected)
         terminal.require(lambda: terminal.frame_has("Vim 한 글"))
-        self.open_popup()
-        text = "popup-only Vim input"
-        terminal.send(text)
-        terminal.require(lambda: terminal.state().get("popup_text") == text)
-        terminal.require(lambda: terminal.frame_has(text))
-        terminal.send(b"\x1b")
-        self.require_popup_closed()
-        self.assertTrue(terminal.state()["alternate"])
-        terminal.require(lambda: terminal.frame_has("Vim 한 글"))
-        terminal.send(":w\r")
-        terminal.result("edited.txt", expected)
         terminal.resize(33, 110)
         terminal.require(
             lambda: (
                 (terminal.state().get("rows"), terminal.state().get("cols"))
-                == (32, 110)
+                == (33, 110)
             )
         )
         terminal.send(
             ":call writefile([string(&lines), string(&columns)], 'vim-size')\r"
         )
-        terminal.result("vim-size", b"32\n110\n")
-        self.require_bar()
+        terminal.result("vim-size", b"33\n110\n")
+        self.require_full_screen()
         terminal.send(":q\r")
         terminal.require(terminal.at_prompt)
         terminal.require(lambda: terminal.frame_has("READY>"))
         self.assertFalse(terminal.state()["alternate"])
-        self.require_bar()
+        self.require_full_screen()
         terminal.submit("stty size > returned-size")
-        terminal.result("returned-size", b"32 110\n")
+        terminal.result("returned-size", b"33 110\n")
 
     def test_native_interrupt_eof_and_outer_terminal_restoration(self):
         """Ctrl+C reaches the running program; Ctrl+D reaches cat and then native tcsh."""
