@@ -12,8 +12,6 @@ from collections.abc import Callable
 
 from ish.runtime.fdio import FDWriter
 
-from .host import scrub_environment
-
 READ_BYTES = 65536
 READ_BUDGET = 256 * 1024
 SHUTDOWN_SECONDS = 2
@@ -32,10 +30,16 @@ class Session:
         output: Callable[[bytes], None],
         exited: Callable[[int], None],
         failed: Callable[[Exception], None],
+        *,
+        env: dict[str, str] | None = None,
+        input_flow: Callable[[bool], None] | None = None,
     ):
         """Keep process configuration separate from UI focus and VT state."""
         self.argv, self.cwd = argv, cwd
         self.output, self.exited, self.failed = output, exited, failed
+        self.env = env
+        self.input_flow = input_flow
+        self.output_enabled = True
         self.pid = self.fd = None
         self.writer = self.waiter = self.loop = None
         self.returncode = None
@@ -49,8 +53,13 @@ class Session:
         if self.pid is not None:
             raise RuntimeError("The terminal session has already started")
         self.loop = asyncio.get_running_loop()
-        env = scrub_environment(os.environ)
-        env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM="ish-vt")
+        if self.env is None:
+            from .host import scrub_environment
+
+            env = scrub_environment(os.environ)
+            env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM="ish-vt")
+        else:
+            env = dict(self.env)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             try:
@@ -62,7 +71,7 @@ class Session:
                 os._exit(127)
         self.size = (cols, rows)
         os.set_blocking(self.fd, False)
-        self.writer = FDWriter(self.loop, self.fd, self.failed)
+        self.writer = FDWriter(self.loop, self.fd, self.failed, on_flow=self.input_flow)
         if self.pending_input:
             self.writer.write(self.pending_input)
             self.pending_input.clear()
@@ -71,6 +80,8 @@ class Session:
 
     def _read(self) -> None:
         """Feed bounded output batches to the VT engine; never write to stdout."""
+        if not self.output_enabled:
+            return
         budget = READ_BUDGET
         try:
             while budget > 0:
@@ -88,6 +99,8 @@ class Session:
                     break
                 budget -= len(data)
                 self.output(data)
+                if not self.output_enabled:
+                    break
         except Exception as exc:
             self.loop.remove_reader(self.fd)
             self.failed(exc)
@@ -124,6 +137,16 @@ class Session:
         if self.fd is not None and not self.closed and self.size != (cols, rows):
             termios.tcsetwinsize(self.fd, (rows, cols))
             self.size = (cols, rows)
+
+    def set_output_enabled(self, enabled: bool) -> None:
+        """Apply backpressure without changing the child or consuming its output."""
+        self.output_enabled = enabled
+        if self.fd is None or self.closed or self.eof:
+            return
+        if enabled:
+            self.loop.add_reader(self.fd, self._read)
+        else:
+            self.loop.remove_reader(self.fd)
 
     async def close(self) -> None:
         """Release the PTY and terminate remaining groups belonging to this session."""

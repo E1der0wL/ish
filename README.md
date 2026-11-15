@@ -1,5 +1,13 @@
 # ish
 
+This worktree adds the isolated **prompt-stream experiment** (`ish-stream`, or
+`python -m ish.stream`). It relays native shell output directly to the host.
+The default has no additional UI, reserved keys, or shell integration. Explicit
+`--demo --shell tcsh` enables a PTK bottom panel and F2 popup at primary prompts;
+tcsh still edits command lines, continuation, and heredocs. See
+[the design, execution instructions, and limits](docs/PROMPT_STREAM.md) and
+[the actual validation scope](docs/STREAM_VALIDATION.md).
+
 This branch also contains an isolated **libghostty-vt + prompt-toolkit terminal
 experiment**. The `ish-vt` entry point leaves command editing with the native
 shell and displays its full terminal without built-in bars or popups. Default

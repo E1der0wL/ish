@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 ish = "ish.main:main"
 ish-vt = "ish.terminal.__main__:main"
+ish-stream = "ish.stream.__main__:main"
 
 [dependency-groups]
 build = [
