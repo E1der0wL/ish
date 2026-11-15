@@ -21,12 +21,12 @@ from ish.terminal.session import Session
 
 from .handoff import Request, Stage
 from .protocol import Event, Keys, Reply, Stream
+from .settings import ESCAPE_DELAY, validate_escape_delay
 
 READ_BYTES = 65536
 PANEL_ROWS = 5
 MIN_ROWS = PANEL_ROWS + 3
 MIN_COLUMNS = 20
-ESCAPE_DELAY = 0.05
 REQUEST_BYTES = 1024
 PENDING_BYTES = 65536
 NONCE_BYTES = 16
@@ -55,9 +55,11 @@ class App:
         library_dir=None,
         logger=None,
         report=None,
+        escape_delay=ESCAPE_DELAY,
     ):
         """Keep unadorned streaming independent of shell integration and PTK UI."""
         self.argv, self.cwd = argv, cwd
+        self.escape_delay = validate_escape_delay(escape_delay)
         self.logger = logger or logging.getLogger(DEFAULT_LOGGER_NAME)
         self.report = report
         self.integration_dir = integration_dir
@@ -425,7 +427,7 @@ class App:
         self.keys.feed(data)
         # This resolves the native Escape/F2 ambiguity only, never readiness.
         if self.keys.pending:
-            self.key_timer = self.loop.call_later(ESCAPE_DELAY, self.keys.flush)
+            self.key_timer = self.loop.call_later(self.escape_delay, self.keys.flush)
 
     def _output(self, data):
         if self.stream:
@@ -485,6 +487,7 @@ class App:
                 bar=self.extensions.bar,
                 popup=self.extensions.popup,
                 on_error=self._ui_error,
+                escape_delay=self.escape_delay,
             )
             await self.panel.start(max(1, self.cols), PANEL_ROWS)
             if self.panel.error is not None:

@@ -229,9 +229,17 @@ class Message(StrEnum):
     PIP_INSTALL_FAIL = auto(), "Failed to install library '{library}'"
     STREAM_DESCRIPTION = (
         auto(),
-        "ish-stream - Run a native shell with direct terminal output and optional prompt-time Python plugins.",
+        "ish - Run a native shell with direct terminal output and optional prompt-time Python plugins.",
     )
-    STREAM_VERSION = auto(), "ish-stream {version}"
+    STREAM_VERSION = auto(), "ish {version}"
+    STREAM_NO_RC_HELP = auto(), "Skip ish's .ishrc.py for this session."
+    STREAM_NO_PLUGINS_HELP = auto(), "Disable all selected plugins for this session."
+    STREAM_ESCAPE_DELAY_HELP = (
+        auto(),
+        "Wait SECONDS to distinguish ESC from Alt sequences (default: 0.05).",
+    )
+    STREAM_RC_NOT_EXECUTED = auto(), "Not executed (read-only query)"
+    STREAM_DIAGNOSE_ESCAPE_DELAY = auto(), "Escape sequence delay (seconds)"
     STREAM_USAGE = auto(), "usage: "
     STREAM_PARSE_ERROR = auto(), "error: {error}"
     STREAM_SHELL_HELP = (
@@ -239,7 +247,10 @@ class Message(StrEnum):
         "Run SHELL; the account's login shell is selected by default.",
     )
     STREAM_CWD_HELP = auto(), "Start the shell in DIR (default: current directory)."
-    STREAM_PLUGIN_HELP = auto(), "Enable a named Python plugin; repeat to select more."
+    STREAM_PLUGIN_HELP = (
+        auto(),
+        "Select Python plugins instead of the rc list; repeat to select more.",
+    )
     STREAM_PLUGIN_DIR_HELP = (
         auto(),
         "Read selected Python plugins from DIR instead of the bundled directory.",
@@ -264,7 +275,7 @@ class Message(StrEnum):
     STREAM_LOG_LEVEL_HELP = auto(), "Set the log threshold (default: WARNING)."
     STREAM_PLATFORM_ERROR = (
         auto(),
-        "ish-stream requires Linux/WSL with a controlling PTY.",
+        "ish requires Linux/WSL with a controlling PTY.",
     )
     STREAM_TTY_ERROR = auto(), "Standard input and output must be terminals."
     STREAM_SHELL_ERROR = auto(), "Shell executable not found: {shell}"
@@ -273,10 +284,10 @@ class Message(StrEnum):
     STREAM_UI_ERROR = auto(), "Plugin UI disabled: {error}"
     STREAM_CLEANUP_ERROR = auto(), "Plugin cleanup failed: {error}"
     STREAM_SESSION_ERROR = auto(), "Session error: {error}"
-    STREAM_DIAGNOSE_TITLE = auto(), "ish-stream environment diagnostics"
+    STREAM_DIAGNOSE_TITLE = auto(), "ish environment diagnostics"
     STREAM_DIAGNOSE_SCOPE = (
         auto(),
-        "Read-only startup settings. No shell or plugin was executed; selected plugins do not certify runtime support or readiness.",
+        "Read-only CLI/default settings; .ishrc.py was not executed. No shell or plugin was executed; selected plugins do not certify runtime support or readiness.",
     )
     STREAM_DIAGNOSE_CWD = auto(), "Shell working directory"
     STREAM_DIAGNOSE_ARGS = auto(), "Shell arguments"

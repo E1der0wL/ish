@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ish"
-version = "1.2.1"
-description = "A prompt-toolkit command editor for interactive Linux shells"
+version = "2.0.0"
+description = "Native shell sessions with optional prompt-toolkit plugins"
 readme = "README.md"
 requires-python = ">=3.12.14,<3.13"
 dependencies = [
@@ -21,9 +21,8 @@ dependencies = [
 ]
 
 [project.scripts]
-ish = "ish.main:main"
+ish = "ish.stream.__main__:main"
 ish-vt = "ish.terminal.__main__:main"
-ish-stream = "ish.stream.__main__:main"
 
 [dependency-groups]
 build = [

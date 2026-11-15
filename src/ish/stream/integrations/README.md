@@ -1,6 +1,6 @@
 # Editable shell integrations
 
-These UTF-8 text files are read afresh when an `ish-stream` session explicitly
+These UTF-8 text files are read afresh when an `ish` session explicitly
 selects UI and a matching shell plugin. They are packaged as source resources,
 not compiled into the relay. The product has no `--demo` option; editable UI
 samples live separately in `examples/stream_plugins/`.

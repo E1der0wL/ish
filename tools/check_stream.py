@@ -59,6 +59,7 @@ LINT_PATHS = (
     "src/ish/runtime/startup.py",
     "src/ish/terminal/session.py",
     "examples/stream_plugins",
+    "examples/ishrc.py",
     "tools/build_distribution.py",
     "tools/check_stream.py",
     "tools/check_stream_package.py",

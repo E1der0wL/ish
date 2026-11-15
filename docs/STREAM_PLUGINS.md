@@ -1,6 +1,6 @@
-# ish-stream Python 플러그인
+# ish Python 플러그인
 
-ish-stream은 기존 ish의 `PluginManager`를 재사용해 선택한 외부 Python 파일을
+ish는 기존 ish의 `PluginManager`를 재사용해 선택한 외부 Python 파일을
 불러온다. 하단 바·팝업 내용과 셸별 시작 정책을 플러그인으로 분리했으며,
 명령줄·보조 프롬프트 편집은 계속 셸이 담당한다. 별도 플러그인 관리자를
 새로 만들거나 Python 명령 dispatcher를 복원한 것은 아니다.
@@ -11,48 +11,81 @@ ish-stream은 기존 ish의 `PluginManager`를 재사용해 선택한 외부 Pyt
 
 ## 실행 방법
 
-Linux/WSL의 대화형 터미널에서, ish가 설치된 Python 환경의 `ish-stream`을 사용한다.
+Linux/WSL의 대화형 터미널에서, ish가 설치된 Python 환경의 `ish`를 사용한다.
 저장소에서 실행할 때는 같은 환경에서 `PYTHONPATH=src python -m ish.stream`으로
 대체할 수 있다.
 
 ```sh
 # 기본형: 추가 UI, UI 단축키, 셸 hook 없이 출력과 입력을 직접 전달한다.
-ish-stream --shell tcsh
+ish --no-rc --shell tcsh
 
 # 저장소 루트에서, 아직 없는 사용자 디렉터리에 셸 provider와 UI 예제를 모은다.
-cp -R src/ish/stream/bundled "$HOME/ish-stream-plugins"
-cp -R examples/stream_plugins/stream_bar "$HOME/ish-stream-plugins/"
-cp -R examples/stream_plugins/stream_popup "$HOME/ish-stream-plugins/"
+cp -R src/ish/stream/bundled "$HOME/ish-plugins"
+cp -R examples/stream_plugins/stream_bar "$HOME/ish-plugins/"
+cp -R examples/stream_plugins/stream_popup "$HOME/ish-plugins/"
 
 # 샘플 하단 바·팝업과 tcsh 연동을 명시적으로 선택한다.
-ish-stream --shell tcsh --plugin-dir "$HOME/ish-stream-plugins" \
+ish --shell tcsh --plugin-dir "$HOME/ish-plugins" \
   --plugin stream_bar --plugin stream_popup --plugin stream_tcsh
 
 # 하단 바만 사용한다. 팝업용 F2 예약은 설치하지 않는다.
-ish-stream --shell tcsh --plugin-dir "$HOME/ish-stream-plugins" \
+ish --shell tcsh --plugin-dir "$HOME/ish-plugins" \
   --plugin stream_bar --plugin stream_tcsh
 
 # 팝업만 사용한다.
-ish-stream --shell zsh --plugin-dir "$HOME/ish-stream-plugins" \
+ish --shell zsh --plugin-dir "$HOME/ish-plugins" \
   --plugin stream_popup --plugin stream_zsh
 ```
 
-`--plugin NAME`은 여러 번 지정할 수 있다. 선택한 순서를 유지하며 같은 이름은
+`--plugin NAME`은 여러 번 지정할 수 있다. 파일 설정의 플러그인 목록을 대체한다.
+선택한 순서를 유지하며 같은 이름은
 한 번만 활성화한다. 등록된 의존 플러그인은 같은 source 디렉터리에서 불러오지만,
 선택하지 않은 모듈의 stream `setup()`을 자동 실행하지는 않는다.
 
 | 옵션 | 의미 |
 | --- | --- |
-| `--plugin NAME` | 명시한 Python 플러그인을 활성화한다. 기본 선택은 없다. |
+| `--plugin NAME` | 이번 실행에 사용할 Python 플러그인 목록을 지정한다. 파일에도 선택이 없으면 기본 선택은 없다. |
+| `--no-plugins` | 다른 설정은 적용하고 플러그인 선택만 무시한다. `--plugin`과 함께 쓸 수 없다. |
 | `--plugin-dir DIR` | 기본 제공 셸 플러그인 디렉터리를 **전체 대체**한다. 누락된 이름을 기본 디렉터리에서 보충하지 않는다. |
-| `--plugin-lib-dir DIR` | 플러그인 Python 패키지를 확인·설치할 별도 디렉터리다. 생략하면 기존 ish 설정의 plugin library 경로를 쓴다. |
+| `--plugin-lib-dir DIR` | 플러그인 Python 패키지를 확인·설치할 별도 디렉터리다. 생략하면 ish 설정의 plugin library 경로를 쓴다. |
 | `--integration-dir DIR` | 셸 플러그인이 사용하는 수정 가능한 `.sh`·`.zsh`·`.csh` 템플릿 디렉터리를 대체한다. |
 
-제품의 `--demo` 옵션은 제거했다. UI 예제는 `examples/stream_plugins/`에 있으며,
-본체 설치에 기본 UI로 포함하지 않는다. `--home`으로 변경한 설정 경로는 기본
-plugin library 경로에도 적용되지만, 사용자 `.ishrc.py`를 실행하거나 그 경로의
-플러그인을 자동으로 선택하지 않는다. 언어·로그·시작 인수와 읽기 전용 진단은
-[시작 옵션](PROMPT_STREAM.md#실행과-시작-옵션)을 참고한다.
+제품에 `--demo` 옵션은 없다. UI 예제는 `examples/stream_plugins/`에 있으며,
+기본 UI로 활성화하지 않는다. `--home`으로 변경한 설정 경로는 `.ishrc.py`와
+기본 plugin library 경로에도 적용한다. 언어·로그·시작 인수와 읽기 전용 진단은
+[사용 안내](../README.md)를 참고한다.
+
+### 선택 저장과 설치본에서 복사
+
+위 예제처럼 파일을 준비했다면 `~/ish/.ishrc.py`에 다음을 적어 선택을 저장한다.
+
+```python
+config.shell = "tcsh"
+config.plugin_dir = "~/ish-plugins"
+config.plugins = ["stream_tcsh", "stream_bar", "stream_popup"]
+```
+
+이후 `ish`를 실행하면 기존 `PluginManager`가 이 이름들을 로딩한다. 별도의
+`plugin.load()` API나 선택 DB를 만들지 않는다. 파일을 바꾸면 다음 세션부터
+적용되고, 실행 중 플러그인을 교체하지 않는다. `--no-rc`는 파일 전체를 무시한다.
+`--no-plugins`는 언어·로그 등 다른 설정을 유지하면서 UI와 셸 연동을 해제한다.
+설정 파일에 쓴 상대 경로는 설정 home을 기준으로 한다.
+
+배포본에는 `src/` 디렉터리 대신 설치된 Python 패키지에 provider 원본이 들어
+있다. 배포 디렉터리에서 다음처럼 경로를 확인하고 복사할 수 있다. 대상 사용자
+디렉터리가 아직 없을 때 실행한다.
+
+```sh
+provider_dir=$(./bin/python/bin/python3 -I -c 'from ish.stream.extensions import DIRECTORY; print(DIRECTORY)')
+cp -R "$provider_dir" "$HOME/ish-plugins"
+cp -R examples/stream_plugins/stream_bar "$HOME/ish-plugins/"
+cp -R examples/stream_plugins/stream_popup "$HOME/ish-plugins/"
+```
+
+wheel 설치 환경에서는 같은 Python의 `python -I -c ...`로 provider 경로를
+확인한다. 샘플 UI는 이 저장소의 `examples/stream_plugins/`에서 가져온다.
+`ish --diagnose`도 기본 provider 경로를 표시하지만 `.ishrc.py`를 실행하지
+않으므로 파일 설정을 적용한 결과는 표시하지 않는다.
 
 UI를 등록하는 플러그인과 현재 셸을 지원하는 플러그인이 함께 있어야 장식을
 사용할 수 있다. 셸 플러그인만 선택하고 UI를 등록하지 않으면 셸 hook도 설치하지
@@ -69,10 +102,10 @@ socket은 설치하지 않는다. F2는 기존 셸 설정대로 전달된다.
 않을 경우에는 셸 provider 디렉터리만 복사해도 된다.
 
 ```sh
-mkdir -p "$HOME/ish-stream-plugins/my_bar"
+mkdir -p "$HOME/ish-plugins/my_bar"
 ```
 
-`$HOME/ish-stream-plugins/my_bar/my_bar.py`를 다음 내용으로 만든다.
+`$HOME/ish-plugins/my_bar/my_bar.py`를 다음 내용으로 만든다.
 
 ```python
 PLUGIN_META = {
@@ -92,19 +125,23 @@ def setup(api):
 복사해 둔 tcsh 플러그인과 함께 선택한다.
 
 ```sh
-ish-stream --shell tcsh \
-  --plugin-dir "$HOME/ish-stream-plugins" \
+ish --shell tcsh \
+  --plugin-dir "$HOME/ish-plugins" \
   --plugin my_bar --plugin stream_tcsh
 ```
 
 `NAME/NAME.py` 또는 `NAME/__init__.py`가 entry가 된다. 둘 다 있으면 `NAME.py`를
 사용한다. `PLUGIN_META`는 기존 관리자와 같은 literal 사전이며, `requirements`는
 다른 ish 플러그인, `dependencies`는 Python 패키지 요구사항이다. 자세한 기존
-metadata 규칙은 [README의 플러그인 안내](../README.md#plugin-metadata-plugin_meta)를
-따른다. 기존 플러그인의 데이터 함수는 재사용할 수 있지만, 기존 `Prompt` 객체의
-편집기 설정을 사용하는 코드는 stream용 등록 API에 맞게 연결해야 한다.
+metadata는 import 전에 읽으므로 함수 호출이나 변수 참조로 구성하지 않는다.
+`requirements`에 이름과 버전 조건을 쓰면 같은 source 디렉터리의 의존 플러그인을
+검사한다. 플러그인 원본 자체를 다운로드하지는 않는다. `dependencies`에는
+`requests>=2.31` 같은 Python 배포 요구사항을 쓴다. 배포명과 import 이름이
+다르면 `PyYAML>=6|yaml`처럼 지정할 수 있다. 필요한 Python 패키지는 선택한
+library 디렉터리에 pip로 설치하므로 패키지 접근 경로나 오프라인 wheel이 필요하다.
+구버전 Prompt 설정 API를 위한 호환 계층은 제공하지 않는다.
 
-수정 내용은 **다음 ish-stream 세션부터** 적용된다. 실행 중인 플러그인이나
+수정 내용은 **다음 ish 세션부터** 적용된다. 실행 중인 플러그인이나
 셸 hook을 실시간 교체하는 기능은 없다. entry 파일은 원본 bytes를 읽으므로
 동일한 크기·mtime의 수정에서도 오래된 entry bytecode를 재사용하지 않는다.
 entry가 import하는 보조 모듈은 일반 Python import 규칙을 따른다.
@@ -129,6 +166,13 @@ setup 중에만 허용된다. setup이 반환한 뒤에는 등록 구성을 변�
 [popup 예제](../examples/stream_plugins/stream_popup/stream_popup.py)를
 참고한다. 본체가 실제 native callback·요청 일치·복귀 acknowledgement를 확인한
 경계에서만 팝업 입력을 전달한다.
+
+팝업 위젯은 PTK의 키 바인딩을 사용한다. `KeyBindings.add("escape", "p")`는
+Alt+P를 표현한다. Esc와 Alt는 같은 ESC 바이트 접두를 쓰므로 단독 Esc 판별에
+짧은 대기가 필요하다. ish는 `config.escape_delay`로 판별 시간을 선택하며,
+기본값은 0.05초다. ESC를 eager binding으로 등록하면 Alt 시퀀스가 끊길 수
+있으므로 같은 팝업에서 Alt 키를 쓰려면 접두 바인딩을 고려한다. 이 설정은
+셸 readiness 판단용 timeout이 아니며 UI 없는 기본형에는 적용하지 않는다.
 
 `setup(api)`는 정리 함수 또는 `None`을 반환한다. 정리 함수는 종료 시 등록의
 역순으로 호출되며 awaitable 반환도 지원한다. 위젯·키 입력·터미널 출력의 수명은
@@ -239,13 +283,13 @@ tcsh에서는 아래 입력을 한 줄씩 제출해 보조 프롬프트와 파�
 
 ```tcsh
 foreach item (one two)
-echo $item >> /tmp/ish-stream-loop-result
+echo $item >> /tmp/ish-loop-result
 end
-cat << EOF > /tmp/ish-stream-heredoc-result
+cat << EOF > /tmp/ish-heredoc-result
 space name
 한글 본문
 EOF
-cat /tmp/ish-stream-loop-result /tmp/ish-stream-heredoc-result
+cat /tmp/ish-loop-result /tmp/ish-heredoc-result
 vim
 ```
 

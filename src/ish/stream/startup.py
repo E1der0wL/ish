@@ -15,20 +15,24 @@ from ish import __version__
 from ish.config import config
 from ish.lang import Message, i18n
 from ish.log import LOG_LEVELS, session_logging
-from ish.runtime.startup import login_shell
 
-PROGRAM = "ish-stream"
-DEFAULT_LOG_LEVEL = "WARNING"
-INTERACTIVE_ARGS = ("-i",)
+from .settings import PATH_OPTIONS, Settings, load
+
+PROGRAM = "ish"
 LOGIN_ARGS = ("-l",)
 STARTUP_LOG_CAPACITY = 4
-PATH_OPTIONS = ("cwd", "plugin_dir", "plugin_lib_dir", "integration_dir", "log_file")
 OPTIONS = (
     (("-h", "--help"), Message.CLI_HELP_OPTION_HELP, {"action": "store_true"}),
     (("--version",), Message.CLI_VERSION_OPTION_HELP, {"action": "store_true"}),
     (("--diagnose",), Message.CLI_DIAGNOSE_OPTION_HELP, {"action": "store_true"}),
     (("--home",), Message.CLI_HOME_OPTION_HELP, {"type": Path, "metavar": "DIR"}),
     (("-l", "--lang"), Message.CLI_LANG_OPTION_HELP, {}),
+    (("--no-rc",), Message.STREAM_NO_RC_HELP, {"action": "store_true"}),
+    (
+        ("--escape-delay",),
+        Message.STREAM_ESCAPE_DELAY_HELP,
+        {"type": float, "metavar": "SECONDS"},
+    ),
     (("--shell",), Message.STREAM_SHELL_HELP, {"metavar": "SHELL"}),
     (("--cwd",), Message.STREAM_CWD_HELP, {"type": Path, "metavar": "DIR"}),
     (
@@ -59,7 +63,7 @@ OPTIONS = (
     (
         ("--log-level",),
         Message.STREAM_LOG_LEVEL_HELP,
-        {"type": str.upper, "choices": tuple(LOG_LEVELS), "default": DEFAULT_LOG_LEVEL},
+        {"type": str.upper, "choices": tuple(LOG_LEVELS)},
     ),
 )
 
@@ -99,18 +103,17 @@ def report_logs(records, logger):
 
 
 def parse(argv=None):
-    """Load settings paths and translations without creating files or loading plugins."""
+    """Resolve CLI over ish rc settings; queries never execute the Python rc."""
     bootstrap = Parser(prog=PROGRAM, add_help=False, allow_abbrev=False)
     bootstrap.add_argument("--home", type=Path)
     bootstrap.add_argument("--lang", "-l")
     first, _ = bootstrap.parse_known_args(argv)
-    if first.home is not None:
-        try:
+    try:
+        config.reset()
+        if first.home is not None:
             config.ISH_HOME = _path(first.home)
-        except (OSError, ValueError) as error:
-            bootstrap.error(
-                i18n.get(Message.CLI_HOME_ERROR, path=first.home, error=error)
-            )
+    except (OSError, ValueError) as error:
+        bootstrap.error(i18n.get(Message.CLI_HOME_ERROR, path=first.home, error=error))
     i18n.base_path = config.LANG_DIR
     # Locale messages are needed to construct the parser. Hold their diagnostics
     # until the full CLI has selected a log level and decided whether to execute.
@@ -130,12 +133,18 @@ def parse(argv=None):
     )
     parser._optionals.title = i18n.get(Message.CLI_OPTIONS_TITLE)
     parser._positionals.title = i18n.get(Message.CLI_ARGUMENTS_TITLE)
+    plugins = parser.add_mutually_exclusive_group()
+    plugins.add_argument(
+        "--no-plugins",
+        action="store_true",
+        help=i18n.get(Message.STREAM_NO_PLUGINS_HELP),
+    )
     for names, message, settings in OPTIONS:
         settings = dict(settings)
         if names == ("--log-file",):
             settings["const"] = config.LOG_FILE
-        parser.add_argument(*names, help=i18n.get(message), **settings)
-    parser.set_defaults(shell=login_shell(), cwd=Path.cwd(), plugin=[])
+        target = plugins if names == ("--plugin",) else parser
+        target.add_argument(*names, help=i18n.get(message), **settings)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--login", action="store_true", help=i18n.get(Message.STREAM_LOGIN_HELP)
@@ -147,25 +156,42 @@ def parse(argv=None):
         help=i18n.get(Message.STREAM_SHELL_ARG_HELP),
     )
     args = parser.parse_args(argv)
-    args.shell_args = list(
-        LOGIN_ARGS
-        if args.login
-        else args.shell_arg
-        if args.shell_arg is not None
-        else INTERACTIVE_ARGS
-    )
+    information = args.help or args.version or args.diagnose
     try:
+        # Reject a non-terminal launch before running arbitrary user initialization.
+        if not information:
+            terminal(parser)
+        selected = Settings() if information or args.no_rc else load(config.RC_FILE)
         for name in PATH_OPTIONS:
             value = getattr(args, name)
             if value is not None:
                 setattr(args, name, _path(value))
+        if args.shell is not None and ("/" in args.shell or args.shell.startswith("~")):
+            args.shell = os.path.abspath(os.path.expanduser(args.shell))
+        for name in selected.__dataclass_fields__:
+            option = "plugin" if name == "plugins" else name
+            value = getattr(args, option, None)
+            if value is not None:
+                setattr(selected, name, value)
+        if args.login:
+            selected.shell_args = list(LOGIN_ARGS)
+        elif args.shell_arg is not None:
+            selected.shell_args = args.shell_arg
+        if args.no_plugins:
+            selected.plugins = []
+        selected.validate(config.ISH_HOME)
+        if selected.lang is not None and selected.lang != first.lang:
+            i18n.load(selected.lang, create=False, logger=startup_logger)
+        for name in selected.__dataclass_fields__:
+            option = "plugin" if name == "plugins" else name
+            setattr(args, option, getattr(selected, name))
     except (OSError, ValueError) as error:
         parser.error(str(error))
     args.home = config.ISH_HOME
     args.lang = i18n.current_lang
     args.log_records = tuple(records.buffer)
     records.close()
-    if args.help or args.version or args.diagnose:
+    if information:
         with session_logging(level=args.log_level) as log:
             report_logs(args.log_records, log.logger)
     if args.help:
@@ -191,6 +217,9 @@ def diagnose(args):
     values.update(
         {
             Message.STREAM_DIAGNOSE_CWD: args.cwd,
+            Message.CLI_DIAGNOSE_RC: config.RC_FILE,
+            Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(Message.STREAM_RC_NOT_EXECUTED),
+            Message.STREAM_DIAGNOSE_ESCAPE_DELAY: args.escape_delay,
             Message.STREAM_DIAGNOSE_ARGS: shlex.join(args.shell_args),
             Message.CLI_DIAGNOSE_PLUGINS: args.plugin_dir or extensions.DIRECTORY,
             Message.STREAM_DIAGNOSE_PLUGIN_LIB: args.plugin_lib_dir
@@ -209,12 +238,16 @@ def diagnose(args):
     )
 
 
-def command(parser, args):
-    """Validate execution prerequisites after read-only information flags finish."""
+def terminal(parser):
+    """Require a controlling terminal before executing user startup code."""
     if os.name != "posix":
         parser.error(i18n.get(Message.STREAM_PLATFORM_ERROR))
     if not os.isatty(0) or not os.isatty(1):
         parser.error(i18n.get(Message.STREAM_TTY_ERROR))
+
+
+def command(parser, args):
+    """Resolve the chosen shell after read-only queries and rc evaluation finish."""
     executable = shutil.which(args.shell)
     if executable is None:
         parser.error(i18n.get(Message.STREAM_SHELL_ERROR, shell=args.shell))

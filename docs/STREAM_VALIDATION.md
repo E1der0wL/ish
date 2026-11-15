@@ -8,6 +8,81 @@ production readiness를 화면 문자열이나 무출력 시간으로 추정하�
 prompt-toolkit 3.0.53이다. Windows Terminal의 설치 package 버전은
 1.24.12741.0이며 실행 파일의 ProductVersion은 1.24.261001001이다.
 
+## ish 2.0.0: ESC·설정·제품 진입점 검증
+
+2026-11-16 검증. 제품 이름은 `ish`, 버전은 `2.0.0`이다.
+`ish` console script와 독립 배포 실행기는 `ish.stream`을 실행한다.
+`ish2`, `ish-stream`, `ish-legacy` 실행기나 구버전 설정 호환 계층은 제공하지 않는다.
+기본 설정 경로는 기존 공통 Config의 `~/ish/.ishrc.py`를 재사용한다.
+
+- ESC/Alt 바이트 판별 기본 대기는 0.05초다. parser가 idle flush에서 정확히
+  Escape 하나를 반환한 경우에만 즉시 취소하며, PTK의 별도 1초 대기를 반복하지
+  않는다. Alt 조합, 불완전 CSI, 붙여넣기와 플러그인의 다중 키 바인딩은 유지한다.
+  실제 PTK Panel에서 5회 측정한 취소 시간은 **51.362–53.258ms**였다.
+  물리 키보드부터 화면 갱신까지의 전체 지연 측정은 아니다.
+- `.ishrc.py`의 `config`에 시작 설정과 `plugins` 목록을 저장한다. 다음 실행에도
+  같은 파일을 읽고 기존 PluginManager가 선택된 플러그인을 로드한다.
+  CLI는 해당 설정을 덮어쓰며 `--plugin`은 파일의 목록을 대체한다.
+  `--no-rc`와 `--no-plugins`, 잘못된 설정의 시작 전 차단, 파일/CLI 상대 경로의
+  기준, symlink 실행 이름 보존을 실제 프로세스와 파일 결과로 확인했다.
+- help/version/diagnose는 기존에 있는 Python rc도 실행하지 않는다.
+  설정·플러그인·로그 파일 생성 여부를 별도 프로세스와 설치 wheel에서 확인했다.
+- 새 진입점이 쓰지 않는 `ish_forward` 및 preload helper 컴파일은 배포에서
+  제거했다. README를 현재 실행·설정·플러그인·진단 사용법 중심으로 바꿨다.
+
+보강 후 다른 담당자가 입력 처리, 설정/시작, 패키징, 호스트 검증기를 교차
+검토했다. 검토에서 발견한 rc 디렉터리 실행, 상대 셸 경로 처리, 테스트의
+PTY EOF 직후 조기 종료 판정 문제를 수정하고 재현 회귀를 추가했다.
+마지막 제품 코드 검토에서는 추가 결함을 발견하지 못했다.
+
+| 범위 | 최종 결과 |
+| --- | --- |
+| `tools/check_stream.py` 전체 회귀 | **360/360**, skip 0, 175.084초 |
+| Ruff lint·format | 68개 파일 통과 |
+| Bash 5.1.16 adapter·CLI | **40/40**, 25.649초 |
+| Bash 5.2.37 adapter·CLI | **40/40**, 25.973초 |
+| 설치 wheel | 버전·진입점·한국어 조회·rc 미실행·리소스 14개·provider/builder 3개 통과 |
+| CPython 포함 독립 배포 | GCC·CC·Clang·G++ 없는 PATH에서 빌드 및 재배치 실행 통과 |
+| 실제 Windows Terminal/WSL | 아래 12개 조합 모두 첫 실행 통과 |
+
+첫 전체 회귀는 번역 테스트가 이전 `ish-stream` 이름을 기대하여 359/360이었다.
+제품명에 맞게 독립적인 기대 문자열을 수정한 뒤 전체 360개를 다시 실행했다.
+첫 실패 기록도 `.cache/ish2/regression-initial.log`에 보존했다.
+같은 디렉터리에 최종 `regression-final.log`, `bash-compat.log`,
+`package-smoke-final.log`, `standalone-build-final.log`, `esc-results.json`이 있다.
+이 임시 증거 디렉터리 이름은 제품 이름이 아니다.
+
+### 실제 Windows Terminal의 설정·입력 검증
+
+Windows Terminal 1.24.12741.0의 기존 창에 공식 `wt.exe` CLI로 검증 탭을 열었다.
+`tests/stream_matrix.py`가 실제 호스트의 응답을 받았으며, CPR을 합성하지 않았다.
+각 실행의 `WT_SESSION`, 실제 argv, 설정 경로와 출력은 `host-final/`에 기록했다.
+
+| 셸 | rc 선택 플러그인 | UI 없는 기본형 | 비동기 오류 복구 | 이전 factory 작업 실패 격리 |
+| --- | --- | --- | --- | --- |
+| tcsh 6.24.13 | 통과 | 통과 | 통과 | 통과 |
+| Bash 5.3.9 | 통과 | 통과 | 통과 | 통과 |
+| zsh 5.9 | 통과 | 통과 | 통과 | 통과 |
+
+플러그인 3개 조합은 CLI의 `--plugin`·`--plugin-dir` 없이 실제 `.ishrc.py`만으로
+선택했다. Alt+B 편집 결과 `팝업 값 one Xtwo`를 파일로 확인했고, ESC 취소 데이터가
+셸에 실행되지 않으며 다음 native 명령만 파일을 만드는 것을 확인했다.
+ESC 전송부터 새 primary 이벤트까지 tcsh **84.84ms**, Bash **75.08ms**,
+zsh **74.54ms**였다. 이는 테스트가 PTY에 보낸 바이트 기준의 측정이다.
+
+기본·플러그인 조합은 native continuation, 공백·Unicode·도구 이름이 들어간
+heredoc, Vim 저장 파일, 실제 호스트의 CPR/DSR/scroll-margin 응답을 확인했다.
+크기 변경은 창 드래그 대신 `wt.exe split-pane`으로 만들었다.
+**120×30 → 82×30** 변화가 호스트와 실행 중인 foreground 프로그램 양쪽에서
+확인된 뒤 외부 검증 gate를 해제했다. 제품 readiness를 timeout으로 판단하지 않는다.
+검증 후 임시 분할 창과 검증 탭은 종료되어 원래 터미널 탭으로 돌아왔다.
+
+12개 모두 종료 코드 0이며 parent termios가 복원됐다. 별도 증거 검사에서
+native 결과 파일 **33개**, 팝업 반환값, 취소 입력 누출 부재를 다시 확인했다.
+검증 당시 소스 206개 SHA256이 작업 폴더와 모두 일치했다. 이후에는 검증 기록과
+README의 구버전 호환 오해를 없애는 표현만 정리했다. 실제 GUI 키보드 인코딩, 화면 픽셀·SIXEL 이미지 시각 확인은 하지 않았고,
+원격 GitHub Actions도 실행하지 않았다.
+
 ## 팝업 생성 작업·검증 경로 보강과 교차 검토
 
 이번 단계는 보강 → 다른 담당자의 검토 → 추가 결함 보강 → 재검토 순서로

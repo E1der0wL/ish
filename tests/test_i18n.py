@@ -89,8 +89,8 @@ class LanguageTests(unittest.TestCase):
         self.language.load("en", create=False)
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
         self.assertEqual(
-            self.language.get(Message.STREAM_VERSION, version="1.2.1"),
-            "ish-stream 1.2.1",
+            self.language.get(Message.STREAM_VERSION, version="2.0.0"),
+            "ish 2.0.0",
         )
 
     def test_unknown_language_uses_english_without_creating_files(self):

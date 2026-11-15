@@ -11,16 +11,34 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
 from stream_host import BAR, HostRun
-from stream_plugins import copy_plugins
+from stream_plugins import SHELL_PLUGINS, copy_plugins
 
 SHELLS = ("tcsh", "bash", "zsh")
 SCENARIOS = ("plugins", "plain", "async-error", "factory-task")
 F2 = b"\x1bOQ"
 FAILURE = "STREAM_ASYNC_FAILURE"
+ESCAPE_RETURN_SECONDS = 1.0
+SETTINGS_PLUGIN = """
+from pathlib import Path
+PLUGIN_META = {"version": "1", "requirements": ["stream_popup"], "dependencies": []}
+STREAM_API = 1
+
+def setup(api):
+    sample = api.get("stream_popup")
+    def create(accept):
+        def record(value):
+            accepted = accept(value)
+            if accepted and value is not None:
+                Path.home().joinpath("popup-value").write_text(value)
+            return accepted
+        return sample.create(record)
+    api.set_popup(create)
+"""
 ASYNC_PLUGIN = """
 import asyncio
 from pathlib import Path
@@ -150,6 +168,63 @@ class AutomaticRun(HostRun):
         )
 
 
+class SettingsRun(AutomaticRun):
+    """Exercise persisted plugin selection and popup keys through the host path."""
+
+    def scenario(self):
+        """Keep the native scenario and include its new ESC recovery file in evidence."""
+        super().scenario()
+        self.result["native_files"].append("escape-result")
+
+    def popup(self):
+        """Record Alt editing, bounded ESC return and the final native consumer."""
+        offset = len(self.output)
+        self.send(F2)
+        self.expect(b"Plugin popup", offset)
+        log_offset = len((self.directory / "session.log").read_text())
+        self.send("팝업 값 one two".encode() + b"\x1bbX\r")
+        value = self.home / "popup-value"
+        self.wait(value.exists, "rc-selected popup accepted its edited value")
+        assert value.read_text() == "팝업 값 one Xtwo", value.read_text()
+        self.primary_after(log_offset)
+        offset = len(self.output)
+        self.send(F2)
+        self.expect(b"Plugin popup", offset)
+        self.send(b"touch escape-leak")
+        log_offset = len((self.directory / "session.log").read_text())
+        started = time.monotonic()
+        self.send(b"\x1b")
+        self.primary_after(log_offset)
+        elapsed = time.monotonic() - started
+        assert elapsed < ESCAPE_RETURN_SECONDS, elapsed
+        self.command("echo restored > escape-result")
+        assert (self.home / "escape-result").read_text() == "restored\n"
+        assert value.read_text() == "팝업 값 one Xtwo"
+        assert not (self.home / "escape-leak").exists()
+        self.result["popup_keys"] = {
+            "value": value.read_text(),
+            "escape_return_seconds": elapsed,
+            "native_file": "escape-result",
+        }
+        self.gate("rc-popup-alt-and-escape", **self.result["popup_keys"])
+
+
+def write_settings(directory: Path, plugins: Path) -> Path:
+    """Save the same public Python settings reused by every selected host run."""
+    path = directory / "settings/.ishrc.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    selected = ["stream_bar", "recorded_popup", *SHELL_PLUGINS]
+    path.write_text(
+        'config.lang = "ko"\n'
+        f"config.plugins = {selected!r}\n"
+        f"config.plugin_dir = {os.path.relpath(plugins, path.parent)!r}\n"
+        'config.log_file = "../session.log"\n'
+        'config.log_level = "DEBUG"\n'
+        "config.escape_delay = 0.05\n"
+    )
+    return path
+
+
 class AsyncFailureRun(AutomaticRun):
     """Keep the native shell usable after a current popup binding fails."""
 
@@ -238,12 +313,18 @@ def main(argv=None):
         parser.error("--require-resize needs a plugins or plain scenario")
     directory.mkdir(parents=True, exist_ok=True)
     plugins = copy_plugins(directory / "plugins")
+    (plugins / "recorded_popup").mkdir()
+    (plugins / "recorded_popup/recorded_popup.py").write_text(SETTINGS_PLUGIN)
     error_plugins = copy_plugins(directory / "async-plugins")
     (error_plugins / "stream_popup/stream_popup.py").write_text(ASYNC_PLUGIN)
     factory_plugins = copy_plugins(directory / "factory-plugins")
     (factory_plugins / "stream_popup/stream_popup.py").write_text(FACTORY_PLUGIN)
     providers = {"async-error": error_plugins, "factory-task": factory_plugins}
-    runners = {"async-error": AsyncFailureRun, "factory-task": FactoryTaskRun}
+    runners = {
+        "plugins": SettingsRun,
+        "async-error": AsyncFailureRun,
+        "factory-task": FactoryTaskRun,
+    }
     results = []
     resize_pending = args.require_resize
     for shell in shells:
@@ -251,8 +332,15 @@ def main(argv=None):
             name = f"{shell}-{scenario}"
             case = directory / name
             selected = scenario != "plain"
-            extra = ("--lang", "ko", "--home", str(case / "settings"))
-            if selected:
+            config_file = (
+                write_settings(case, plugins) if scenario == "plugins" else None
+            )
+            extra = (
+                ()
+                if config_file
+                else ("--lang", "ko", "--home", str(case / "settings"))
+            )
+            if selected and config_file is None:
                 extra += (
                     "--log-level",
                     "DEBUG",
@@ -265,6 +353,7 @@ def main(argv=None):
                 selected,
                 shell,
                 plugin_dir=providers.get(scenario, plugins),
+                config_file=config_file,
                 extra_args=extra,
                 require_resize=resize,
             )

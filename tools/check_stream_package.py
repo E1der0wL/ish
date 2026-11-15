@@ -1,4 +1,4 @@
-"""Build and test the installed stream wheel outside the source tree.
+"""Build and test the installed ish wheel outside the source tree.
 
 Run with the project's Python and uv available. Runtime dependencies are exported
 from uv.lock; wheel construction uses the declared PEP 517 build environment.
@@ -32,6 +32,7 @@ INTEGRATIONS = (
 )
 RESOURCES = (
     "ish/lang/locales/ko.json",
+    "ish/stream/settings.py",
     *(f"ish/stream/bundled/{name}/{name}.py" for name in PROVIDERS),
     *(f"ish/stream/integrations/{name}" for name in INTEGRATIONS),
 )
@@ -53,6 +54,7 @@ package = Path(ish.__file__).resolve().parent
 prefix = Path(sys.prefix).resolve()
 assert package.is_relative_to(prefix), ('ish imported outside installation', package)
 assert importlib.metadata.version('ish') == expected['version']
+assert ish.__version__ == expected['version']
 for name, digest in expected['resources'].items():
     path = package.parent / name
     assert path.resolve().is_relative_to(package), ('resource escaped package', name)
@@ -162,11 +164,11 @@ def check(uv: str, work: Path) -> None:
     )
 
     settings = outside / "absent-settings"
-    executable = installation / "bin/ish-stream"
+    executable = installation / "bin/ish"
     for option, marker in (
         ("--help", "사용법:"),
-        ("--version", "ish-stream " + expected["version"]),
-        ("--diagnose", "ish-stream 환경 진단"),
+        ("--version", "ish " + expected["version"]),
+        ("--diagnose", "ish 환경 진단"),
     ):
         result = run(
             [str(executable), "--home", str(settings), "--lang", "ko", option],
@@ -180,8 +182,38 @@ def check(uv: str, work: Path) -> None:
             )
         if option == "--help" and "--demo" in result.stdout:
             raise RuntimeError("Installed help still exposes the removed demo option")
+    # Queries must not execute executable Python configuration, even when it exists.
+    settings.mkdir()
+    marker = outside / "rc-executed"
+    (settings / ".ishrc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed')\n"
+        "raise RuntimeError('queries executed configuration')\n",
+        encoding="utf-8",
+    )
+    for option in ("--help", "--version", "--diagnose"):
+        result = run(
+            [str(executable), "--home", str(settings), "--lang", "ko", option],
+            cwd=outside,
+            installed=True,
+            capture_output=True,
+        )
+        if (
+            marker.exists()
+            or result.stderr
+            or sorted(settings.iterdir()) != [settings / ".ishrc.py"]
+        ):
+            raise RuntimeError(f"Installed {option} executed or modified settings")
+    for removed in ("ish-stream", "ish2", "ish-legacy"):
+        if (installation / "bin" / removed).exists():
+            raise RuntimeError(
+                f"Installed package still exposes the old {removed} command"
+            )
+    for retained in ("ish-vt",):
+        if not (installation / "bin" / retained).is_file():
+            raise RuntimeError(f"Installed package lost the {retained} command")
     print(
-        "Installed ish-stream entry point, Korean help/diagnosis and resources passed."
+        "Installed ish entry point, read-only queries, Korean help/diagnosis and resources passed."
     )
 
 
@@ -195,7 +227,7 @@ def main() -> int:
         print("Stream package checks require uv", file=sys.stderr)
         return 2
     try:
-        with tempfile.TemporaryDirectory(prefix="ish-stream-package-") as directory:
+        with tempfile.TemporaryDirectory(prefix="ish-package-") as directory:
             check(uv, Path(directory))
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"Stream package check failed: {error}", file=sys.stderr)

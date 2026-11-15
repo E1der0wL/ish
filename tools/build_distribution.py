@@ -1,7 +1,7 @@
 """Package a relocatable Linux x86_64 CPython installation and the locked ish wheel.
 
-Run with tools/build.sh. Build on the oldest glibc host you support: compiling the
-native helpers on a newer system does not make them backward compatible.
+Run with tools/build.sh. The pinned runtime determines platform and libc
+requirements; dependencies come from locked wheels without compiling shell helpers.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
+DOCUMENTATION_PATHS = ("README.md", "docs", "examples")
+LAUNCHERS = ("ish",)
 SOURCE_PATHS = (
     "src",
     "pyproject.toml",
@@ -29,6 +31,7 @@ SOURCE_PATHS = (
     "tools/python-runtime.toml",
     "tools/ish-launcher.sh",
     "tools/build_distribution.py",
+    *DOCUMENTATION_PATHS,
 )
 SOURCE_CACHE_DIRS = frozenset(("__pycache__", ".pytest_cache", ".ruff_cache"))
 SOURCE_BINARY_SUFFIXES = frozenset(
@@ -68,6 +71,25 @@ def sha256(path: Path) -> str:
     """Hash large runtime archives without retaining them in memory."""
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def copy_documentation(root: Path, destination: Path) -> None:
+    """Keep the user guide and its local links usable in a relocated installation."""
+    for name in DOCUMENTATION_PATHS:
+        source = root / name
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(
+                source,
+                target,
+                ignore=shutil.ignore_patterns(
+                    *SOURCE_CACHE_DIRS,
+                    *(f"*{suffix}" for suffix in SOURCE_BINARY_SUFFIXES),
+                ),
+            )
+        else:
+            shutil.copy2(source, target)
 
 
 def runtime_archive(spec: dict, supplied: Path | None, cache: Path) -> Path:
@@ -157,8 +179,6 @@ def require_case_sensitive_output(destination: Path) -> None:
 def main() -> None:
     """Build in a private staging directory and publish only a verified installation."""
     from ish.runtime.distribution import RUNTIME_MARKER
-    from ish.shell.adapter import preload_libraries
-    from ish.shell.integration import build_binary
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -187,7 +207,7 @@ def main() -> None:
         parser.error(f"Build on Linux x86_64 with Python {spec['version']}")
     if (root / ".python-version").read_text().strip() != spec["version"]:
         parser.error(".python-version and tools/python-runtime.toml must agree")
-    for tool in ("uv", "gcc"):
+    for tool in ("uv",):
         if not shutil.which(tool):
             parser.error(f"Missing build tool: {tool}")
     project = tomllib.loads((root / "pyproject.toml").read_text())
@@ -303,23 +323,20 @@ def main() -> None:
             cwd=root,
             check=True,
         )
-        if not build_binary(directory=bundle / "libexec"):
-            raise RuntimeError("Could not compile ish_forward")
-        for library in preload_libraries():
-            if not build_binary(directory=bundle / "libexec", library=library):
-                raise RuntimeError(f"Could not compile {library.binary_name}")
         relocate_python_scripts(bundle / "python")
-        shutil.copy2(root / "tools/ish-launcher.sh", bundle / "ish")
-        (bundle / "ish").chmod(0o755)
+        for name in LAUNCHERS:
+            shutil.copy2(root / f"tools/{name}-launcher.sh", bundle / name)
+            (bundle / name).chmod(0o755)
         (bundle / "python" / RUNTIME_MARKER).write_text(
             json.dumps(spec, indent=2) + "\n"
         )
-        shutil.copy2(root / "README.md", bundle / "README.md")
+        copy_documentation(root, bundle)
         for pattern in ("LICENSE", "LICENSE.*", "COPYING", "COPYING.*"):
             for license_path in root.glob(pattern):
                 shutil.copy2(license_path, bundle / license_path.name)
         shutil.copy2(requirements, bundle / "requirements.txt")
-        subprocess.run([str(bundle / "ish"), "--version"], cwd=work, check=True)
+        for name in LAUNCHERS:
+            subprocess.run([str(bundle / name), "--version"], cwd=work, check=True)
         # Capture the actual installed inventory instead of importing packages.
         packages = json.loads(
             subprocess.check_output(
@@ -346,13 +363,15 @@ def main() -> None:
         }
         destination.mkdir(parents=True)
         shutil.copytree(bundle, destination / "bin", symlinks=True)
-        (destination / "ish").symlink_to("./bin/ish")
-        shutil.copy2(root / "README.md", destination / "README.md")
+        for name in LAUNCHERS:
+            (destination / name).symlink_to(f"./bin/{name}")
+        copy_documentation(root, destination)
         for pattern in ("LICENSE", "LICENSE.*", "COPYING", "COPYING.*"):
             for license_path in root.glob(pattern):
                 shutil.copy2(license_path, destination / license_path.name)
         (destination / "build.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        subprocess.run([str(destination / "ish"), "--version"], cwd=work, check=True)
+        for name in LAUNCHERS:
+            subprocess.run([str(destination / name), "--version"], cwd=work, check=True)
     print(f"Distribution: {destination}", flush=True)
 
 

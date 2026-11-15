@@ -30,6 +30,7 @@ def main(argv=None):
                     library_dir=options.plugin_lib_dir,
                     logger=log.logger,
                     report=log.flush,
+                    escape_delay=options.escape_delay,
                 )
                 result = asyncio.run(app.run())
                 if app.error:

@@ -3,59 +3,33 @@
 브랜치: `experiment/prompt-stream`. 기존 `experiment/ghostty-ptk`와
 `refactor/editor-request` 폴더·브랜치는 변경하지 않는다. `2a6c9d4`는
 기존 terminal 실험의 미커밋 구현을 새 브랜치에 보존한 기준 커밋이다.
-`ish`와 `ish-vt`는 기존 진입점이며 이번 실험은 `ish-stream`에만 적용한다.
+terminal 실험은 별도 `ish-vt` 진입점이다. 출력 직접 전달 구현은 제품 진입점
+`ish`와 버전 2.0.0을 사용하며 이전 버전용 호환 진입점은 제공하지 않는다.
 
 ## 실행과 시작 옵션
 
-Linux/WSL의 대화형 터미널에서 ish가 설치된 Python 환경의 `ish-stream`을 실행한다.
-저장소에서 실행할 때는 저장소 루트에서 `PYTHONPATH=src python -m ish.stream`으로
-대체할 수 있다. 실행 환경은 프로젝트의 Python·의존성 요구사항을 충족해야 한다.
+제품 실행 명령은 `ish`다. `ish-vt`는 별도 터미널 에뮬레이션 실험이며,
+내부 Python 모듈 `ish.stream`과 wire/API 이름은 호환을 위해 유지한다.
+Linux/WSL의 대화형 터미널에서 `ish --shell tcsh`처럼 실행한다.
+설치·시작 옵션·로그·진단은 [README](../README.md)를 따른다.
 
-```sh
-# 추가 UI·키 바인딩·셸 hook 없는 기본형
-ish-stream
-ish-stream --shell tcsh --cwd "$HOME"
+ish는 시작할 때 기본 `~/ish/.ishrc.py` 또는 `--home DIR`의 `.ishrc.py`를
+읽는다. 이전 버전의 설정을 자동 변환하거나 호환 API로 실행하지 않는다.
+파일의 `config`는 시작 옵션과 명시적 플러그인 선택을 선언하는 객체이며,
+기존 Prompt 편집기 객체는 제공하지 않는다. CLI가 같은 설정을 덮어쓰고,
+`--no-rc`는 파일 전체, `--no-plugins`는 플러그인 선택만 무시한다.
+파일에 저장한 선택을 매번 다시 읽으며, 플러그인 로딩은 기존 PluginManager가
+계속 소유한다. 설정이나 플러그인의 변경은 새 세션에만 적용한다.
 
-# 대화형 세션을 시작하지 않는 조회
-ish-stream --lang ko --help
-ish-stream --version
-ish-stream --shell bash --diagnose
+`--help`, `--version`, `--diagnose`는 설정 Python 코드·플러그인·셸을 실행하지
+않고 설정·로그 파일을 만들지 않는다. 진단은 CLI/기본값과 리소스 경로를 보고하며
+파일 설정의 실행 결과나 플러그인 지원 여부를 검증하지 않는다. 조회 언어는
+`--lang`으로 지정한다. 파일 로그는 진단용이며 native 입력·출력 bytes를 수집하지
+않는다. 콘솔 로그는 셸 시작 전이나 터미널 복원 후에만 출력한다.
 
-# native 로그인 셸 / 명시적인 native 시작 인수
-ish-stream --shell tcsh --login
-ish-stream --shell bash --shell-arg=--noprofile --shell-arg=--norc --shell-arg=-i
-
-# 선택적인 UTF-8 파일 로그
-ish-stream --shell bash --home "$HOME/ish-stream" --log-file --log-level INFO
-```
-
-| 옵션 | 동작 |
-| --- | --- |
-| `--shell SHELL` | 실행 파일 이름 또는 경로를 선택한다. 생략하면 계정의 passwd 셸, `SHELL`, `sh` 순으로 선택한다. |
-| `--cwd DIR` | 셸의 시작 디렉터리다. 생략하면 현재 디렉터리다. |
-| `--login` | 기본 `-i` 대신 `-l` 하나를 전달한다. `--shell-arg`와 함께 쓸 수 없다. |
-| `--shell-arg ARG` | 반복한 값을 순서대로 전달하며 기본 `-i`를 대체한다. `-`로 시작하는 값은 `--shell-arg=-f`처럼 쓴다. |
-| `--home DIR` | ish 설정·언어 파일·기본 플러그인 library·기본 로그 경로의 기준이다. 셸의 `HOME`은 바꾸지 않는다. |
-| `--lang CODE`, `-l CODE` | 기존 언어 로더를 사용한다. 영어 기본 문구, 제공되는 한국어 번역, 사용자 언어 파일을 사용한다. `-l`은 언어 옵션이며 로그인은 `--login`이다. |
-| `--help`, `--version`, `--diagnose` | 플러그인이나 셸을 실행하지 않으며 설정·로그 파일을 만들지 않는 조회다. 대화형 TTY도 필요하지 않다. |
-| `--log-file [PATH]` | 선택하면 UTF-8 append 파일 로그를 켠다. 경로를 생략하면 `config.LOG_FILE`, 기본적으로 `~/ish/.ish.log`를 사용한다. 옵션 자체를 생략하면 파일 로그는 없다. 일반 파일만 허용하고 터미널 장치·FIFO는 거부한다. |
-| `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` 중 선택한다. 기본값은 `WARNING`이다. |
-
-로그는 진단용이다. 본체는 native 입력·출력 bytes를 기록하지 않는다. 파일 로그는
-발생 시 기록하고, 콘솔 진단은 셸 시작 전 또는 터미널 복원 후에만 출력하여 실행 중
-화면에 끼어들지 않는다. 진단 조회는 선택한 경로와 환경을 보여주지만 플러그인의 실행
-가능성이나 셸 연동 지원 여부를 검증하지 않는다.
-
-언어 선택은 ish의 도움말·진단·사용자 안내에 적용한다. 셸과 외부 프로그램의
-출력 언어는 바꾸지 않으며, Python argparse의 일부 상세 오류·기술 로그·외부
-플러그인의 자체 메시지는 영어로 남을 수 있다. 플러그인은 공통 `get_logger()`를
-사용해야 이 로그 정책을 따른다. 플러그인의 직접 `print()`나 별도 logger까지
-가로채지는 않는다. 로그 회전·보관 기간 정책은 이번 범위에 포함하지 않는다.
-
-`ish-stream`은 기존 ish의 `.ishrc.py`를 실행하지 않는다. 기본형은 명시적인
-플러그인 선택이 없으며 기존 셸의 rc 파일과 native 입력 경로를 사용한다.
-로그인이나 사용자 지정 시작 인수가 선택된 UI provider의 지원 범위를 벗어나면,
-원래 인수를 보존하여 **UI 없이 native 셸을 한 번만 시작**한다.
+플러그인 선택이 없는 기본형은 셸 hook 없이 사용자 셸을 시작한다. 로그인이나
+사용자 지정 시작 인수가 UI provider의 지원 범위를 벗어나면 원래 argv/env를
+보존하여 UI 없이 native 셸을 한 번만 시작한다.
 
 ## 요청 상태와 검증 명령
 
@@ -86,7 +60,7 @@ uv run --no-sync python tools/check_stream_package.py
 Linux/WSL에서 Bash·zsh·tcsh·Vim이 필요하다. `--lint-only` 또는 `--tests-only`로
 검사 단계를 나눌 수 있다. 필수 환경·모듈 누락, 빈 테스트, import 오류, skip은
 실패로 처리한다. 새 `test_stream_*.py`는 자동 발견하고, 기존 공통 모듈 회귀도
-함께 실행한다. 현재 유지 대상 stream 20개·공통 7개 모듈은 모두 필수다.
+함께 실행한다. 검사기의 유지 대상 stream·공통 모듈은 모두 필수다.
 유지 대상 모듈을 추가할 때는 필수 목록과 독립 누락 검사도 함께 갱신한다.
 검사 범위는 실행기 한 곳에 정의하며 `.gitattributes`는 Python의
 LF 줄바꿈을 유지한다.
@@ -104,7 +78,12 @@ uv run --no-sync python tests/stream_matrix.py .cache/host-new-run --require-res
 ```
 
 Bash/zsh/tcsh의 기본형·샘플 플러그인·비동기 오류 복구·이전 factory 작업 실패
-12개 조합을 순서대로 검사한다. 첫 `STREAM_NATIVE_READY`에서 창 크기를 바꾸고,
+12개 조합을 순서대로 검사한다. 플러그인 조합은 실제 `.ishrc.py`의 선택을
+읽으며 CLI에 `--plugin`을 전달하지 않는다. 샘플 팝업을 재사용해 Alt+B 편집
+결과를 파일로 확인하고, Esc 취소 후 native 복귀 시간과 후속 명령의 파일 결과도
+기록한다. 이 시간은 PTY에서 Esc를 보낸 뒤 native 복귀 이벤트까지의 관측이며,
+GUI 키 입력·픽셀 응답 시간을 뜻하지 않는다.
+첫 `STREAM_NATIVE_READY`에서 창 크기를 바꾸고,
 드래그를 끝낸 뒤 Enter를 누르면 이후 단계는 자동 진행한다. `--shell`과
 `--scenario`로 범위를 제한할 수 있고, 재시도에는 반드시 새 증거 폴더를 사용한다.
 이 실행기는 실제 파일·PTY·호스트 응답을 검사하며 픽셀·GUI 키보드 검사는 아니다.
@@ -123,10 +102,10 @@ runner와 설치 방식은 [GitHub 공식 문서](https://docs.github.com/en/act
 아래 복사 명령은 대상 디렉터리가 아직 없을 때 실행하는 예다.
 
 ```sh
-cp -R src/ish/stream/bundled "$HOME/ish-stream-plugins"
-cp -R examples/stream_plugins/stream_bar "$HOME/ish-stream-plugins/"
-cp -R examples/stream_plugins/stream_popup "$HOME/ish-stream-plugins/"
-ish-stream --shell tcsh --plugin-dir "$HOME/ish-stream-plugins" \
+cp -R src/ish/stream/bundled "$HOME/ish-plugins"
+cp -R examples/stream_plugins/stream_bar "$HOME/ish-plugins/"
+cp -R examples/stream_plugins/stream_popup "$HOME/ish-plugins/"
+ish --shell tcsh --plugin-dir "$HOME/ish-plugins" \
   --plugin stream_bar --plugin stream_popup --plugin stream_tcsh
 ```
 
@@ -152,7 +131,7 @@ Enter로 값을 반환하거나 Esc/Ctrl+C/Ctrl+D로 닫는다. 팝업 결과는
 
 ```sh
 cp -R src/ish/stream/integrations /원하는/경로/ish-integrations
-ish-stream --shell bash --plugin-dir "$HOME/ish-stream-plugins" \
+ish --shell bash --plugin-dir "$HOME/ish-plugins" \
   --plugin stream_bar --plugin stream_popup --plugin stream_bash \
   --integration-dir /원하는/경로/ish-integrations
 ```
@@ -167,7 +146,7 @@ source하지 않는다. 파일 첫 줄의 `# ish-stream-api: 1`과 `@NAME@` 런�
 전에 발견하여 안내 후 **UI 없는 기본형으로 한 번만 시작**한다. 연동이 없는
 셸 이름도 같은 경로를 사용한다. UI 플러그인을 선택하지 않으면 잘못된 연동 경로도 읽지
 않는다. 사용자가 편집한 스크립트가 이미 실행된 뒤의 임의 문법/동작 오류를
-자동으로 되돌리는 기능은 아니다. 이때는 `--plugin` 없이 연동을 건너뛸 수 있다.
+자동으로 되돌리는 기능은 아니다. 이때는 `--no-plugins`로 연동을 건너뛸 수 있다.
 
 기존 셸의 hook과 정책 변경에는 본체 재빌드가 필요 없다. 기존 공통 통신 계약을
 구현하는 새 셸은 외부 Python provider로 등록할 수 있다. 공통 통신 계약 자체를
@@ -312,7 +291,7 @@ PTY read는 64 KiB씩 수행한다. 팝업 요청 대기 입력이 64 KiB에
 도달하면 외부 입력 read를 멈춰 무제한 버퍼를 만들지 않는다. private 제어
 요청은 1 KiB, private OSC 후보는 256 bytes, 짧은 escape 후보는 128 bytes로
 제한한다. 이 제한을 이미지 payload나 일반 셸 출력 크기 제한으로 사용하지 않는다.
-50 ms의 Escape 구분 지연은 F2와 단독 Escape의 키 인코딩 모호성만 해결하며
+기본 50 ms의 Escape 구분 지연(`config.escape_delay`)은 F2·Alt·단독 Escape의 키 인코딩 모호성만 해결하며
 셸 readiness를 추정하지 않는다. 테스트 deadline은 실패 판정에만 사용한다.
 
 실제 검증 결과와 호스트 화면을 확인하지 못한 범위는

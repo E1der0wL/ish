@@ -660,7 +660,10 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.panel.open_popup()
         await self.frame_matching(lambda value: value.popup)
         self.panel.feed(b"\x1b")
-        await self.frame_matching(lambda value: not value.popup)
+        # This is a user-visible latency budget, independent of the configured
+        # timer. The previous parser + key-binding waits took about 1.5 seconds.
+        async with asyncio.timeout(0.35):
+            await self.frame_matching(lambda value: not value.popup)
         self.assertEqual(self.results, [None])
         for key in (b"\x03", b"\x04"):
             self.panel.open_popup()
@@ -711,6 +714,129 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.remainders, [])
         self.panel.feed(b"X\rTAIL")
         self.assertEqual(self.results, ["one Xtwo"])
+        self.assertEqual(self.remainders, [b"TAIL"])
+
+    async def test_split_alt_and_arrow_keys_retain_editing_and_native_tail(self):
+        """Read boundaries do not turn complete Meta or cursor keys into cancel."""
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"one two\x1b")
+        await asyncio.sleep(0)
+        self.panel.feed(b"bX\x1b[")
+        await asyncio.sleep(0)
+        self.panel.feed(b"DZ\rTAIL\xff")
+        self.assertEqual(self.results, ["one ZXtwo"])
+        self.assertEqual(self.remainders, [b"TAIL\xff"])
+
+    async def test_escape_delay_can_allow_slow_split_alt_input(self):
+        """A longer configured ambiguity window preserves delayed Meta suffixes."""
+        await self.configure(popup=create, escape_delay=0.3)
+        self.panel.show()
+        self.panel.open_popup()
+        await self.frame_matching(lambda value: value.popup)
+        self.panel.feed(b"one two\x1b")
+        await asyncio.sleep(0.1)
+        self.assertTrue(self.panel.popup)
+        self.panel.feed(b"bX\rTAIL")
+        self.assertEqual(self.results, ["one Xtwo"])
+        self.assertEqual(self.remainders, [b"TAIL"])
+
+    async def test_plugin_alt_binding_keeps_custom_result_and_native_suffix(self):
+        """A plugin's Meta binding still wins over the unknown-Meta fallback."""
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("escape", "p")
+            def selected(event):
+                accept("plugin:" + field.text)
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"chosen\x1b")
+        await asyncio.sleep(0)
+        self.panel.feed(b"pNATIVE")
+        self.assertEqual(self.results, ["plugin:chosen"])
+        self.assertEqual(self.remainders, [b"NATIVE"])
+
+    async def test_escape_timeout_does_not_shorten_plugin_key_chords(self):
+        """Ambiguous terminal bytes and deliberate multi-key chords stay separate."""
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("c-x", "c-y")
+            def selected(event):
+                accept("chord")
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        await self.frame_matching(lambda value: value.popup)
+        self.panel.feed(b"\x18")
+        await asyncio.sleep(0.15)
+        self.panel.feed(b"\x19TAIL")
+        self.assertEqual(self.results, ["chord"])
+        self.assertEqual(self.remainders, [b"TAIL"])
+
+    async def test_alt_escape_keeps_the_complete_key_binding(self):
+        """A second Escape completes Meta-Escape instead of cancelling alone."""
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"\x1b\x1b")
+        await asyncio.sleep(0.15)
+        self.assertTrue(self.panel.popup)
+        self.panel.feed(b"value\r")
+        self.assertEqual(self.results, ["value"])
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("escape", "escape")
+            def selected(event):
+                accept("meta-escape")
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        await self.frame_matching(lambda value: value.popup)
+        self.panel.feed(b"\x1b\x1b")
+        async with asyncio.timeout(0.35):
+            await self.frame_matching(lambda value: not value.popup)
+        self.assertEqual(self.results, ["value", "meta-escape"])
+
+    async def test_partial_csi_timeout_is_not_a_standalone_escape(self):
+        """A parser flush yielding Meta-[ remains popup-owned input."""
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"\x1b[")
+        await asyncio.sleep(0.15)
+        self.assertTrue(self.panel.popup)
+        self.panel.feed(b"value\rTAIL")
+        self.assertEqual(self.results, ["value"])
+        self.assertEqual(self.remainders, [b"TAIL"])
+
+    async def test_split_paste_end_survives_the_escape_timeout(self):
+        """A quiet gap inside a paste cannot dispatch its Escape as a cancel."""
+        self.panel.show()
+        self.panel.open_popup()
+        text = "first\nsecond 한글\x03\x04"
+        self.panel.feed(b"\x1b[200~" + text.encode() + b"\x1b[")
+        await asyncio.sleep(0.15)
+        self.assertTrue(self.panel.popup)
+        self.assertEqual(self.results, [])
+        self.panel.feed(b"201~\rTAIL")
+        self.assertEqual(self.results, [text])
         self.assertEqual(self.remainders, [b"TAIL"])
 
     async def test_large_paste_does_not_block_a_pipe_or_reach_shell(self):

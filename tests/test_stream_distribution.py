@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_distribution import source_digest
+from tools.build_distribution import copy_documentation, source_digest
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_INPUTS = (
@@ -17,6 +21,11 @@ BUILD_INPUTS = (
     "tools/python-runtime.toml",
     "tools/ish-launcher.sh",
     "tools/build_distribution.py",
+)
+DOCUMENTS = (
+    "README.md",
+    "docs/STREAM_PLUGINS.md",
+    "examples/stream_plugins/stream_popup/stream_popup.py",
 )
 RESOURCES = (
     "src/ish/stream/integrations/bash.sh",
@@ -37,7 +46,7 @@ class SourceIdentityTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         self.root = self.directory / "project"
-        for relative in (*BUILD_INPUTS, *RESOURCES):
+        for relative in (*BUILD_INPUTS, *RESOURCES, *DOCUMENTS):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / relative).read_bytes())
@@ -115,3 +124,95 @@ class SourceIdentityTests(unittest.TestCase):
         (self.root / "uv.lock").unlink()
         with self.assertRaises(FileNotFoundError):
             source_digest(self.root)
+
+    def test_published_guide_and_examples_change_identity(self):
+        """The artifact identity covers the usage instructions shipped to users."""
+        original = source_digest(self.root)
+        for relative in DOCUMENTS:
+            with self.subTest(path=relative):
+                path = self.root / relative
+                content = path.read_bytes()
+                try:
+                    path.write_bytes(content + b"\nchanged\n")
+                    self.assertNotEqual(source_digest(self.root), original)
+                finally:
+                    path.write_bytes(content)
+
+    def test_published_guide_keeps_local_links_and_excludes_caches(self):
+        """Relocated users receive editable examples without development bytecode."""
+        cache = self.root / "examples/stream_plugins/stream_popup/__pycache__"
+        cache.mkdir()
+        (cache / "stream_popup.cpython-312.pyc").write_bytes(b"not a source file")
+        destination = self.directory / "release"
+        copy_documentation(self.root, destination)
+        files = sorted(
+            path.relative_to(destination).as_posix()
+            for path in destination.rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(files, sorted(DOCUMENTS))
+        for relative in DOCUMENTS:
+            self.assertEqual(
+                (destination / relative).read_bytes(),
+                (self.root / relative).read_bytes(),
+            )
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires POSIX launchers")
+class LauncherTests(unittest.TestCase):
+    """Execute the public launcher after relocation and observe interpreter argv."""
+
+    def test_relocated_launchers_preserve_arguments_directory_and_status(self):
+        """ish selects the stream entry point without rewriting native shell arguments."""
+        with tempfile.TemporaryDirectory(prefix="ish-launchers-") as temporary:
+            directory = Path(temporary)
+            original = directory / "original"
+            python = original / "bin/python/bin/python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "print(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd(), "
+                "'term': os.environ['TERM']}))\n"
+                "sys.exit(7)\n"
+            )
+            python.chmod(0o755)
+            for name in ("ish",):
+                launcher = original / "bin" / name
+                shutil.copy2(ROOT / f"tools/{name}-launcher.sh", launcher)
+                launcher.chmod(0o755)
+                (original / name).symlink_to(f"./bin/{name}")
+            relocated = directory / "relocated space"
+            original.rename(relocated)
+            outside = directory / "caller"
+            outside.mkdir()
+            env = dict(os.environ, TERM="fixture-terminal")
+            env["PATH"] = str(relocated) + os.pathsep + env.get("PATH", "")
+            for name, module in (("ish", "ish.stream"),):
+                with self.subTest(launcher=name):
+                    result = subprocess.run(
+                        [name, "--shell-arg", "a b", "유니코드"],
+                        cwd=outside,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 7, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(
+                        json.loads(result.stdout),
+                        {
+                            "args": [
+                                "-I",
+                                "-m",
+                                module,
+                                "--shell-arg",
+                                "a b",
+                                "유니코드",
+                            ],
+                            "cwd": str(outside),
+                            "term": "fixture-terminal",
+                        },
+                    )

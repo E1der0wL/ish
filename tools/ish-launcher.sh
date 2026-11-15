@@ -9,4 +9,4 @@ ish_launcher=$(readlink -f -- "$ish_launcher")
 ish_directory=$(dirname -- "$ish_launcher")
 # Isolate interpreter imports without changing the environment passed to the shell.
 # exec keeps the Python process responsible for signals, exit status, and cleanup.
-exec "$ish_directory/python/bin/python3" -I -m ish.main "$@"
+exec "$ish_directory/python/bin/python3" -I -m ish.stream "$@"

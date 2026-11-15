@@ -23,6 +23,29 @@ from stream_matrix import AutomaticRun
 
 ROOT = Path(__file__).resolve().parents[1]
 DEADLINE = 5
+SETTINGS_DEADLINE = 20
+SETTINGS_DRIVER = """
+import sys
+from pathlib import Path
+from stream_host import BAR
+from stream_matrix import SETTINGS_PLUGIN, SettingsRun, write_settings
+from stream_plugins import copy_plugins
+
+root = Path(sys.argv[1])
+plugins = copy_plugins(root / "plugins")
+(plugins / "recorded_popup").mkdir()
+(plugins / "recorded_popup/recorded_popup.py").write_text(SETTINGS_PLUGIN)
+case = root / "case"
+runner = SettingsRun(case, True, sys.argv[2], plugin_dir=plugins,
+                     config_file=write_settings(case, plugins))
+try:
+    runner.start()
+    runner.expect(BAR)
+    runner.popup()
+    runner.finish("escape-result")
+finally:
+    runner.close()
+"""
 
 
 @unittest.skipUnless(os.name == "posix", "requires native PTYs and SIGWINCH")
@@ -169,6 +192,56 @@ class HostResizeTests(unittest.TestCase):
             [110, 35],
         )
         self.assertFalse(runner.confirm_resize)
+
+    def test_saved_plugin_selection_drives_popup_keys_without_cli_plugins(self):
+        """The maintained host runner consumes rc selections and verifies real files."""
+        for shell in ("tcsh", "bash", "zsh"):
+            with self.subTest(shell=shell):
+                self.saved_plugin_selection(shell)
+
+    def saved_plugin_selection(self, shell):
+        """Run the new host stage through nested PTYs before requiring a real host."""
+        directory = self.directory / shell
+        master, slave = self.terminal()
+        termios.tcsetwinsize(slave, (30, 100))
+        saved = termios.tcgetattr(slave)
+        process = subprocess.Popen(
+            [sys.executable, "-c", SETTINGS_DRIVER, str(directory), shell],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(ROOT / "src") + os.pathsep + str(ROOT / "tests"),
+            ),
+        )
+
+        def stopped():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=DEADLINE)
+
+        self.addCleanup(stopped)
+        output = bytearray()
+        deadline = time.monotonic() + SETTINGS_DEADLINE
+        while process.poll() is None:
+            self.assertLess(time.monotonic(), deadline, bytes(output))
+            if select.select([master], [], [], 0.05)[0]:
+                output.extend(os.read(master, 65536))
+        self.assertEqual(process.returncode, 0, bytes(output))
+        case = directory / "case"
+        result = json.loads((case / "result.json").read_text())
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(result["parent_termios_restored"])
+        self.assertEqual(termios.tcgetattr(slave), saved)
+        environment = json.loads((case / "environment.json").read_text())
+        self.assertNotIn("--plugin", environment["argv"])
+        self.assertNotIn("--plugin-dir", environment["argv"])
+        self.assertEqual(environment["config_file"], str(case / "settings/.ishrc.py"))
+        self.assertEqual((case / "home/popup-value").read_text(), "팝업 값 one Xtwo")
+        self.assertEqual((case / "home/escape-result").read_text(), "restored\n")
+        self.assertFalse((case / "home/escape-leak").exists())
+        self.assertLess(result["popup_keys"]["escape_return_seconds"], 1.0)
 
 
 class HostMatrixCommandTests(unittest.TestCase):

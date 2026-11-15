@@ -59,6 +59,7 @@ class HostRun:
         require_resize=False,
         integration_dir=None,
         plugin_dir=None,
+        config_file=None,
         extra_args=(),
     ):
         """Prepare isolated shell state and evidence without starting another GUI."""
@@ -72,6 +73,7 @@ class HostRun:
         self.require_resize = require_resize
         self.integration_dir = integration_dir
         self.plugin_dir = plugin_dir
+        self.config_file = config_file
         self.extra_args = tuple(extra_args)
         self.fd = self.pid = None
         self.stage = 0
@@ -124,9 +126,12 @@ class HostRun:
             "--cwd",
             str(self.home),
         ]
-        argv.extend(
-            plugin_options(self.home, demo=self.demo, directory=self.plugin_dir)
-        )
+        if self.config_file is None:
+            argv.extend(
+                plugin_options(self.home, demo=self.demo, directory=self.plugin_dir)
+            )
+        else:
+            argv.extend(("--home", str(self.config_file.parent)))
         if self.integration_dir is not None:
             argv.extend(["--integration-dir", str(self.integration_dir)])
         argv.extend(self.extra_args)
@@ -164,6 +169,10 @@ class HostRun:
                 "plugin_dir": str(self.plugin_dir)
                 if self.plugin_dir is not None
                 else None,
+                "config_file": str(self.config_file)
+                if self.config_file is not None
+                else None,
+                "argv": argv,
                 "pid": self.pid,
                 "input_method": "scripted bytes into outer PTY; host responses relayed",
             },
@@ -251,6 +260,17 @@ class HostRun:
         if self.demo:
             self.expect(BAR, after)
 
+    def popup(self):
+        """Exercise the shared sample while allowing focused matrix key checks."""
+        offset = len(self.output)
+        self.send(b"\x1bOQ")
+        self.expect(b"Plugin popup", offset)
+        self.send("팝업 값".encode())
+        self.gate("popup")
+        close_offset = len(self.output)
+        self.send(b"\r")
+        self.expect(BAR, close_offset)
+
     def scenario(self):
         """Expose each screen for independent GUI inspection and assert actual files."""
         self.expect(PROMPT)
@@ -258,17 +278,7 @@ class HostRun:
             self.expect(BAR)
         self.gate("primary-bar" if self.demo else "primary-without-ui")
         if self.demo:
-            offset = len(self.output)
-            self.send(b"\x1bOQ")
-            self.expect(b"Plugin popup", offset)
-            self.send("팝업 값".encode())
-            self.gate("popup")
-            close_offset = len(self.output)
-            # Enter unambiguously closes the popup even if the next scripted
-            # submission shares a read batch. Standalone Escape needs its key
-            # ambiguity interval; the PTY matrix verifies that path separately.
-            self.send(b"\r")
-            self.expect(BAR, close_offset)
+            self.popup()
         offset = len(self.output)
         loop_open, loop_body = LOOP_INPUT[self.shell]
         self.send(loop_open)

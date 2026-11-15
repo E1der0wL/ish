@@ -107,6 +107,254 @@ class StartupTests(unittest.TestCase):
         shell.chmod(0o700)
         return shell
 
+    def terminal(self, *options, default_home=False):
+        """Launch the public CLI in a real controlling PTY and capture its exit."""
+        import pty
+        import termios
+
+        argv = [sys.executable, "-m", "ish.stream"]
+        if not default_home:
+            argv += ["--home", str(self.home)]
+        argv += list(map(str, options))
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.root)
+            termios.tcsetwinsize(0, (24, 80))
+            os.execvpe(argv[0], argv, self.env)
+            os._exit(127)
+        status = None
+        eof = False
+        output = bytearray()
+        deadline = time.monotonic() + DEADLINE
+        try:
+            while time.monotonic() < deadline:
+                if not eof and select.select([fd], [], [], 0.05)[0]:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        chunk = b""
+                    output.extend(chunk)
+                    if not chunk:
+                        eof = True
+                if status is None:
+                    found, waited = os.waitpid(pid, os.WNOHANG)
+                    if found:
+                        status = os.waitstatus_to_exitcode(waited)
+                if eof and status is not None:
+                    break
+                if eof:
+                    time.sleep(0.01)
+        finally:
+            if status is None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            os.close(fd)
+        return status, output.decode(errors="replace")
+
+    def write_rc(self, text):
+        """Persist user choices in the public rc file."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / ".ishrc.py").write_text(text, encoding="utf-8")
+
+    def recording_plugin(self, name):
+        """Make actual PluginManager import, setup and cleanup independently visible."""
+        directory = self.home / "plugins" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.py").write_text(
+            "from pathlib import Path\n"
+            "PLUGIN_META = {'version':'1', 'requirements':[], 'dependencies':[]}\n"
+            "STREAM_API = 1\n"
+            f"target = Path({str(self.root / (name + '-runs'))!r})\n"
+            "def record(text):\n"
+            "    with target.open('a') as file: file.write(text + '\\n')\n"
+            "record('import')\n"
+            "def setup(api):\n"
+            "    record('setup')\n"
+            "    return lambda: record('cleanup')\n",
+            encoding="utf-8",
+        )
+
+    def test_information_queries_do_not_execute_existing_rc(self):
+        """Queries remain useful even when Python configuration is broken or active."""
+        marker = self.root / "rc-ran"
+        self.write_rc(
+            f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        before = self.files()
+        for flag in ("--help", "--version", "--diagnose"):
+            result = self.cli(flag, "--lang", "en")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.files(), before)
+        result = self.cli("--diagnose", "--lang", "en")
+        self.assertIn(".ishrc.py was not executed", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_plugin_selection_persists_across_real_sessions(self):
+        """The same saved selection loads through PluginManager on each new launch."""
+        shell = self.trap_shell()
+        self.recording_plugin("saved")
+        work = self.home / "work"
+        work.mkdir()
+        shell.write_text(
+            "#!/bin/sh\npwd > "
+            + shlex.quote(str(self.root / "cwd-result"))
+            + "\nprintf '%s\\n' \"$@\" > "
+            + shlex.quote(str(self.root / "argv-result"))
+            + "\n",
+            encoding="utf-8",
+        )
+        self.write_rc(
+            f"config.shell = {str(shell)!r}\n"
+            "config.shell_args = ['--from-rc', 'two words']\n"
+            "config.cwd = 'work'\nconfig.plugin_dir = 'plugins'\n"
+            "config.plugins = ['saved', 'saved']\nconfig.lang = 'ko'\n"
+            "config.escape_delay = 0.15\nconfig.log_file = 'session.log'\n"
+            "config.log_level = 'debug'\n"
+        )
+        for run in (1, 2):
+            status, output = self.terminal()
+            self.assertEqual(status, 0, output)
+            self.assertEqual(
+                (self.root / "saved-runs").read_text(), "import\nsetup\ncleanup\n" * run
+            )
+            self.assertEqual((self.root / "cwd-result").read_text().strip(), str(work))
+            self.assertEqual(
+                (self.root / "argv-result").read_text(), "--from-rc\ntwo words\n"
+            )
+        self.assertTrue((self.home / "session.log").is_file())
+        self.assertNotIn("\x1b[", output)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_cli_replaces_saved_plugins_and_can_disable_or_skip_rc(self):
+        """One-shot choices neither append unwanted plugins nor rewrite saved settings."""
+        shell = self.trap_shell()
+        for name in ("saved", "once"):
+            self.recording_plugin(name)
+        self.write_rc(
+            f"config.shell = {str(shell)!r}\nconfig.plugin_dir = 'plugins'\n"
+            "config.plugins = ['saved']\nconfig.lang = 'ko'\n"
+            "config.cwd = 'missing-work'\n"
+        )
+        original = (self.home / ".ishrc.py").read_bytes()
+        status, output = self.terminal("--plugin", "once", "--cwd", ".", "--lang", "en")
+        self.assertEqual(status, 0, output)
+        self.assertFalse((self.root / "saved-runs").exists())
+        self.assertEqual(
+            (self.root / "once-runs").read_text(), "import\nsetup\ncleanup\n"
+        )
+        status, output = self.terminal("--no-plugins", "--cwd", ".")
+        self.assertEqual(status, 0, output)
+        self.assertFalse((self.root / "saved-runs").exists())
+        self.assertEqual((self.home / ".ishrc.py").read_bytes(), original)
+        self.write_rc("raise RuntimeError('BROKEN CONFIG')\n")
+        status, output = self.terminal("--no-rc", "--shell", shell)
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("BROKEN CONFIG", output)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_default_home_loads_saved_ish_settings(self):
+        """Only ~/ish/.ishrc.py is executed when no --home override is present."""
+        shell = self.trap_shell()
+        directory = self.native_home / "ish"
+        directory.mkdir()
+        (directory / ".ishrc.py").write_text(f"config.shell = {str(shell)!r}\n")
+        before = self.files()
+        status, output = self.terminal(default_home=True)
+        self.assertEqual(status, 0, output)
+        self.assertEqual((self.root / "shell-executed").read_text(), "executed")
+        after = self.files()
+        del after["shell-executed"]
+        self.assertEqual(after, before)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_invalid_rc_stops_before_starting_a_shell(self):
+        """Typos and invalid choices fail explicitly without partially applying config."""
+        shell = self.trap_shell()
+        for choice in (
+            "config.typo = True",
+            "config.plugins = 'saved'",
+            "config.shell_args = '-i'",
+            "config.escape_delay = float('nan')",
+            "config.escape_delay = True",
+            "config.escape_delay = 0",
+            "config.escape_delay = 3",
+            "config.cwd = None",
+            "config.log_level = 'NOPE'",
+            "raise SystemExit(0)",
+            "syntax error !",
+        ):
+            with self.subTest(choice=choice):
+                self.write_rc(choice + "\n")
+                status, output = self.terminal("--shell", shell, "--lang", "en")
+                self.assertEqual(status, 2, output)
+                self.assertIn(".ishrc.py", output)
+                self.assertNotIn("Traceback", output)
+                self.assertFalse((self.root / "shell-executed").exists())
+
+    def test_cli_escape_delay_and_plugin_exclusion_are_validated(self):
+        """CLI timing and mutually exclusive plugin policies reject bad values."""
+        for args in (
+            ("--escape-delay=nan",),
+            ("--escape-delay=0",),
+            ("--no-plugins", "--plugin", "one"),
+        ):
+            with self.subTest(args=args):
+                result = self.cli("--diagnose", *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_relative_shell_and_cli_override_keep_distinct_bases(self):
+        """RC executable paths use its home, while explicit CLI paths use launch cwd."""
+        shell = self.trap_shell()
+        self.write_rc("config.shell = './named-shell'\n")
+        (self.home / "named-shell").symlink_to(shell)
+        status, output = self.terminal()
+        self.assertEqual(status, 0, output)
+        status, output = self.terminal("--shell", "./shell-trap")
+        self.assertEqual(status, 0, output)
+        (self.root / "shell-executed").unlink()
+        self.write_rc("config.shell = '~/absent-shell'\nconfig.lang = 'ko'\n")
+        status, output = self.terminal()
+        self.assertEqual(status, 2, output)
+        self.assertIn("셸 실행 파일을 찾을 수 없습니다", output)
+        self.assertIn(str(self.native_home / "absent-shell"), output)
+        self.assertFalse((self.root / "shell-executed").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_directory_is_rejected_without_running_main(self):
+        """A mistaken directory cannot turn run_path into package execution."""
+        shell = self.trap_shell()
+        directory = self.home / ".ishrc.py"
+        directory.mkdir(parents=True)
+        (directory / "__main__.py").write_text(
+            "raise RuntimeError('DIRECTORY EXECUTED')"
+        )
+        status, output = self.terminal("--shell", shell)
+        self.assertEqual(status, 2, output)
+        self.assertIn("configuration must be a regular Python file", output)
+        self.assertNotIn("DIRECTORY EXECUTED", output)
+        self.assertFalse((self.root / "shell-executed").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_exit_cleanup_can_finish_after_terminal_eof(self):
+        """The harness must observe process completion after its last terminal write."""
+        shell = self.trap_shell()
+        marker = self.root / "exit-cleanup"
+        self.write_rc(
+            "import atexit, os, time\nfrom pathlib import Path\n"
+            "def finish():\n"
+            "    for fd in (0, 1, 2): os.close(fd)\n"
+            "    time.sleep(0.1)\n"
+            f"    Path({str(marker)!r}).write_text('complete')\n"
+            "atexit.register(finish)\n"
+        )
+        status, output = self.terminal("--shell", shell)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(marker.read_text(), "complete")
+
     def test_information_flags_need_no_terminal_or_new_files(self):
         """Help, version and diagnosis cannot import plugins, run shells or create logs."""
         plugins = self.trap_plugin()
@@ -134,7 +382,7 @@ class StartupTests(unittest.TestCase):
                     self.root / "absent-cwd",
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("ish-stream", result.stdout)
+                self.assertIn("ish", result.stdout)
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(self.files(), before)
 
@@ -152,7 +400,7 @@ class StartupTests(unittest.TestCase):
         """Shipped Korean is usable on a fresh installation and translates headings."""
         for flag, expected in (
             ("--help", "사용법:"),
-            ("--diagnose", "ish-stream 환경 진단"),
+            ("--diagnose", "ish 환경 진단"),
         ):
             with self.subTest(flag=flag):
                 result = self.cli(flag, "--lang", "ko")
@@ -195,7 +443,7 @@ class StartupTests(unittest.TestCase):
                         self.root / "new-log" / "query.log",
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("ish-stream", result.stdout)
+                    self.assertIn("ish", result.stdout)
                     self.assertEqual(
                         result.stderr.count("Cannot load language file"), warnings
                     )
@@ -208,7 +456,7 @@ class StartupTests(unittest.TestCase):
         """The stream entry point keeps an independently recognizable version label."""
         result = self.cli("--lang", "en", "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout, r"\Aish-stream \d+\.\d+\.\d+\n\Z")
+        self.assertEqual(result.stdout, "ish 2.0.0\n")
 
     def test_removed_demo_flag_is_rejected(self):
         """The obsolete implicit demo selector is absent from the public CLI."""
@@ -376,17 +624,6 @@ class StartupTests(unittest.TestCase):
                     os.close(fd)
                 self.assertEqual(status, 0, bytes(output))
                 self.assertEqual(result.read_text(), str(self.root / name) + "\n")
-
-    def test_original_entry_information_queries_are_preserved(self):
-        """Shared translation and diagnostic changes retain old ish's information CLI."""
-        before = self.files()
-        for flag in ("--help", "--version", "--diagnose"):
-            with self.subTest(flag=flag):
-                result = self.cli(flag, "--lang", "en", module="ish.main")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("ish", result.stdout)
-                self.assertNotIn("ish-stream", result.stdout)
-                self.assertEqual(self.files(), before)
 
 
 if __name__ == "__main__":

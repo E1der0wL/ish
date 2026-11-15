@@ -37,12 +37,12 @@ from prompt_toolkit.output import ColorDepth, DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.styles import Attrs
 
+from .settings import ESCAPE_DELAY, validate_escape_delay
 from .ui import PopupFactory, PopupView
 
 DEFAULT_COLUMNS = 80
 DEFAULT_ROWS = 5
 POPUP_MIN_ROWS = 3
-KEY_FLUSH_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -200,6 +200,7 @@ class Panel:
         on_error: Callable[[Exception], None] | None = None,
         bar: AnyFormattedText | None = None,
         popup: PopupFactory | None = None,
+        escape_delay: float = ESCAPE_DELAY,
     ):
         """Keep UI callbacks separate from all shell/host input and output."""
         self.on_frame, self.on_focus, self.on_result = on_frame, on_focus, on_result
@@ -207,6 +208,7 @@ class Panel:
         self.on_error = on_error
         self.bar = bar
         self._factory = popup
+        self.escape_delay = validate_escape_delay(escape_delay)
         self.visible = False
         self.popup = False
         self.app = None
@@ -216,6 +218,8 @@ class Panel:
         self._parser = None
         self._decoder = None
         self._flush_handle = None
+        self._flushing_keys = False
+        self._flushed_keys = None
         self._generation = 0
         self._view = None
         self._empty = Window()
@@ -230,7 +234,7 @@ class Panel:
         self.output = ViewportOutput(cols, rows)
         bindings = KeyBindings()
 
-        @bindings.add("escape")
+        @bindings.add("escape", eager=Condition(lambda: self._flushing_keys))
         @bindings.add("c-c", eager=True)
         @bindings.add("c-d", eager=True)
         def cancel(event):
@@ -389,7 +393,7 @@ class Panel:
             if self._flush_handle is not None:
                 self._flush_handle.cancel()
             self._flush_handle = asyncio.get_running_loop().call_later(
-                KEY_FLUSH_SECONDS, self._flush_keys, generation
+                self.escape_delay, self._flush_keys, generation
             )
         return True
 
@@ -403,6 +407,9 @@ class Panel:
 
         def key_received(key):
             if self.popup and self.visible and generation == self._generation:
+                if self._flushed_keys is not None:
+                    self._flushed_keys.append(key)
+                    return
                 try:
                     self.app.key_processor.feed(key)
                     self.app.key_processor.process_keys()
@@ -416,9 +423,23 @@ class Panel:
         if self.popup and self.visible and generation == self._generation:
             try:
                 with set_app(self.app):
+                    # The parser has already waited for an Alt/terminal-key
+                    # suffix. Only this idle boundary resolves Escape eagerly;
+                    # ordinary input retains PTK's Meta and multi-key bindings.
+                    # An incomplete CSI can flush to Escape plus other keys, so
+                    # collect the parser's result before deciding it is alone.
+                    received = self._parser.feed_key_callback
+                    keys = self._flushed_keys = []
                     self._parser.flush()
+                    self._flushed_keys = None
+                    self._flushing_keys = len(keys) == 1 and keys[0].key == Keys.Escape
+                    for key in keys:
+                        received(key)
             except Exception as error:
                 self._fail(error)
+            finally:
+                self._flushed_keys = None
+                self._flushing_keys = False
 
     def _fail(self, error):
         """Revoke a broken UI once and discard input still owned by that popup."""
