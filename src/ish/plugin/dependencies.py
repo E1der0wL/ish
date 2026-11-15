@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import csv
 import fcntl
+import hashlib
 import importlib
 import importlib.metadata
 import os
 import subprocess
 import sys
 import tempfile
+from io import StringIO
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -39,6 +43,9 @@ _NATIVE_EXTENSIONS = (".so", ".pyd")
 PACKAGE_ENTRY = "__init__" + PYTHON_SOURCE_SUFFIX
 _COMPARE_BYTES = 128 * 1024
 _MISSING_MODULE = object()
+_RECORD = "RECORD"
+_DIST_INFO_SUFFIX = ".dist-info"
+_REQUIRED_RECORD_FILES = frozenset(("METADATA", "WHEEL", _RECORD))
 
 
 @contextlib.contextmanager
@@ -106,6 +113,67 @@ def distribution_files(distribution, root: Path) -> set[Path]:
         if path.is_relative_to(root):
             paths.add(path.relative_to(root))
     return paths
+
+
+def has_distribution_files(distribution, *, required: bool = False) -> bool:
+    """Validate recorded library files without importing code or reading outside it.
+
+    Managed installs require a RECORD. External editable/legacy distributions
+    without one retain metadata/import validation. Console scripts and other
+    entries outside the distribution's library root are outside this check.
+    Missing bytecode is harmless because Python may regenerate it.
+    """
+    try:
+        record = distribution.read_text(_RECORD)
+        if record is None:
+            return not required
+        base = Path(os.path.abspath(distribution.locate_file("")))
+        root = base.resolve()
+        # Distribution.files omits missing paths in Python 3.12. Read the raw
+        # inventory so an absent recorded file remains a failed requirement.
+        rows = list(csv.reader(StringIO(record)))
+        if not rows:
+            return False
+        if any(len(row) != 3 for row in rows):
+            return False
+        if required:
+            recorded = {Path(row[0]) for row in rows}
+            metadata_directories = {
+                path.parent
+                for path in recorded
+                if path.name == _RECORD and path.parent.suffix == _DIST_INFO_SUFFIX
+            }
+            if not any(
+                {directory / name for name in _REQUIRED_RECORD_FILES} <= recorded
+                for directory in metadata_directories
+            ):
+                return False
+        for row in rows:
+            relative, checksum, size = row
+            if Path(relative).suffix == _BYTECODE:
+                continue
+            lexical = Path(os.path.abspath(distribution.locate_file(relative)))
+            if not lexical.is_relative_to(base):
+                continue
+            path = lexical.resolve()
+            if not path.is_relative_to(root):
+                return False
+            if not path.is_file():
+                return False
+            if size and path.stat().st_size != int(size):
+                return False
+            if checksum:
+                algorithm, separator, expected = checksum.partition("=")
+                if not separator or not expected:
+                    return False
+                with path.open("rb") as source:
+                    digest = hashlib.file_digest(source, algorithm).digest()
+                encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+                if encoded != expected:
+                    return False
+        return True
+    except (OSError, ValueError, TypeError, csv.Error):
+        return False
 
 
 def _distribution_name(distribution) -> str:

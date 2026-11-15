@@ -6,12 +6,14 @@ import errno
 import json
 import locale
 import logging
+import re
 import shutil
 import tempfile
 import textwrap
 import threading
 from enum import StrEnum, auto
 from pathlib import Path
+from string import Formatter
 from types import MappingProxyType
 from typing import Any, Dict, Optional
 
@@ -30,6 +32,9 @@ _UNSUPPORTED_HARD_LINK = frozenset({errno.ENOTSUP, errno.EPERM, errno.ENOSYS})
 _FALLBACK_COPY_BYTES = 64 * 1024
 _LOCALE_SEPARATOR = "_"
 _INVALID_MESSAGES = "Language messages must map strings to strings"
+_LANGUAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
+_BUNDLED_DIRECTORY = Path(__file__).with_name("locales")
+_FORMATTER = Formatter()
 
 
 class Message(StrEnum):
@@ -222,9 +227,71 @@ class Message(StrEnum):
     PM_PYTHON_NOT_FOUND = auto(), "Failed to find python. Cannot load"
     PM_PYTHON_VERSION_MISMATCH = auto(), "{value} != {req}"
     PIP_INSTALL_FAIL = auto(), "Failed to install library '{library}'"
+    STREAM_DESCRIPTION = (
+        auto(),
+        "ish-stream - Run a native shell with direct terminal output and optional prompt-time Python plugins.",
+    )
+    STREAM_VERSION = auto(), "ish-stream {version}"
+    STREAM_USAGE = auto(), "usage: "
+    STREAM_PARSE_ERROR = auto(), "error: {error}"
+    STREAM_SHELL_HELP = (
+        auto(),
+        "Run SHELL; the account's login shell is selected by default.",
+    )
+    STREAM_CWD_HELP = auto(), "Start the shell in DIR (default: current directory)."
+    STREAM_PLUGIN_HELP = auto(), "Enable a named Python plugin; repeat to select more."
+    STREAM_PLUGIN_DIR_HELP = (
+        auto(),
+        "Read selected Python plugins from DIR instead of the bundled directory.",
+    )
+    STREAM_PLUGIN_LIB_HELP = auto(), "Use DIR for plugin Python dependencies."
+    STREAM_INTEGRATION_HELP = (
+        auto(),
+        "Read the selected shell integration's text resources from DIR.",
+    )
+    STREAM_LOGIN_HELP = (
+        auto(),
+        "Start a login shell; unsupported plugin startup modes fall back to native operation.",
+    )
+    STREAM_SHELL_ARG_HELP = (
+        auto(),
+        "Replace the default -i shell arguments; repeat as --shell-arg=ARG.",
+    )
+    STREAM_LOG_FILE_HELP = (
+        auto(),
+        "Append logs to PATH; without PATH use ish's configured log file.",
+    )
+    STREAM_LOG_LEVEL_HELP = auto(), "Set the log threshold (default: WARNING)."
+    STREAM_PLATFORM_ERROR = (
+        auto(),
+        "ish-stream requires Linux/WSL with a controlling PTY.",
+    )
+    STREAM_TTY_ERROR = auto(), "Standard input and output must be terminals."
+    STREAM_SHELL_ERROR = auto(), "Shell executable not found: {shell}"
+    STREAM_CWD_ERROR = auto(), "Working directory not found: {path}"
+    STREAM_FALLBACK = auto(), "{error}; starting without UI"
+    STREAM_UI_ERROR = auto(), "Plugin UI disabled: {error}"
+    STREAM_CLEANUP_ERROR = auto(), "Plugin cleanup failed: {error}"
+    STREAM_SESSION_ERROR = auto(), "Session error: {error}"
+    STREAM_DIAGNOSE_TITLE = auto(), "ish-stream environment diagnostics"
+    STREAM_DIAGNOSE_SCOPE = (
+        auto(),
+        "Read-only startup settings. No shell or plugin was executed; selected plugins do not certify runtime support or readiness.",
+    )
+    STREAM_DIAGNOSE_CWD = auto(), "Shell working directory"
+    STREAM_DIAGNOSE_ARGS = auto(), "Shell arguments"
+    STREAM_DIAGNOSE_SELECTED_PLUGINS = auto(), "Selected plugins"
+    STREAM_DIAGNOSE_PLUGIN_LIB = auto(), "Plugin library directory"
+    STREAM_DIAGNOSE_INTEGRATIONS = auto(), "Shell integration directory"
+    STREAM_DIAGNOSE_LOG_FILE = auto(), "Log file"
+    STREAM_DIAGNOSE_LOG_LEVEL = auto(), "Log threshold"
 
 
 _DEFAULT_MESSAGES = MappingProxyType({item.value: item.english for item in Message})
+_MESSAGE_FIELDS = {
+    key: {field for _, field, _, _ in _FORMATTER.parse(value) if field is not None}
+    for key, value in _DEFAULT_MESSAGES.items()
+}
 
 
 def _publish_missing(staged: Path, destination: Path) -> None:
@@ -265,6 +332,12 @@ class _Messages(dict):
         """Keep the same string-to-string contract for every mutation path."""
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError(_INVALID_MESSAGES)
+        if key in _MESSAGE_FIELDS:
+            fields = {
+                field for _, field, _, _ in _FORMATTER.parse(value) if field is not None
+            }
+            if fields != _MESSAGE_FIELDS[key]:
+                raise ValueError(f"Translation placeholders do not match {key}")
 
     def __setitem__(self, key, value):
         """Reject malformed values before changing a single translation."""
@@ -316,6 +389,10 @@ class I18N:
 
     def _language_path(self, lang: str) -> Path:
         """Map a language name to its JSON file under the current base directory."""
+        if not isinstance(lang, str) or not _LANGUAGE_NAME.fullmatch(lang):
+            raise ValueError(
+                "Language must be a single language code, such as en or ko"
+            )
         return self.base_path / (lang + _JSON_SUFFIX)
 
     def _get_lang_file(self, lang: Optional[str], *, create: bool = True) -> Path:
@@ -341,7 +418,10 @@ class I18N:
                 staged = Path(temporary) / default_file.name
                 with staged.open("w", encoding=self.encoder) as stream:
                     json.dump(
-                        self._messages, stream, ensure_ascii=False, indent=_JSON_INDENT
+                        dict(_DEFAULT_MESSAGES),
+                        stream,
+                        ensure_ascii=False,
+                        indent=_JSON_INDENT,
                     )
                 _publish_missing(staged, default_file)
         except OSError as exc:
@@ -361,18 +441,29 @@ class I18N:
             pass
         return self.default_lang
 
-    def load(self, lang: Optional[str] = None, *, create: bool = True):
-        """Build messages from built-in values, the default language, and the selected
-        language.
+    def load(self, lang: Optional[str] = None, *, create: bool = True, logger=None):
+        """Merge English defaults, user fallback, shipped locale and user locale.
 
         Log invalid JSON and read errors, and discard stale translations from the
         previous language. Set create=False for CLI queries that must not write files.
         """
-        selected = lang or self.current_lang
+        logger = logger or logging.getLogger(DEFAULT_LOGGER_NAME)
+        selected = self.current_lang if lang is None else lang
         # Start fresh on each switch: old translations must not leak into a new locale.
         messages = _Messages(_DEFAULT_MESSAGES)
-        selected_path = self._get_lang_file(selected, create=create)
-        paths = dict.fromkeys([self._language_path(self.default_lang), selected_path])
+        selected_path = self._language_path(selected)
+        default_path = self._language_path(self.default_lang)
+        self._get_lang_file(selected, create=create)
+        # User English remains the fallback for untranslated keys. A shipped
+        # locale then supplies its translations, and the selected user file wins.
+        language = (
+            selected.replace("-", _LOCALE_SEPARATOR)
+            .partition(_LOCALE_SEPARATOR)[0]
+            .lower()
+        )
+        paths = [default_path, _BUNDLED_DIRECTORY / (language + _JSON_SUFFIX)]
+        if selected_path != default_path:
+            paths.append(selected_path)
         for path in paths:
             if not path.exists():
                 continue
@@ -383,9 +474,7 @@ class I18N:
                     raise ValueError(_INVALID_MESSAGES)
                 messages.update(translated)
             except (OSError, ValueError) as exc:
-                logging.getLogger(DEFAULT_LOGGER_NAME).warning(
-                    "Cannot load language file %s: %s", path, exc
-                )
+                logger.warning("Cannot load language file %s: %s", path, exc)
         with self._lock:
             self._messages = messages
             self.current_lang = selected
@@ -396,11 +485,15 @@ class I18N:
             self._messages |= messages
 
     def get(self, key: str, **kwargs: Any) -> str:
-        """Format a translation, returning the original text if a key or argument is
-        missing.
-        """
+        """Format a message, falling back to English for a broken known template."""
         msg = self._messages.get(key, key)
         try:
             return msg.format(**kwargs)
         except Exception:
+            fallback = _DEFAULT_MESSAGES.get(key)
+            if fallback is not None:
+                try:
+                    return fallback.format(**kwargs)
+                except Exception:
+                    pass
             return msg

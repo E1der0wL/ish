@@ -2,12 +2,22 @@
 
 import asyncio
 import contextlib
+import gc
 import io
 import unittest
+import warnings
 
 import pyte
+from examples.stream_plugins.stream_bar.stream_bar import BAR_STYLE, BAR_TEXT
+from examples.stream_plugins.stream_popup.stream_popup import create
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.widgets import TextArea
 
 from ish.stream.panel import Panel
+from ish.stream.ui import PopupView
 
 
 class PanelTests(unittest.IsolatedAsyncioTestCase):
@@ -19,19 +29,36 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.focus = []
         self.results = []
         self.remainders = []
+        self.errors = []
+        self.failed = asyncio.Event()
         self.changed = asyncio.Event()
 
         def painted(frame):
             self.frames.append(frame)
             self.changed.set()
 
+        self.painted = painted
+        self.host_output = io.StringIO()
+        self.panel = None
+        await self.configure(bar=[(BAR_STYLE, BAR_TEXT)], popup=create)
+
+    async def configure(self, **content):
+        """Replace the public panel with explicitly supplied plugin content."""
+        if self.panel is not None:
+            await self.panel.close()
+
+        def failed(error):
+            self.errors.append(error)
+            self.failed.set()
+
         self.panel = Panel(
-            painted,
+            self.painted,
             on_focus=self.focus.append,
             on_result=self.results.append,
             on_remainder=self.remainders.append,
+            on_error=failed,
+            **content,
         )
-        self.host_output = io.StringIO()
         with contextlib.redirect_stdout(self.host_output):
             await self.panel.start(50, 5)
 
@@ -56,6 +83,480 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.panel.open_popup())
         self.assertFalse(self.panel.feed(b"echo native\r"))
         self.assertEqual(self.focus, [])
+
+    async def test_panel_has_no_builtin_bar_or_popup(self):
+        """Without a content plugin the renderer creates no decoration or editor."""
+        await self.configure()
+        self.panel.show()
+        frame = await self.frame_matching(lambda value: not value.popup)
+        self.assertTrue(all(not line.strip() for line in frame.lines))
+        self.assertFalse(self.panel.open_popup())
+        self.assertFalse(self.panel.feed(b"native\r"))
+        self.assertEqual(self.focus, [])
+
+    async def test_plugin_bar_callback_and_popup_content_render(self):
+        """Content comes from external factories, including a live formatted bar."""
+        status = ["FIRST"]
+
+        def popup(accept):
+            field = TextArea(
+                height=1,
+                multiline=False,
+                accept_handler=lambda buffer: accept("plugin:" + buffer.text),
+            )
+            return PopupView(
+                HSplit([Window(FormattedTextControl("Custom view"), height=1), field]),
+                field,
+            )
+
+        await self.configure(bar=lambda: [("bold", status[0])], popup=popup)
+        self.panel.show()
+        await self.frame_matching(lambda value: "FIRST" in value.lines[-1])
+        status[0] = "SECOND"
+        self.panel.show()
+        await self.frame_matching(lambda value: "SECOND" in value.lines[-1])
+        self.assertTrue(self.panel.open_popup())
+        self.panel.feed("한글\r".encode())
+        self.assertEqual(self.results, ["plugin:한글"])
+
+    async def test_custom_popup_key_returns_exact_native_suffix(self):
+        """A plugin may accept with Tab without losing following bytes in that read."""
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("tab", eager=True)
+            def selected(event):
+                accept(field.text)
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.assertTrue(self.panel.open_popup())
+        suffix = b"echo native\r\xff"
+        self.panel.feed(b"chosen\t" + suffix)
+        self.assertEqual(self.results, ["chosen"])
+        self.assertEqual(self.remainders, [suffix])
+        self.assertEqual(self.focus, [True, False])
+
+    async def test_old_plugin_callback_cannot_close_a_new_popup(self):
+        """Each new view receives a callback tied to only its own input lifetime."""
+        callbacks = []
+
+        def popup(accept):
+            callbacks.append(accept)
+            field = TextArea(height=1)
+            return PopupView(field, field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.assertTrue(self.panel.open_popup())
+        self.assertTrue(callbacks[0]("first"))
+        self.assertTrue(self.panel.open_popup())
+        self.assertFalse(callbacks[0]("stale"))
+        self.assertTrue(self.panel.popup)
+        self.assertTrue(callbacks[1]("second"))
+        self.assertEqual(self.results, ["first", "second"])
+        self.assertEqual(self.focus, [True, False, True, False])
+
+    async def test_invalid_factory_does_not_claim_native_input(self):
+        """Malformed plugin content fails before the coordinator grants focus."""
+        await self.configure(popup=lambda accept: object())
+        self.panel.show()
+        with self.assertRaisesRegex(TypeError, "PopupView"):
+            self.panel.open_popup()
+        self.assertFalse(self.panel.popup)
+        self.assertFalse(self.panel.feed(b"native input"))
+        self.assertEqual(self.focus, [])
+
+    async def test_bar_render_error_disables_frames_and_reports_once(self):
+        """A failing dynamic bar cannot escape through PTK's scheduled redraw."""
+        broken = [False]
+
+        def bar():
+            if broken[0]:
+                raise ValueError("bar failed")
+            return "working"
+
+        await self.configure(bar=bar)
+        self.panel.show()
+        await self.frame_matching(lambda value: "working" in value.lines[-1])
+        count = len(self.frames)
+        broken[0] = True
+        self.panel.show()
+        async with asyncio.timeout(3):
+            await self.failed.wait()
+        self.assertEqual([str(error) for error in self.errors], ["bar failed"])
+        self.assertEqual(len(self.frames), count)
+        self.assertFalse(self.panel.open_popup())
+        self.assertFalse(self.panel.feed(b"native input"))
+
+    async def test_nested_popup_render_error_releases_focus(self):
+        """Failures inside external widget content use the same UI error boundary."""
+
+        def popup(accept):
+            def text():
+                raise RuntimeError("popup render failed")
+
+            field = TextArea(height=1)
+            return PopupView(HSplit([Window(FormattedTextControl(text)), field]), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        async with asyncio.timeout(3):
+            await self.failed.wait()
+        self.assertEqual([str(error) for error in self.errors], ["popup render failed"])
+        self.assertEqual(self.focus, [True, False])
+        self.assertFalse(self.panel.popup)
+        self.assertEqual(self.results, [])
+
+    async def test_binding_error_discards_remaining_popup_input(self):
+        """Failing plugin input must not replay the rest of its read as shell code."""
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("tab", eager=True)
+            def failed(event):
+                raise ValueError("popup binding failed")
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"abc\techo must-not-run\r")
+        self.assertEqual(
+            [str(error) for error in self.errors], ["popup binding failed"]
+        )
+        self.assertEqual(self.focus, [True, False])
+        self.assertFalse(self.panel.popup)
+        self.assertEqual(self.results, [])
+        self.assertEqual(self.remainders, [])
+
+    async def test_async_binding_error_releases_focus_without_console_output(self):
+        """An awaited plugin failure uses the same boundary as synchronous input."""
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: loop_errors.append(context))
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("tab", eager=True)
+            async def failed(event):
+                await asyncio.sleep(0)
+                raise ValueError("async popup binding failed")
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        try:
+            await self.configure(popup=popup)
+            self.panel.show()
+            self.panel.open_popup()
+            self.panel.feed(b"abc\techo must-not-run\r")
+            async with asyncio.timeout(3):
+                await self.failed.wait()
+            await asyncio.sleep(0)
+            self.assertEqual(
+                [str(error) for error in self.errors], ["async popup binding failed"]
+            )
+            self.assertEqual(self.focus, [True, False])
+            self.assertFalse(self.panel.popup)
+            self.assertEqual(self.results, [])
+            self.assertEqual(self.remainders, [])
+            self.assertEqual(loop_errors, [])
+        finally:
+            loop.set_exception_handler(previous)
+
+    async def test_async_binding_accepts_the_current_popup_once(self):
+        """Wrapping background work preserves a successful PTK async binding."""
+        accepted = asyncio.Event()
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("tab", eager=True)
+            async def selected(event):
+                await asyncio.sleep(0)
+                accept(field.text)
+                accepted.set()
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"chosen\t")
+        async with asyncio.timeout(3):
+            await accepted.wait()
+        self.assertEqual(self.results, ["chosen"])
+        self.assertEqual(self.focus, [True, False])
+        self.assertEqual(self.errors, [])
+        self.assertFalse(self.panel.feed(b"native input"))
+
+    async def test_retired_popup_tasks_cannot_fail_a_new_popup(self):
+        """Late failures and their child tasks keep the old popup's lifetime."""
+        started, release = asyncio.Event(), asyncio.Event()
+        tasks, loop_errors = [], []
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: loop_errors.append(context))
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(
+                height=1,
+                multiline=False,
+                accept_handler=lambda buffer: accept(buffer.text),
+            )
+
+            async def child():
+                await asyncio.sleep(0)
+                raise ValueError("retired child failed")
+
+            @bindings.add("tab", eager=True)
+            async def delayed(event):
+                tasks.append(asyncio.current_task())
+                started.set()
+                await release.wait()
+                tasks.append(event.app.create_background_task(child()))
+                raise ValueError("retired popup failed")
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        try:
+            await self.configure(popup=popup)
+            self.panel.show()
+            self.panel.open_popup()
+            self.panel.feed(b"old\t")
+            async with asyncio.timeout(3):
+                await started.wait()
+            self.panel.close_popup()
+            self.assertTrue(self.panel.open_popup())
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            self.assertTrue(self.panel.popup)
+            self.panel.feed(b"new\r")
+            self.assertEqual(self.results, [None, "new"])
+            self.assertEqual(self.errors, [])
+            self.assertEqual(loop_errors, [])
+        finally:
+            release.set()
+            loop.set_exception_handler(previous)
+
+    async def test_factory_background_work_uses_the_current_panel(self):
+        """Factories get the owning PTK app before their view has acquired focus."""
+        release = asyncio.Event()
+        applications, tasks, loop_errors = [], [], []
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: loop_errors.append(context))
+
+        async def work():
+            await release.wait()
+            raise ValueError("current factory task failed")
+
+        def popup(accept):
+            applications.append(get_app())
+            tasks.append(get_app().create_background_task(work()))
+            field = TextArea(height=1)
+            return PopupView(field, field)
+
+        try:
+            await self.configure(popup=popup)
+            self.panel.show()
+            self.assertTrue(self.panel.open_popup())
+            self.assertIs(applications[0], self.panel.app)
+            release.set()
+            async with asyncio.timeout(3):
+                await self.failed.wait()
+            self.assertEqual(
+                [str(error) for error in self.errors], ["current factory task failed"]
+            )
+            self.assertEqual(self.focus, [True, False])
+            self.assertFalse(self.panel.popup)
+            self.assertEqual(loop_errors, [])
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            loop.set_exception_handler(previous)
+
+    async def test_retired_factory_task_cannot_fail_a_new_popup(self):
+        """Task ownership starts during construction, before the popup is focused."""
+        release = asyncio.Event()
+        tasks = []
+
+        async def work():
+            await release.wait()
+            raise ValueError("retired factory task failed")
+
+        def popup(accept):
+            if not tasks:
+                tasks.append(get_app().create_background_task(work()))
+            field = TextArea(
+                height=1,
+                multiline=False,
+                accept_handler=lambda buffer: accept(buffer.text),
+            )
+            return PopupView(field, field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.assertTrue(self.panel.open_popup())
+        self.panel.close_popup()
+        self.assertTrue(self.panel.open_popup())
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertTrue(self.panel.popup)
+        self.panel.feed(b"new\r")
+        self.assertEqual(self.results, [None, "new"])
+        self.assertEqual(self.errors, [])
+
+    async def test_failed_factory_descendants_cannot_fail_a_later_popup(self):
+        """Construction failure retires work, including children created later."""
+        release = asyncio.Event()
+        tasks = []
+
+        async def child():
+            raise ValueError("failed factory child")
+
+        async def work():
+            await release.wait()
+            tasks.append(get_app().create_background_task(child()))
+            raise ValueError("failed factory parent")
+
+        def popup(accept):
+            if not tasks:
+                tasks.append(get_app().create_background_task(work()))
+                raise ValueError("factory construction failed")
+            field = TextArea(
+                height=1,
+                multiline=False,
+                accept_handler=lambda buffer: accept(buffer.text),
+            )
+            return PopupView(field, field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        with self.assertRaisesRegex(ValueError, "factory construction failed"):
+            self.panel.open_popup()
+        self.assertEqual(self.focus, [])
+        self.assertTrue(self.panel.open_popup())
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertTrue(self.panel.popup)
+        self.panel.feed(b"new\r")
+        self.assertEqual(self.results, ["new"])
+        self.assertEqual(self.errors, [])
+
+    async def test_shutdown_cancels_async_binding_without_ui_failure(self):
+        """PTK still owns task cancellation when the panel application stops."""
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            @bindings.add("tab", eager=True)
+            async def waiting(event):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"\t")
+        async with asyncio.timeout(3):
+            await started.wait()
+            await self.panel.close()
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.errors, [])
+        self.assertEqual(self.focus, [True, False])
+
+    async def test_task_cancelled_before_start_does_not_leak_a_coroutine(self):
+        """An immediately cancelled public PTK task leaves no unawaited work."""
+        tasks = []
+        ran = []
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            async def work():
+                ran.append(True)
+
+            @bindings.add("tab", eager=True)
+            def cancel(event):
+                task = event.app.create_background_task(work())
+                task.cancel()
+                tasks.append(task)
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", RuntimeWarning)
+            self.panel.feed(b"\t")
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            tasks.clear()
+            gc.collect()
+        self.assertEqual(ran, [])
+        self.assertEqual(self.errors, [])
+        self.assertEqual(observed, [])
+
+    async def test_shutdown_rejects_tasks_spawned_by_cancelled_bindings(self):
+        """A cancelled plugin's finally block cannot extend the stopped UI lifetime."""
+        started = asyncio.Event()
+        child_started, children = [], []
+
+        def popup(accept):
+            bindings = KeyBindings()
+            field = TextArea(height=1)
+
+            async def child():
+                child_started.append(True)
+                await asyncio.Event().wait()
+
+            @bindings.add("tab", eager=True)
+            async def waiting(event):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    children.append(event.app.create_background_task(child()))
+
+            return PopupView(HSplit([field], key_bindings=bindings), field)
+
+        await self.configure(popup=popup)
+        self.panel.show()
+        self.panel.open_popup()
+        self.panel.feed(b"\t")
+        async with asyncio.timeout(3):
+            await started.wait()
+            await self.panel.close()
+        self.assertEqual(child_started, [])
+        self.assertEqual(len(children), 1)
+        self.assertTrue(children[0].cancelled())
+        self.assertEqual(self.errors, [])
 
     async def test_only_reserved_rows_are_painted_with_default_background(self):
         """Panel painting preserves rows above and below its rectangle."""

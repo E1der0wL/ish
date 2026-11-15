@@ -12,12 +12,19 @@ HIDE = b"\x1b]777;ish;test-session-42;2;H\x1b\\"
 class Recorder:
     """Record externally observable bytes, UI events and unsafe transitions."""
 
-    def __init__(self):
+    def __init__(self, *, track_rewind=False, track_clear=False):
         """Construct a stream without borrowing any implementation validators."""
         self.timeline = []
         self.events = []
         self.chunks = []
-        self.stream = Stream(NONCE, self.write, self.event, self.unsafe)
+        self.stream = Stream(
+            NONCE,
+            self.write,
+            self.event,
+            self.unsafe,
+            self.rewind if track_rewind else None,
+            self.cleared if track_clear else None,
+        )
 
     def write(self, data):
         """Collect actual forwarded bytes in their original order."""
@@ -32,6 +39,14 @@ class Recorder:
     def unsafe(self):
         """Record when the owner must stop decorating the current prompt."""
         self.timeline.append(("unsafe", None))
+
+    def rewind(self):
+        """Record controls which invalidate a prior blank-area observation."""
+        self.timeline.append(("rewind", None))
+
+    def cleared(self):
+        """Record completed host erasure, separately from primary eligibility."""
+        self.timeline.append(("cleared", None))
 
     @property
     def data(self):
@@ -59,6 +74,101 @@ class StreamTests(unittest.TestCase):
             ],
         )
 
+    def test_blank_evidence_follows_complete_host_erase(self):
+        """Fragmented ED0/ED2 never publish evidence before their final byte."""
+        for wire in (b"\x1b[J", b"\x1b[0J", b"\x1b[2J"):
+            with self.subTest(wire=wire):
+                recorder = Recorder(track_clear=True)
+                recorder.stream.feed(wire[:-1])
+                self.assertEqual(recorder.timeline, [])
+                recorder.stream.feed(wire[-1:])
+                self.assertEqual(
+                    recorder.timeline,
+                    [("unsafe", None), ("bytes", wire), ("cleared", None)],
+                )
+                self.assertEqual(recorder.events, [])
+
+    def test_selective_or_upper_erase_does_not_claim_blank_rows(self):
+        """ED1, ED3 and protected-cell erase leave no lower-screen guarantee."""
+        for wire in (b"\x1b[1J", b"\x1b[3J", b"\x1b[?J", b"\x1b[?0J"):
+            with self.subTest(wire=wire):
+                recorder = Recorder(track_clear=True)
+                recorder.stream.feed(wire)
+                self.assertEqual(recorder.data, wire)
+                self.assertNotIn(("cleared", None), recorder.timeline)
+
+    def test_input_modes_preserve_existing_display_evidence(self):
+        """Cursor/keypad encoding modes pass unchanged without erasing panels."""
+        recorder = Recorder(track_clear=True, track_rewind=True)
+        wire = b"\x1b[?1h\x1b=\x1b[?1l\x1b>"
+        recorder.stream.feed(wire)
+        self.assertEqual(recorder.data, wire)
+        self.assertTrue(all(kind == "bytes" for kind, _ in recorder.timeline))
+
+    def test_event_callback_runs_after_record_state_is_cleared(self):
+        """A callback may inspect the boundary without seeing a pending marker."""
+        seen = []
+        output = []
+
+        def observe(kind, serial):
+            seen.append((kind, serial, stream.boundary))
+            stream.finish()
+
+        stream = Stream(NONCE, output.append, observe, lambda: None)
+        stream.feed(PRIMARY + b"prompt")
+        self.assertEqual(seen, [("P", 1, True)])
+        self.assertEqual(output, [b"prompt"])
+
+    def test_rewind_controls_notify_before_their_unchanged_wire_bytes(self):
+        """Backward cursor, screen edits and saved cursors invalidate blank evidence."""
+        for control in (
+            b"\x1b[A",
+            b"\x1b[2F",
+            b"\x1b[1;1H",
+            b"\x1b[2;3f",
+            b"\x1b[3d",
+            b"\x1b[2J",
+            b"\x1b[r",
+            b"\x1b[S",
+            b"\x1b[T",
+            b"\x1b[2L",
+            b"\x1b[3M",
+            b"\x1b[s",
+            b"\x1b[u",
+            b"\x1b7",
+            b"\x1b8",
+            b"\x1bM",
+            b"\x8d",
+        ):
+            with self.subTest(control=control):
+                recorder = Recorder(track_rewind=True)
+                for byte in control:
+                    recorder.stream.feed(bytes((byte,)))
+                self.assertEqual(recorder.data, control)
+                self.assertEqual(recorder.timeline[0], ("rewind", None))
+                self.assertEqual(recorder.timeline.count(("rewind", None)), 1)
+
+    def test_forward_text_and_horizontal_controls_do_not_invalidate_blank_evidence(
+        self,
+    ):
+        """Append-only output is distinguishable without modeling terminal cells."""
+        wire = b"text\r\n\b\t\x1b[B\x1b[2E\x1b[3C\x1b[4D\x1b[6G\x1b[32m\x1b[0m"
+        recorder = Recorder(track_rewind=True)
+        recorder.stream.feed(wire)
+        self.assertEqual(recorder.data, wire)
+        self.assertNotIn(("rewind", None), recorder.timeline)
+        self.assertNotIn(("unsafe", None), recorder.timeline)
+
+    def test_utf8_continuation_is_not_a_raw_reverse_index(self):
+        """A Unicode continuation byte cannot be mistaken for a C1 cursor command."""
+        wire = "Í".encode()
+        recorder = Recorder(track_rewind=True)
+        for byte in wire:
+            recorder.stream.feed(bytes((byte,)))
+        self.assertEqual(recorder.data, wire)
+        self.assertNotIn(("rewind", None), recorder.timeline)
+        self.assertNotIn(("unsafe", None), recorder.timeline)
+
     def test_all_record_split_positions_preserve_events_and_output(self):
         """Read boundaries must not change private event recognition."""
         wire = b"hello" + PRIMARY + b"user> " + HIDE + b"done\r\n"
@@ -81,7 +191,15 @@ class StreamTests(unittest.TestCase):
 
     def test_malformed_private_lookalikes_are_forwarded(self):
         """Unknown fields and malformed serials are never UI notifications."""
-        for body in (b"x;P", b"-1;P", b"3;X", b"4;P;extra", b";H"):
+        for body in (
+            b"x;P",
+            b"-1;P",
+            b"3;X",
+            b"4;P;extra",
+            b";H",
+            b"5;\xff",
+            b"6;\xc3\xa9",
+        ):
             with self.subTest(body=body):
                 wire = b"\x1b]777;ish;test-session-42;" + body + b"\x07"
                 recorder = Recorder()

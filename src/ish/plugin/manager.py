@@ -12,7 +12,7 @@ import importlib.util
 import re
 import sys
 import traceback
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError
 from itertools import count, islice
@@ -31,6 +31,7 @@ from ish.log import get_logger
 from .dependencies import (
     PACKAGE_ENTRY,
     PYTHON_SOURCE_SUFFIX,
+    has_distribution_files,
     has_duplicate_metadata,
     has_import,
     install_dependency,
@@ -185,8 +186,10 @@ class PluginManager:
     dependency cycles with a loading stack and unregister failed modules.
     """
 
-    def __init__(self):
+    def __init__(self, *, script_dir: Path | None = None, lib_dir: Path | None = None):
         """Prepare the registry, installation history, cycle-detection set, and logger."""
+        self._script_dir = Path(script_dir) if script_dir is not None else None
+        self._lib_dir = Path(lib_dir) if lib_dir is not None else None
         self.registry = PluginRegistry()
         self.python_exe: Optional[str] = None
         self.plugins: List[Any] = []
@@ -197,6 +200,20 @@ class PluginManager:
         self._entry_modules: dict[str, tuple[str, Any]] = {}
 
         self.logger = get_logger()
+
+    @property
+    def script_dir(self) -> Path:
+        """Use an explicit source root or the current legacy configuration."""
+        return (
+            self._script_dir
+            if self._script_dir is not None
+            else config.PLUGIN_SCRIPT_DIR
+        )
+
+    @property
+    def lib_dir(self) -> Path:
+        """Use an explicit library root or the current legacy configuration."""
+        return self._lib_dir if self._lib_dir is not None else config.PLUGIN_LIB_DIR
 
     def _parse_plugin_requirement(
         self, req: str
@@ -225,11 +242,17 @@ class PluginManager:
                 return candidate
         return None
 
-    @staticmethod
-    def _get_plugin_path(name: str) -> Path:
+    def _get_plugin_path(self, name: str) -> Path:
         """Resolve the user source directory for a plugin name."""
-        plugin_dir = config.PLUGIN_SCRIPT_DIR / name
-        return plugin_dir
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.startswith(_HIDDEN_PREFIX)
+            or "/" in name
+            or "\\" in name
+        ):
+            raise ValueError("A plugin name must identify one visible source directory")
+        return self.script_dir / name
 
     def _get_plugin_meta(self, path: Path) -> object:
         """Read the literal PLUGIN_META value without executing the module."""
@@ -267,13 +290,12 @@ class PluginManager:
             )
             return False
 
-    def _has_extras(self, requirement: Requirement, seen=None) -> bool:
-        """Check installed metadata for an extras dependency tree without importing it.
-
-        Only extras requests traverse dependency metadata. The visited set is
-        local to this check, so cycles terminate without caching stale installs.
-        """
+    def _has_dependencies(
+        self, requirement: Requirement, seen=None, checked=None
+    ) -> bool:
+        """Validate the active distribution tree and its files without importing it."""
         seen = set() if seen is None else seen
+        checked = set() if checked is None else checked
         key = (canonicalize_name(requirement.name), frozenset(requirement.extras))
         try:
             distribution = importlib.metadata.distribution(requirement.name)
@@ -281,6 +303,16 @@ class PluginManager:
             return False
         if not self._is_version_allowed(distribution.version, requirement.specifier):
             return False
+        name = key[0]
+        if name not in checked:
+            if has_duplicate_metadata(requirement.name, self.lib_dir):
+                return False
+            root = Path(distribution.locate_file("")).resolve()
+            if not has_distribution_files(
+                distribution, required=root.is_relative_to(self.lib_dir.resolve())
+            ):
+                return False
+            checked.add(name)
         if key in seen:
             return True
         seen.add(key)
@@ -291,14 +323,14 @@ class PluginManager:
                 child.marker.evaluate({_EXTRA_MARKER: extra}) for extra in extras
             ):
                 continue
-            if not self._has_extras(child, seen):
+            if not self._has_dependencies(child, seen, checked):
                 return False
         return True
 
     def _is_library_available(
         self, library: str, *, import_parents: bool = True, installed: bool = False
     ) -> bool:
-        """Check metadata and imports, distinguishing missing parents from broken imports."""
+        """Check installed files, active dependencies and the requested import."""
         dependency = DependencySpec.parse(library)
         requirement = dependency.requirement
         if not dependency.active:
@@ -311,19 +343,10 @@ class PluginManager:
             and dependency.specification not in self._installed_libs
         ):
             return False
-        if has_duplicate_metadata(requirement.name, config.PLUGIN_LIB_DIR):
+        # File validation runs before imports so an incomplete package is repaired
+        # while the existing installation transaction can still roll it back.
+        if not self._has_dependencies(requirement):
             return False
-        # Check the version before find_spec can import a dotted name's parent.
-        if requirement.extras:
-            if not self._has_extras(requirement):
-                return False
-        elif requirement.specifier:
-            try:
-                version = importlib.metadata.version(requirement.name)
-            except PackageNotFoundError:
-                return False
-            if not self._is_version_allowed(version, requirement.specifier):
-                return False
         name = dependency.import_name
         if not import_parents:
             return has_import(name)
@@ -386,7 +409,7 @@ class PluginManager:
         Pass an argument vector rather than a shell string, and report installation
         failures as False.
         """
-        if not config.PLUGIN_LIB_DIR or not self.python_exe:
+        if not self.lib_dir or not self.python_exe:
             self.logger.warning(i18n.get(Message.PIP_INSTALL_FAIL, library=library))
             return False
 
@@ -395,7 +418,7 @@ class PluginManager:
             with install_dependency(
                 self.python_exe,
                 specification,
-                config.PLUGIN_LIB_DIR,
+                self.lib_dir,
                 self._dependency_constraints(),
             ):
                 if not self._is_library_available(
@@ -447,7 +470,12 @@ class PluginManager:
         self._entry_modules[plugin_name] = (full_module_name, module)
         sys.modules[full_module_name] = module
 
-        spec.loader.exec_module(module)
+        # Editable entry files must not reuse timestamp bytecode when an edit
+        # preserves both size and the filesystem's timestamp granularity.
+        code = compile(
+            plugin_file.read_bytes(), str(plugin_file), "exec", dont_inherit=True
+        )
+        exec(code, module.__dict__)
         if info is not None:
             info.module = module
         return info
@@ -541,33 +569,44 @@ class PluginManager:
         finally:
             self._loading_stack.discard(plugin_name)
 
-    def load(self) -> List[Any]:
-        """Add installation directories to the import path and load user plugins
-        sequentially.
+    def load(self, names: Sequence[str] | None = None) -> List[Any]:
+        """Load selected plugins in order, or discover all legacy plugins with None.
 
         Use the current interpreter to install dependencies. Log individual plugin
-        errors and continue loading other plugins.
+        errors and continue loading other plugins. An empty selection runs none.
         """
-        if str(config.PLUGIN_LIB_DIR) not in sys.path:
-            sys.path.insert(0, str(config.PLUGIN_LIB_DIR))
+        if isinstance(names, (str, bytes)):
+            raise TypeError("Selected plugins must be a sequence of names")
+        if str(self.lib_dir) not in sys.path:
+            sys.path.insert(0, str(self.lib_dir))
 
-        if str(config.PLUGIN_SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(config.PLUGIN_SCRIPT_DIR))
+        if str(self.script_dir) not in sys.path:
+            sys.path.insert(0, str(self.script_dir))
 
         # Use the interpreter that owns ish's environment, including under uv.
         self.python_exe = sys.executable
-        return self._load_plugins()
+        return self._load_plugins(names)
 
-    def _load_plugins(self) -> List[Any]:
+    def _load_plugins(self, names: Sequence[str] | None = None) -> List[Any]:
         """Load plugin directories after configuring dependency installation and imports."""
         loaded_infos = []
-        plugin_dirs = [
-            d
-            for d in config.PLUGIN_SCRIPT_DIR.iterdir()
-            if d.is_dir() and not d.name.startswith(_HIDDEN_PREFIX)
-        ]
-        for plugin_dir in plugin_dirs:
+        selected = (
+            names
+            if names is not None
+            else [
+                d.name
+                for d in self.script_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(_HIDDEN_PREFIX)
+            ]
+        )
+        visited = set()
+        for name in selected:
+            plugin_dir = self.script_dir / str(name)
             try:
+                plugin_dir = self._get_plugin_path(name)
+                if name in visited:
+                    continue
+                visited.add(name)
                 info = self._resolve(plugin_dir)
                 if info:
                     loaded_infos.append(info)
@@ -577,17 +616,15 @@ class PluginManager:
                     )
             except Exception:
                 format_exc = str(traceback.format_exc())
-                target_path = str(config.PLUGIN_LIB_DIR)
+                target_path = str(self.lib_dir)
                 log_sys_path = f"sys.path count: {len(sys.path)}\n" + "\n".join(
                     [f"  - {p}" for p in sys.path]
                 )
-                lib_dir_exists = config.PLUGIN_LIB_DIR.exists()
+                lib_dir_exists = self.lib_dir.exists()
                 lib_dir_contents = ""
                 if lib_dir_exists:
                     try:
-                        dir_contents = islice(
-                            config.PLUGIN_LIB_DIR.iterdir(), _DEBUG_FILE_LIMIT
-                        )
+                        dir_contents = islice(self.lib_dir.iterdir(), _DEBUG_FILE_LIMIT)
                         lib_dir_contents = "\n" + "\n".join(
                             f"  - {f.name}" for f in dir_contents
                         )

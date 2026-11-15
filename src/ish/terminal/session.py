@@ -33,12 +33,18 @@ class Session:
         *,
         env: dict[str, str] | None = None,
         input_flow: Callable[[bool], None] | None = None,
+        child_exited: Callable[[int], None] | None = None,
     ):
-        """Keep process configuration separate from UI focus and VT state."""
+        """Keep process exit observation separate from final output completion.
+
+        child_exited observes native process termination; exited follows final
+        delivery to output. Neither callback claims a host writer has drained.
+        """
         self.argv, self.cwd = argv, cwd
         self.output, self.exited, self.failed = output, exited, failed
         self.env = env
         self.input_flow = input_flow
+        self.child_exited = child_exited
         self.output_enabled = True
         self.pid = self.fd = None
         self.writer = self.waiter = self.loop = None
@@ -47,12 +53,15 @@ class Session:
         self.closed = False
         self.size = (0, 0)
         self.pending_input = bytearray()
+        self._output_done = None
+        self._final_remaining = None
 
     def start(self, cols: int, rows: int) -> None:
         """Create the shell's controlling terminal before starting background work."""
         if self.pid is not None:
             raise RuntimeError("The terminal session has already started")
         self.loop = asyncio.get_running_loop()
+        self._output_done = self.loop.create_future()
         if self.env is None:
             from .host import scrub_environment
 
@@ -67,7 +76,7 @@ class Session:
                 termios.tcsetwinsize(0, (rows, cols))
                 os.execvpe(self.argv[0], self.argv, env)
             except BaseException as exc:
-                os.write(2, f"ish-vt: {exc}\r\n".encode(errors="replace"))
+                os.write(2, f"ish: {exc}\r\n".encode(errors="replace"))
                 os._exit(127)
         self.size = (cols, rows)
         os.set_blocking(self.fd, False)
@@ -79,15 +88,19 @@ class Session:
         self.waiter = self.loop.create_task(self._wait())
 
     def _read(self) -> None:
-        """Feed bounded output batches to the VT engine; never write to stdout."""
-        if not self.output_enabled:
+        """Deliver bounded output batches, retaining final work across pauses."""
+        if self.closed or not self.output_enabled or self._output_done.done():
             return
         budget = READ_BUDGET
+        if self._final_remaining is not None:
+            budget = min(budget, self._final_remaining)
         try:
             while budget > 0:
                 try:
                     data = os.read(self.fd, min(READ_BYTES, budget))
                 except BlockingIOError:
+                    if self._final_remaining is not None:
+                        self._finish_output()
                     break
                 except OSError as exc:
                     if exc.errno != errno.EIO:
@@ -95,27 +108,52 @@ class Session:
                     data = b""
                 if not data:
                     self.eof = True
-                    self.loop.remove_reader(self.fd)
+                    self._finish_output()
                     break
                 budget -= len(data)
+                if self._final_remaining is not None:
+                    self._final_remaining -= len(data)
                 self.output(data)
+                if self._final_remaining == 0:
+                    self._finish_output()
+                    break
                 if not self.output_enabled:
                     break
         except Exception as exc:
-            self.loop.remove_reader(self.fd)
+            self._finish_output(delivered=False)
             self.failed(exc)
 
+    def _finish_output(self, *, delivered=True) -> None:
+        """Finish the final delivery or release its waiter during forced close."""
+        self.loop.remove_reader(self.fd)
+        if not self._output_done.done():
+            self._output_done.set_result(delivered)
+
     async def _wait(self) -> None:
-        """Reap the actual child without foreground polling or /proc inspection."""
+        """Observe child exit before reporting completion of its final output."""
         _, status = await asyncio.to_thread(os.waitpid, self.pid, 0)
         self.returncode = os.waitstatus_to_exitcode(status)
         if not self.closed:
+            # Fresh and previously queued input must not reach a retained slave
+            # while the host finishes consuming this child's output.
+            self.writer.close()
+            try:
+                if self.child_exited:
+                    self.child_exited(self.returncode)
+            except Exception as exc:
+                self._finish_output(delivered=False)
+                self.failed(exc)
+                return
             # A background process may keep the slave open after the shell has
-            # exited. Drain already available output without tying UI lifetime
-            # to that process or guessing from a quiet-output timeout.
-            if not self.eof:
+            # exited, or keep producing output. Preserve the existing one-pass
+            # final budget, carrying its remainder across host backpressure.
+            # EAGAIN ends that pass without waiting for a retained slave's EOF.
+            if not self._output_done.done():
+                self._final_remaining = READ_BUDGET
                 self._read()
-            self.exited(self.returncode)
+            delivered = await self._output_done
+            if delivered and not self.closed:
+                self.exited(self.returncode)
 
     def send(self, data: bytes) -> None:
         """Queue bytes from the focused pane or a terminal protocol reply."""
@@ -141,10 +179,14 @@ class Session:
     def set_output_enabled(self, enabled: bool) -> None:
         """Apply backpressure without changing the child or consuming its output."""
         self.output_enabled = enabled
-        if self.fd is None or self.closed or self.eof:
+        if self.fd is None or self.closed or self._output_done.done():
             return
         if enabled:
             self.loop.add_reader(self.fd, self._read)
+            if self._final_remaining is not None:
+                # A retained slave with no pending bytes is not readable. Probe
+                # once after resuming so EAGAIN can finish the final pass.
+                self.loop.call_soon(self._read)
         else:
             self.loop.remove_reader(self.fd)
 
@@ -156,6 +198,7 @@ class Session:
         self.pending_input.clear()
         if self.fd is None:
             return
+        self._finish_output(delivered=False)
         groups = {self.pid} if self.returncode is None else set()
         try:
             groups.add(os.tcgetpgrp(self.fd))

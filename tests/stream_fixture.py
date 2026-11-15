@@ -8,6 +8,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import termios
 import time
@@ -20,6 +21,20 @@ HOST_QUERIES = b"\x1b[6n\x1bP$qr\x1b\\\x1b[5n"
 QUERY_SECONDS = 20
 INPUT_GATE_SECONDS = 30
 INPUT_READ_BYTES = 65536
+SIZE_POLL_SECONDS = 0.05
+SHELL_STARTUP = {
+    "tcsh": (
+        ".tcshrc",
+        "set prompt = 'STREAM_PRIMARY> '\nset prompt2 = 'STREAM_MORE> '\nset history = 20\n",
+    ),
+    "bash": (".bashrc", "PS1='STREAM_PRIMARY> '\nPS2='STREAM_MORE> '\n"),
+    "zsh": (".zshrc", "PROMPT='STREAM_PRIMARY> '\nPS2='STREAM_MORE> '\n"),
+}
+SHELL_EXECUTABLE_ENV = {
+    "bash": "ISH_TEST_BASH",
+    "tcsh": "ISH_TEST_TCSH",
+    "zsh": "ISH_TEST_ZSH",
+}
 RAW_OUTPUT = (
     b"\x1b]2;STREAM_NATIVE_TITLE\x07"
     b"\x1b[38;2;17;35;51mTRUECOLOR\x1b[0m\r\n"
@@ -31,6 +46,21 @@ RAW_OUTPUT = (
     + b"\x1b\\"
     + b"STREAM_RAW_DONE\r\n"
 )
+
+
+def configure_shell(directory: Path, shell: str, startup: str = "") -> None:
+    """Write an isolated native rc file shared by PTY and real host tests."""
+    filename, source = SHELL_STARTUP[shell]
+    (directory / filename).write_text(source + startup, encoding="utf-8")
+
+
+def shell_executable(shell: str) -> str:
+    """Resolve the selected binary before fixtures change their working directory."""
+    selected = os.environ.get(SHELL_EXECUTABLE_ENV[shell]) or shell
+    executable = shutil.which(selected)
+    # Keep the invocation name (including symlinks) so adapter selection still
+    # sees the shell the caller chose. Missing selections remain explicit.
+    return os.path.abspath(executable) if executable else selected
 
 
 def raw_input(path: Path) -> None:
@@ -88,21 +118,36 @@ def gated_input(directory: Path) -> None:
 def watch_size(path: Path) -> None:
     """Record the kernel PTY size initially and after actual SIGWINCH delivery."""
     sizes = []
+    resize_pending = False
 
-    def record(*_):
+    def changed(*_):
+        nonlocal resize_pending
+        resize_pending = True
+
+    def record():
         size = os.get_terminal_size(0)
         sizes.append([size.columns, size.lines])
-        path.write_text(json.dumps(sizes))
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(sizes))
+        temporary.replace(path)
 
-    signal.signal(signal.SIGWINCH, record)
+    previous_resize = signal.signal(signal.SIGWINCH, changed)
     saved = termios.tcgetattr(0)
     try:
         tty.setraw(0, termios.TCSANOW)
         record()
         os.write(1, READY)
-        while os.read(0, 1) != b"q":
-            pass
+        while True:
+            if resize_pending:
+                resize_pending = False
+                record()
+            if select.select([0], [], [], SIZE_POLL_SECONDS)[0]:
+                if os.read(0, 1) == b"q":
+                    if resize_pending:
+                        record()
+                    break
     finally:
+        signal.signal(signal.SIGWINCH, previous_resize)
         termios.tcsetattr(0, termios.TCSANOW, saved)
         os.write(1, DONE)
 

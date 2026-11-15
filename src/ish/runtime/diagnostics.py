@@ -12,8 +12,6 @@ from ish import __version__
 from ish.config import config
 from ish.lang import Message, i18n
 from ish.runtime.distribution import bundled_forward_binary, bundled_root
-from ish.shell.adapter import get_adapter
-from ish.shell.constants import NATIVE_COMPILER
 
 _TERM_ENV = "TERM"
 
@@ -38,12 +36,14 @@ def _cache_status() -> tuple[str, str]:
             else Message.CLI_DIAGNOSE_NO
         )
         return access, noexec
-    except OSError:
+    except (OSError, AttributeError):
         return (i18n.get(Message.CLI_DIAGNOSE_UNAVAILABLE),) * 2
 
 
 def _helper_status() -> str:
     """Locate the bundled helper or compiler without importing the build machinery."""
+    from ish.shell.constants import NATIVE_COMPILER
+
     path = bundled_forward_binary()
     if path is not None:
         return i18n.get(
@@ -59,21 +59,17 @@ def _helper_status() -> str:
     )
 
 
-def print_diagnostics(option: Namespace) -> None:
-    """Print a translated pre-rc snapshot, including unavailable or unsupported resources.
+def environment_fields(shell: str) -> dict[Message, object]:
+    """Collect shared runtime facts without invoking shell adapters or user code.
 
     A successful report does not certify shell health or the ability to execute files.
     Missing dependencies are reported as data; no shell or helper is spawned here.
     """
     missing = i18n.get(Message.CLI_DIAGNOSE_MISSING)
     unavailable = i18n.get(Message.CLI_DIAGNOSE_UNAVAILABLE)
-    shell_path = shutil.which(option.shell)
+    shell_path = shutil.which(shell)
     if shell_path:
         shell_path = os.path.abspath(shell_path)
-    try:
-        adapter = get_adapter(option.shell, shell_path).name
-    except ValueError:
-        adapter = i18n.get(Message.CLI_DIAGNOSE_UNSUPPORTED)
     try:
         columns, rows = os.get_terminal_size(sys.stdout.fileno())
         size = i18n.get(
@@ -83,7 +79,7 @@ def print_diagnostics(option: Namespace) -> None:
         size = unavailable
     cache_access, cache_noexec = _cache_status()
 
-    values = {
+    return {
         Message.CLI_DIAGNOSE_VERSION: __version__,
         Message.CLI_DIAGNOSE_RUNTIME: i18n.get(
             Message.CLI_DIAGNOSE_BUNDLED
@@ -94,31 +90,17 @@ def print_diagnostics(option: Namespace) -> None:
         Message.CLI_DIAGNOSE_EXECUTABLE: sys.executable,
         Message.CLI_DIAGNOSE_PLATFORM: f"{sys.platform} {platform.release()} {platform.machine()}",
         Message.CLI_DIAGNOSE_LIBC: " ".join(platform.libc_ver()).strip() or unavailable,
-        Message.CLI_DIAGNOSE_SHELL: option.shell,
+        Message.CLI_DIAGNOSE_SHELL: shell,
         Message.CLI_DIAGNOSE_SHELL_PATH: shell_path or missing,
         Message.CLI_DIAGNOSE_SHELL_REALPATH: os.path.realpath(shell_path)
         if shell_path
         else missing,
-        Message.CLI_DIAGNOSE_ADAPTER: adapter,
         Message.CLI_DIAGNOSE_HOME: config.ISH_HOME,
-        Message.CLI_DIAGNOSE_RC: config.RC_FILE,
-        Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(
-            Message.CLI_DIAGNOSE_DISABLED
-            if option.no_rc
-            else Message.CLI_DIAGNOSE_ENABLED
-        ),
-        Message.CLI_DIAGNOSE_PLUGINS: config.PLUGIN_SCRIPT_DIR,
-        Message.CLI_DIAGNOSE_PLUGIN_POLICY: i18n.get(
-            Message.CLI_DIAGNOSE_DISABLED
-            if option.no_plugins
-            else Message.CLI_DIAGNOSE_ENABLED
-        ),
         Message.CLI_DIAGNOSE_LANGUAGE: i18n.current_lang,
         Message.CLI_DIAGNOSE_LANGUAGE_DIR: config.LANG_DIR,
         Message.CLI_DIAGNOSE_CACHE: config.CACHE_DIR,
         Message.CLI_DIAGNOSE_CACHE_ACCESS: cache_access,
         Message.CLI_DIAGNOSE_CACHE_NOEXEC: cache_noexec,
-        Message.CLI_DIAGNOSE_HELPER: _helper_status(),
         Message.CLI_DIAGNOSE_TERMINAL: os.environ.get(_TERM_ENV) or unavailable,
         Message.CLI_DIAGNOSE_STDIN_TTY: i18n.get(
             Message.CLI_DIAGNOSE_YES if sys.stdin.isatty() else Message.CLI_DIAGNOSE_NO
@@ -128,7 +110,53 @@ def print_diagnostics(option: Namespace) -> None:
         ),
         Message.CLI_DIAGNOSE_TERMINAL_SIZE: size,
     }
-    print(i18n.get(Message.CLI_DIAGNOSE_TITLE))
-    print(i18n.get(Message.CLI_DIAGNOSE_SCOPE))
+
+
+def display_diagnostics(
+    title: Message, scope: Message, values: dict[Message, object]
+) -> None:
+    """Print already collected facts using the shared translation manager."""
+    print(i18n.get(title))
+    print(i18n.get(scope))
     for label, value in values.items():
         print(f"{i18n.get(label)}: {value}")
+
+
+def print_diagnostics(option: Namespace) -> None:
+    """Preserve the original ish report and its main-specific adapter facts."""
+    from ish.shell.adapter import get_adapter
+
+    shell_path = shutil.which(option.shell)
+    if shell_path:
+        shell_path = os.path.abspath(shell_path)
+    try:
+        adapter = get_adapter(option.shell, shell_path).name
+    except ValueError:
+        adapter = i18n.get(Message.CLI_DIAGNOSE_UNSUPPORTED)
+    extra = {
+        Message.CLI_DIAGNOSE_SHELL_REALPATH: {
+            Message.CLI_DIAGNOSE_ADAPTER: adapter,
+        },
+        Message.CLI_DIAGNOSE_HOME: {
+            Message.CLI_DIAGNOSE_RC: config.RC_FILE,
+            Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(
+                Message.CLI_DIAGNOSE_DISABLED
+                if option.no_rc
+                else Message.CLI_DIAGNOSE_ENABLED
+            ),
+            Message.CLI_DIAGNOSE_PLUGINS: config.PLUGIN_SCRIPT_DIR,
+            Message.CLI_DIAGNOSE_PLUGIN_POLICY: i18n.get(
+                Message.CLI_DIAGNOSE_DISABLED
+                if option.no_plugins
+                else Message.CLI_DIAGNOSE_ENABLED
+            ),
+        },
+        Message.CLI_DIAGNOSE_CACHE_NOEXEC: {
+            Message.CLI_DIAGNOSE_HELPER: _helper_status(),
+        },
+    }
+    values = {}
+    for label, value in environment_fields(option.shell).items():
+        values[label] = value
+        values.update(extra.get(label, {}))
+    display_diagnostics(Message.CLI_DIAGNOSE_TITLE, Message.CLI_DIAGNOSE_SCOPE, values)

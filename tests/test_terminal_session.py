@@ -1,14 +1,20 @@
 """Verify native terminal transport completion and failure using actual PTYs."""
 
 import asyncio
+import fcntl
 import os
+import select
 import sys
 import unittest
 
+from ish.runtime.fdio import FDWriter
 from ish.terminal.session import Session
 
 DEADLINE = 5
 OVERSIZED_INPUT = 5 * 1024 * 1024
+FINAL_OUTPUT = b"x" * 10000 + b"FINAL_MARKER"
+HOST_PIPE_BYTES = 4096
+HOST_QUEUE_BYTES = 32768
 
 
 @unittest.skipUnless(os.name == "posix", "A POSIX controlling PTY is required")
@@ -54,6 +60,15 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
             while marker not in self.output:
                 self.output_changed.clear()
                 await self.output_changed.wait()
+
+        await asyncio.wait_for(wait(), DEADLINE)
+
+    async def require_child_exit(self):
+        """Observe the real child's exit separately from output completion."""
+
+        async def wait():
+            while self.session.returncode is None:
+                await asyncio.sleep(0)
 
         await asyncio.wait_for(wait(), DEADLINE)
 
@@ -109,6 +124,174 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.session.send(b"AFTER_CHILD_EXIT\n")
         with self.assertRaises(BlockingIOError):
             os.read(self.slave, 128)
+
+    async def test_paused_final_output_precedes_completion(self):
+        """Backpressure cannot discard final bytes when the real child exits."""
+        self.start("import os\nos.write(1," + repr(FINAL_OUTPUT) + ")\n")
+
+        def pause(data):
+            self.received(data)
+            self.session.set_output_enabled(False)
+
+        self.session.output = pause
+        await self.require_child_exit()
+        self.assertFalse(self.completed.is_set())
+        self.assertLess(len(self.output), len(FINAL_OUTPUT))
+        self.session.output = self.received
+        self.session.set_output_enabled(True)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertEqual(bytes(self.output), FINAL_OUTPUT)
+        self.assertEqual(self.exits, [0])
+        self.assertEqual(self.errors, [])
+
+    async def test_host_writer_backpressure_preserves_final_output(self):
+        """A real blocked host pipe resumes without losing the child's last bytes."""
+        loop = asyncio.get_running_loop()
+        reader, writer = os.pipe()
+        os.set_blocking(reader, False)
+        os.set_blocking(writer, False)
+        fcntl.fcntl(writer, fcntl.F_SETPIPE_SZ, HOST_PIPE_BYTES)
+        payload = FINAL_OUTPUT * 3
+        delivered = bytearray()
+        host_done = asyncio.Event()
+        child_done = asyncio.Event()
+        flow = []
+
+        def changed(paused):
+            flow.append(paused)
+            self.session.set_output_enabled(not paused)
+
+        host = FDWriter(
+            loop,
+            writer,
+            self.errors.append,
+            max_pending_bytes=HOST_QUEUE_BYTES,
+            on_flow=changed,
+        )
+
+        def receive(data):
+            self.received(data)
+            host.write(data)
+
+        def consume():
+            while True:
+                try:
+                    data = os.read(reader, 65536)
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                delivered.extend(data)
+            if len(delivered) >= len(payload):
+                host_done.set()
+
+        try:
+            self.start("import os\nos.write(1," + repr(payload) + ")\n")
+            self.session.output = receive
+            self.session.child_exited = lambda code: child_done.set()
+            await asyncio.wait_for(child_done.wait(), DEADLINE)
+            self.assertIn(True, flow)
+            self.assertFalse(self.completed.is_set())
+            loop.add_reader(reader, consume)
+            await asyncio.wait_for(self.completed.wait(), DEADLINE)
+            await asyncio.wait_for(host.drain(), DEADLINE)
+            await asyncio.wait_for(host_done.wait(), DEADLINE)
+            self.assertEqual(bytes(delivered), payload)
+            self.assertEqual(bytes(self.output), payload)
+            self.assertEqual(self.exits, [0])
+            self.assertEqual(self.errors, [])
+        finally:
+            loop.remove_reader(reader)
+            host.close()
+            os.close(reader)
+            os.close(writer)
+
+    async def test_paused_exit_with_open_slave_drains_without_waiting_for_eof(self):
+        """A retained slave cannot prolong completion after final bytes are delivered."""
+        self.start(
+            "import os,sys\n"
+            "print('SLAVE='+os.ttyname(0),flush=True)\n"
+            "sys.stdin.readline()\n"
+            "os.write(1," + repr(FINAL_OUTPUT) + ")\n"
+        )
+        await self.require_output(b"\r\n")
+        line = bytes(self.output).split(b"\r\n", 1)[0]
+        self.slave = os.open(
+            os.fsdecode(line.removeprefix(b"SLAVE=")), os.O_RDWR | os.O_NOCTTY
+        )
+        self.session.set_output_enabled(False)
+        self.session.send(b"finish\n")
+        await self.require_child_exit()
+        self.assertFalse(self.completed.is_set())
+        self.session.set_output_enabled(True)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertTrue(self.output.endswith(FINAL_OUTPUT))
+        self.assertEqual(bytes(self.output).count(FINAL_OUTPUT), 1)
+        self.assertEqual(self.exits, [0])
+        self.assertEqual(self.errors, [])
+        os.fstat(self.slave)
+
+    async def test_close_releases_paused_exit_without_reporting_completion(self):
+        """Forced close cancels final delivery instead of hanging on paused output."""
+        self.start("import os\nos.write(1," + repr(FINAL_OUTPUT) + ")\n")
+
+        def pause(data):
+            self.received(data)
+            self.session.set_output_enabled(False)
+
+        self.session.output = pause
+        await self.require_child_exit()
+        await asyncio.wait_for(self.session.close(), DEADLINE)
+        self.assertEqual(self.exits, [])
+        self.assertEqual(self.errors, [])
+
+    async def test_child_exit_discards_input_queued_for_a_retained_slave(self):
+        """Host draining must not deliver pre-exit queued input to another consumer."""
+        self.start(
+            "import os,sys,tty\n"
+            "tty.setraw(0)\n"
+            "print('SLAVE='+os.ttyname(0),flush=True)\n"
+            "sys.stdin.readline()\n"
+            "os.write(1," + repr(FINAL_OUTPUT) + ")\n"
+        )
+        await self.require_output(b"\n")
+        line = bytes(self.output).split(b"\n", 1)[0]
+        self.slave = os.open(
+            os.fsdecode(line.removeprefix(b"SLAVE=")), os.O_RDWR | os.O_NOCTTY
+        )
+        self.session.set_output_enabled(False)
+        self.session.send(b"finish\n" + b"q" * (1024 * 1024))
+        await self.require_child_exit()
+        self.assertFalse(self.completed.is_set())
+        self.assertTrue(self.session.writer.closed)
+        os.set_blocking(self.slave, False)
+        # Empty bytes already accepted by the terminal before process exit.
+        while select.select((self.slave,), (), (), 0)[0]:
+            os.read(self.slave, 65536)
+        # Let ready callbacks run: an uncancelled native writer would now send
+        # its queued suffix into the independently retained slave.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        with self.assertRaises(BlockingIOError):
+            os.read(self.slave, 65536)
+        self.session.set_output_enabled(True)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertTrue(self.output.endswith(FINAL_OUTPUT))
+        self.assertEqual(self.exits, [0])
+
+    async def test_child_exit_callback_failure_releases_completion_wait(self):
+        """A lifecycle observer failure reports failure without a hanging drain."""
+
+        def failed_observer(code):
+            raise RuntimeError("broken child observer")
+
+        self.start("print('FINAL')")
+        self.session.child_exited = failed_observer
+        await asyncio.wait_for(self.session.waiter, DEADLINE)
+        self.assertEqual(self.exits, [])
+        self.assertEqual(
+            [str(error) for error in self.errors], ["broken child observer"]
+        )
 
     async def test_oversized_input_reports_transport_failure(self):
         """A rejected paste reaches the failure callback instead of escaping a key handler."""

@@ -4,6 +4,12 @@ import argparse
 import json
 import socket
 
+if __package__:
+    from .protocol import Reply
+else:
+    # Shell widgets execute this file directly with no package search path.
+    from protocol import Reply
+
 MAX_REPLY = 64
 
 
@@ -25,7 +31,7 @@ def main():
                 if not data:
                     break
                 answer.extend(data)
-            return 0 if answer in (b"done\n", b"cancel\n") else 1
+            return 0 if answer in (Reply.DONE, Reply.CANCEL) else 1
     except OSError:
         return 1
 

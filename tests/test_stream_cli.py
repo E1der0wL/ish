@@ -22,49 +22,75 @@ from pathlib import Path
 
 import pyte
 
-from stream_fixture import RAW_OUTPUT
+from stream_fixture import RAW_OUTPUT, configure_shell, shell_executable
+from stream_plugins import plugin_options
+from stream_state import INPUT_BYTES, failure, snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/stream_fixture.py"
 DEADLINE = 15
 PROMPT = b"STREAM_PRIMARY> "
+BAR = b"ish stream | native shell | F2 popup"
 F2 = b"\x1bOQ"
 PASTE_BYTES = 6 * 1024 * 1024
 PRESSURE_BYTES = 2 * 1024 * 1024
 WRITE_BYTES = 65536
+CPR_QUERY = b"\x1b[6n"
 
 
 class StreamProcess:
     """Drive the public CLI through its controlling terminal and observe output."""
 
-    def __init__(self, directory: Path, *, demo=False):
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        demo=False,
+        startup="",
+        shell="tcsh",
+        integration_dir=None,
+        plugins=(),
+        plugin_dir=None,
+        library_dir=None,
+        extra_args=(),
+    ):
         """Start an isolated user configuration and a real PTY child process."""
         self.directory = directory
+        self.demo = demo
         self.output = bytearray()
         self.screen = pyte.Screen(80, 24)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.stream = pyte.Stream(self.screen)
+        self.query_pending = b""
         self.status = None
-        (directory / ".tcshrc").write_text(
-            "set prompt = 'STREAM_PRIMARY> '\n"
-            "set prompt2 = 'STREAM_MORE> '\n"
-            "set history = 20\n"
-        )
+        self.sent = bytearray()
+        self.pty_end = None
+        self.cleanup_started = False
+        self.before_cleanup = None
+        configure_shell(directory, shell, startup)
         argv = [
             sys.executable,
             "-m",
             "ish.stream",
             "--shell",
-            "tcsh",
+            shell_executable(shell),
             "--cwd",
             str(directory),
         ]
-        if demo:
-            argv.append("--demo")
+        argv.extend(
+            plugin_options(directory, demo=demo, names=plugins, directory=plugin_dir)
+        )
+        if integration_dir is not None:
+            argv.extend(("--integration-dir", str(integration_dir)))
+        if library_dir is not None:
+            argv.extend(("--plugin-lib-dir", str(library_dir)))
+        argv.extend(extra_args)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             termios.tcsetwinsize(0, (24, 80))
             env = dict(os.environ)
+            for name in ("ZDOTDIR", "BASH_ENV", "ENV"):
+                env.pop(name, None)
             env.update(
                 HOME=str(directory),
                 TERM="xterm-256color",
@@ -83,17 +109,55 @@ class StreamProcess:
         except OSError as error:
             if error.errno != errno.EIO:
                 raise
+            if self.pty_end is None:
+                self.pty_end = {"kind": "EIO", "state": self.state()}
             return b""
+        if not data and self.pty_end is None:
+            self.pty_end = {"kind": "EOF", "state": self.state()}
         self.output.extend(data)
+        self._display(data)
+        return data
+
+    def state(self):
+        """Observe the CLI without reaping or altering the PTY's input state."""
+        return snapshot(
+            self.pid, self.fd, returncode=self.status, cleanup=self.cleanup_started
+        )
+
+    def diagnostic(self, reason):
+        """Keep first PTY closure evidence separate from later fixture teardown."""
+        return failure(
+            reason, self.state(), self.output, self.sent, pty_end=self.pty_end
+        )
+
+    def _display(self, data: bytes):
+        """Answer a split CPR at its exact stream position in the test host."""
         # The CLI is the only possible requester at these test boundaries.
-        pieces = data.split(b"\x1b[6n")
-        for index, piece in enumerate(pieces):
-            self.stream.feed(self.decoder.decode(piece))
-            if index != len(pieces) - 1:
+        pending = self.query_pending + data
+        self.query_pending = b""
+        while pending:
+            offset = pending.find(CPR_QUERY)
+            if offset >= 0:
+                self.stream.feed(self.decoder.decode(pending[:offset]))
                 self.send(
                     f"\x1b[{self.screen.cursor.y + 1};{self.screen.cursor.x + 1}R".encode()
                 )
-        return data
+                pending = pending[offset + len(CPR_QUERY) :]
+                continue
+            keep = next(
+                (
+                    size
+                    for size in range(min(len(pending), len(CPR_QUERY) - 1), 0, -1)
+                    if CPR_QUERY.startswith(pending[-size:])
+                ),
+                0,
+            )
+            if keep:
+                self.stream.feed(self.decoder.decode(pending[:-keep]))
+                self.query_pending = pending[-keep:]
+            else:
+                self.stream.feed(self.decoder.decode(pending))
+            break
 
     def wait(self, predicate, description):
         """Use elapsed time solely to fail a test, never to infer readiness."""
@@ -102,9 +166,7 @@ class StreamProcess:
             if predicate():
                 return
             self.read()
-        raise AssertionError(
-            f"Timed out: {description}\n{bytes(self.output[-4000:])!r}"
-        )
+        raise AssertionError(self.diagnostic(f"Timed out: {description}"))
 
     def expect(self, data: bytes, after=0):
         """Wait for a fixture byte marker, allowing a caller to reject older output."""
@@ -124,18 +186,30 @@ class StreamProcess:
 
     def send(self, data: bytes):
         """Write literal external input without using internal Application methods."""
+        self.sent.extend(data[-INPUT_BYTES:])
+        del self.sent[:-INPUT_BYTES]
         view = memoryview(data)
         while view:
             try:
                 view = view[os.write(self.fd, view) :]
             except BlockingIOError:
                 select.select([], [self.fd], [], 1)
+            except OSError as error:
+                raise AssertionError(
+                    self.diagnostic(f"PTY write failed: {error}")
+                ) from error
 
     def command(self, text: str):
         """Submit one command and wait for the next actual shell prompt output."""
         offset = len(self.output)
         self.send(text.encode() + b"\r")
         self.expect(PROMPT, offset)
+        if self.demo:
+            self.expect(BAR, offset)
+            self.wait(
+                lambda: BAR.decode() in "\n".join(self.screen.display),
+                "current primary panel after native command",
+            )
 
     def fixture(self, kind: str, path: Path | None = None):
         """Run an independent native stdin/output/size fixture from the shell."""
@@ -163,7 +237,12 @@ class StreamProcess:
 
     def stop(self):
         """Close and reap only the CLI process created by this fixture."""
+        if self.cleanup_started:
+            return
+        self.before_cleanup = self.state()
+        self.cleanup_started = True
         os.close(self.fd)
+        self.fd = None
         if self.status is not None:
             return
         try:
@@ -194,9 +273,9 @@ class StreamCliTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
 
-    def start(self, *, demo=False):
+    def start(self, *, demo=False, startup=""):
         """Register cleanup before waiting for the native primary prompt."""
-        process = StreamProcess(self.directory, demo=demo)
+        process = StreamProcess(self.directory, demo=demo, startup=startup)
         self.addCleanup(process.stop)
         process.expect(PROMPT)
         return process
@@ -209,6 +288,76 @@ class StreamCliTests(unittest.TestCase):
         self.assertIn(RAW_OUTPUT, bytes(process.output[offset:]))
         self.assertNotIn(b"F2", bytes(process.output[:offset]))
         self.assertNotIn(b"\x1b[?1049h", bytes(process.output[:offset]))
+
+    def test_empty_submissions_keep_natural_prompt_rows(self):
+        """Empty Enter adds one adjacent native prompt without consuming extra history."""
+        process = self.start(demo=True)
+        bar = b"ish stream | native shell | F2 popup"
+        process.expect(bar)
+        prompt = PROMPT.decode().rstrip()
+        for count in range(1, 5):
+            with self.subTest(submissions=count):
+                offset = len(process.output)
+                process.send(b"\r")
+                process.expect(PROMPT, offset)
+                process.expect(bar, offset)
+                rows = [
+                    row
+                    for row, line in enumerate(process.screen.display)
+                    if line.rstrip() == prompt
+                ]
+                self.assertEqual(
+                    len(rows), count + 1, "\n".join(process.screen.display)
+                )
+                self.assertEqual(rows, list(range(rows[0], rows[0] + count + 1)))
+
+    def test_short_command_output_survives_prompt_return(self):
+        """A short command's result remains visible across subsequent prompt returns."""
+        process = self.start(demo=True)
+        bar = b"ish stream | native shell | F2 popup"
+        process.expect(bar)
+        marker = "RETAIN_SHORT_COMMAND_OUTPUT"
+        offset = len(process.output)
+        process.command("echo " + marker)
+        process.expect(bar, offset)
+        for count in range(4):
+            with self.subTest(empty_submissions=count):
+                self.assertIn(
+                    marker,
+                    [line.rstrip() for line in process.screen.display],
+                    "\n".join(process.screen.display),
+                )
+                if count != 3:
+                    offset = len(process.output)
+                    process.send(b"\r")
+                    process.expect(PROMPT, offset)
+                    process.expect(bar, offset)
+
+    def test_popup_close_preserves_visible_history(self):
+        """Closing a popup does not scroll away the existing native output above it."""
+        startup = "".join(f"echo RETAIN_START_{number}\n" for number in range(8))
+        process = self.start(demo=True, startup=startup)
+        bar = b"ish stream | native shell | F2 popup"
+        process.expect(bar)
+        before = [
+            line.rstrip()
+            for line in process.screen.display
+            if line.startswith("RETAIN_START_")
+        ]
+        self.assertTrue(before, "Startup fixture did not leave visible history")
+        offset = len(process.output)
+        process.send(F2)
+        process.expect(b"Plugin popup", offset)
+        offset = len(process.output)
+        process.send(b"\x1b")
+        process.expect(PROMPT, offset)
+        process.expect(bar, offset)
+        after = [
+            line.rstrip()
+            for line in process.screen.display
+            if line.startswith("RETAIN_START_")
+        ]
+        self.assertEqual(after, before, "\n".join(process.screen.display))
 
     def test_native_continuation_heredoc_and_typeahead(self):
         """Rapid multiline input produces only the intended native file content."""
@@ -429,6 +578,30 @@ class StreamCliTests(unittest.TestCase):
         process.send(b"\x04")
         process.wait(lambda: process.poll() is not None, "native Ctrl+D exit")
         self.assertEqual(process.status, 0)
+
+    def test_shell_exit_during_popup_does_not_wait_for_user_input(self):
+        """A dead shell revokes popup focus and completes without a manual close."""
+        for shell in ("tcsh", "bash", "zsh"):
+            with self.subTest(shell=shell):
+                directory = self.directory / shell
+                directory.mkdir()
+                process = StreamProcess(
+                    directory, demo=True, shell=shell, startup="echo $$ > shell-pid"
+                )
+                try:
+                    process.expect(BAR)
+                    process.send(F2)
+                    process.expect(b"Plugin popup")
+                    shell_pid = int((directory / "shell-pid").read_text())
+                    os.kill(shell_pid, signal.SIGKILL)
+                    process.wait(
+                        lambda process=process: process.poll() is not None,
+                        "shell exit while popup owns input",
+                    )
+                    self.assertEqual(process.status, 128 + signal.SIGKILL)
+                    self.assertNotIn(b"Traceback", process.output)
+                finally:
+                    process.stop()
 
 
 if __name__ == "__main__":

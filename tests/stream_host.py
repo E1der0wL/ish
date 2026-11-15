@@ -22,17 +22,45 @@ import traceback
 import tty
 from pathlib import Path
 
+from stream_fixture import SHELL_STARTUP, configure_shell, shell_executable
+from stream_plugins import plugin_options
+
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT = b"STREAM_PRIMARY> "
+BAR = b"ish stream | native shell | F2 popup"
 TEST_SECONDS = 45
 GATE_SECONDS = 600
 READ_BYTES = 65536
+LOOP_INPUT = {
+    "tcsh": (
+        b"foreach stream_item (one two)\r",
+        b"echo $stream_item >> loop-result\rend\r",
+    ),
+    "bash": (
+        b"for stream_item in one two; do\r",
+        b"printf '%s\\n' \"$stream_item\" >> loop-result\rdone\r",
+    ),
+    "zsh": (
+        b"for stream_item in one two; do\r",
+        b"printf '%s\\n' \"$stream_item\" >> loop-result\rdone\r",
+    ),
+}
 
 
 class HostRun:
     """Keep the real host as renderer and response source throughout each stage."""
 
-    def __init__(self, directory: Path, demo: bool):
+    def __init__(
+        self,
+        directory: Path,
+        demo: bool,
+        shell: str = "tcsh",
+        *,
+        require_resize=False,
+        integration_dir=None,
+        plugin_dir=None,
+        extra_args=(),
+    ):
         """Prepare isolated shell state and evidence without starting another GUI."""
         self.directory = directory.resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -40,22 +68,28 @@ class HostRun:
         self.home.mkdir(exist_ok=True)
         self.output = bytearray()
         self.demo = demo
+        self.shell = shell
+        self.require_resize = require_resize
+        self.integration_dir = integration_dir
+        self.plugin_dir = plugin_dir
+        self.extra_args = tuple(extra_args)
         self.fd = self.pid = None
         self.stage = 0
+        self.commands = 0
         self.sizes = []
+        self.resize_pending = False
         self.exiting = False
         self.exited = False
         self.result = {
             "status": "running",
             "scope": "native files and real host protocol responses",
             "demo": demo,
+            "shell": shell,
             "stages": [],
             "pixel_verification": "not performed",
             "gui_keyboard_verification": "not performed",
         }
-        (self.home / ".tcshrc").write_text(
-            "set prompt = 'STREAM_PRIMARY> '\nset prompt2 = 'STREAM_MORE> '\n"
-        )
+        configure_shell(self.home, shell)
         self.saved = termios.tcgetattr(0)
         self.original_resize = signal.getsignal(signal.SIGWINCH)
 
@@ -66,7 +100,13 @@ class HostRun:
         temporary.replace(self.directory / name)
 
     def resize(self, *_):
-        """Propagate an actual Windows Terminal/WSL resize to ish's outer PTY."""
+        """Schedule host resize work without reentering ioctl or file publication."""
+        self.resize_pending = True
+
+    def _apply_resize(self):
+        if not self.resize_pending:
+            return
+        self.resize_pending = False
         rows, cols = termios.tcgetwinsize(0)
         self.sizes.append([cols, rows])
         if self.fd is not None:
@@ -80,17 +120,23 @@ class HostRun:
             "-m",
             "ish.stream",
             "--shell",
-            "tcsh",
+            shell_executable(self.shell),
             "--cwd",
             str(self.home),
         ]
-        if self.demo:
-            argv.append("--demo")
+        argv.extend(
+            plugin_options(self.home, demo=self.demo, directory=self.plugin_dir)
+        )
+        if self.integration_dir is not None:
+            argv.extend(["--integration-dir", str(self.integration_dir)])
+        argv.extend(self.extra_args)
         rows, cols = termios.tcgetwinsize(0)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             termios.tcsetwinsize(0, (rows, cols))
             environment = dict(os.environ)
+            for name in ("ZDOTDIR", "BASH_ENV", "ENV"):
+                environment.pop(name, None)
             environment.update(
                 HOME=str(self.home),
                 PYTHONPATH=str(ROOT / "src") + os.pathsep + str(ROOT / "tests"),
@@ -101,6 +147,7 @@ class HostRun:
         tty.setraw(0)
         signal.signal(signal.SIGWINCH, self.resize)
         self.resize()
+        self._apply_resize()
         self.record(
             "environment.json",
             {
@@ -108,6 +155,15 @@ class HostRun:
                 "WT_SESSION": os.environ.get("WT_SESSION"),
                 "WSL_DISTRO_NAME": os.environ.get("WSL_DISTRO_NAME"),
                 "python": sys.version,
+                "shell_executable": shell_executable(self.shell),
+                "integration_dir": (
+                    str(self.integration_dir)
+                    if self.integration_dir is not None
+                    else None
+                ),
+                "plugin_dir": str(self.plugin_dir)
+                if self.plugin_dir is not None
+                else None,
                 "pid": self.pid,
                 "input_method": "scripted bytes into outer PTY; host responses relayed",
             },
@@ -124,6 +180,7 @@ class HostRun:
 
     def pump(self):
         """Relay output unchanged to the host and actual host input back to ish."""
+        self._apply_resize()
         ready, _, _ = select.select([0, self.fd], [], [], 0.05)
         if self.fd in ready:
             try:
@@ -144,7 +201,11 @@ class HostRun:
         if 0 in ready:
             data = os.read(0, READ_BYTES)
             if data:
-                self.send(data)
+                self.host_input(data)
+
+    def host_input(self, data: bytes):
+        """Relay host responses and keyboard bytes without interpreting them."""
+        self.send(data)
 
     def wait(self, predicate, description, timeout=TEST_SECONDS):
         """Wait for concrete observations; time is only a test failure limit."""
@@ -170,16 +231,31 @@ class HostRun:
         self.wait(gate.exists, f"screenshot gate {self.stage}: {name}", GATE_SECONDS)
 
     def command(self, command: str):
-        """Submit through the real CLI and wait for the next native primary prompt."""
+        """Submit through the real CLI and observe a subsequent native file result."""
+        self.commands += 1
+        completed = self.home / f"command-completed-{self.commands}"
+        marker = f"STREAM_COMMAND_{self.commands}_DONE"
         offset = len(self.output)
-        self.send(command.encode() + b"\r")
-        self.expect(PROMPT, offset)
+        # A native editor can redisplay PS1 before executing queued multiline
+        # input. A prompt substring alone must not complete the command check.
+        followup = shlex.join(["/usr/bin/touch", str(completed)])
+        followup += " && " + shlex.join(["/usr/bin/printf", "\\n%s\\n", marker])
+        self.send(command.encode() + b"\n" + followup.encode() + b"\r")
+        self.wait(completed.exists, "native command completion file")
+        # Creation can precede the final prompt hook. The printed marker's
+        # line breaks distinguish it from the command echoed by the editor.
+        observed = b"\r\n" + marker.encode() + b"\r\n"
+        self.expect(observed, offset)
+        after = self.output.index(observed, offset) + len(observed)
+        self.expect(PROMPT, after)
+        if self.demo:
+            self.expect(BAR, after)
 
     def scenario(self):
         """Expose each screen for independent GUI inspection and assert actual files."""
         self.expect(PROMPT)
         if self.demo:
-            self.expect(b"ish stream | native shell | F2 popup")
+            self.expect(BAR)
         self.gate("primary-bar" if self.demo else "primary-without-ui")
         if self.demo:
             offset = len(self.output)
@@ -188,13 +264,17 @@ class HostRun:
             self.send("팝업 값".encode())
             self.gate("popup")
             close_offset = len(self.output)
-            self.send(b"\x1b")
-            self.expect(PROMPT, close_offset)
+            # Enter unambiguously closes the popup even if the next scripted
+            # submission shares a read batch. Standalone Escape needs its key
+            # ambiguity interval; the PTY matrix verifies that path separately.
+            self.send(b"\r")
+            self.expect(BAR, close_offset)
         offset = len(self.output)
-        self.send(b"foreach stream_item (one two)\r")
+        loop_open, loop_body = LOOP_INPUT[self.shell]
+        self.send(loop_open)
         self.expect(b"STREAM_MORE", offset)
         self.gate("native-continuation-without-ui")
-        self.send(b"echo $stream_item >> loop-result\rend\r")
+        self.send(loop_body)
         self.wait((self.home / "loop-result").exists, "foreach file")
         self.expect(PROMPT, offset)
         assert (self.home / "loop-result").read_text() == "one\ntwo\n"
@@ -205,9 +285,24 @@ class HostRun:
             "  spaced 한글\nish_exit\npython\n"
         )
         offset = len(self.output)
-        self.send(b"vim -Nu NONE -n vim-result\r")
+        vim_command = shlex.join(
+            [
+                "vim",
+                "-Nu",
+                "NONE",
+                "-n",
+                "--cmd",
+                'autocmd TermResponseAll cursorblink call writefile([v:termblinkresp], "vim-host-response")',
+                "vim-result",
+            ]
+        )
+        self.send(vim_command.encode() + b"\r")
         self.expect(b"\x1b[?1049h", offset)
         self.expect(b"vim-result", offset)
+        # Do not race :wq against Vim's own delayed host interrogation. The
+        # event proves that Vim itself consumed the actual cursor-blink reply.
+        self.wait((self.home / "vim-host-response").exists, "Vim host cursor response")
+        self.result["vim_host_response"] = (self.home / "vim-host-response").read_text()
         self.gate("vim-without-ui")
         self.send(b"iSTREAM_VIM_RESULT\x1b:wq\r")
         self.wait((self.home / "vim-result").exists, "Vim file")
@@ -235,7 +330,35 @@ class HostRun:
         self.gate("sixel-native-program-without-ui")
         self.send(b"q")
         self.expect(PROMPT, offset)
-        self.gate("resize-and-primary-return", initial_size=self.sizes[0])
+        resize_path = self.home / "resize-result"
+        offset = len(self.output)
+        resize_command = shlex.join(
+            [
+                sys.executable,
+                str(ROOT / "tests/stream_fixture.py"),
+                "size",
+                str(resize_path),
+            ]
+        )
+        self.send(resize_command.encode() + b"\r")
+        self.expect(b"STREAM_NATIVE_READY", offset)
+        self.gate("resize-native-program", initial_size=self.sizes[-1])
+        if self.require_resize:
+
+            def changed():
+                try:
+                    observed = json.loads(resize_path.read_text())
+                except (FileNotFoundError, ValueError):
+                    return False
+                return (
+                    any(size != observed[0] for size in observed)
+                    and observed[-1] == self.sizes[-1]
+                )
+
+            self.wait(changed, "actual host resize reaching native foreground PTY")
+        self.result["foreground_sizes"] = json.loads(resize_path.read_text())
+        self.send(b"q")
+        self.expect(PROMPT, offset)
         self.command("echo finished > host-result")
         self.wait((self.home / "host-result").exists, "final native file")
         assert (self.home / "host-result").read_text() == "finished\n"
@@ -284,8 +407,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--shell", choices=tuple(SHELL_STARTUP), default="tcsh")
+    parser.add_argument("--require-resize", action="store_true")
+    parser.add_argument("--integration-dir", type=Path)
+    parser.add_argument("--plugin-dir", type=Path)
     args = parser.parse_args()
-    runner = HostRun(args.directory, args.demo)
+    runner = HostRun(
+        args.directory,
+        args.demo,
+        args.shell,
+        require_resize=args.require_resize,
+        integration_dir=args.integration_dir,
+        plugin_dir=args.plugin_dir,
+    )
     try:
         runner.start()
         runner.scenario()

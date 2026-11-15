@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import pwd
 from functools import cached_property
 from pathlib import Path
 from typing import Optional
@@ -12,6 +11,7 @@ from typing import Optional
 from ish import __version__
 from ish.config import config
 from ish.lang import Message, i18n
+from ish.runtime.startup import login_shell
 
 __all__ = ["ArgumentParser"]
 
@@ -63,9 +63,7 @@ class ArgumentParser:
 
     def __init__(self):
         """Prepare defaults without creating files or importing the interactive UI."""
-        self.login_shell: str = str(
-            os.path.basename(pwd.getpwuid(os.getuid()).pw_shell)
-        )
+        self.login_shell: str = os.path.basename(login_shell())
         self._load_messages()
 
     def _load_messages(self, lang: Optional[str] = None) -> None:

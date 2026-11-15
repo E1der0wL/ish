@@ -1,0 +1,25 @@
+--- a/lib/readline/input.c
++++ b/lib/readline/input.c
+@@ -881,6 +881,9 @@
+       if (result == 0)
+         _rl_timeout_handle ();		/* check the timeout */
+ #endif
++      /* Diagnostic: readiness and this check are not atomic with read. */
++      if (_rl_caught_signal)
++	continue;
+       if (result >= 0)
+ 	result = read (fd, &c, sizeof (unsigned char));
+ 
+--- a/lib/readline/signals.c
++++ b/lib/readline/signals.c
+@@ -307,6 +307,10 @@
+ 
+   _rl_handling_signal = 0;
+   RL_UNSETSTATE(RL_STATE_SIGHANDLER);
++  /* Diagnostic: process the application's deferred signal before returning
++     into an operation whose Readline state was released by cleanup. */
++  if (rl_signal_event_hook)
++    (*rl_signal_event_hook) ();
+   SIGHANDLER_RETURN;
+ }
+ 

@@ -21,11 +21,47 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
-import zstandard
+SOURCE_PATHS = (
+    "src",
+    "pyproject.toml",
+    "uv.lock",
+    ".python-version",
+    "tools/python-runtime.toml",
+    "tools/ish-launcher.sh",
+    "tools/build_distribution.py",
+)
+SOURCE_CACHE_DIRS = frozenset(("__pycache__", ".pytest_cache", ".ruff_cache"))
+SOURCE_BINARY_SUFFIXES = frozenset(
+    (".pyc", ".pyo", ".so", ".pyd", ".dll", ".dylib", ".o", ".a")
+)
 
-from ish.runtime.distribution import RUNTIME_MARKER
-from ish.shell.adapter import preload_libraries
-from ish.shell.integration import build_binary
+
+def source_digest(root: Path) -> str:
+    """Identify source and packaged resources, excluding generated caches and binaries."""
+    paths = []
+    for name in SOURCE_PATHS:
+        path = root / name
+        candidates = path.rglob("*") if path.is_dir() else (path,)
+        for candidate in candidates:
+            relative = candidate.relative_to(root)
+            if (
+                any(
+                    part in SOURCE_CACHE_DIRS
+                    or part.endswith((".egg-info", ".dist-info"))
+                    for part in relative.parts
+                )
+                or candidate.suffix in SOURCE_BINARY_SUFFIXES
+            ):
+                continue
+            if candidate.is_file():
+                paths.append(candidate)
+            elif candidate == path and not path.exists():
+                raise FileNotFoundError(path)
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda value: value.relative_to(root).as_posix()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update(bytes.fromhex(sha256(path)))
+    return digest.hexdigest()
 
 
 def sha256(path: Path) -> str:
@@ -69,6 +105,8 @@ def extract_runtime(archive: Path, bundle: Path) -> None:
 
 def extract_licenses(archive: Path, bundle: Path) -> None:
     """Retain licenses and metadata from the full archive without shipping build objects."""
+    import zstandard
+
     with archive.open("rb") as source:
         with zstandard.ZstdDecompressor().stream_reader(source) as reader:
             with tarfile.open(fileobj=reader, mode="r|") as tar:
@@ -118,6 +156,10 @@ def require_case_sensitive_output(destination: Path) -> None:
 
 def main() -> None:
     """Build in a private staging directory and publish only a verified installation."""
+    from ish.runtime.distribution import RUNTIME_MARKER
+    from ish.shell.adapter import preload_libraries
+    from ish.shell.integration import build_binary
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--build-id", help="Release identifier for the output and manifest"
@@ -149,21 +191,10 @@ def main() -> None:
         if not shutil.which(tool):
             parser.error(f"Missing build tool: {tool}")
     project = tomllib.loads((root / "pyproject.toml").read_text())
-    digest = hashlib.sha256()
-    for path in sorted((root / "src").rglob("*.py")) + [
-        root / "pyproject.toml",
-        root / "uv.lock",
-        root / ".python-version",
-        root / "tools/python-runtime.toml",
-        root / "tools/ish-launcher.sh",
-        Path(__file__),
-    ]:
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes())
+    digest = source_digest(root)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     build_id = (
-        args.build_id
-        or f"{project['project']['version']}-{timestamp}-{digest.hexdigest()[:8]}"
+        args.build_id or f"{project['project']['version']}-{timestamp}-{digest[:8]}"
     )
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", build_id) or build_id in {".", ".."}:
         parser.error(
@@ -309,7 +340,7 @@ def main() -> None:
             "packages": packages,
             "platform": platform.platform(),
             "libc": platform.libc_ver(),
-            "source_sha256": digest.hexdigest(),
+            "source_sha256": digest,
             "wheel_sha256": sha256(wheel),
             "created_utc": timestamp,
         }

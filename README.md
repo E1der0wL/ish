@@ -3,9 +3,19 @@
 This worktree adds the isolated **prompt-stream experiment** (`ish-stream`, or
 `python -m ish.stream`). It relays native shell output directly to the host.
 The default has no additional UI, reserved keys, or shell integration. Explicit
-`--demo --shell tcsh` enables a PTK bottom panel and F2 popup at primary prompts;
-tcsh still edits command lines, continuation, and heredocs. See
+Python plugins can add a PTK bottom panel and F2 popup at primary prompts;
+the native shell still edits command lines, continuation, and heredocs. UI samples
+live in `examples/stream_plugins/` and are selected with `--plugin`; the product
+`--demo` option has been removed. The bundled plugins are shell providers.
+The default shell comes from the account database, then `SHELL`, then `sh`.
+`--login` and repeatable `--shell-arg` select native startup arguments; UI providers
+that do not support those arguments fall back before the shell starts.
+`--home`, `--lang`, and optional `--log-file [PATH]` reuse ish's settings and
+logging facilities. `ish-stream --help`, `--version`, and `--diagnose` are read-only
+and do not execute plugins or create settings/log files. Stream does not run the
+original ish `.ishrc.py`. See
 [the design, execution instructions, and limits](docs/PROMPT_STREAM.md) and
+[external Python plugins](docs/STREAM_PLUGINS.md), along with
 [the actual validation scope](docs/STREAM_VALIDATION.md).
 
 This branch also contains an isolated **libghostty-vt + prompt-toolkit terminal
@@ -409,10 +419,24 @@ ish logs the failure and skips that plugin. Align the dependency requirements an
 restart ish before retrying a version change. Dotted import names, such as
 `"distribution|namespace.package"`, are supported.
 
+Availability checks validate active transitive dependencies and the original
+RECORD inventory, including recorded library file presence, sizes and hashes.
+Managed installs require a RECORD with metadata inventory; a remaining version
+file or top-level module does not prove a complete installation. Missing bytecode
+is harmless. External legacy/editable distributions without RECORD retain the
+metadata/import-only check, and native ABI compatibility is not an execution test.
+Python requirements without distribution metadata are no longer accepted solely
+because an import of that name can be located.
+
 Plugins normally load before `.ishrc.py` runs. `plugin.get("my_ui")` looks up
 the registered module; it does not import an arbitrary file or trigger loading.
 Check for `None`, particularly when starting with `--no-plugins` or after a plugin
 fails to load.
+
+The separate `ish-stream` entry point reuses this manager with explicit plugin
+selection. Its native shell editor uses a different UI registration contract;
+see [stream Python plugins](docs/STREAM_PLUGINS.md). Existing `.ishrc.py` and
+`Prompt` APIs are unchanged for `ish` and are not implicitly run by `ish-stream`.
 
 ### Command execution and API compatibility
 

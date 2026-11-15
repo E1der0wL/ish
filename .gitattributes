@@ -1,2 +1,4 @@
 # Keep executable shell scripts usable after a Windows checkout.
 *.sh text eol=lf
+# Match Ruff on both Windows worktrees and Linux PR runners.
+*.py text eol=lf

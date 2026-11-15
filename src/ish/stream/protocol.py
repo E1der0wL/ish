@@ -7,6 +7,7 @@ The bounded buffer holds only a possible private record or short CSI prefix.
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum, StrEnum
 
 ESC = 0x1B
 BEL = 0x07
@@ -14,17 +15,53 @@ CANCEL = (0x18, 0x1A)
 STRING_STARTS = {ord("]"), ord("P"), ord("_"), ord("^"), ord("X")}
 MAX_RECORD = 256
 MAX_SEQUENCE = 128
+REWIND_CSI = frozenset(b"AFHfdJrSTLMsu")
+REWIND_ESCAPE = (b"\x1b7", b"\x1b8", b"\x1bM")
+C1_REVERSE_INDEX = 0x8D
+CLEAR_BELOW = (b"\x1b[J", b"\x1b[0J", b"\x1b[2J")
+SAFE_MODES = (b"?1", b"?25", b"?2004")
+SAFE_ESCAPE = (b"\x1b=", b"\x1b>")
+SAFE_CSI = frozenset(b"ABCDEFGKmP@X")
+MODE_CSI = frozenset(b"hl")
+PRIVATE_PREFIX = b"\x1b]777;ish;"
+
+
+class Event(StrEnum):
+    """Native notifications ordered with output, never command-input readiness.
+
+    PRIMARY permits consideration of prompt decoration. HIDE revokes it.
+    BOUNDARY identifies a native widget wait, which must still match a live
+    shortcut request and authenticated helper connection before popup focus.
+    """
+
+    PRIMARY = "P"
+    HIDE = "H"
+    BOUNDARY = "B"
+
+
+class Reply(bytes, Enum):
+    """Resolve a native helper wait, independently of the popup's chosen value.
+
+    DONE permits normal native return after the UI releases focus. CANCEL
+    rejects or revokes the handoff. Both end the helper wait; neither confirms
+    that the shell has already returned to its primary editor.
+    """
+
+    DONE = b"done\n"
+    CANCEL = b"cancel\n"
 
 
 class Stream:
     """Keep host controls intact and order UI events with shell output."""
 
-    def __init__(self, nonce: str, write, event, unsafe):
+    def __init__(self, nonce: str, write, event, unsafe, rewind=None, cleared=None):
         """Accept session-local events and a single ordered outer writer."""
-        self.prefix = b"\x1b]777;ish;" + nonce.encode("ascii") + b";"
+        self.prefix = PRIVATE_PREFIX + nonce.encode("ascii") + b";"
         self.write: Callable[[bytes], None] = write
         self.event = event
         self.unsafe = unsafe
+        self.rewind = rewind
+        self.cleared = cleared
         self.state = "ground"
         self.pending = bytearray()
         self.kind = 0
@@ -37,48 +74,43 @@ class Stream:
         """Return whether UI bytes may be inserted without splitting a record."""
         return self.state == "ground" and self.utf8_left == 0
 
-    def _private(self):
-        raw = bytes(self.pending)
+    def _private(self, raw):
         suffix = 2 if raw.endswith(b"\x1b\\") else 1
         body = raw[len(self.prefix) : -suffix]
         try:
             number, kind = body.split(b";")
             serial = int(number)
+            event = Event(kind.decode("ascii"))
         except ValueError:
             self.write(raw)
             return
-        if kind not in (b"P", b"H", b"B") or not number.isdigit():
+        if not number.isdigit():
             self.write(raw)
         elif serial > self.last_serial:
             self.last_serial = serial
-            self.event(kind.decode("ascii"), serial)
+            self.event(event, serial)
 
     def _control(self, raw):
+        if self.rewind and (
+            (raw.startswith(b"\x1b[") and raw[-1] in REWIND_CSI) or raw in REWIND_ESCAPE
+        ):
+            self.rewind()
         if raw.startswith(b"\x1b["):
-            body, final = raw[2:-1], raw[-1:]
-            safe = final in (
-                b"A",
-                b"B",
-                b"C",
-                b"D",
-                b"E",
-                b"F",
-                b"G",
-                b"K",
-                b"m",
-                b"P",
-                b"@",
-                b"X",
-            )
-            safe |= final in (b"h", b"l") and body in (b"?25", b"?2004")
+            body, final = raw[2:-1], raw[-1]
+            safe = final in SAFE_CSI
+            safe |= final in MODE_CSI and body in SAFE_MODES
             if not safe:
                 self.unsafe()
-        else:
+        elif raw not in SAFE_ESCAPE:
             self.unsafe()
         self.write(raw)
+        if raw in CLEAR_BELOW and self.cleared:
+            # This is evidence only after the host received the complete ED.
+            # Selective erase and ED1/ED3 do not establish blank rows below.
+            self.cleared()
 
     def feed(self, data: bytes):
-        """Forward fragments, including oversized and unfinished host strings."""
+        """Relay bytes and deliver complete private events in stream order."""
         output = bytearray()
 
         def flush():
@@ -112,6 +144,12 @@ class Stream:
                     self.kind = ord("]") if byte == 0x9D else 0
                     self.state = "raw_csi" if byte == 0x9B else "string"
                     self.escaped = False
+                    output.append(byte)
+                elif byte == C1_REVERSE_INDEX:
+                    flush()
+                    if self.rewind:
+                        self.rewind()
+                    self.unsafe()
                     output.append(byte)
                 else:
                     output.append(byte)
@@ -181,8 +219,8 @@ class Stream:
                 matches = self.prefix.startswith(raw) or raw.startswith(self.prefix)
                 if complete and raw.startswith(self.prefix):
                     self.state = "ground"
-                    self._private()
                     self.pending.clear()
+                    self._private(raw)
                 elif not matches or len(raw) > MAX_RECORD or byte in CANCEL:
                     self.unsafe()
                     self.write(raw)

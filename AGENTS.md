@@ -3,9 +3,13 @@
 ## 범위와 목표
 
 - 이 브랜치는 experiment/prompt-stream에서 native 셸 출력 직접 전달과 primary 프롬프트 전용 PTK UI를 실험한다. 기존 experiment/ghostty-ptk 폴더와 브랜치를 수정하지 않는다.
-- ish-stream은 별도 진입점이다. 기본형은 UI/단축키/셸 hook 없이 직접 전달하고 --demo에서만 tcsh primary 장식과 제한된 PTK 팝업을 켠다. continuation과 프로그램 stdin은 항상 셸에 맡긴다.
+- ish-stream은 별도 진입점이다. 기본형은 UI/단축키/셸 hook 없이 직접 전달하고, 명시적으로 선택한 Python 플러그인에서만 primary 장식과 제한된 PTK 팝업을 켠다. 제품 --demo 옵션은 없으며 샘플 하단 바·팝업은 examples/stream_plugins에 둔다. 테스트의 demo 편의 인자는 명시적인 플러그인 선택으로 변환하고 제품 경로에 추가하지 않는다. continuation과 프로그램 stdin은 항상 셸에 맡긴다.
+- ish-stream의 셸 동작과 셸별 정책은 수정 가능한 integrations 외부 텍스트에 둔다. 기본형은 연동 파일을 읽지 않으며, UI 준비 중 파일 누락·계약 불일치는 셸 실행 전에 UI 없는 경로로 전환한다. 변경은 새 세션에 적용한다. Bash 팝업의 F2는 지원하는 Readline 키맵에서 전용으로 예약하며 continuation/read-e에서는 팝업 없이 소비한다. 외부 프로그램 입력은 그대로 전달하고 하단 바만 선택한 세션의 F2도 변경하지 않는다.
 - 명령줄과 continuation 편집은 셸이 담당하고, PTK는 화면 합성과 팝업 포커스를 담당한다.
 - 기본형은 전체 셸 화면만 표시한다. 하단 바·우측 프롬프트·팝업과 해당 UI 전용 단축키를 기본으로 추가하지 않고 향후 플러그인으로 제공한다. 기본 전경·배경색은 외부 터미널 기본색을 유지하며 프로그램이 명시한 색상과 구별한다.
+- Python 플러그인 로딩·메타데이터·의존성 검사는 기존 PluginManager가 소유한다. stream은 표시 내용과 셸 builder 등록 API만 제공하며 별도의 Python 로더를 만들지 않는다. 플러그인 변경은 새 세션에 적용한다. 본체가 native 입력·단일 writer·요청 identity·포커스 동기화를 계속 소유한다.
+- 언어·설정 경로·로그·진단은 기존 공통 구현을 재사용한다. help/version/diagnose 조회는 플러그인이나 셸을 실행하지 않고 설정·로그 파일을 생성하지 않는다. stream은 기존 ish의 .ishrc.py를 실행하지 않는다. 선택적인 파일 로그는 진단만 기록하며 native 입력·출력 bytes를 수집하지 않는다. 콘솔 로그는 셸 시작 전 또는 터미널 복원 후에만 출력한다.
+- 시작 옵션은 native 셸에 전달한다. --login은 -l 단독이며 --shell-arg와 상호 배제한다. 명시적인 --shell-arg 목록은 기본 -i를 대체한다. UI provider가 지원하지 않는 시작 인수는 셸 실행 전에 UI 없이 원래 argv/env로 시작하며 검증되지 않은 연동을 켜지 않는다.
 - 기존 ish-vt의 스크롤백·선택 범위는 libghostty-vt가 소유한다. 새 ish-stream의 화면·스크롤백·마우스는 호스트가 처리한다. 화면 문자열로 입력 소비자를 추측하지 않는다.
 - 기존 refactor/editor-request 브랜치와 폴더를 보존한다. 기존 ish 진입점은 유지하며 별도 ish-vt 진입점에서 먼저 검증한다.
 - 첫 검증 대상은 Linux/WSL의 tcsh, heredoc, Vim과 resize다. OS 이식과 전 셸 자동완성 지원은 검증 없이 선언하지 않는다.
@@ -27,6 +31,8 @@
 - 새 terminal 경로에서는 한 PTK Application이 외부 입력과 렌더링을 소유한다. 셸 입력은 terminal 포커스일 때 PTY로 전달하고, 팝업 입력은 팝업에서만 소비한다.
 - 기존 ish-vt는 셸 출력을 VT 상태에만 반영한다. 새 ish-stream은 하나의 coordinator/writer에서 셸 바이트와 제한된 PTK panel 출력을 순서대로 전달한다. 플러그인은 외부 터미널 writer를 소유하지 않는다.
 - prompt 마커는 UI 표시/숨김 알림이며 구문 입력 권한이나 실행 readiness가 아니다. postcmd를 입력 권한으로 해석하지 않는다. 제어문 중간에 UI를 삽입하지 않으며 미지원 상태에서는 장식을 해제한다.
+- stream 팝업 요청의 identity와 상태 전이는 handoff.Request가 소유한다. 첫 B만 identity를 확정하며, 팝업 닫힘·done 큐 등록·P 복귀 완료를 구분한다. 완료와 취소는 되돌릴 수 없는 별도 결과이며, 취소된 요청도 native 복귀 경계까지 입력 보류가 필요할 수 있다. 팝업 값의 취소와 handoff 취소를 합치지 않는다.
+- Python 공통 wire 값과 의미는 stream.protocol의 Event/Reply에서 정의한다. 외부 셸 스크립트의 wire 구현과 독립 테스트의 literal 기대값은 각 경계에 유지한다. 기본 리소스 경로는 실제 로더가 소유하고 진단은 그 값을 읽는다.
 - 셸 버퍼·커서를 입증하지 못한 상태에서는 화면 문자열을 역파싱하여 자동완성 후보를 적용하지 않는다.
 - 명령 편집과 ish 명령 dispatch를 분리한다. continuation·heredoc 본문을 내부 명령이나 Python 도구로 실행하지 않는다.
 - 프로그램 stdin과 Python input()은 native 입력 경로를 유지한다.
@@ -36,6 +42,8 @@
 ## 검증과 변경 범위
 
 - 변경 경계에 맞는 테스트와 린트를 실행한다. 기존 API와 hook 순서를 바꿀 때는 호환 영향과 근거를 명시한다.
+- stream의 PR 검사와 로컬 검사는 tools/check_stream.py를 공유한다. 필수 환경·테스트 모듈 누락, 빈 테스트, skip을 성공으로 간주하지 않는다. GitHub 실행 여부와 실제 호스트 터미널 검증 여부는 따로 보고한다.
+- 새 stream 회귀 모듈을 유지 대상으로 추가할 때 검사기의 REQUIRED_STREAM과 독립적인 누락 검사 기대 목록에도 등록한다. 새 파일 자동 수집만으로 삭제·누락 방어가 된 것으로 간주하지 않는다.
 - tests 디렉터리의 기존 로컬 테스트는 대부분 Git 추적 밖에 있다. 새 회귀 테스트는 명시적인 ignore 예외로 추적 가능하게 유지한다.
 - 새 테스트는 실제 편집 입력, 반환값, 파일 결과 등 관찰 가능한 계약을 확인한다. 구현의 검증 함수를 그대로 호출해 기대값을 만들지 않는다.
 - 기존 main 작업 폴더의 파일과 환경은 변경하지 않고 이 worktree에서 작업한다.

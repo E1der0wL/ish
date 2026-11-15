@@ -15,9 +15,11 @@ import time
 import unittest
 from pathlib import Path
 
+from ish.stream.bundled.stream_tcsh.stream_tcsh import build
 from ish.stream.shells import Integration
+from stream_fixture import shell_executable
 
-TCSH = shutil.which("tcsh")
+TCSH = shutil.which(shell_executable("tcsh"))
 NONCE = "0123456789abcdef0123456789abcdef"
 MARKER = re.compile(rb"\x1b\]777;ish;" + NONCE.encode() + rb";(\d+);([PBH])\x07")
 
@@ -25,11 +27,26 @@ MARKER = re.compile(rb"\x1b\]777;ish;" + NONCE.encode() + rb";(\d+);([PBH])\x07"
 class Shell:
     """Drive native shell input without parsing it or implementing an editor."""
 
-    def __init__(self, root, *, integration=True, startup=True, popup_socket=None):
+    def __init__(
+        self,
+        root,
+        *,
+        integration=True,
+        startup=True,
+        popup_socket=None,
+        script_dir=None,
+    ):
         """Give every test a controlling terminal and isolated user startup file."""
         env = dict(os.environ, HOME=str(root), TERM="xterm-256color", LANG="C.UTF-8")
         self.integration = (
-            Integration([TCSH, "-i"], env, nonce=NONCE, popup_socket=popup_socket)
+            Integration(
+                [TCSH, "-i"],
+                env,
+                nonce=NONCE,
+                build=build,
+                popup_socket=popup_socket,
+                script_dir=script_dir,
+            )
             if integration
             else None
         )
@@ -100,6 +117,7 @@ class ShellTests(unittest.TestCase):
         fallback=False,
         prefix="ish-stream-test-",
         popup=False,
+        script_dir=None,
     ):
         """Apply the same user configuration to wrapped and stock tcsh."""
         with tempfile.TemporaryDirectory(prefix=prefix) as directory:
@@ -118,6 +136,7 @@ class ShellTests(unittest.TestCase):
                 root,
                 integration=integration,
                 popup_socket=str(root / "control.sock") if popup else None,
+                script_dir=script_dir,
             )
             shell.listener = listener
             try:
@@ -130,6 +149,24 @@ class ShellTests(unittest.TestCase):
     def events(self, data):
         """Decode test expectations independently of the production stream parser."""
         return [(int(serial), kind.decode()) for serial, kind in MARKER.findall(data)]
+
+    def test_external_script_edits_apply_to_the_next_session(self):
+        """An edited script changes actual shell results without reloading Python."""
+        bundled = Path(__file__).resolve().parents[1] / "src/ish/stream/integrations"
+        with tempfile.TemporaryDirectory(prefix="ish-tcsh-scripts-") as directory:
+            scripts = Path(directory, "scripts")
+            shutil.copytree(bundled, scripts)
+            path = scripts / "tcsh.csh"
+            original = path.read_text()
+            header, source = original.split("\n", 1)
+            for value in ("FIRST", "SECOND"):
+                path.write_text(header + f"\necho {value} > external-result\n" + source)
+                with self.session(script_dir=scripts) as (root, shell):
+                    self.assertEqual(
+                        (root / "external-result").read_text(), value + "\n"
+                    )
+                    shell.submit("echo native > result\n")
+                    self.assertEqual((root / "result").read_text(), "native\n")
 
     def test_user_hooks_status_and_history_match_native(self):
         """Bookkeeping adds neither user hook invocations nor history commands."""
@@ -161,6 +198,42 @@ class ShellTests(unittest.TestCase):
             self.assertEqual(self.events(output), [(2, "H"), (3, "P")])
             self.assertLess(output.index(b";H\x07"), output.index(b"RUN\r\n"))
             self.assertTrue(output.endswith(b";3;P\x07READY> "))
+
+    def test_popup_empty_and_quoted_commands_match_native(self):
+        """Empty history and quoted command data preserve output, hooks and status."""
+        config = (
+            "alias precmd 'echo PRE:$status >> hooks'\n"
+            "alias postcmd 'echo POST:$status >> hooks'\n"
+        )
+        commands = (
+            "/bin/false\n",
+            "\n",
+            "\n",
+            "echo $status > status\n",
+            'echo "`/bin/sh action.sh`" > result; echo tail >> result\n',
+            "\n",
+        )
+        results = []
+        for enabled in (False, True):
+            with self.session(integration=enabled, popup=enabled, config=config) as (
+                root,
+                shell,
+            ):
+                (root / "action.sh").write_text(
+                    "printf 'called\\n' >> calls\nprintf '%s' 'value ; \"quoted\"'\n"
+                )
+                output = [
+                    MARKER.sub(b"", shell.submit(command)) for command in commands
+                ]
+                files = tuple(
+                    (root / name).read_bytes()
+                    for name in ("hooks", "status", "calls", "result")
+                )
+                self.assertEqual(
+                    files[1:], (b"1\n", b"called\n", b'value ; "quoted"\ntail\n')
+                )
+                results.append((output, files))
+        self.assertEqual(*results)
 
     def test_empty_and_syntax_error_return_to_confirmed_primary(self):
         """A skipped postcmd does not manufacture an execution acknowledgement."""
