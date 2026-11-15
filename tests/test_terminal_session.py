@@ -102,6 +102,13 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.exits, [0])
         self.assertEqual(self.errors, [])
         os.fstat(self.slave)
+        # A retained slave may belong to a background process. While the UI
+        # drains host protocol replies after child exit, it must not grant that
+        # stale consumer fresh keyboard or clipboard-response input.
+        os.set_blocking(self.slave, False)
+        self.session.send(b"AFTER_CHILD_EXIT\n")
+        with self.assertRaises(BlockingIOError):
+            os.read(self.slave, 128)
 
     async def test_oversized_input_reports_transport_failure(self):
         """A rejected paste reaches the failure callback instead of escaping a key handler."""
@@ -110,6 +117,29 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.session.send(b"x" * OVERSIZED_INPUT)
         self.assertEqual(len(self.errors), 1)
         self.assertIsInstance(self.errors[0], BufferError)
+
+    async def test_typeahead_before_start_reaches_native_stdin_once(self):
+        """Input during host negotiation is retained by the transport owner."""
+        self.session = Session(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys; print('CONSUMED:'+repr(sys.stdin.readline()))",
+            ],
+            os.getcwd(),
+            self.received,
+            self.exited,
+            self.errors.append,
+        )
+        self.session.send(b"early ")
+        self.session.send("한 글\n".encode())
+        self.session.start(80, 24)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        expected = "CONSUMED:'early 한 글\\n'".encode()
+        self.assertEqual(bytes(self.output).count(expected), 1)
+        self.assertEqual(self.exits, [0])
+        self.assertEqual(self.errors, [])
 
 
 if __name__ == "__main__":

@@ -12,11 +12,14 @@ from collections.abc import Callable
 
 from ish.runtime.fdio import FDWriter
 
+from .host import scrub_environment
+
 READ_BYTES = 65536
 READ_BUDGET = 256 * 1024
 SHUTDOWN_SECONDS = 2
 SHUTDOWN_INTERVAL = 0.05
 TERM = "xterm-256color"
+MAX_PENDING_INPUT = 4 * 1024 * 1024
 
 
 class Session:
@@ -39,13 +42,14 @@ class Session:
         self.eof = False
         self.closed = False
         self.size = (0, 0)
+        self.pending_input = bytearray()
 
     def start(self, cols: int, rows: int) -> None:
         """Create the shell's controlling terminal before starting background work."""
         if self.pid is not None:
             raise RuntimeError("The terminal session has already started")
         self.loop = asyncio.get_running_loop()
-        env = os.environ.copy()
+        env = scrub_environment(os.environ)
         env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM="ish-vt")
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
@@ -59,6 +63,9 @@ class Session:
         self.size = (cols, rows)
         os.set_blocking(self.fd, False)
         self.writer = FDWriter(self.loop, self.fd, self.failed)
+        if self.pending_input:
+            self.writer.write(self.pending_input)
+            self.pending_input.clear()
         self.loop.add_reader(self.fd, self._read)
         self.waiter = self.loop.create_task(self._wait())
 
@@ -99,9 +106,16 @@ class Session:
 
     def send(self, data: bytes) -> None:
         """Queue bytes from the focused pane or a terminal protocol reply."""
-        if not self.closed and not self.eof and self.writer is not None:
+        if not self.closed and not self.eof and self.returncode is None:
             try:
-                self.writer.write(data)
+                if self.writer is None:
+                    if len(self.pending_input) + len(data) > MAX_PENDING_INPUT:
+                        raise BufferError(
+                            "Pending startup input exceeds the byte limit"
+                        )
+                    self.pending_input.extend(data)
+                else:
+                    self.writer.write(data)
             except Exception as exc:
                 self.failed(exc)
 
@@ -116,6 +130,7 @@ class Session:
         if self.closed:
             return
         self.closed = True
+        self.pending_input.clear()
         if self.fd is None:
             return
         groups = {self.pid} if self.returncode is None else set()

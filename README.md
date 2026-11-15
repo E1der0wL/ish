@@ -3,14 +3,24 @@
 This branch also contains an isolated **libghostty-vt + prompt-toolkit terminal
 experiment**. The `ish-vt` entry point leaves command editing with the native
 shell and displays its full terminal without built-in bars or popups. Default
-colors use the host terminal's colors. Additional UI is reserved for future
-plugins. The existing `ish`
+colors use the host terminal's colors. Optional UI is loaded explicitly with
+`--plugin module:setup`; the default has no plugin surfaces or shortcuts. The existing `ish`
 entry point keeps its previous behavior. See
 [the experiment and its validation scope](docs/TERMINAL_EXPERIMENT.md).
 
-The terminal experiment includes native scrollback browsing, mouse forwarding
-for applications such as Vim, and drag selection with an OSC 52 clipboard copy
-request. It keeps the full terminal area free of built-in overlays.
+The terminal experiment includes native scrollback, application mouse input,
+word/line/rectangle selection, and selection copy. On a host with confirmed
+clipboard reads, middle-click pastes the system PRIMARY selection. It keeps
+the full terminal area free of built-in overlays and observes the host's initial
+colors and palette without painting a fixed default background.
+Kitty and bounded iTerm inline image inputs use the native image store. Verified
+Kitty and WezTerm iTerm output paths with measured cell geometry also compose
+images with opt-in PTK popups. SIXEL is unsupported; xterm remains a text host.
+Child clipboard writes are enabled by default; `--clipboard read-write` also
+allows reads through a confirmed host clipboard protocol. Normal exit and handled
+SIGTERM/SIGHUP restore the terminal modes and supported presentation state. See the
+[capability matrix and actual GUI validation](docs/TERMINAL_CAPABILITIES.md)
+and [image, clipboard, color, and restoration limits](docs/TERMINAL_PROTOCOLS.md).
 
 ish is an interactive command editor for Linux shells. It adds multiline editing,
 syntax highlighting, completion, and Python UI extensions

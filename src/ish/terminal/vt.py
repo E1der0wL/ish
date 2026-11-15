@@ -2,18 +2,24 @@
 
 All methods belong to one event-loop thread. The native bridge owns VT state;
 Python receives a bounded bulk snapshot, never one FFI call per terminal cell.
-This text renderer deliberately does not expose images, links or clipboard IO.
+Images are read by generation separately from the cell snapshot.
 """
 
 from __future__ import annotations
 
 import ctypes
+import io
+import math
 import os
 import struct
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+from .engine import EngineError, check_library
+from .inputs import InputPipeline
 
 SHIFT = 1
 CTRL = 2
@@ -22,6 +28,7 @@ MAX_CELLS = 262_144
 MAX_BUFFER = 32 * 1024 * 1024
 DEFAULT_SCROLLBACK_LINES = 10_000
 DEFAULT_SCROLLBACK_BYTES = 32 * 1024 * 1024
+DEFAULT_IMAGE_BYTES = 16 * 1024 * 1024
 MOUSE_ACTIONS = {"press": 0, "release": 1, "move": 2}
 MOUSE_BUTTONS = {
     None: 0,
@@ -37,9 +44,21 @@ LIBRARY_ENV = "ISH_GHOSTTY_LIB"
 DEFAULT_LIBRARY = (
     Path(__file__).resolve().parents[3] / ".cache/ghostty-vt/install/lib/libish_vt.so"
 )
-HEADER = struct.Struct("<7I2Q")
+HEADER = struct.Struct("<7I2Q5IQ4I")
 # The native snapshot carries color presence separately from RGB values.
-CELL = struct.Struct("<HB6BI")
+CELL = struct.Struct("<HB6B4I3BI")
+PLACEMENT = struct.Struct("<IIQii6Iii")
+IMAGE_HEADER = struct.Struct("<IIQ")
+IMAGE_CONTEXT = struct.Struct("<12I16s")
+EFFECT_HEADER = struct.Struct("<II")
+EFFECT_KINDS = {1: "bell", 2: "title", 3: "pwd"}
+CURSOR_SHAPES = ("bar", "block", "underline", "block_hollow")
+KEY_ACTIONS = {"release": 0, "press": 1, "repeat": 2}
+SELECTION_ACTIONS = {"press": 0, "release": 1, "drag": 2, "autoscroll": 3, "reset": 4}
+SELECTION_BEHAVIORS = ("cell", "word", "line", "output")
+SELECTION_AUTOSCROLL = (0, -1, 1)
+REPEAT_INTERVAL_NS = 500_000_000
+REPEAT_DISTANCE = 1.0
 COLOR_FG = 1
 COLOR_BG = 2
 COUNT = struct.Struct("<I")
@@ -74,6 +93,94 @@ SPECIAL_KEYS = frozenset(
 
 
 @dataclass(frozen=True)
+class Cell:
+    """One native grapheme at an exact grid position; wide tails are omitted."""
+
+    x: int
+    text: str
+    width: int
+    style: str
+    flags: int
+    fg: tuple[int, int, int] | None
+    bg: tuple[int, int, int] | None
+    underline: int
+    underline_color: tuple[int, int, int] | None
+    hyperlink: str | None
+
+    @property
+    def overline(self) -> bool:
+        """Native SGR 53 decoration, independent of PTK's basic style vocabulary."""
+        return bool(self.flags & 128)
+
+
+@dataclass(frozen=True)
+class SelectionState:
+    """Native gesture results; the frontend owns only its input timer."""
+
+    click_count: int
+    dragged: bool
+    autoscroll: int
+    behavior: str
+
+
+@dataclass(frozen=True)
+class Image:
+    """An immutable copy of one native image generation, normalized to RGBA."""
+
+    id: int
+    generation: int
+    width: int
+    height: int
+    rgba: bytes
+
+
+@dataclass(frozen=True)
+class ImageContext:
+    """Live native cursor and styling at a complete input protocol boundary."""
+
+    cols: int
+    rows: int
+    x: int
+    y: int
+    cell_width: int
+    cell_height: int
+    origin: int
+    wraparound: int
+    insert: int
+    margins: int
+    pending_wrap: int
+    ground: int
+    style: bytes
+
+
+@dataclass(frozen=True)
+class Placement:
+    """A native source crop and destination rectangle in viewport pixels."""
+
+    id: int
+    image_id: int
+    image_generation: int
+    x: int
+    y: int
+    width: int
+    height: int
+    source_x: int
+    source_y: int
+    source_width: int
+    source_height: int
+    layer: int
+    z: int
+
+
+@dataclass(frozen=True)
+class Effect:
+    """A bounded native side effect for the sole outer output owner."""
+
+    kind: str
+    data: bytes = b""
+
+
+@dataclass(frozen=True)
 class Frame:
     """Visible terminal rows as PTK style/text runs and a zero-based cursor."""
 
@@ -87,6 +194,77 @@ class Frame:
     viewport_active: bool = True
     scrollback_rows: int = 0
     viewport_offset: int = 0
+    cells: tuple[tuple[Cell, ...], ...] = ()
+    cursor_shape: str = "block"
+    cursor_blink: bool = False
+    cell_width: int = 0
+    cell_height: int = 0
+    images: tuple[Placement, ...] = ()
+    image_generation: int = 0
+    cursor_color: tuple[int, int, int] | None = None
+
+    @property
+    def cursor_default(self) -> bool:
+        """Whether cursor presentation should inherit the outer terminal default."""
+        return self.cursor_color is None
+
+
+class _DecodedImage(ctypes.Structure):
+    _fields_ = [
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("data", ctypes.c_void_p),
+        ("data_len", ctypes.c_size_t),
+    ]
+
+
+_DecodePNG = ctypes.CFUNCTYPE(
+    ctypes.c_bool,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.POINTER(_DecodedImage),
+)
+_PNG_CALLBACKS: list[object] = []
+
+
+def _install_png_decoder(library: ctypes.CDLL) -> None:
+    """Install once before native state exists; the callback owns no VT state."""
+
+    @_DecodePNG
+    def decode(_userdata, allocator, data, length, output):
+        """Copy a bounded PNG into the allocator supplied by the VT engine."""
+        try:
+            from PIL import Image as PillowImage
+
+            if not 0 < length <= MAX_BUFFER:
+                return False
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", PillowImage.DecompressionBombWarning)
+                png = PillowImage.open(io.BytesIO(ctypes.string_at(data, length)))
+            with png:
+                if (
+                    png.format != "PNG"
+                    or not 0 < png.width * png.height <= (MAX_BUFFER - 16) // 4
+                ):
+                    return False
+                rgba = png.convert("RGBA").tobytes()
+                target = library.ish_vt_image_alloc(allocator, len(rgba))
+                if not target:
+                    return False
+                ctypes.memmove(target, rgba, len(rgba))
+                output.contents.width = png.width
+                output.contents.height = png.height
+                output.contents.data = target
+                output.contents.data_len = len(rgba)
+                return True
+        except Exception:
+            # Exceptions must never escape a C callback.
+            return False
+
+    _check(library.ish_vt_png_decoder(decode))
+    _PNG_CALLBACKS.append(decode)
 
 
 class TerminalError(RuntimeError):
@@ -126,6 +304,7 @@ def _style(
     return " ".join(parts)
 
 
+@lru_cache(maxsize=1)
 def _load() -> ctypes.CDLL:
     path = Path(os.environ.get(LIBRARY_ENV, DEFAULT_LIBRARY))
     try:
@@ -135,6 +314,10 @@ def _load() -> ctypes.CDLL:
             f"Cannot load {path}. Run tools/build_ghostty_vt.py in Linux/WSL, "
             f"or set {LIBRARY_ENV} to the built libish_vt.so."
         ) from error
+    try:
+        library._ish_engine = check_library(library)
+    except EngineError as error:
+        raise TerminalError(str(error)) from error
     pointer = ctypes.c_void_p
     size = ctypes.c_size_t
     unsigned = ctypes.c_uint
@@ -143,9 +326,32 @@ def _load() -> ctypes.CDLL:
         "ish_vt_new": ([unsigned, unsigned], pointer),
         "ish_vt_free": ([pointer], None),
         "ish_vt_feed": ([pointer, ctypes.c_char_p, size], ctypes.c_int),
-        "ish_vt_resize": ([pointer, unsigned, unsigned], ctypes.c_int),
+        "ish_vt_resize": (
+            [pointer, unsigned, unsigned, unsigned, unsigned],
+            ctypes.c_int,
+        ),
         "ish_vt_replies": ([pointer, *output], ctypes.c_int),
         "ish_vt_frame": ([pointer, *output], ctypes.c_int),
+        "ish_vt_effects": ([pointer, *output], ctypes.c_int),
+        "ish_vt_graphics": ([pointer, ctypes.c_uint64], ctypes.c_int),
+        "ish_vt_appearance": (
+            [pointer, ctypes.c_char_p, size, ctypes.c_int],
+            ctypes.c_int,
+        ),
+        "ish_vt_image_context": ([pointer, *output], ctypes.c_int),
+        "ish_vt_unused_image_id": (
+            [pointer, ctypes.POINTER(ctypes.c_uint32)],
+            ctypes.c_int,
+        ),
+        "ish_vt_release_hold": ([pointer], ctypes.c_int),
+        "ish_vt_image": ([pointer, ctypes.c_uint32, *output], ctypes.c_int),
+        "ish_vt_tick": (
+            [pointer, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)],
+            ctypes.c_int,
+        ),
+        "ish_vt_focus": ([pointer, unsigned, *output], ctypes.c_int),
+        "ish_vt_png_decoder": ([_DecodePNG], ctypes.c_int),
+        "ish_vt_image_alloc": ([pointer, size], pointer),
         "ish_vt_key": (
             [
                 pointer,
@@ -153,6 +359,7 @@ def _load() -> ctypes.CDLL:
                 ctypes.c_char_p,
                 size,
                 ctypes.c_uint32,
+                unsigned,
                 unsigned,
                 *output,
             ],
@@ -173,6 +380,9 @@ def _load() -> ctypes.CDLL:
                 ctypes.c_int32,
                 ctypes.c_int32,
                 unsigned,
+                unsigned,
+                ctypes.c_int32,
+                ctypes.c_int32,
                 *output,
             ],
             ctypes.c_int,
@@ -181,11 +391,29 @@ def _load() -> ctypes.CDLL:
         "ish_vt_update_selection": ([pointer, unsigned, unsigned], ctypes.c_int),
         "ish_vt_clear_selection": ([pointer], ctypes.c_int),
         "ish_vt_selection_text": ([pointer, *output], ctypes.c_int),
+        "ish_vt_selection": (
+            [
+                pointer,
+                unsigned,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_uint64,
+                ctypes.c_bool,
+                ctypes.c_uint64,
+                ctypes.c_double,
+                ctypes.c_bool,
+                ctypes.POINTER(ctypes.c_uint32),
+            ],
+            ctypes.c_int,
+        ),
     }
     for name, (arguments, result) in signatures.items():
         function = getattr(library, name)
         function.argtypes = arguments
         function.restype = result
+    _install_png_decoder(library)
     return library
 
 
@@ -204,13 +432,18 @@ class Terminal:
         """Create a grid and a receiver for terminal-generated PTY responses."""
         _dimensions(cols, rows)
         self._library = _load()
+        self.engine = self._library._ish_engine
         self._handle = self._library.ish_vt_new(cols, rows)
         if not self._handle:
             raise TerminalError("Cannot allocate libghostty-vt terminal")
         self._reply = reply
         self.cols = cols
         self.rows = rows
+        self.cell_width = self.cell_height = 0
+        self.graphics_enabled = False
+        self._inputs = None
         try:
+            self._inputs = InputPipeline(self, self.engine)
             self.set_scrollback_limit(scrollback_lines, scrollback_bytes)
         except Exception:
             self.close()
@@ -239,15 +472,60 @@ class Terminal:
             self._reply(data)
 
     def feed(self, data: bytes) -> None:
-        """Parse arbitrary PTY output, then enqueue any generated PTY replies."""
+        """Frame bounded adapter controls and feed every other byte to native VT."""
+        self._open()
+        self._inputs.feed(data)
+
+    def feed_raw(self, data: bytes) -> None:
+        """Feed native bytes directly; adapters call this only at full boundaries."""
         _check(self._library.ish_vt_feed(self._open(), data, len(data)))
         self._deliver_replies()
 
-    def resize(self, cols: int, rows: int) -> None:
+    @property
+    def input_routes(self):
+        """Expose implementation choices without leaking provider objects."""
+        return self._inputs.routes
+
+    @property
+    def image_errors(self):
+        """Read supplemental image diagnostics through the common boundary."""
+        return self._inputs.image_errors
+
+    @property
+    def clipboard(self):
+        """Keep the existing pre-input clipboard attachment API."""
+        return self._inputs.clipboard
+
+    @clipboard.setter
+    def clipboard(self, broker):
+        self._inputs.clipboard = broker
+
+    def resize(
+        self,
+        cols: int,
+        rows: int,
+        cell_width: int | None = None,
+        cell_height: int | None = None,
+    ) -> None:
         """Resize the VT; the session separately resizes the child PTY."""
         _dimensions(cols, rows)
-        _check(self._library.ish_vt_resize(self._open(), cols, rows))
+        cell_width = self.cell_width if cell_width is None else cell_width
+        cell_height = self.cell_height if cell_height is None else cell_height
+        if (
+            not 0 <= cell_width <= 65_535
+            or not 0 <= cell_height <= 65_535
+            or bool(cell_width) != bool(cell_height)
+        ):
+            raise ValueError(
+                "Cell pixel dimensions must both be zero or positive 16-bit values"
+            )
+        _check(
+            self._library.ish_vt_resize(
+                self._open(), cols, rows, cell_width, cell_height
+            )
+        )
         self.cols, self.rows = cols, rows
+        self.cell_width, self.cell_height = cell_width, cell_height
         self._deliver_replies()
 
     def frame(self) -> Frame:
@@ -263,10 +541,21 @@ class Terminal:
             active,
             history,
             offset_top,
+            shape,
+            blinking,
+            cell_width,
+            cell_height,
+            image_count,
+            image_generation,
+            cursor_color_present,
+            cursor_red,
+            cursor_green,
+            cursor_blue,
         ) = HEADER.unpack_from(data)
         _dimensions(cols, rows)
         offset = HEADER.size
         lines = []
+        cell_rows = []
         for _ in range(rows):
             (count,) = COUNT.unpack_from(data, offset)
             offset += COUNT.size
@@ -275,15 +564,58 @@ class Terminal:
             runs: list[tuple[str, str]] = []
             fragments: list[str] = []
             previous_style = ""
+            native_cells = []
             for _ in range(count):
-                *attributes, length = CELL.unpack_from(data, offset)
+                (
+                    flags,
+                    colors,
+                    red,
+                    green,
+                    blue,
+                    bg_red,
+                    bg_green,
+                    bg_blue,
+                    length,
+                    x,
+                    width,
+                    underline_present,
+                    ul_red,
+                    ul_green,
+                    ul_blue,
+                    link_length,
+                ) = CELL.unpack_from(data, offset)
                 offset += CELL.size
                 end = offset + length
-                if end > len(data):
+                if (
+                    end + link_length > len(data)
+                    or x + width > cols
+                    or width not in (1, 2)
+                ):
                     raise TerminalError("Truncated native cell")
                 text = data[offset:end].decode("utf-8")
-                offset = end
-                style = _style(*attributes)
+                hyperlink = (
+                    data[end : end + link_length].decode("utf-8", errors="replace")
+                    if link_length
+                    else None
+                )
+                offset = end + link_length
+                style = _style(
+                    flags, colors, red, green, blue, bg_red, bg_green, bg_blue
+                )
+                native_cells.append(
+                    Cell(
+                        x,
+                        text,
+                        width,
+                        style,
+                        flags,
+                        (red, green, blue) if colors & COLOR_FG else None,
+                        (bg_red, bg_green, bg_blue) if colors & COLOR_BG else None,
+                        (flags >> 8) & 7,
+                        (ul_red, ul_green, ul_blue) if underline_present else None,
+                        hyperlink,
+                    )
+                )
                 if fragments and previous_style != style:
                     runs.append((previous_style, "".join(fragments)))
                     fragments = []
@@ -292,6 +624,13 @@ class Terminal:
             if fragments:
                 runs.append((previous_style, "".join(fragments)))
             lines.append(runs)
+            cell_rows.append(tuple(native_cells))
+        images = []
+        if image_count > (len(data) - offset) // PLACEMENT.size:
+            raise TerminalError("Truncated native image list")
+        for _ in range(image_count):
+            images.append(Placement(*PLACEMENT.unpack_from(data, offset)))
+            offset += PLACEMENT.size
         if offset != len(data):
             raise TerminalError("Unexpected native frame data")
         return Frame(
@@ -305,10 +644,126 @@ class Terminal:
             bool(active),
             history,
             offset_top,
+            tuple(cell_rows),
+            CURSOR_SHAPES[shape] if shape < len(CURSOR_SHAPES) else "block",
+            bool(blinking),
+            cell_width,
+            cell_height,
+            tuple(images),
+            image_generation,
+            (cursor_red, cursor_green, cursor_blue) if cursor_color_present else None,
         )
 
+    def set_appearance(
+        self,
+        appearance=None,
+        *,
+        foreground=None,
+        background=None,
+        cursor=None,
+        palette=None,
+        scheme=None,
+    ) -> None:
+        """Apply observed host defaults without replacing the child's OSC overrides.
+
+        Unknown colors stay unknown; unknown palette entries use the native
+        baseline. Rendering still inherits host defaults unless the child has
+        explicitly overridden them, including an override of the same RGB.
+        """
+        if appearance is not None:
+            foreground, background, cursor, palette, scheme = (
+                getattr(appearance, name)
+                for name in ("foreground", "background", "cursor", "palette", "scheme")
+            )
+        if scheme not in (None, "light", "dark"):
+            raise ValueError("Invalid terminal color scheme")
+        palette = (None,) * 256 if palette is None else tuple(palette)
+        if len(palette) != 256:
+            raise ValueError("Appearance palette must contain 256 entries")
+        encoded = bytearray()
+        for color in (foreground, background, cursor, *palette):
+            if color is None:
+                encoded.extend(b"\0\0\0\0")
+                continue
+            if len(color) != 3 or not all(
+                isinstance(channel, int) and 0 <= channel <= 255 for channel in color
+            ):
+                raise ValueError("Appearance colors must be RGB byte triples")
+            encoded.extend((1, *color))
+        data = bytes(encoded)
+        _check(
+            self._library.ish_vt_appearance(
+                self._open(), data, len(data), {None: -1, "light": 0, "dark": 1}[scheme]
+            )
+        )
+        self._deliver_replies()
+
+    def set_graphics(self, enabled: bool, max_bytes: int = DEFAULT_IMAGE_BYTES) -> None:
+        """Enable only after the outer renderer confirms a supported image path."""
+        if not 0 < max_bytes <= MAX_BUFFER:
+            raise ValueError("Image storage limit exceeds the bounded native buffer")
+        if enabled:
+            if not self.cell_width or not self.cell_height:
+                raise ValueError("Graphics require confirmed cell pixel dimensions")
+            try:
+                from PIL import Image as _PillowImage  # noqa: F401
+            except ImportError as error:
+                raise TerminalError("PNG images require Pillow") from error
+        _check(self._library.ish_vt_graphics(self._open(), max_bytes if enabled else 0))
+        self.graphics_enabled = bool(enabled)
+        if not enabled:
+            self._inputs.cancel_images()
+
+    def image_context(self) -> ImageContext:
+        """Query live native state even while presentation is held or scrolled."""
+        return ImageContext(*IMAGE_CONTEXT.unpack(self._bytes("ish_vt_image_context")))
+
+    def unused_image_id(self) -> int:
+        """Select an unused image identity without replacing a child image."""
+        value = ctypes.c_uint32()
+        _check(self._library.ish_vt_unused_image_id(self._open(), ctypes.byref(value)))
+        return value.value
+
+    def image(self, image_id: int) -> Image | None:
+        """Copy decoded pixels on demand, never on every cell redraw."""
+        if not 0 <= image_id < 2**32:
+            raise ValueError("Image ID exceeds unsigned 32-bit range")
+        data = self._bytes("ish_vt_image", image_id)
+        if not data:
+            return None
+        width, height, generation = IMAGE_HEADER.unpack_from(data)
+        if len(data) != IMAGE_HEADER.size + width * height * 4:
+            raise TerminalError("Invalid native image payload")
+        return Image(image_id, generation, width, height, data[IMAGE_HEADER.size :])
+
+    def tick(self, now_ms: int) -> int | None:
+        """Advance native image playback once and return its next deadline."""
+        if not 0 <= now_ms < 2**64:
+            raise ValueError("Animation timestamp exceeds unsigned 64-bit range")
+        deadline = ctypes.c_uint64()
+        _check(self._library.ish_vt_tick(self._open(), now_ms, ctypes.byref(deadline)))
+        return None if deadline.value == 2**64 - 1 else deadline.value
+
+    def encode_focus(self, focused: bool) -> bytes:
+        """Report actual frontend focus only when the child requested it."""
+        return self._bytes("ish_vt_focus", bool(focused))
+
+    def drain_events(self) -> tuple[Effect, ...]:
+        """Consume native side effects once, without writing the outer terminal."""
+        data = self._bytes("ish_vt_effects")
+        events = []
+        offset = 0
+        while offset < len(data):
+            kind, length = EFFECT_HEADER.unpack_from(data, offset)
+            offset += EFFECT_HEADER.size
+            if offset + length > len(data) or kind not in EFFECT_KINDS:
+                raise TerminalError("Invalid native effect")
+            events.append(Effect(EFFECT_KINDS[kind], data[offset : offset + length]))
+            offset += length
+        return tuple(events)
+
     def _state(self) -> ctypes.Array:
-        values = (ctypes.c_uint64 * 6)()
+        values = (ctypes.c_uint64 * 8)()
         _check(self._library.ish_vt_state(self._open(), values))
         return values
 
@@ -331,6 +786,20 @@ class Terminal:
     def mouse_reporting(self) -> bool:
         """Whether the child enabled a native mouse tracking mode."""
         return bool(self._state()[3])
+
+    @property
+    def synchronized_output(self) -> bool:
+        """Whether the application currently holds its rendering transaction."""
+        return bool(self._state()[6])
+
+    @property
+    def render_hold_serial(self) -> int:
+        """Identify a native hold start even when end/start share one PTY read."""
+        return int(self._state()[7])
+
+    def release_render_hold(self) -> None:
+        """End a stalled presentation hold without changing shell input state."""
+        _check(self._library.ish_vt_release_hold(self._open()))
 
     def set_scrollback_limit(
         self, lines: int, max_bytes: int = DEFAULT_SCROLLBACK_BYTES
@@ -357,12 +826,19 @@ class Terminal:
         _check(self._library.ish_vt_scroll(self._open(), 1, 0))
 
     def encode_mouse(
-        self, action: str, button: str | None, x: int, y: int, modifiers: int = 0
+        self,
+        action: str,
+        button: str | None,
+        x: int,
+        y: int,
+        modifiers: int = 0,
+        *,
+        pixel_position: tuple[int, int] | None = None,
     ) -> bytes:
         """Encode zero-based cell events using current native tracking and format.
 
-        Pixel reporting (1016) is unsupported because the frontend has no pixel
-        coordinates. Such events produce no bytes, as do disabled mouse events.
+        Mode 1016 emits bytes only when the caller supplies actual host pixel
+        coordinates and confirmed cell geometry. A cell centre is not evidence.
         """
         if action not in MOUSE_ACTIONS or button not in MOUSE_BUTTONS:
             raise ValueError("Unknown mouse action or button")
@@ -370,6 +846,12 @@ class Terminal:
             raise ValueError("Unsupported mouse modifiers")
         if not -(2**31) <= x < 2**31 or not -(2**31) <= y < 2**31:
             raise ValueError("Mouse coordinates exceed signed 32-bit range")
+        pixel_x, pixel_y = pixel_position if pixel_position is not None else (0, 0)
+        if pixel_position is not None:
+            if not self.cell_width or not self.cell_height:
+                raise ValueError("Pixel mouse requires confirmed cell geometry")
+            if not -(2**31) <= pixel_x < 2**31 or not -(2**31) <= pixel_y < 2**31:
+                raise ValueError("Mouse pixels exceed signed 32-bit range")
         return self._bytes(
             "ish_vt_mouse",
             MOUSE_ACTIONS[action],
@@ -377,11 +859,73 @@ class Terminal:
             x,
             y,
             modifiers,
+            pixel_position is not None,
+            pixel_x,
+            pixel_y,
         )
 
     def _selection_point(self, x: int, y: int) -> None:
         if not 0 <= x < self.cols or not 0 <= y < self.rows:
             raise ValueError("Selection point is outside the viewport")
+
+    def selection(
+        self,
+        action: str,
+        x: int = 0,
+        y: int = 0,
+        *,
+        position=None,
+        time_ns: int | None = None,
+        repeat_interval_ns: int = REPEAT_INTERVAL_NS,
+        repeat_distance: float = REPEAT_DISTANCE,
+        rectangle: bool = False,
+    ) -> SelectionState:
+        """Apply a native pointer gesture in viewport cell coordinates.
+
+        Position is the unclipped pointer in cell units; an omitted position
+        uses the cell centre. Negative/outside drag coordinates request native
+        autoscroll. A tick scrolls one row and updates selection atomically.
+        Reset cancels the gesture while preserving the installed selection.
+        """
+        if action not in SELECTION_ACTIONS:
+            raise ValueError("Unknown selection action")
+        if not all(
+            isinstance(value, int) and -(2**31) <= value < 2**31 for value in (x, y)
+        ):
+            raise ValueError("Selection coordinates exceed signed 32-bit range")
+        position = (x + 0.5, y + 0.5) if position is None else position
+        if len(position) != 2 or not all(math.isfinite(value) for value in position):
+            raise ValueError("Invalid selection pointer position")
+        if time_ns is not None and not 0 <= time_ns < 2**64:
+            raise ValueError("Invalid selection event time")
+        if (
+            not 0 <= repeat_interval_ns < 2**64
+            or not math.isfinite(repeat_distance)
+            or repeat_distance < 0
+        ):
+            raise ValueError("Invalid repeat-click policy")
+        result = (ctypes.c_uint32 * 4)()
+        _check(
+            self._library.ish_vt_selection(
+                self._open(),
+                SELECTION_ACTIONS[action],
+                x,
+                y,
+                *position,
+                time_ns or 0,
+                time_ns is not None,
+                repeat_interval_ns,
+                repeat_distance,
+                rectangle,
+                result,
+            )
+        )
+        return SelectionState(
+            result[0],
+            bool(result[1]),
+            SELECTION_AUTOSCROLL[result[2]],
+            SELECTION_BEHAVIORS[result[3]],
+        )
 
     def begin_selection(self, x: int, y: int) -> None:
         """Track a native viewport cell as an anchor; no selection exists yet."""
@@ -401,7 +945,9 @@ class Terminal:
         """Copy current selected text using native unwrap/format semantics."""
         return self._bytes("ish_vt_selection_text").decode("utf-8")
 
-    def encode_key(self, key: str, modifiers: int = 0) -> bytes:
+    def encode_key(
+        self, key: str, modifiers: int = 0, *, action: str = "press"
+    ) -> bytes:
         """Encode a named key or text with the terminal's current input modes.
 
         A terminal frontend cannot recover physical keys from arbitrary text.
@@ -409,21 +955,28 @@ class Terminal:
         C0 bytes already decoded by PTK retain their original meaning.
         """
         self._open()
+        if action not in KEY_ACTIONS:
+            raise ValueError("Unknown key action")
+        native_action = KEY_ACTIONS[action]
         if modifiers & ~(SHIFT | CTRL | ALT):
             raise ValueError("Unsupported key modifiers")
         text = key.encode("utf-8")
         if len(text) > MAX_BUFFER:
             raise ValueError("Input is too large")
         if key in SPECIAL_KEYS:
-            return self._bytes("ish_vt_key", text, b"", 0, 0, modifiers)
+            return self._bytes("ish_vt_key", text, b"", 0, 0, modifiers, native_action)
         if len(key) != 1:
-            if modifiers:
-                raise ValueError("Modifiers require one key")
+            if modifiers or action != "press":
+                raise ValueError("Modifiers and key actions require one key")
             return text
         point = ord(key)
         if point < 32 or point == 127:
+            if action == "release":
+                return b""
             return (b"\x1b" if modifiers & ALT else b"") + text
-        return self._bytes("ish_vt_key", b"", text, len(text), point, modifiers)
+        return self._bytes(
+            "ish_vt_key", b"", text, len(text), point, modifiers, native_action
+        )
 
     def encode_paste(self, text: str | bytes) -> bytes:
         """Encode an explicit user paste, honoring native bracketed-paste mode."""
@@ -435,8 +988,12 @@ class Terminal:
     def close(self) -> None:
         """Release native state; repeated closes are harmless."""
         if self._handle:
-            self._library.ish_vt_free(self._handle)
-            self._handle = None
+            try:
+                if self._inputs is not None:
+                    self._inputs.close()
+            finally:
+                self._library.ish_vt_free(self._handle)
+                self._handle = None
 
     def __enter__(self) -> Terminal:
         """Keep the terminal alive for a with block."""

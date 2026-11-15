@@ -1,6 +1,6 @@
 # VT 화면 합성과 native 셸 편집 실험
 
-이 문서는 `libghostty-vt`의 화면 상태를 PTK 전체 화면에 표시하고, 실제 명령줄 편집은 셸에 맡기는 별도 실험의 범위와 자동완성 조사 결과를 기록한다. 조사 기준일은 2026-11-14다. 이전 `refactor/editor-request` 브랜치의 PTK primary/continuation 편집 경로는 별도 구현으로 보존한다.
+이 문서는 `libghostty-vt`의 화면 상태를 PTK 전체 화면에 표시하고, 실제 명령줄 편집은 셸에 맡기는 별도 실험의 범위와 자동완성 조사 결과를 기록한다. 구현·검증 갱신일은 2026-11-15다. 이전 `refactor/editor-request` 브랜치의 PTK primary/continuation 편집 경로는 별도 구현으로 보존한다. 이미지·입력·부수 효과별 현재 범위와 검증 방법은 [capability 표](TERMINAL_CAPABILITIES.md)에 정리한다.
 
 ## 기본형의 계약
 
@@ -20,11 +20,13 @@
                           외부 터미널
 ```
 
-PTK가 외부 입력과 최종 화면 출력을 소유하고, 셸이 명령줄 버퍼와 continuation을 소유한다. 셸의 출력을 외부 터미널에 직접 쓰는 우회 경로는 만들지 않는다. 기본형에는 하단 바, 추가 우측 프롬프트, 팝업 또는 전용 단축키가 없다. 셸과 프로그램이 전체 행·열을 사용한다. 추가 UI는 향후 플러그인 범위이며 현재 플러그인 API를 새로 제공하지 않는다.
+PTK가 외부 입력과 최종 화면 출력을 소유하고, 셸이 명령줄 버퍼와 continuation을 소유한다. 셸의 출력을 외부 터미널에 직접 쓰는 우회 경로는 만들지 않는다. 기본형에는 하단 바, 추가 우측 프롬프트, 팝업 또는 전용 단축키가 없다. 셸과 프로그램이 전체 행·열을 사용한다. 추가 UI는 명시적인 `--plugin module:setup`으로만 불러온다. 플러그인 API와 수명·포커스 계약은 [capability 문서](TERMINAL_CAPABILITIES.md#플러그인-계약)에 설명한다.
 
 기본 전경·배경은 외부 터미널의 기본색을 사용한다. 여기서 투명 배경은 고정 검정색을 칠하지 않고 외부 터미널의 배경 설정에 맡긴다는 의미다. 창 자체의 투명도는 외부 터미널이 결정한다. 셸이나 프로그램이 명시한 배경색은 보존하며, 색상이 검정이라는 이유로 기본색으로 치환하지 않는다.
 
-프로그램이 OSC 10/11로 바꾼 기본 전경·배경은 명시된 색으로 유지하고 OSC 110/111로 초기화하면 외부 기본색으로 돌아간다. ANSI 팔레트 색상은 현재 libghostty-vt가 해석한 RGB를 사용한다. 외부 터미널의 사용자 팔레트까지 완전히 동기화하는 기능은 아직 없으므로 모든 테마 색상이 동일하다고 보장하지 않는다.
+시작 시 외부 터미널의 기본 전경·배경·커서 RGB와 256개 ANSI 팔레트 항목을 조회하고 실제 응답한 값만 native 상태에 적용한다. 없는 응답은 추측하지 않는다. 기본색 셀은 여전히 외부 기본색을 상속하며, 관측한 RGB로 배경을 고정하지 않는다. 프로그램이 OSC 10/11로 바꾼 기본 전경·배경은 명시된 색으로 유지하고 OSC 110/111로 초기화하면 상속 상태로 돌아간다.
+
+지원이 확인된 호스트의 2031 명암 변경 통지는 native 경로에 연결했다. 이 통지는 새 RGB와 팔레트 전체를 제공하지 않으므로 변경 후 현재 RGB 관측은 미확인으로 바꾼다. 자식이 명시한 색상 override는 보존한다. 초기 snapshot과 현재 관측을 구별하며 모든 실행 중 테마 변경 후 팔레트 동등성을 보장하지 않는다. 커서·overline·title·종료 복원의 호스트별 정책은 [프로토콜 계약](TERMINAL_PROTOCOLS.md)에 정리한다.
 
 첫 대상은 Linux x86_64/WSL의 tcsh다. 새 worktree에는 독립적인 `.venv`와 실제로 빌드한 native library가 준비되어 있다. WSL에서 다음과 같이 실행한다.
 
@@ -43,7 +45,7 @@ python3.12 -m venv .venv
 
 `--cache-dir`는 다운로드·빌드 작업 위치다. 결과는 checkout의 `.cache/ghostty-vt/install/lib`에 설치한다. WSL에서는 Linux 파일시스템의 캐시를 권장한다. `ISH_GHOSTTY_LIB`를 지정할 경우 raw libghostty가 아니라 이 실험의 C bridge인 `libish_vt.so` 경로를 전달한다. 기본값은 checkout에 빌드한 bridge다. `.venv`와 `.cache`는 Git에 넣지 않는다. 공식 라이브러리의 역할은 [libghostty-vt 문서](https://lib.ghostty.org/vt/index.html)를 참고한다.
 
-기본색과 viewport 상태를 보존하기 위해 C bridge의 화면 레코드가 확장되었고, 스크롤·마우스·선택 API도 추가되었다. 이전 실험에서 빌드한 `.so`를 사용하는 checkout은 위 build 명령을 다시 실행해야 한다. 현재 작업 폴더의 라이브러리는 변경된 코드에 맞춰 재빌드했다.
+기본색·viewport·grapheme 폭·하이퍼링크·밑줄·이미지 snapshot을 보존하도록 C bridge를 확장했다. 이전 실험의 `.so`는 재빌드해야 한다. 이미 같은 libghostty-vt를 설치한 checkout에서는 `.venv/bin/python tools/build_ghostty_vt.py --bridge-only`로 bridge만 다시 빌드할 수 있다. 현재 작업 폴더의 라이브러리는 변경된 코드에 맞춰 재빌드했다.
 
 | 조작 | 기본형의 의미 |
 | --- | --- |
@@ -52,8 +54,10 @@ python3.12 -m venv .venv
 | F2 / F10 / Esc | 다른 키와 마찬가지로 셸이나 foreground 프로그램에 전달한다. ish UI 단축키로 예약하지 않는다. |
 | 휠 | 일반 화면에서는 이전/다음 출력 3줄을 탐색한다. live 화면에서 프로그램이 마우스를 요청했다면 그 프로그램으로 보낸다. |
 | Shift+PageUp / Shift+PageDown | primary 화면의 출력을 화면 높이에서 한 줄을 뺀 만큼 탐색한다. alternate 화면에서는 프로그램에 원래 키를 전달한다. |
-| 왼쪽 드래그 | 프로그램이 마우스를 요청하지 않았거나 과거 출력을 보고 있다면 텍스트를 선택한다. 놓으면 내부 선택 텍스트를 저장하고 외부 클립보드 복사를 요청한다. |
-| 가운데 버튼 | 로컬 선택 경로에서는 ish에서 마지막으로 선택한 텍스트를 native paste로 보낸다. 프로그램 마우스 모드에서는 프로그램에 전달한다. |
+| 왼쪽 드래그 | 프로그램이 마우스를 요청하지 않았거나 과거 출력을 보고 있다면 텍스트를 선택한다. 놓으면 clipboard와 PRIMARY 복사를 요청한다. |
+| 더블 / 트리플 클릭 | 로컬 선택 경로에서 native 단어 / 줄 선택을 사용한다. |
+| Alt+드래그 | 로컬 선택 경로에서 사각형 영역을 선택한다. 선택 방식은 press 시 결정한다. |
+| 가운데 버튼 | 로컬 경로에서는 확인된 host protocol로 시스템 PRIMARY를 읽어 native paste로 보낸다. 읽기를 지원하지 않으면 오래된 선택으로 대체하지 않는다. 프로그램 마우스 모드에서는 프로그램에 전달한다. |
 | Ctrl+C / Ctrl+D | PTY로 전달한다. 취소·EOF의 의미는 셸, 프로그램, PTY 설정이 결정한다. |
 | 종료 | 셸의 `exit` 또는 셸이 허용하는 Ctrl+D로 종료한다. |
 
@@ -67,11 +71,13 @@ python3.12 -m venv .venv
 
 마우스는 외부 터미널의 SGR·X10·urxvt 이벤트를 물리 셀 좌표로 읽는다. PTK의 문자열 index로 바꾸지 않으므로 한글 뒤의 클릭 위치도 달라지지 않는다. 프로그램의 1000·1002·1003 등 모드와 보고 형식은 libghostty encoder가 적용한다. 실제로 전달한 press는 같은 소비자에게 release하고, history로 이동할 때는 마지막 live 좌표에서 먼저 release한다. 과거 화면의 클릭·드래그는 실행 중 프로그램으로 보내지 않는다.
 
-로컬 드래그 선택의 anchor는 native tracked grid reference로 관리하며 출력·reflow 후에도 같은 내용에 연결한다. 선택 텍스트도 VT formatter에서 얻어 줄바꿈·Unicode 의미를 보존한다. 선택 영역 표시는 셀 강조만 사용하며 바나 팝업을 추가하지 않는다. 더블 클릭 단어 선택·트리플 클릭 줄 선택·선택 중 자동 스크롤은 아직 별도 구현 범위다.
+로컬 선택 범위와 단어·줄·사각형 선택 의미는 native selection API가 관리한다. anchor는 출력·reflow 후에도 native grid에 연결하고 선택 텍스트는 VT formatter에서 얻어 줄바꿈·Unicode 의미를 보존한다. 화면 밖으로 드래그하는 동안 native 자동 스크롤을 구동하며 종료·resize·포커스 전환 시 오래된 timer와 capture를 해제한다. 선택 영역 표시는 셀 강조만 사용하며 바나 팝업을 추가하지 않는다.
 
-드래그를 놓으면 PTK 출력 경로로 OSC 52 클립보드 쓰기를 요청한다(UTF-8 1MiB 이하). 실제 시스템 클립보드 반영은 외부 터미널의 OSC 52 지원·허용 설정에 따른다. 가운데 버튼은 OS 클립보드를 읽지 않고 ish의 마지막 선택 텍스트를 붙여넣는다. 외부 앱에서 복사한 내용은 외부 터미널의 일반 붙여넣기 키를 사용한다. 외부 터미널의 Shift+드래그 선택도 사용할 수 있다. Windows Terminal의 이 동작은 [공식 선택 문서](https://learn.microsoft.com/en-us/windows/terminal/selection)에 설명되어 있다. Shift 마우스 이벤트가 ish에 전달되는 경우에도 프로그램 전달 대신 로컬 선택·탐색으로 처리한다.
+선택을 놓으면 같은 PTK 출력 경로로 OSC52의 clipboard와 PRIMARY 쓰기를 요청한다(UTF-8 1MiB 이하). 실제 시스템 반영은 외부 터미널의 지원·허용 설정에 따른다. 가운데 버튼은 5522 읽기가 확인된 호스트에서 시스템 PRIMARY를 조회한다. 그동안 입력 소비자가 바뀌면 요청을 취소하고 오래된 응답을 새 프로그램이나 팝업에 붙이지 않는다. 미지원·busy·실패 시 로컬 선택 cache를 대신 붙이지 않는다. 직접 선택 복사와 PRIMARY 붙여넣기는 `--clipboard`의 자식 접근 정책과 별개다.
 
-현재 외부 입력은 셀 좌표다. 프로그램이 1016 pixel mouse 모드를 요구하면 가짜 픽셀 좌표를 만들어 전달하지 않으며, 이 모드는 지원 완료 범위가 아니다. 상위 터미널에서 가져온 실제 pixel geometry를 연결하는 것은 별도 작업이다.
+외부 터미널의 일반 붙여넣기 키와 Shift+드래그 선택도 사용할 수 있다. Windows Terminal의 선택 동작은 [공식 문서](https://learn.microsoft.com/en-us/windows/terminal/selection)에 설명되어 있다. Shift 마우스 이벤트가 ish에 전달되는 경우에도 프로그램 전달 대신 로컬 선택·탐색으로 처리한다.
+
+검증된 Kitty와 실제 셀 크기가 있으면 외부 1016 pixel mouse를 활성화한다. PTK 위젯에는 셀 좌표를 전달하고, native encoder에는 원래 픽셀 좌표를 보존한다. geometry를 얻지 못하면 셀 경로로 제한하며 가짜 픽셀 위치를 만들지 않는다. resize 후 커널 pixel geometry가 없으면 확장 기능을 보수적으로 비활성화한다.
 
 이 실험은 primary/continuation을 판정하여 편집기를 교체하지 않는다. tcsh의 보조 프롬프트도 native 편집 경로에서 처리한다. 그러므로 이는 모든 셸의 continuation을 PTK 편집기로 대체했다는 결과가 아니다. `$<`, 외부 프로그램의 stdin, Python 프로그램의 `input()`도 같은 native PTY 경로에 남는다. 새 source FIFO 실행 경로나 Python 도구 dispatch는 도입하지 않는다.
 
@@ -138,7 +144,7 @@ tcsh 6.24.13의 `complete`는 외부 명령의 출력을 후보로 사용할 수
 
 WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도의 pyte 화면으로 PTK가 출력한 셸·Vim 화면과 셀 색상을 확인하고, 입력의 최종 소비자가 만든 파일을 독립적인 기대값과 비교한다. `--dump-state PATH`는 테스트를 위한 명시적 진단 옵션이며 화면 텍스트를 기록한다. 이 값이나 prompt 문자열을 production 입력 권한 판단에 사용하지 않는다.
 
-스크롤백·마우스 추가 후 VT 22개, 실제 CLI 16개, 외부 마우스 디코더 8개로 총 46개 테스트가 통과했다. 입력 capture 보완 뒤에는 영향받는 실제 마우스·선택 경로만 재확인했다. session 3개는 이전 실험에서 통과한 변경 없는 검증이다. Ruff 검사와 C bridge의 `-Wall -Wextra -Werror` 빌드도 통과했다.
+기존 VT·실제 CLI·마우스·session 회귀와 새 native 이미지·host 협상·합성·실제 GUI 검증을 함께 유지한다. 최신 재실행 범위와 결과는 [capability 문서](TERMINAL_CAPABILITIES.md#검증)에 기록한다. Ruff 검사와 C bridge의 `-Wall -Wextra -Werror` 빌드도 확인했다.
 
 | 파일 | 검증 범위 |
 | --- | --- |
@@ -146,6 +152,12 @@ WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도�
 | `tests/test_terminal_session.py` | 실제 PTY 입력과 마지막 출력, 다른 slave FD가 열려 있어도 직접 자식 종료 감지, 쓰기 큐 초과의 오류 전달 |
 | `tests/test_terminal_cli.py` | 실제 tcsh 보조 입력·heredoc·Tab·stdin·paste·기본색·F2/F10·Vim·resize·Ctrl+C/D, 화면 history·anchor·입력 복귀, mouse wire와 capture, 선택·복사 요청, Vim 클릭·휠 |
 | `tests/test_terminal_mouse.py` | 독립적인 SGR·X10·urxvt wire 기대값, 버튼·이동·modifier·휠, 물리 셀 좌표, 잘못된 데이터 거부 |
+| `tests/test_terminal_host.py` | 단일 reader의 응답·키 순서, capability 확정, 기본색·팔레트·2031 관측, 복원 가능 여부와 오래된 응답 거부 |
+| `tests/test_terminal_selection.py` | native 단어·줄·사각형 선택과 자동 스크롤 controller, capture/timer 취소 |
+| `tests/test_terminal_clipboard.py` | clipboard transaction, PRIMARY 요청 identity·취소·늦은 응답과 실제 PTK 포커스 전환 시 소비자 보존 |
+| `tests/test_terminal_appearance_gui.py` | 실제 Kitty의 사용자 기본색·팔레트 query와 픽셀, overline, 커서 적용/reset, 실제 명암 변경과 자식 override 보존 |
+| `tests/test_terminal_selection_gui.py` | 실제 Kitty/Xvfb의 더블 클릭 clipboard/PRIMARY 복사와 외부 PRIMARY의 native paste; 자식 정책 `off` |
+| `tests/test_terminal_basics_gui.py` | 실제 Kitty의 정상 종료·SIGTERM·SIGHUP 후 termios, title, cursor, mode, cwd 표시 복원 |
 
 실제 사용자 경로에서 확인한 결과는 다음과 같다.
 
@@ -161,15 +173,24 @@ WSL의 실제 controlling PTY에서 tcsh를 실행했다. CLI 검증은 별도�
 - 실제 출력 80줄을 휠·페이지 키로 탐색하고 추가 출력 12줄 뒤에도 이전 화면 위치가 유지됨을 확인했다. resize 후에도 정확한 stdin 파일과 PTY 크기를 확인했다.
 - 1000/1002/1003 SGR 및 legacy 모드에서 실제 프로그램이 받은 모든 mouse bytes를 독립 기대값과 비교했다. Shift 변경, 창 밖 release, history 진입 전 release 및 후속 중복 제거도 검증했다.
 - 실제 Vim에서 클릭한 줄·열과 휠에 따른 화면 위치를 파일로 확인했고 alternate 화면에 primary history가 섞이지 않음을 확인했다.
-- 드래그한 `COPY_ME`의 선택 강조, PTK가 내보낸 OSC52 요청 payload, 가운데 버튼으로 native stdin이 받은 파일을 확인했다. 외부 호스트 앱이 실제 OS 클립보드에 수락하는지는 테스트 대상 밖이다.
+- 드래그한 `COPY_ME`의 선택 강조와 OSC52 요청 payload를 확인했다. 추가 실제 Kitty/Xvfb 검증에서는 더블 클릭한 단어가 OS clipboard와 PRIMARY에 복사되고, 외부 프로그램이 바꾼 Unicode·여러 줄 PRIMARY가 native stdin에 정확한 bracketed paste bytes로 들어가는 것을 확인했다. 자식 clipboard 접근을 꺼도 명시적 사용자 동작은 유지된다.
+- 실제 Kitty에서 사용자 지정 OSC10/11/12·OSC4 query 응답과 ANSI 색상 픽셀을 비교했다. Overline의 실제 표시, 자식 커서 색상과 reset, 외부 dark→light 변경 통지, 명시적 자식 전경 보존도 확인했다. 통지 후 새 RGB를 관측한 것으로 기록하지 않는다.
+- 정상 셸 종료와 ish에 전달한 SIGTERM/SIGHUP 각각에서 독립 부모 관찰자가 termios·cursor·mode 복원을 확인했다. 실제 호스트 title과 cwd 표시도 시작 상태로 돌아왔다. title stack이 없는 호스트나 SIGKILL까지 같은 보장을 확장하지 않는다.
 
-이전 바·팝업 구현의 검증 기록은 `1d0e605`에 보존한다. 현재 테스트는 기본형의 전체 화면과 native 입력 계약을 확인한다.
+이전 기본 바·팝업 구현의 검증 기록은 `1d0e605`에 보존한다. 현재 팝업은 명시적으로 불러온 플러그인에서만 생성하며, 실제 Kitty 화면의 이미지 가림·이동·복원을 픽셀로 검증한다.
 
 테스트 재실행 명령은 다음과 같다.
 
 ```sh
 PYTHONPATH=src:tests PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m unittest \
-  test_terminal_vt test_terminal_mouse test_terminal_session test_terminal_cli -v
+  test_terminal_vt test_terminal_graphics_vt test_terminal_graphics \
+  test_terminal_host test_terminal_mouse test_terminal_session \
+  test_terminal_protocol test_terminal_image_protocol test_terminal_clipboard \
+  test_terminal_selection test_terminal_basics \
+  test_terminal_composition test_terminal_cli -v
+
+# 별도 Xvfb와 실제 호스트로 이미지·클립보드·색상·선택·복원 검증
+.venv/bin/python tools/check_terminal_gui.py
 ```
 
 새 `.venv`의 editable 설치, `ish-vt --help`, native library 로드도 확인했다. C bridge는 `-Wall -Wextra -Werror` 검사를 통과했다. 화면 판독과 테스트 deadline은 관찰·실패 판정에만 사용한다.
@@ -177,8 +198,10 @@ PYTHONPATH=src:tests PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m unittest \
 ## 남은 범위
 
 - 빌드·실행 검증은 Linux x86_64/WSL에 한정된다. native Windows·macOS 지원이나 성능 동등성은 검증하지 않았다. 현재 native 빌드는 SIMD를 비활성화한다.
-- 하단 바·오른쪽 프롬프트·팝업, PTK 자동완성 dropdown, 기존 ish 설정·플러그인 API 이식은 후속 플러그인 범위다. 기본형에는 추가 UI가 없다.
+- 선택적 하단 바·팝업 수명과 포커스 API는 추가했다. 실제 오른쪽 프롬프트와 PTK 자동완성 dropdown의 셸 편집 버퍼 연동, 기존 ish 설정·플러그인 API 이식은 후속 범위다. 기본형에는 추가 UI가 없다.
 - native history·사용자 keymap 전체, continuation/heredoc 도중 Ctrl+C/D, 모든 background job·disown 종료 조합은 아직 별도 검증하지 않았다. 세션 종료는 직접 자식과 현재 foreground process group을 정리하며 전체 프로세스 트리 관리를 보장하지 않는다.
-- 기본 화면·색상·커서·alternate screen·내부 scrollback·셀 단위 마우스는 연결했다. 이미지, 하이퍼링크, 모든 확장 키보드 프로토콜은 지원 완료 범위가 아니다. 복잡한 emoji 조합의 폭과 외부 터미널별 Unicode 차이도 추가 검증이 필요하다. 클립보드 및 pixel mouse 범위는 위 절에 구분했다.
-- PTK는 외부 대체 화면을 사용하며 실행 중 출력은 내부 scrollback에서 탐색한다. 자식의 `TERM`·`COLORTERM`·`TERM_PROGRAM`은 가상 터미널에 맞게 설정하며, 커서 위치·표시는 전달하지만 커서 모양은 아직 전달하지 않는다. 기본 UI를 없앤 결과가 모든 터미널 동작의 완전한 동등성을 뜻하지는 않는다.
+- 이미지 입력에는 Kitty·iTerm inline을 연결했고, 출력에는 Kitty와 확인된 WezTerm iTerm adapter를 사용한다. SIXEL 입력·출력은 모두 미지원이며 custom 코드와 libsixel 의존성을 제거했다. xterm은 text·색상·resize 호스트로 유지한다. iTerm layer/alpha에는 [명시적인 제한](TERMINAL_PROTOCOLS.md)이 있다.
+- 초기 기본색·256개 팔레트는 실제 응답한 항목만 적용한다. 2031은 명암 변경 통지까지 연결했고 변경 후 RGB 전체 동기화는 보장하지 않는다. 커서 색상은 원래 상태를 관측해 복원할 수 있을 때만 외부에 적용한다. OSC7 종료 보고는 시작 프로세스 cwd이며 조회할 수 없는 이전 호스트 metadata를 복구한 것이 아니다.
+- 모든 확장 키보드와 외부 터미널별 Unicode 차이는 지원 완료 범위가 아니다. 자식 clipboard는 OSC52/iTerm write와 correlated 5522 read/write를 지원하며 unsolicited MIME paste 모드는 별도 범위다. 시스템 PRIMARY는 검증된 host read가 필요하다.
+- PTK는 외부 대체 화면을 사용하며 실행 중 출력은 내부 scrollback에서 탐색한다. 자식의 `TERM`·`COLORTERM`·`TERM_PROGRAM`은 가상 터미널에 맞게 설정하고 외부 호스트 식별 환경 변수는 제거한다. 기본 UI를 없앤 결과가 모든 터미널 동작의 완전한 동등성을 뜻하지는 않는다.
 - 첫 실험에서 입증한 것은 native tcsh 편집과 PTK 화면 합성의 공존이다. 모든 셸 자동완성, 모든 VT 기능, 기존 PTK 명령 편집 API와의 동등 호환성 또는 제품 완성도를 선언하지 않는다.

@@ -133,6 +133,15 @@ Path('selection-input').write_text(sys.stdin.readline())
 """
 
 
+class OuterScreen(pyte.Screen):
+    """Keep pyte's independent cells while ignoring unsupported private queries."""
+
+    def report_device_status(self, mode, **kwargs):
+        """Private theme queries have no response in this deliberately basic host."""
+        if not kwargs.get("private"):
+            super().report_device_status(mode)
+
+
 class Terminal:
     """Drive one real outer terminal without consulting production input policy."""
 
@@ -144,7 +153,7 @@ class Terminal:
         self.query_tail = b""
         self.status = None
         self.prompt_before = None
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = OuterScreen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.state_path = root / "terminal-state.json"
         (root / ".tcshrc").write_text(
@@ -359,6 +368,20 @@ class TerminalCLITests(unittest.TestCase):
         self.assertNotIn("popup_text", state)
         self.assertFalse(terminal.frame_has("ish-vt |"))
         self.assertFalse(terminal.frame_has("ish-vt popup"))
+
+    def test_diagnostics_separate_engine_routes_host_and_policy(self):
+        """A real PTY session exposes selections without reserving a UI row."""
+        state = self.terminal.state()
+        self.assertEqual(state["engine"]["version"], "1.0.1")
+        self.assertEqual(state["engine"]["native_inputs"], ["kitty"])
+        self.assertEqual(
+            state["input_routes"],
+            {"kitty": "native", "iterm": "adapter", "sixel": "unsupported"},
+        )
+        self.assertEqual(state["host_adapter"], "unknown")
+        self.assertFalse(state["graphics_enabled"])
+        self.assertEqual(state["clipboard_policy"], {"read": False, "write": True})
+        self.assertEqual(state["popups"], [])
 
     def test_native_backslash_continuation_keeps_both_lines(self):
         """Native tcsh collects continuation while PTK supplies only terminal rendering."""
@@ -701,7 +724,7 @@ class TerminalCLITests(unittest.TestCase):
                 terminal.require(terminal.at_prompt)
         self.require_full_screen()
 
-    def test_native_selection_copies_and_middle_click_pastes_into_stdin(self):
+    def test_native_selection_copies_without_faking_unsupported_primary_reads(self):
         """A drag selects native cells and requests OSC52 without adding UI."""
         terminal = self.terminal
         (self.root / "selection-reader.py").write_text(SELECTION_READER)
@@ -709,16 +732,16 @@ class TerminalCLITests(unittest.TestCase):
         terminal.result("selection-ready", b"waiting")
         terminal.require(lambda: terminal.screen.display[0].startswith("COPY_ME"))
         previous = len(terminal.output)
-        terminal.send(b"\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<2;3;1M\x1b[<2;3;1m\x1b[<32;4;1M")
+        terminal.send(b"\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<2;3;1M\x1b[<2;3;1m\x1b[<32;5;1M")
         terminal.require(lambda: terminal.screen.buffer[0][3].reverse)
         self.assertNotIn(b"\x1b]52;", terminal.output[previous:])
-        terminal.send(b"\x1b[<32;7;1M\x1b[<0;7;1m")
+        terminal.send(b"\x1b[<32;8;1M\x1b[<0;8;1m")
         terminal.require(
-            lambda: b"\x1b]52;c;Q09QWV9NRQ==" in terminal.output[previous:]
+            lambda: b"\x1b]52;cp;Q09QWV9NRQ==" in terminal.output[previous:]
         )
         self.assertEqual(terminal.output[previous:].count(b"\x1b]52;"), 1)
         terminal.send(b"\x1b[<1;5;5M\x1b[<1;5;5m\r")
-        terminal.result("selection-input", b"COPY_ME\n")
+        terminal.result("selection-input", b"\n")
         terminal.require(terminal.at_prompt)
         self.require_full_screen()
 
