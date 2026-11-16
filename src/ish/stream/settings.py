@@ -8,6 +8,7 @@ import runpy
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ish.lang import Message, i18n
 from ish.log import LOG_LEVELS
 from ish.runtime.startup import login_shell
 
@@ -20,6 +21,35 @@ PATH_OPTIONS = ("cwd", "plugin_dir", "plugin_lib_dir", "integration_dir", "log_f
 RC_RUN_NAME = "__ishrc__"
 
 
+class SettingsError(ValueError):
+    """Keep a settings diagnostic translatable until startup selects its language."""
+
+    def __init__(self, message: Message, **values):
+        """Retain the owned message and its data without freezing a locale."""
+        super().__init__(message)
+        self.message, self.values = message, values
+
+    def __str__(self):
+        """Render only after the caller has applied CLI and rc language precedence."""
+        return i18n.get(self.message, **self.values)
+
+
+class RcError(ValueError):
+    """Retain a failed rc's partial settings and original exception for reporting."""
+
+    def __init__(self, path: Path, settings: Settings, error: BaseException):
+        """Preserve the explicit language even when later configuration fails."""
+        super().__init__(path)
+        self.path, self.settings, self.error = path, settings, error
+
+    def __str__(self):
+        """Translate the ish context while preserving foreign exception details."""
+        error = str(self.error)
+        if not isinstance(self.error, SettingsError):
+            error = f"{type(self.error).__name__}: {error}"
+        return i18n.get(Message.STREAM_RC_ERROR, path=self.path, error=error)
+
+
 def validate_escape_delay(value):
     """Return a finite byte-sequence wait in seconds, rejecting ambiguous values."""
     if (
@@ -27,8 +57,10 @@ def validate_escape_delay(value):
         or not MIN_ESCAPE_DELAY <= value <= MAX_ESCAPE_DELAY
         or not math.isfinite(value)
     ):
-        raise ValueError(
-            f"escape_delay must be between {MIN_ESCAPE_DELAY} and {MAX_ESCAPE_DELAY} seconds"
+        raise SettingsError(
+            Message.STREAM_SETTING_ESCAPE,
+            minimum=MIN_ESCAPE_DELAY,
+            maximum=MAX_ESCAPE_DELAY,
         )
     return float(value)
 
@@ -52,9 +84,9 @@ class Settings:
     def validate(self, base: Path):
         """Normalize file-relative paths and reject misspelled or invalid choices."""
         if self.lang is not None and (not isinstance(self.lang, str) or not self.lang):
-            raise ValueError("lang must be a nonempty language code or None")
+            raise SettingsError(Message.STREAM_SETTING_LANG)
         if not isinstance(self.shell, str) or not self.shell or "\0" in self.shell:
-            raise ValueError("shell must be a nonempty executable name or path")
+            raise SettingsError(Message.STREAM_SETTING_SHELL)
         if "/" in self.shell or self.shell.startswith("~"):
             # Keep the selected symlink name: providers may interpret argv[0].
             self.shell = os.path.abspath(base / Path(self.shell).expanduser())
@@ -63,10 +95,10 @@ class Settings:
             if not isinstance(values, (list, tuple)) or any(
                 not isinstance(value, str) or "\0" in value for value in values
             ):
-                raise ValueError(f"{name} must be a list of strings")
+                raise SettingsError(Message.STREAM_SETTING_LIST, name=name)
             setattr(self, name, list(values))
         if any(not name for name in self.plugins):
-            raise ValueError("plugins must contain nonempty names")
+            raise SettingsError(Message.STREAM_SETTING_PLUGINS)
         self.plugins = list(dict.fromkeys(self.plugins))
         for name in PATH_OPTIONS:
             value = getattr(self, name)
@@ -77,14 +109,16 @@ class Settings:
                 or not str(value)
                 or "\0" in str(value)
             ):
-                raise ValueError(f"{name} must be a path")
+                raise SettingsError(Message.STREAM_SETTING_PATH, name=name)
             path = Path(value).expanduser()
             setattr(self, name, (base / path).resolve())
         if (
             not isinstance(self.log_level, str)
             or self.log_level.upper() not in LOG_LEVELS
         ):
-            raise ValueError("log_level must be one of " + ", ".join(LOG_LEVELS))
+            raise SettingsError(
+                Message.STREAM_SETTING_LEVEL, levels=", ".join(LOG_LEVELS)
+            )
         self.log_level = self.log_level.upper()
         self.escape_delay = validate_escape_delay(self.escape_delay)
 
@@ -95,11 +129,11 @@ def load(path: Path) -> Settings:
     try:
         if path.exists():
             if not path.is_file():
-                raise ValueError("configuration must be a regular Python file")
+                raise SettingsError(Message.STREAM_RC_FILE_ERROR)
             runpy.run_path(
                 str(path), run_name=RC_RUN_NAME, init_globals={"config": settings}
             )
         settings.validate(path.parent)
     except (Exception, SystemExit) as error:
-        raise ValueError(f"{path}: {type(error).__name__}: {error}") from error
+        raise RcError(path, settings, error) from error
     return settings

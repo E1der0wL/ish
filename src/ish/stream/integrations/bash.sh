@@ -11,7 +11,7 @@ if [[ -r @RC@ ]]; then builtin source @RC@; fi
 _ish_stream_status=$?
 if (( BASH_VERSINFO[0] < _ish_stream_min_major ||
       (BASH_VERSINFO[0] == _ish_stream_min_major && BASH_VERSINFO[1] < _ish_stream_min_minor) )); then
-    builtin printf '%s\n' 'ish prompt decorations require Bash 5.1 or later' >&2
+    builtin printf '%s\n' @VERSION_NOTICE@ >&2
     builtin return "$_ish_stream_status"
 fi
 _ish_stream_nonce=@NONCE@

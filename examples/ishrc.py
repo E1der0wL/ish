@@ -1,6 +1,7 @@
 """Copy to ~/ish/.ishrc.py and edit choices for subsequent ish sessions."""
 
-config.lang = "ko"  # noqa: F821
+# None detects LANG and falls back to English; use "ko" or "en" to override.
+config.lang = None  # noqa: F821
 config.escape_delay = 0.05  # noqa: F821
 
 # No plugins means no UI, popup shortcut, or shell hook.

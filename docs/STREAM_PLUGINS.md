@@ -148,6 +148,24 @@ entry가 import하는 보조 모듈은 일반 Python import 규칙을 따른다.
 
 ## stream 등록 API
 
+표시 문구는 본체와 같은 `ish.lang.i18n`을 사용한다. 본체가 언어팩을 읽은 뒤
+플러그인을 불러오므로 영어 기본값을 등록할 때 이미 있는 번역을 덮어쓰지 않는다.
+예를 들어 플러그인에서 다음처럼 기본 문구와 하단 바를 등록할 수 있다.
+
+```python
+from ish.lang import i18n
+
+def setup(api):
+    i18n.message.setdefault("my_plugin_status", "Ready")
+    api.set_bar(lambda: i18n.get("my_plugin_status"))
+```
+
+사용자의 `~/ish/lang/ko.json`에 `"my_plugin_status": "준비됨"`을 추가하면
+한국어 설정에서 이 문구를 사용한다. 키에는 플러그인 이름을 포함해 충돌을 피한다.
+기본 제공 샘플 바·팝업은 공통 카탈로그의 `stream_sample_bar`와
+`stream_sample_popup`을 사용하며 같은 언어팩으로 바꿀 수 있다. 번역 대상은
+표시 문구이며, 셸 명령·입력 데이터·요청 identity는 번역하지 않는다.
+
 외부 모듈은 정수 `STREAM_API = 1`과 `setup(api)`를 제공해야 한다. 다음 등록은
 setup 중에만 허용된다. setup이 반환한 뒤에는 등록 구성을 변경할 수 없다.
 

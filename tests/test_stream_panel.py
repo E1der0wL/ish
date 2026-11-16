@@ -4,11 +4,14 @@ import asyncio
 import contextlib
 import gc
 import io
+import json
+import tempfile
 import unittest
 import warnings
+from pathlib import Path
 
 import pyte
-from examples.stream_plugins.stream_bar.stream_bar import BAR_STYLE, BAR_TEXT
+from examples.stream_plugins.stream_bar.stream_bar import setup as setup_bar
 from examples.stream_plugins.stream_popup.stream_popup import create
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.key_binding import KeyBindings
@@ -16,6 +19,8 @@ from prompt_toolkit.layout import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
 
+from ish.lang import i18n
+from ish.stream.extensions import Extensions
 from ish.stream.panel import Panel
 from ish.stream.ui import PopupView
 
@@ -40,7 +45,9 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.painted = painted
         self.host_output = io.StringIO()
         self.panel = None
-        await self.configure(bar=[(BAR_STYLE, BAR_TEXT)], popup=create)
+        content = Extensions()
+        setup_bar(content)
+        await self.configure(bar=content.bar, popup=create)
 
     async def configure(self, **content):
         """Replace the public panel with explicitly supplied plugin content."""
@@ -118,6 +125,54 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.panel.open_popup())
         self.panel.feed("한글\r".encode())
         self.assertEqual(self.results, ["plugin:한글"])
+
+    async def test_sample_content_uses_language_selected_after_module_import(self):
+        """A selected locale reaches the real plugin setup and popup factory."""
+        previous = i18n.current_lang, i18n.base_path, i18n.message
+        self.addCleanup(setattr, i18n, "current_lang", previous[0])
+        self.addCleanup(setattr, i18n, "base_path", previous[1])
+        self.addCleanup(setattr, i18n, "message", previous[2])
+        temporary = tempfile.TemporaryDirectory(prefix="ish-panel-language-")
+        self.addCleanup(temporary.cleanup)
+        i18n.base_path = Path(temporary.name)
+        i18n.load("ko", create=False)
+        content = Extensions()
+        setup_bar(content)
+        await self.configure(bar=content.bar, popup=create)
+        self.panel.show()
+        await self.frame_matching(
+            lambda frame: "ish | 기본 셸 | F2 팝업" in "\n".join(frame.lines)
+        )
+        self.assertTrue(self.panel.open_popup())
+        await self.frame_matching(
+            lambda frame: "플러그인 팝업 | Enter 확인" in "\n".join(frame.lines)
+        )
+        self.panel.feed("한글 입력\r".encode())
+        self.assertEqual(self.results, ["한글 입력"])
+        self.assertEqual(self.remainders, [])
+        (i18n.base_path / "ko.json").write_text(
+            json.dumps(
+                {
+                    "stream_sample_bar": "사용자 하단 바",
+                    "stream_sample_popup": "사용자 팝업",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        i18n.load("ko", create=False)
+        content = Extensions()
+        setup_bar(content)
+        await self.configure(bar=content.bar, popup=create)
+        self.panel.show()
+        await self.frame_matching(
+            lambda frame: "사용자 하단 바" in "\n".join(frame.lines)
+        )
+        self.assertTrue(self.panel.open_popup())
+        await self.frame_matching(lambda frame: "사용자 팝업" in "\n".join(frame.lines))
+        self.panel.feed("다른 입력\r".encode())
+        self.assertEqual(self.results, ["한글 입력", "다른 입력"])
+        self.assertEqual(self.remainders, [])
 
     async def test_custom_popup_key_returns_exact_native_suffix(self):
         """A plugin may accept with Tab without losing following bytes in that read."""

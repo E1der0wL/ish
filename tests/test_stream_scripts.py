@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -66,6 +67,41 @@ class ScriptTests(unittest.TestCase):
                 process, home = self.start(shell, self.root / "missing", demo=False)
                 self.native_result(process, home)
                 self.assertNotIn(b"starting without UI", process.output)
+
+    def test_translated_shell_notice_is_literal_data(self):
+        """Custom language text cannot inject shell syntax or script placeholders."""
+        scripts = self.root / "scripts"
+        shutil.copytree(SCRIPTS, scripts)
+        entry = scripts / "bash.sh"
+        entry.write_text(
+            entry.read_text().replace(
+                "_ish_stream_min_major=5", "_ish_stream_min_major=999"
+            )
+        )
+        settings = self.root / "settings"
+        (settings / "lang").mkdir(parents=True)
+        notice = "번역 ' \" $(touch translated-command) `touch translated-backtick` %s @UNKNOWN@\n다음 줄"
+        (settings / "lang/ko.json").write_text(
+            json.dumps({"stream_bash_version": notice}, ensure_ascii=False)
+        )
+        home = self.root / "native"
+        home.mkdir()
+        process = StreamProcess(
+            home,
+            shell="bash",
+            demo=True,
+            integration_dir=scripts,
+            extra_args=("--home", str(settings), "--lang", "ko"),
+        )
+        self.addCleanup(process.stop)
+        process.demo = False
+        process.expect(notice.replace("\n", "\r\n").encode())
+        process.expect(PROMPT)
+        process.command("echo native > result")
+        process.expect_file(home / "result", "native\n")
+        self.assertFalse((home / "translated-command").exists())
+        self.assertFalse((home / "translated-backtick").exists())
+        self.assertNotIn("기본 셸 | F2 팝업".encode(), process.output)
 
     def test_missing_demo_scripts_fall_back_before_user_startup(self):
         """The native shell starts once and receives its own function keys."""

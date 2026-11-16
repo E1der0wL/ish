@@ -18,6 +18,8 @@ from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
+from ish.lang import Message, i18n
+
 INSTALL_LOCK_SUFFIX = ".install.lock"
 _LOCK_MODE = 0o600
 _STAGE_PREFIX = ".install-"
@@ -61,9 +63,7 @@ def _installation_lock(target: Path):
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError(
-                f"Another dependency installation is using {target}; retry after it finishes"
-            ) from exc
+            raise RuntimeError(i18n.get(Message.PM_INSTALL_BUSY, path=target)) from exc
         try:
             yield
         finally:
@@ -232,9 +232,7 @@ def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: P
         if not origin:
             # Adding a regular package over an active namespace changes imports.
             if locations is not None and relative / PACKAGE_ENTRY in incoming:
-                raise RuntimeError(
-                    f"Package {name!r} is in use; restart ish before replacing it"
-                )
+                raise RuntimeError(i18n.get(Message.PM_PACKAGE_BUSY, name=name))
             continue
         origin = Path(origin).resolve()
         if locations is not None:
@@ -242,13 +240,9 @@ def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: P
                 if path.is_relative_to(relative):
                     current = origin.parent / path.relative_to(relative)
                     if not _same_contents(current, source):
-                        raise RuntimeError(
-                            f"Package {name!r} is in use; restart ish before replacing it"
-                        )
+                        raise RuntimeError(i18n.get(Message.PM_PACKAGE_BUSY, name=name))
             if any(path.is_relative_to(origin.parent) for path in removed_files):
-                raise RuntimeError(
-                    f"Package {name!r} is in use; restart ish before replacing it"
-                )
+                raise RuntimeError(i18n.get(Message.PM_PACKAGE_BUSY, name=name))
         else:
             for path, source in incoming.items():
                 if path.parent == relative.parent and (
@@ -257,13 +251,9 @@ def check_loaded_files(incoming: dict[Path, Path], removed: set[Path], target: P
                     and path.suffix in _NATIVE_EXTENSIONS
                 ):
                     if not _same_contents(origin, source):
-                        raise RuntimeError(
-                            f"Module {name!r} is in use; restart ish before replacing it"
-                        )
+                        raise RuntimeError(i18n.get(Message.PM_MODULE_BUSY, name=name))
             if origin in removed_files:
-                raise RuntimeError(
-                    f"Module {name!r} is in use; restart ish before replacing it"
-                )
+                raise RuntimeError(i18n.get(Message.PM_MODULE_BUSY, name=name))
 
 
 def _remove_empty_directories(paths: set[Path], root: Path) -> None:
@@ -326,16 +316,14 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
             if (name := _distribution_name(dist))
         }
         if not new:
-            raise RuntimeError("pip did not produce an installed distribution")
+            raise RuntimeError(i18n.get(Message.PM_PIP_EMPTY))
         # Pip stages independently. Re-read target ownership only after taking
         # the lock, and hold it through the caller's validation and any rollback.
         with _installation_lock(target):
             for dist in loaded_distributions():
                 name = _distribution_name(dist)
                 if name in new and dist.version != new[name].version:
-                    raise RuntimeError(
-                        f"Dependency {name!r} is in use; restart ish before changing its version"
-                    )
+                    raise RuntimeError(i18n.get(Message.PM_DEPENDENCY_BUSY, name=name))
             incoming = {
                 path.relative_to(stage): path
                 for path in stage.rglob("*")
@@ -355,9 +343,7 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
             }
             # Never overwrite another distribution's shared file with different bytes.
             if retained_files & changed.keys():
-                raise RuntimeError(
-                    "Dependency installation would overwrite files owned by another package"
-                )
+                raise RuntimeError(i18n.get(Message.PM_FILE_OWNERSHIP))
             removed = old_files - incoming.keys() - retained_files
             # Older pip installs may record bytecode. Removing a cache is safe even
             # when its unchanged source package is already imported.
@@ -382,13 +368,9 @@ def install_dependency(python: str, requirement: str, target: Path, constraints=
             affected = set(changed) | removed
             for path in affected:
                 if not (target / path).resolve().is_relative_to(target):
-                    raise RuntimeError(
-                        f"Dependency path leaves the plugin directory: {path}"
-                    )
+                    raise RuntimeError(i18n.get(Message.PM_PATH_OUTSIDE, path=path))
                 if (target / path).is_dir():
-                    raise RuntimeError(
-                        f"Dependency file conflicts with an existing directory: {path}"
-                    )
+                    raise RuntimeError(i18n.get(Message.PM_PATH_DIRECTORY, path=path))
             backup = temporary / _BACKUP_DIR
             saved, installed = [], []
             try:

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from stream_fixture import RAW_OUTPUT
 from stream_plugins import copy_plugins
 from test_stream_cli import BAR, F2, PROMPT, StreamProcess
 
@@ -83,7 +84,9 @@ class ExtensionTests(unittest.TestCase):
     def test_edited_popup_consumes_input_and_returns_native_suffix(self):
         """The external view changes while its accepted text never becomes a command."""
         entry = self.plugins / "stream_popup/stream_popup.py"
-        entry.write_text(entry.read_text().replace("Plugin popup", "EXTERNAL POPUP"))
+        entry.write_text(
+            entry.read_text().replace("Message.STREAM_SAMPLE_POPUP", "'EXTERNAL POPUP'")
+        )
         process = self.start(demo=True)
         process.expect(BAR)
         process.send(F2)
@@ -94,6 +97,52 @@ class ExtensionTests(unittest.TestCase):
         process.expect_file(self.root / "complete", "complete\n")
         self.assertFalse((self.root / "popup-leak").exists())
         self.assertEqual((self.root / "result").read_text(), "once\n")
+        self.exit(process)
+
+    def test_korean_sample_and_logs_preserve_native_output_and_input(self):
+        """Localized UI owns only popup input; native bytes and files stay exact."""
+        log = self.root / "korean.log"
+        process = self.start(
+            demo=True,
+            extra_args=("--lang", "ko", "--log-file", str(log), "--log-level", "DEBUG"),
+        )
+        # The fixture's demo flag only controls its English-bar wait heuristic.
+        process.demo = False
+        process.expect("ish | 기본 셸 | F2 팝업".encode())
+        process.send(F2)
+        process.expect("플러그인 팝업 | Enter 확인 | Esc 취소".encode())
+        process.send(b"touch popup-leak\recho native >> result\r")
+        process.expect_file(self.root / "result", "native\n")
+        offset = process.fixture("output")
+        process.expect(b"STREAM_RAW_DONE", offset)
+        self.assertIn(RAW_OUTPUT, bytes(process.output[offset:]))
+        process.command("echo complete > complete")
+        process.expect_file(self.root / "complete", "complete\n")
+        self.assertFalse((self.root / "popup-leak").exists())
+        self.exit(process)
+        diagnostic = log.read_text()
+        for text in (
+            "세션 시작 shell=",
+            "셸 이벤트 kind=P",
+            "팝업 focus=True",
+            "팝업 focus=False",
+            "세션 종료 status=0",
+        ):
+            self.assertIn(text, diagnostic)
+        self.assertNotIn("Shell event kind=", diagnostic)
+
+    def test_korean_plugin_error_falls_back_to_native_shell(self):
+        """An incompatible selected plugin reports a translated startup error."""
+        self.plugin("bad", "STREAM_API = 999\ndef setup(api): raise AssertionError()\n")
+        process = self.start(
+            plugins=("stream_bar", "stream_tcsh", "bad"),
+            extra_args=("--lang", "ko"),
+        )
+        process.expect("지원하지 않는 플러그인 API입니다: bad".encode())
+        process.expect("UI 없이 셸을 시작합니다.".encode())
+        process.command("echo recovered > result")
+        process.expect_file(self.root / "result", "recovered\n")
+        self.assertNotIn("기본 셸 | F2 팝업".encode(), process.output)
         self.exit(process)
 
     def test_cleanup_runs_in_reverse_order_after_native_exit(self):

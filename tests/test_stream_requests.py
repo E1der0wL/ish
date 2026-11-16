@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from examples.stream_plugins.stream_bar.stream_bar import BAR_TEXT
 from examples.stream_plugins.stream_popup.stream_popup import create
 
 from ish.stream.app import App
@@ -18,6 +17,7 @@ from ish.stream.protocol import Keys, Stream
 NONCE = "socket-test-session-0123456789abcdef"
 F2 = b"\x1bOQ"
 DEADLINE = 3
+BAR = "Request test bar"
 
 
 class NativeSession:
@@ -104,7 +104,7 @@ class RequestTests(unittest.IsolatedAsyncioTestCase):
             self.app._paint,
             on_focus=focus,
             on_result=self.results.append,
-            bar=BAR_TEXT,
+            bar=BAR,
             popup=create,
         )
         await self.app.panel.start(80, 5)

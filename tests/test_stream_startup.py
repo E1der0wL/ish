@@ -409,6 +409,208 @@ class StartupTests(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertFalse(self.home.exists())
 
+    def test_queries_choose_cli_then_lang_then_english_without_reading_rc(self):
+        """LANG works without installed locales and cannot be superseded by LC_ALL."""
+        marker = self.root / "rc-executed"
+        self.write_rc(
+            'config.lang = "ko"\nfrom pathlib import Path\n'
+            f"Path({str(marker)!r}).write_text('executed')\n"
+        )
+        for language, cli, expected in (
+            ("ko_KR.UTF-8", (), "사용법:"),
+            ("ko_KR@custom", (), "사용법:"),
+            ("en_US.UTF-8", (), "usage:"),
+            ("ko_KR.UTF-8", ("--lang", "en"), "usage:"),
+            ("en_US.UTF-8", ("--lang", "ko"), "사용법:"),
+            (None, (), "usage:"),
+            ("", (), "usage:"),
+            ("C", (), "usage:"),
+        ):
+            with self.subTest(language=language, cli=cli):
+                if language is None:
+                    self.env.pop("LANG", None)
+                else:
+                    self.env["LANG"] = language
+                # This variable deliberately disagrees with LANG's Korean case.
+                self.env["LC_ALL"] = "C.UTF-8"
+                result = self.cli("--help", *cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith(expected), result.stdout)
+                self.assertFalse(marker.exists())
+
+    def test_argparse_details_and_usage_are_translated_independently(self):
+        """Pinned argparse errors use translated content, not only a Korean wrapper."""
+        for options, expected in (
+            (("--unknown",), "알 수 없는 인수: --unknown"),
+            (("--shell",), "인수 --shell: 값 하나가 필요합니다"),
+            (("--home",), "인수 --home: 값 하나가 필요합니다"),
+            (
+                ("--escape-delay=oops",),
+                "인수 --escape-delay: 올바르지 않은 float 형식의 값: 'oops'",
+            ),
+            (
+                ("--log-level=wrong",),
+                "인수 --log-level: 선택할 수 없는 값: 'WRONG' (가능한 값:",
+            ),
+            (
+                ("--login", "--shell-arg=-i"),
+                "인수 --shell-arg: 인수 --login와 함께 사용할 수 없습니다",
+            ),
+            (
+                ("--no-plugins", "--plugin", "one"),
+                "인수 --plugin: 인수 --no-plugins와 함께 사용할 수 없습니다",
+            ),
+            (
+                ("--help=value",),
+                "인수 -h/--help: 이 옵션은 값을 받지 않습니다: 'value'",
+            ),
+            (
+                ("--no-rc=value",),
+                "인수 --no-rc: 이 옵션은 값을 받지 않습니다: 'value'",
+            ),
+        ):
+            with self.subTest(options=options):
+                result = self.cli(*options, "--lang", "ko")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("사용법:", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("usage:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.home.exists())
+
+    def test_invalid_language_uses_lang_for_the_complete_error(self):
+        """An unusable explicit language falls back without leaking English context."""
+        self.env["LANG"] = "ko_KR.UTF-8"
+        for options, expected in (
+            (("--lang",), "인수 --lang/-l: 값 하나가 필요합니다"),
+            (("--lang", "../outside"), "언어"),
+        ):
+            with self.subTest(options=options):
+                result = self.cli(*options)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("사용법:", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Language must", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_invalid_cli_never_executes_rc_to_discover_its_language(self):
+        """Invalid arguments use CLI/LANG; reporting cannot execute arbitrary rc code."""
+        marker = self.root / "rc-executed"
+        self.write_rc(
+            'config.lang = "ko"\nfrom pathlib import Path\n'
+            f"Path({str(marker)!r}).write_text('executed')\n"
+        )
+        self.env["LANG"] = "en_US.UTF-8"
+        for options, expected in (
+            ((), "unrecognized arguments: --unknown"),
+            (("--lang", "ko"), "알 수 없는 인수: --unknown"),
+        ):
+            with self.subTest(options=options):
+                result = self.cli("--unknown", *options)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_execution_language_precedence_is_cli_then_rc_then_lang_then_english(self):
+        """A real startup error observes independent expected messages for each source."""
+        shell = self.trap_shell()
+        for language, rc_language, options, expected in (
+            ("en_US.UTF-8", "ko", (), "작업 디렉터리를 찾을 수 없습니다"),
+            ("ko_KR.UTF-8", "en", (), "Working directory"),
+            ("ko_KR.UTF-8", "ko", ("--lang", "en"), "Working directory"),
+            ("en_US.UTF-8", "en", ("--lang", "ko"), "작업 디렉터리를 찾을 수 없습니다"),
+            ("ko_KR.UTF-8", None, (), "작업 디렉터리를 찾을 수 없습니다"),
+            (None, None, (), "Working directory"),
+        ):
+            with self.subTest(language=language, rc=rc_language, options=options):
+                if language is None:
+                    self.env.pop("LANG", None)
+                else:
+                    self.env["LANG"] = language
+                self.write_rc(
+                    f"config.lang = {rc_language!r}\nconfig.cwd = 'absent-work'\n"
+                )
+                status, output = self.terminal("--shell", shell, *options)
+                self.assertEqual(status, 2, output)
+                self.assertIn(expected, output)
+                self.assertFalse((self.root / "shell-executed").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_language_applies_to_validation_before_the_shell_starts(self):
+        """Early validation retains the rc language instead of freezing LANG's English."""
+        shell = self.trap_shell()
+        for choice, expected in (
+            (
+                "config.shell = ''",
+                "shell은 비어 있지 않은 실행 파일 이름 또는 경로여야 합니다",
+            ),
+            ("config.plugins = 'saved'", "plugins은 문자열 목록이어야 합니다"),
+            ("config.shell_args = '-i'", "shell_args은 문자열 목록이어야 합니다"),
+            (
+                "config.plugins = ['']",
+                "plugins에는 비어 있지 않은 이름을 지정해야 합니다",
+            ),
+            ("config.cwd = None", "cwd은 경로여야 합니다"),
+            ("config.log_level = 'WRONG'", "log_level은"),
+            (
+                "config.escape_delay = 0",
+                "escape_delay는 0.005초 이상 2.0초 이하여야 합니다",
+            ),
+        ):
+            with self.subTest(choice=choice):
+                self.write_rc(f"config.lang = 'ko'\n{choice}\n")
+                status, output = self.terminal("--shell", shell)
+                self.assertEqual(status, 2, output)
+                self.assertIn("설정 파일", output)
+                self.assertIn(str(self.home / ".ishrc.py"), output)
+                self.assertIn(expected, output)
+                self.assertNotIn("Traceback", output)
+                self.assertFalse((self.root / "shell-executed").exists())
+        self.write_rc("config.lang = 'ko'\nconfig.plugins = 'saved'\n")
+        status, output = self.terminal("--shell", shell, "--lang", "en")
+        self.assertEqual(status, 2, output)
+        self.assertIn("plugins must be a list of strings", output)
+        self.assertNotIn("설정 파일", output)
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_exception_keeps_foreign_detail_under_the_selected_language(self):
+        """The ish error is translated even if user code fails after setting its language."""
+        self.write_rc("config.lang = 'ko'\nraise RuntimeError('USER DETAIL')\n")
+        status, output = self.terminal("--shell", self.trap_shell())
+        self.assertEqual(status, 2, output)
+        self.assertIn("설정 파일", output)
+        self.assertIn("RuntimeError: USER DETAIL", output)
+        self.assertNotIn("Traceback", output)
+        self.assertFalse((self.root / "shell-executed").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires a controlling PTY")
+    def test_rc_language_replaces_provisional_translation_warnings_once(self):
+        """A broken English fallback reports once in the final rc-selected language."""
+        shell = self.trap_shell()
+        self.write_rc(
+            "config.lang = 'ko'\nconfig.log_level = 'WARNING'\n"
+            "config.log_file = 'startup.log'\n"
+        )
+        languages = self.home / "lang"
+        languages.mkdir()
+        (languages / "en.json").write_text("{", encoding="utf-8")
+        for language in ("en_US.UTF-8", "ko_KR.UTF-8"):
+            with self.subTest(language=language):
+                self.env["LANG"] = language
+                log_file = self.home / "startup.log"
+                log_file.unlink(missing_ok=True)
+                status, output = self.terminal("--shell", shell)
+                self.assertEqual(status, 0, output)
+                records = log_file.read_text(encoding="utf-8")
+                for messages in (output, records):
+                    self.assertEqual(
+                        messages.count("을 불러올 수 없습니다"), 1, messages
+                    )
+                    self.assertNotIn("Cannot load language file", messages)
+                self.assertEqual(output.count("[WARNING]"), 1, output)
+                self.assertEqual((self.root / "shell-executed").read_text(), "executed")
+
     def test_user_language_override_works_in_any_argument_order(self):
         """The selected settings directory supplies translations before help is printed."""
         self.write_language(
@@ -445,7 +647,7 @@ class StartupTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("ish", result.stdout)
                     self.assertEqual(
-                        result.stderr.count("Cannot load language file"), warnings
+                        result.stderr.count("을 불러올 수 없습니다"), warnings
                     )
                     self.assertEqual(result.stderr.count("[WARNING]"), warnings)
                     if not warnings:

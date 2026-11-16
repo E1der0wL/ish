@@ -10,6 +10,7 @@ import signal
 import termios
 from collections.abc import Callable
 
+from ish.lang import Message, i18n
 from ish.runtime.fdio import FDWriter
 
 READ_BYTES = 65536
@@ -59,7 +60,7 @@ class Session:
     def start(self, cols: int, rows: int) -> None:
         """Create the shell's controlling terminal before starting background work."""
         if self.pid is not None:
-            raise RuntimeError("The terminal session has already started")
+            raise RuntimeError(i18n.get(Message.SESSION_STARTED))
         self.loop = asyncio.get_running_loop()
         self._output_done = self.loop.create_future()
         if self.env is None:
@@ -161,9 +162,7 @@ class Session:
             try:
                 if self.writer is None:
                     if len(self.pending_input) + len(data) > MAX_PENDING_INPUT:
-                        raise BufferError(
-                            "Pending startup input exceeds the byte limit"
-                        )
+                        raise BufferError(i18n.get(Message.INPUT_LIMIT))
                     self.pending_input.extend(data)
                 else:
                     self.writer.write(data)

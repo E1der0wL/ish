@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+from ish.lang import Message, i18n
+
 DIRECTORY = Path(__file__).with_name("integrations")
 HEADER = "# ish-stream-api: 1"
 TOKEN = re.compile(r"@[A-Z][A-Z0-9_]*@")
@@ -23,10 +25,10 @@ def render(
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        raise Unavailable(f"Cannot read shell integration: {path}") from error
+        raise Unavailable(i18n.get(Message.STREAM_SCRIPT_READ, path=path)) from error
     header, separator, source = source.partition("\n")
     if not separator or header != HEADER:
-        raise Unavailable(f"Unsupported shell integration contract: {path}")
+        raise Unavailable(i18n.get(Message.STREAM_SCRIPT_CONTRACT, path=path))
 
     def replace(match):
         token = match.group()
@@ -34,7 +36,7 @@ def render(
             return replacements[token]
         except KeyError as error:
             raise Unavailable(
-                f"Unknown integration placeholder {token}: {path}"
+                i18n.get(Message.STREAM_SCRIPT_TOKEN, token=token, path=path)
             ) from error
 
     return TOKEN.sub(replace, source)

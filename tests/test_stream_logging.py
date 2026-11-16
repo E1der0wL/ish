@@ -213,7 +213,7 @@ class StreamLoggingTests(unittest.TestCase):
         language = home / "lang"
         language.mkdir(parents=True)
         (language / "ko.json").write_text("{invalid", encoding="utf-8")
-        marker = b"Cannot load language file"
+        marker = "을 불러올 수 없습니다:".encode()
         for level, count in (("WARNING", 1), ("CRITICAL", 0)):
             with self.subTest(level=level):
                 path = self.root / (level.lower() + ".log")
@@ -231,6 +231,7 @@ class StreamLoggingTests(unittest.TestCase):
                 )
                 self.assertEqual(process.output.count(marker), count)
                 self.assertEqual(path.read_bytes().count(marker), count)
+                self.assertNotIn(b"Cannot load language file", process.output)
                 self.finish(process)
                 self.assertEqual(process.output.count(marker), count)
                 self.assertEqual(path.read_bytes().count(marker), count)

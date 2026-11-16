@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -16,7 +18,7 @@ from ish.config import config
 from ish.lang import Message, i18n
 from ish.log import LOG_LEVELS, session_logging
 
-from .settings import PATH_OPTIONS, Settings, load
+from .settings import PATH_OPTIONS, RcError, Settings, load
 
 PROGRAM = "ish"
 LOGIN_ARGS = ("-l",)
@@ -26,7 +28,7 @@ OPTIONS = (
     (("--version",), Message.CLI_VERSION_OPTION_HELP, {"action": "store_true"}),
     (("--diagnose",), Message.CLI_DIAGNOSE_OPTION_HELP, {"action": "store_true"}),
     (("--home",), Message.CLI_HOME_OPTION_HELP, {"type": Path, "metavar": "DIR"}),
-    (("-l", "--lang"), Message.CLI_LANG_OPTION_HELP, {}),
+    (("-l", "--lang"), Message.CLI_LANG_OPTION_HELP, {"metavar": "LANG"}),
     (("--no-rc",), Message.STREAM_NO_RC_HELP, {"action": "store_true"}),
     (
         ("--escape-delay",),
@@ -66,6 +68,59 @@ OPTIONS = (
         {"type": str.upper, "choices": tuple(LOG_LEVELS)},
     ),
 )
+METAVARS = {
+    "DIR": Message.STREAM_META_DIR,
+    "SECONDS": Message.STREAM_META_SECONDS,
+    "SHELL": Message.STREAM_META_SHELL,
+    "NAME": Message.STREAM_META_NAME,
+    "PATH": Message.STREAM_META_PATH,
+    "ARG": Message.STREAM_META_ARG,
+    "LANG": Message.STREAM_META_LANG,
+}
+# argparse has no per-instance gettext hook. Normalize its pinned Python 3.12
+# diagnostics here, keeping the parser's argument handling and exception causes.
+ARGUMENT_ERRORS = (
+    (
+        re.compile(r"unrecognized arguments: (?P<arguments>.*)", re.S),
+        Message.STREAM_ARG_UNKNOWN,
+    ),
+    (re.compile(r"expected one argument"), Message.STREAM_ARG_EXPECTED),
+    (
+        re.compile(r"not allowed with argument (?P<argument>.*)", re.S),
+        Message.STREAM_ARG_CONFLICT,
+    ),
+    (
+        re.compile(
+            r"invalid choice: (?P<value>.*?) \(choose from (?P<choices>.*)\)", re.S
+        ),
+        Message.STREAM_ARG_CHOICE,
+    ),
+    (
+        re.compile(r"invalid (?P<kind>.*?) value: (?P<value>.*)", re.S),
+        Message.STREAM_ARG_VALUE,
+    ),
+    (
+        re.compile(r"ignored explicit argument (?P<value>.*)", re.S),
+        Message.STREAM_ARG_EXPLICIT,
+    ),
+)
+ARGUMENT_CONTEXT = re.compile(r"argument (?P<argument>[^:]+): (?P<error>.*)", re.S)
+
+
+def argument_message(message):
+    """Translate stdlib-owned diagnostics without changing argparse's global state."""
+    context = ARGUMENT_CONTEXT.fullmatch(message)
+    if context is not None:
+        return i18n.get(
+            Message.STREAM_ARG_ERROR,
+            argument=context["argument"],
+            error=argument_message(context["error"]),
+        )
+    for pattern, key in ARGUMENT_ERRORS:
+        matched = pattern.fullmatch(message)
+        if matched is not None:
+            return i18n.get(key, **matched.groupdict())
+    return message
 
 
 class Formatter(argparse.HelpFormatter):
@@ -79,15 +134,30 @@ class Formatter(argparse.HelpFormatter):
             i18n.get(Message.STREAM_USAGE) if prefix is None else prefix,
         )
 
+    def _metavar_formatter(self, action, default_metavar):
+        metavar = action.metavar or default_metavar
+        if metavar in METAVARS:
+            # Resolve labels at rendering time: rc validation can select a
+            # language after the parser has already checked the command line.
+            action = copy.copy(action)
+            action.metavar = i18n.get(METAVARS[metavar])
+        return super()._metavar_formatter(action, default_metavar)
+
 
 class Parser(argparse.ArgumentParser):
     """Use the shared message catalog for CLI error presentation."""
 
+    def __init__(self, *args, **kwargs):
+        """Keep bootstrap usage and full help on the same translated formatter."""
+        kwargs.setdefault("formatter_class", Formatter)
+        super().__init__(*args, **kwargs)
+
     def error(self, message):
-        """Exit with a translated prefix and argparse's original argument detail."""
+        """Translate both argument context and detail at the parser boundary."""
         self.print_usage(sys.stderr)
         self.exit(
-            2, f"{self.prog}: {i18n.get(Message.STREAM_PARSE_ERROR, error=message)}\n"
+            2,
+            f"{self.prog}: {i18n.get(Message.STREAM_PARSE_ERROR, error=argument_message(message))}\n",
         )
 
 
@@ -104,16 +174,36 @@ def report_logs(records, logger):
 
 def parse(argv=None):
     """Resolve CLI over ish rc settings; queries never execute the Python rc."""
-    bootstrap = Parser(prog=PROGRAM, add_help=False, allow_abbrev=False)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Only the explicit language is interpreted first. Invalid unrelated options
+    # must still use a later --lang, without running the arbitrary Python rc.
+    language = Parser(
+        prog=PROGRAM, add_help=False, allow_abbrev=False, exit_on_error=False
+    )
+    language.add_argument("--lang", "-l")
+    first = argparse.Namespace(lang=None, home=None)
+    try:
+        language.parse_known_args(argv, namespace=first)
+    except argparse.ArgumentError:
+        # The complete bootstrap below retains the original failure and order.
+        pass
+    bootstrap = Parser(
+        prog=PROGRAM, add_help=False, allow_abbrev=False, exit_on_error=False
+    )
     bootstrap.add_argument("--home", type=Path)
     bootstrap.add_argument("--lang", "-l")
-    first, _ = bootstrap.parse_known_args(argv)
+    bootstrap_error = None
+    try:
+        bootstrap.parse_known_args(argv, namespace=first)
+    except argparse.ArgumentError as error:
+        bootstrap_error = error
+    home_error = None
     try:
         config.reset()
         if first.home is not None:
             config.ISH_HOME = _path(first.home)
     except (OSError, ValueError) as error:
-        bootstrap.error(i18n.get(Message.CLI_HOME_ERROR, path=first.home, error=error))
+        home_error = error
     i18n.base_path = config.LANG_DIR
     # Locale messages are needed to construct the parser. Hold their diagnostics
     # until the full CLI has selected a log level and decided whether to execute.
@@ -122,8 +212,16 @@ def parse(argv=None):
     startup_logger.addHandler(records)
     try:
         i18n.load(first.lang, create=False, logger=startup_logger)
-    except ValueError as error:
-        bootstrap.error(str(error))
+    except ValueError:
+        # A malformed explicit language has no usable catalog of its own.
+        i18n.load(create=False, logger=startup_logger)
+        bootstrap.error(i18n.get(Message.I18N_LANGUAGE_ERROR))
+    if home_error is not None:
+        bootstrap.error(
+            i18n.get(Message.CLI_HOME_ERROR, path=first.home, error=home_error)
+        )
+    if bootstrap_error is not None:
+        bootstrap.error(str(bootstrap_error))
     parser = Parser(
         prog=PROGRAM,
         description=i18n.get(Message.STREAM_DESCRIPTION),
@@ -162,6 +260,7 @@ def parse(argv=None):
         if not information:
             terminal(parser)
         selected = Settings() if information or args.no_rc else load(config.RC_FILE)
+        _rc_language(selected, first.lang, startup_logger, records)
         for name in PATH_OPTIONS:
             value = getattr(args, name)
             if value is not None:
@@ -180,11 +279,15 @@ def parse(argv=None):
         if args.no_plugins:
             selected.plugins = []
         selected.validate(config.ISH_HOME)
-        if selected.lang is not None and selected.lang != first.lang:
-            i18n.load(selected.lang, create=False, logger=startup_logger)
         for name in selected.__dataclass_fields__:
             option = "plugin" if name == "plugins" else name
             setattr(args, option, getattr(selected, name))
+    except RcError as error:
+        try:
+            _rc_language(error.settings, first.lang, startup_logger, records)
+        except ValueError as language_error:
+            parser.error(str(RcError(error.path, error.settings, language_error)))
+        parser.error(str(error))
     except (OSError, ValueError) as error:
         parser.error(str(error))
     args.home = config.ISH_HOME
@@ -204,6 +307,20 @@ def parse(argv=None):
         diagnose(args)
         return parser, args, True
     return parser, args, False
+
+
+def _rc_language(settings, explicit, logger, records):
+    """Apply rc language only after execution, keeping explicit CLI language first."""
+    if (
+        explicit is None
+        and isinstance(settings.lang, str)
+        and settings.lang
+        and settings.lang != i18n.current_lang
+    ):
+        # These records describe only the provisional language load. The final
+        # load rechecks its fallback files and reports them in the chosen language.
+        records.buffer.clear()
+        i18n.load(settings.lang, create=False, logger=logger)
 
 
 def diagnose(args):

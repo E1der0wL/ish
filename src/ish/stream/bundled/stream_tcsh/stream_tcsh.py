@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ish.lang import Message, i18n
 from ish.stream import request
 from ish.stream.scripts import render
 
@@ -30,7 +31,7 @@ def setup(api):
 def _quote(value: str) -> str:
     """Quote one tcsh literal without interpolating shell or history expressions."""
     if "\n" in value or "\r" in value or "\x00" in value:
-        raise ValueError("Shell integration paths must not contain line breaks or NUL")
+        raise ValueError(i18n.get(Message.STREAM_SHELL_PATH))
     return "'" + value.replace("'", "'\\''").replace("!", "\\!") + "'"
 
 
@@ -46,9 +47,7 @@ def _fold(source: str) -> str:
 def build(argv, env, directory: Path, nonce, popup_socket, *, script_dir=None):
     """Prepare external tcsh fragments before changing the child environment."""
     if tuple(argv[1:]) not in SUPPORTED_ARGS:
-        raise ValueError(
-            "tcsh prompt decorations require non-login interactive startup"
-        )
+        raise ValueError(i18n.get(Message.STREAM_TCSH_STARTUP))
     values = {
         "@NONCE@": nonce,
         "@PYTHON@": _quote(sys.executable),

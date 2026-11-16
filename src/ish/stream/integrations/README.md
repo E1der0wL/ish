@@ -36,6 +36,9 @@ after the popup closes. Display text alone never grants popup focus.
   External programs still receive their native input. Ordinary Enter stays
   native. Completion, search and custom reader guards remain necessary.
   A bar without a popup leaves the user's F2 bindings intact.
+  `@VERSION_NOTICE@` supplies the selected language's unsupported-version message
+  as one shell-quoted argument. Keep `builtin printf '%s\n' @VERSION_NOTICE@`
+  so translation text remains data, including quotes, percent signs and newlines.
 - `zsh.env`, `zsh.rc`, `zsh.zsh`: native startup path preservation and ZLE
   lifecycle/widget integration. Existing zsh key restoration is retained.
 - `tcsh.csh` and `tcsh-*.csh`: existing tcsh startup and popup fragments.

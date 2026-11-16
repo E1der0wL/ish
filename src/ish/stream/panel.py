@@ -37,6 +37,8 @@ from prompt_toolkit.output import ColorDepth, DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.styles import Attrs
 
+from ish.lang import Message, i18n
+
 from .settings import ESCAPE_DELAY, validate_escape_delay
 from .ui import PopupFactory, PopupView
 
@@ -76,7 +78,7 @@ class Frame:
         cursor moves, preventing subsequent text from consuming pending wrap.
         """
         if top < 1:
-            raise ValueError("Panel top must be a positive terminal row")
+            raise ValueError(i18n.get(Message.STREAM_PANEL_ROW))
         stream = StringIO()
         output = Vt100_Output(
             stream,
@@ -229,7 +231,7 @@ class Panel:
     async def start(self, cols: int = DEFAULT_COLUMNS, rows: int = DEFAULT_ROWS):
         """Start the real PTK event loop, initially hidden, without host I/O."""
         if self.task is not None or self._closed:
-            raise RuntimeError("Panel can only be started once")
+            raise RuntimeError(i18n.get(Message.STREAM_PANEL_ONCE))
         self._validate_size(cols, rows)
         self.output = ViewportOutput(cols, rows)
         bindings = KeyBindings()
@@ -291,13 +293,13 @@ class Panel:
     @staticmethod
     def _validate_size(cols, rows):
         if cols < 1 or rows < 1:
-            raise ValueError("Panel dimensions must be positive")
+            raise ValueError(i18n.get(Message.STREAM_PANEL_SIZE))
 
     def resize(self, cols: int, rows: int):
         """Relayout widgets without acquiring or resizing the shell screen."""
         self._validate_size(cols, rows)
         if self.app is None or self._closed:
-            raise RuntimeError("Panel is not running")
+            raise RuntimeError(i18n.get(Message.STREAM_PANEL_NOT_RUNNING))
         self.output.size = Size(rows=rows, columns=cols)
         if rows < POPUP_MIN_ROWS:
             self.close_popup()
@@ -306,7 +308,7 @@ class Panel:
     def show(self):
         """Allow frames after the coordinator has acquired a prompt region."""
         if self.app is None or self._closed or self.error is not None:
-            raise RuntimeError("Panel is not running")
+            raise RuntimeError(i18n.get(Message.STREAM_PANEL_NOT_RUNNING))
         self.visible = True
         self.app.invalidate()
 
@@ -338,7 +340,7 @@ class Panel:
             with self.app.task_scope(self._task_error(generation)), set_app(self.app):
                 view = self._factory(accept)
                 if not isinstance(view, PopupView):
-                    raise TypeError("A popup factory must return PopupView")
+                    raise TypeError(i18n.get(Message.STREAM_POPUP_VIEW))
                 to_container(view.content)
                 self.app.key_processor.reset()
                 self._view = view

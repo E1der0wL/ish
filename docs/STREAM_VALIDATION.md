@@ -8,6 +8,64 @@ production readiness를 화면 문자열이나 무출력 시간으로 추정하�
 prompt-toolkit 3.0.53이다. Windows Terminal의 설치 package 버전은
 1.24.12741.0이며 실행 파일의 ProductVersion은 1.24.261001001이다.
 
+## ish 2.0.0: LANG 자동 감지와 제품 문구 번역
+
+2026-11-16 검증. 기존 `ish.lang.i18n`을 재사용하며 언어는 명시한 설정
+(`--lang`이 rc의 `config.lang`을 덮어씀), `LANG`, 영어 순서로 선택한다.
+자동 감지는 설치된 locale이나 `LC_ALL`·`LC_MESSAGES`·`LANGUAGE`에 의존하지 않는다.
+조회와 rc를 읽기 전의 인수·TTY 오류는 rc를 실행하지 않고 CLI/LANG만 적용한다.
+
+설정·argparse 안내와 오류 본문, 플러그인·전송·로그 오류, 세션 진단, 기본 제공
+샘플 하단 바·팝업을 공통 카탈로그에 연결했다. Bash 버전 경고도 번역문을
+안전하게 인용해 전달한다. 입력 처리·wire 값·셸 hook 순서는 변경하지 않았다.
+셸 출력, 외부 예외의 원문, 내부 helper 전용 도움말과 표시하지 않는 metadata는
+번역 대상이 아니다. 임의 외부 플러그인의 자체 문자열도 자동으로 번역하지 않는다.
+
+| 검증 | 최종 결과 |
+| --- | --- |
+| `tools/check_stream.py` 전체 회귀 | **385/385**, skip 0, 189.142초 |
+| Ruff lint·format | 유지 대상 68개 파일 통과 |
+| Bash 5.1.16 adapter·CLI | **40/40**, 49.660초 |
+| Bash 5.2.37 adapter·CLI | **40/40**, 39.675초 |
+| 설치 wheel | 한국어 조회·rc 미실행·리소스 14개·provider/builder 3개 통과 |
+| 실제 Windows Terminal/WSL | Bash/zsh/tcsh × 기본형·플러그인·비동기 오류·이전 팝업 task **12/12** |
+
+언어 관련 회귀는 LANG 형태와 영어 기본값, 명시 설정 우선순위, LC_* 무시,
+조회의 rc 미실행, 한국어 설정 오류, 언어 전환 후 중복 경고 방지, 사용자 언어팩
+덮어쓰기, 부분 번역 fallback, 잘못된 JSON/자리표시자를 확인한다. 실제 제품의
+Message 소비 목록과 한국어 키·자리표시자를 비교해 번역 누락을 실패로 처리한다.
+사용자 ko.json의 문구는 실제 PTK 바·팝업과 반환값으로 확인했다. 셸에 전달하는
+번역문에는 따옴표·명령 치환·backtick·개행·placeholder 모양을 넣고 실행되지 않음을
+실제 파일 결과로 검증했다.
+
+실제 호스트는 Windows Terminal 1.24.12741.0, WSL Ubuntu, Python 3.12.14이며
+Bash 5.3.9/zsh 5.9/tcsh 6.24.13을 사용했다. 플러그인 조합은 `LANG=C.UTF-8`에서
+rc의 한국어 설정을, 나머지 조합은 `LANG=ko_KR.UTF-8` 자동 선택을 확인했다.
+한국어 UI와 로그, continuation·heredoc·Vim·ESC/Alt 복귀, 오류 후 native 복구를
+확인했고 **native 파일 45개와 팝업 결과 6개**를 별도 기대값으로 대조했다.
+`printenv LANG`의 실제 파일 결과로 12개 세션 모두 native 환경을 바꾸지 않았음을
+확인했다. tcsh에서 실제 pane resize를 실행해 호스트와 foreground 프로그램이
+모두 120×30 → 82×30을 관찰했다. 세 셸의 resize 회귀는 별도 실제 PTY 검사에도
+포함된다. 모든 세션은 종료 코드 0과 부모 termios 복원을 확인했다.
+
+재검토에서 초기 언어 경고의 중복, 사용자 언어팩에 영향을 받는 테스트 격리를
+보강했다. 전체 회귀에서는 샘플 상수 이름 변경을 놓친 요청 fixture와 ESC 후
+하단 바 재출력을 팝업 복귀로 오인하는 테스트 경합을 발견했다. 후자는 관찰용
+PTY read를 32바이트로 나누어 같은 실패를 재현하고, 새 로그 구간의
+focus 해제 → primary 이벤트 → 요청 완료를 확인하도록 고쳤다. 제품 입력 코드는
+바꾸지 않았다. 최초 집중 검사 중 `/mnt`에서 zsh 시작 출력이 없는 timeout도
+한 번 있었으나 Linux snapshot 집중 검사·전체 회귀·실제 호스트에서는 재현되지
+않았다. 해당 timeout의 환경 원인은 확정하지 않았다.
+
+초기 실패 기록과 포맷 검사 중단 기록도 `.cache/i18n/`에 보존했다. 최종 전체
+기록은 `final4-full.log`, 추가 Bash는 `final2-compat.log`, 설치 wheel은
+`final2-package.log`, 실제 호스트는 `host-final/`과 `host-results.json`에 있다.
+최종 회귀와 호스트·wheel·Bash 검사 사이의 제품 소스 **96개가 동일**함을
+`source-results.json`으로 확인했다. 이후 차이는 테스트 2개와 설정 예제·README다.
+최종 검증 후 이 보고서만 추가했다. GitHub Actions 원격 실행, 물리 키보드/IME와
+화면 픽셀 판독은 이번 검증에 포함하지 않는다. 호스트 입력은 실제 터미널의
+외부 PTY에 스크립트로 전송하고 실제 호스트 응답과 파일 결과를 관찰했다.
+
 ## ish 2.0.0: ESC·설정·제품 진입점 검증
 
 2026-11-16 검증. 제품 이름은 `ish`, 버전은 `2.0.0`이다.

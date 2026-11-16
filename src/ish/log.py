@@ -116,12 +116,14 @@ class _SessionFileHandler(_SessionErrors, logging.FileHandler):
         Checking the path before opening it would race with symlink replacement,
         and opening a FIFO normally could block before its type is checked.
         """
+        from ish.lang import Message, i18n
+
         descriptor = os.open(self.baseFilename, _SESSION_FILE_FLAGS, _FILE_PERMISSIONS)
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise OSError(
                     errno.EINVAL,
-                    "Log destination must be a regular file",
+                    i18n.get(Message.LOG_DESTINATION),
                     self.baseFilename,
                 )
             return os.fdopen(
@@ -168,21 +170,26 @@ class SessionLog:
             except (OSError, ValueError) as error:
                 self._failed(error)
             if self._error is not None:
-                destination.write(f"[ERROR] Log output failed: {self._error}\n")
+                from ish.lang import Message, i18n
+
+                message = i18n.get(Message.LOG_OUTPUT_ERROR, error=self._error)
+                destination.write(f"[ERROR] {message}\n")
                 self._error = None
             destination.flush()
 
 
 def _level(value: str | int) -> int:
     """Normalize supported public levels without configuring a logger."""
+    from ish.lang import Message, i18n
+
     if isinstance(value, str):
         try:
             return LOG_LEVELS[value.upper()]
         except KeyError as error:
-            raise ValueError(f"Unknown log level: {value}") from error
+            raise ValueError(i18n.get(Message.LOG_LEVEL_ERROR, value=value)) from error
     if type(value) is int and value in LOG_LEVELS.values():
         return value
-    raise ValueError(f"Unknown log level: {value}")
+    raise ValueError(i18n.get(Message.LOG_LEVEL_ERROR, value=value))
 
 
 @contextmanager

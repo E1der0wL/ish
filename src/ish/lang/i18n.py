@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import errno
 import json
-import locale
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -31,8 +31,12 @@ _LANG_STAGE_PREFIX = ".ish-lang-"
 _UNSUPPORTED_HARD_LINK = frozenset({errno.ENOTSUP, errno.EPERM, errno.ENOSYS})
 _FALLBACK_COPY_BYTES = 64 * 1024
 _LOCALE_SEPARATOR = "_"
-_INVALID_MESSAGES = "Language messages must map strings to strings"
 _LANGUAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
+_LOCALE_NAME = re.compile(
+    r"(?P<language>[A-Za-z]{2,3})(?:[_-][A-Za-z0-9]+)*"
+    r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)?(?:@[A-Za-z0-9][A-Za-z0-9_-]*)?\Z"
+)
+_LANG_ENV = "LANG"
 _BUNDLED_DIRECTORY = Path(__file__).with_name("locales")
 _FORMATTER = Formatter()
 
@@ -130,7 +134,7 @@ class Message(StrEnum):
     )
     CLI_LANG_OPTION_HELP = (
         auto(),
-        "Set the interface language. Defaults to the system language, with English fallback.",
+        "Set the interface language. Otherwise use LANG, with English fallback.",
     )
     CLI_VERSION_OPTION_HELP = auto(), "Show the ish version and exit."
     CLI_VERSION = auto(), "ish {version}"
@@ -226,7 +230,123 @@ class Message(StrEnum):
     PM_LOAD_FAIL = auto(), "Failed to load plugin '{plugin_file}'"
     PM_PYTHON_NOT_FOUND = auto(), "Failed to find python. Cannot load"
     PM_PYTHON_VERSION_MISMATCH = auto(), "{value} != {req}"
+    PM_EXPECT_STRING = auto(), "expected a string"
+    PM_EXPECT_STRINGS = auto(), "expected a list or tuple of strings"
+    PM_META_MAPPING = auto(), "{field} must be a mapping"
+    PM_META_LITERAL = auto(), "{field} must be literal"
+    PM_NAME_INVALID = auto(), "A plugin name must identify one visible source directory"
+    PM_VERSION_INVALID = (
+        auto(),
+        "Invalid version requirement {requirement!r} for {version!r}: {error}",
+    )
+    PM_REQUIREMENT_INVALID = (
+        auto(),
+        "Invalid Python requirement {requirement!r}: {error}",
+    )
+    PM_INSTALLED_INVALID = (
+        auto(),
+        "Installed dependency does not provide the requested import and version",
+    )
+    PM_ENTRY_CONFLICT = (
+        auto(),
+        "Plugin entry {name!r} conflicts with an existing module",
+    )
+    PM_NAMESPACE_CONFLICT = (
+        auto(),
+        "Plugin namespace {name!r} is owned by another package",
+    )
+    PM_SELECTION_INVALID = auto(), "Selected plugins must be a sequence of names"
+    PM_INSTALL_BUSY = (
+        auto(),
+        "Another dependency installation is using {path}; retry after it finishes",
+    )
+    PM_PACKAGE_BUSY = (
+        auto(),
+        "Package {name!r} is in use; restart ish before replacing it",
+    )
+    PM_MODULE_BUSY = (
+        auto(),
+        "Module {name!r} is in use; restart ish before replacing it",
+    )
+    PM_PIP_EMPTY = auto(), "pip did not produce an installed distribution"
+    PM_DEPENDENCY_BUSY = (
+        auto(),
+        "Dependency {name!r} is in use; restart ish before changing its version",
+    )
+    PM_FILE_OWNERSHIP = (
+        auto(),
+        "Dependency installation would overwrite files owned by another package",
+    )
+    PM_PATH_OUTSIDE = auto(), "Dependency path leaves the plugin directory: {path}"
+    PM_PATH_DIRECTORY = (
+        auto(),
+        "Dependency file conflicts with an existing directory: {path}",
+    )
+    PM_DEBUG_PATHS = auto(), "sys.path count: {count}\n{paths}"
+    PM_DEBUG_DIRECTORY_READ = auto(), "Error reading directory"
+    PM_DEBUG_LIBRARY = (
+        auto(),
+        "Plugin Lib Dir exists: {exists}\nPlugin Lib Dir path: {path}\nPlugin Lib Dir contents (top {limit}): {contents}",
+    )
+    PM_DEBUG_PYTHON = (
+        auto(),
+        "Python Executable: {executable}\nPython Version: {version}",
+    )
+    PM_DEBUG_TITLE = auto(), "Debug Info"
+    PM_DEBUG_SYS_PATH = auto(), "Sys Path"
+    PM_DEBUG_LIB_DIR = auto(), "Plugin Lib Dir"
+    PM_DEBUG_TRACEBACK = auto(), "Traceback"
     PIP_INSTALL_FAIL = auto(), "Failed to install library '{library}'"
+
+    # Translation validation and diagnostics.
+    I18N_LANGUAGE_ERROR = (
+        auto(),
+        "Language must be a single language code, such as en or ko",
+    )
+    I18N_MESSAGES_ERROR = auto(), "Language messages must map strings to strings"
+    I18N_FIELDS_ERROR = auto(), "Translation placeholders do not match {name}"
+    I18N_FORMAT_ERROR = auto(), "Invalid translation template for {name}: {error}"
+    I18N_CREATE_ERROR = auto(), "Cannot create language file {path}: {error}"
+    I18N_LOAD_ERROR = auto(), "Cannot load language file {path}: {error}"
+
+    # Shared logging and native transport diagnostics.
+    LOG_DESTINATION = auto(), "Log destination must be a regular file"
+    LOG_OUTPUT_ERROR = auto(), "Log output failed: {error}"
+    LOG_LEVEL_ERROR = auto(), "Unknown log level: {value}"
+    INPUT_PREFIX_ERROR = auto(), "Native prefix is outside the input payload"
+    WRITER_CLOSED = auto(), "Writer is closed"
+    WRITE_LIMIT = auto(), "Pending terminal writes exceed the byte limit"
+    WRITE_EMPTY = auto(), "write returned zero bytes"
+    SESSION_STARTED = auto(), "The terminal session has already started"
+    INPUT_LIMIT = auto(), "Pending startup input exceeds the byte limit"
+
+    # Native-stream startup and UI messages.
+    STREAM_SETTING_LANG = auto(), "lang must be a nonempty language code or None"
+    STREAM_SETTING_SHELL = auto(), "shell must be a nonempty executable name or path"
+    STREAM_SETTING_LIST = auto(), "{name} must be a list of strings"
+    STREAM_SETTING_PLUGINS = auto(), "plugins must contain nonempty names"
+    STREAM_SETTING_PATH = auto(), "{name} must be a path"
+    STREAM_SETTING_LEVEL = auto(), "log_level must be one of {levels}"
+    STREAM_SETTING_ESCAPE = (
+        auto(),
+        "escape_delay must be between {minimum} and {maximum} seconds",
+    )
+    STREAM_RC_FILE_ERROR = auto(), "configuration must be a regular Python file"
+    STREAM_RC_ERROR = auto(), "Cannot load configuration {path}: {error}"
+    STREAM_ARG_ERROR = auto(), "argument {argument}: {error}"
+    STREAM_ARG_UNKNOWN = auto(), "unrecognized arguments: {arguments}"
+    STREAM_ARG_EXPECTED = auto(), "expected one argument"
+    STREAM_ARG_CONFLICT = auto(), "not allowed with argument {argument}"
+    STREAM_ARG_CHOICE = auto(), "invalid choice: {value} (choose from {choices})"
+    STREAM_ARG_VALUE = auto(), "invalid {kind} value: {value}"
+    STREAM_ARG_EXPLICIT = auto(), "ignored explicit argument {value}"
+    STREAM_META_DIR = auto(), "DIR"
+    STREAM_META_SECONDS = auto(), "SECONDS"
+    STREAM_META_SHELL = auto(), "SHELL"
+    STREAM_META_NAME = auto(), "NAME"
+    STREAM_META_PATH = auto(), "PATH"
+    STREAM_META_ARG = auto(), "ARG"
+    STREAM_META_LANG = auto(), "LANG"
     STREAM_DESCRIPTION = (
         auto(),
         "ish - Run a native shell with direct terminal output and optional prompt-time Python plugins.",
@@ -297,6 +417,65 @@ class Message(StrEnum):
     STREAM_DIAGNOSE_LOG_FILE = auto(), "Log file"
     STREAM_DIAGNOSE_LOG_LEVEL = auto(), "Log threshold"
 
+    # Optional plugin registration, rendering and shell integration.
+    STREAM_PLUGIN_ONCE = auto(), "Stream plugins can only be loaded once"
+    STREAM_PLUGIN_MISSING = auto(), "Cannot load stream plugin: {name}"
+    STREAM_PLUGIN_API = auto(), "Unsupported stream plugin API: {name}"
+    STREAM_PLUGIN_SETUP = auto(), "Stream plugin has no setup function: {name}"
+    STREAM_PLUGIN_CLEANUP = auto(), "Plugin setup must return a cleanup or None"
+    STREAM_REGISTER_SETUP = auto(), "Stream registration is only available during setup"
+    STREAM_BAR_EXISTS = auto(), "A stream bar is already registered"
+    STREAM_BAR_REQUIRED = auto(), "A bar provider must not be None"
+    STREAM_POPUP_EXISTS = auto(), "A stream popup is already registered"
+    STREAM_POPUP_CALLABLE = auto(), "A popup factory must be callable"
+    STREAM_SHELL_CALLBACKS = (
+        auto(),
+        "A shell registration needs matching and build functions",
+    )
+    STREAM_SHELL_MISSING = (
+        auto(),
+        "No prompt integration is installed for this shell in the selected plugins",
+    )
+    STREAM_SHELL_MULTIPLE = auto(), "Multiple selected plugins support this shell"
+    STREAM_SCRIPT_READ = auto(), "Cannot read shell integration: {path}"
+    STREAM_SCRIPT_CONTRACT = auto(), "Unsupported shell integration contract: {path}"
+    STREAM_SCRIPT_TOKEN = auto(), "Unknown integration placeholder {token}: {path}"
+    STREAM_NONCE_INVALID = auto(), "Invalid shell notification nonce"
+    STREAM_HOME_ABSOLUTE = auto(), "Shell integration requires an absolute HOME"
+    STREAM_PANEL_ROW = auto(), "Panel top must be a positive terminal row"
+    STREAM_PANEL_ONCE = auto(), "Panel can only be started once"
+    STREAM_PANEL_SIZE = auto(), "Panel dimensions must be positive"
+    STREAM_PANEL_NOT_RUNNING = auto(), "Panel is not running"
+    STREAM_POPUP_VIEW = auto(), "A popup factory must return PopupView"
+    STREAM_BASH_STARTUP = (
+        auto(),
+        "Bash prompt decorations require a non-login interactive shell",
+    )
+    STREAM_ZSH_STARTUP = (
+        auto(),
+        "zsh prompt decorations require non-login interactive startup",
+    )
+    STREAM_TCSH_STARTUP = (
+        auto(),
+        "tcsh prompt decorations require non-login interactive startup",
+    )
+    STREAM_SHELL_PATH = (
+        auto(),
+        "Shell integration paths must not contain line breaks or NUL",
+    )
+    STREAM_BASH_VERSION = auto(), "ish prompt decorations require Bash 5.1 or later"
+
+    # Native-stream diagnostics and optional sample UI.
+    STREAM_CHILD_EXIT = auto(), "Child exit status={status}; draining output"
+    STREAM_SHELL_EVENT = auto(), "Shell event kind={kind} serial={serial}"
+    STREAM_POPUP_REQUEST = auto(), "Popup request stage={stage} serial={serial}"
+    STREAM_POPUP_FOCUS = auto(), "Popup focus={focus}"
+    STREAM_RESIZE = auto(), "Terminal resize columns={columns} rows={rows}"
+    STREAM_SESSION_START = auto(), "Session start shell={shell} plugins={plugins}"
+    STREAM_SESSION_EXIT = auto(), "Session exit status={status}"
+    STREAM_SAMPLE_BAR = auto(), "ish stream | native shell | F2 popup"
+    STREAM_SAMPLE_POPUP = auto(), "Plugin popup | Enter accepts | Esc cancels"
+
 
 _DEFAULT_MESSAGES = MappingProxyType({item.value: item.english for item in Message})
 _MESSAGE_FIELDS = {
@@ -328,27 +507,55 @@ def _publish_missing(staged: Path, destination: Path) -> None:
             shutil.copyfileobj(source, target, _FALLBACK_COPY_BYTES)
 
 
+class _TranslationError(ValueError):
+    """Retain a validation message until the selected language is available."""
+
+    def __init__(self, message: Message, **values):
+        """Keep the ordinary English exception useful outside a language manager."""
+        self.message, self.values = message, values
+        super().__init__(message.english.format(**values))
+
+
 class _Messages(dict):
     """Validate message mutations once, retaining ordinary dictionary reads."""
 
-    __slots__ = ()
+    __slots__ = ("translate",)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, translate=None, **kwargs):
         """Copy validated values so caller-held dictionaries cannot bypass validation."""
         super().__init__()
+        self.translate = translate
         self.update(*args, **kwargs)
 
     @staticmethod
-    def _validate(key, value):
+    def _validate_entry(key, value):
         """Keep the same string-to-string contract for every mutation path."""
         if not isinstance(key, str) or not isinstance(value, str):
-            raise ValueError(_INVALID_MESSAGES)
+            raise _TranslationError(Message.I18N_MESSAGES_ERROR)
         if key in _MESSAGE_FIELDS:
-            fields = {
-                field for _, field, _, _ in _FORMATTER.parse(value) if field is not None
-            }
+            try:
+                fields = {
+                    field
+                    for _, field, _, _ in _FORMATTER.parse(value)
+                    if field is not None
+                }
+            except ValueError as error:
+                raise _TranslationError(
+                    Message.I18N_FORMAT_ERROR, name=key, error=error
+                ) from error
             if fields != _MESSAGE_FIELDS[key]:
-                raise ValueError(f"Translation placeholders do not match {key}")
+                raise _TranslationError(Message.I18N_FIELDS_ERROR, name=key)
+
+    def _validate(self, key, value):
+        """Localize active mapping errors while leaving staged load errors deferred."""
+        try:
+            self._validate_entry(key, value)
+        except _TranslationError as error:
+            if self.translate is not None:
+                raise ValueError(
+                    self.translate(error.message, **error.values)
+                ) from error
+            raise
 
     def __setitem__(self, key, value):
         """Reject malformed values before changing a single translation."""
@@ -385,7 +592,7 @@ class I18N:
         self.base_path: Path = config.LANG_DIR
 
         self._lock = threading.RLock()
-        self._messages = _Messages(_DEFAULT_MESSAGES)
+        self._messages = _Messages(_DEFAULT_MESSAGES, translate=self.get)
 
     @property
     def message(self) -> Dict[str, str]:
@@ -396,14 +603,12 @@ class I18N:
     def message(self, value: Dict[str, str]) -> None:
         """Replace the active message mapping while holding the lock."""
         with self._lock:
-            self._messages = _Messages(value)
+            self._messages = _Messages(value, translate=self.get)
 
     def _language_path(self, lang: str) -> Path:
         """Map a language name to its JSON file under the current base directory."""
         if not isinstance(lang, str) or not _LANGUAGE_NAME.fullmatch(lang):
-            raise ValueError(
-                "Language must be a single language code, such as en or ko"
-            )
+            raise ValueError(self.get(Message.I18N_LANGUAGE_ERROR))
         return self.base_path / (lang + _JSON_SUFFIX)
 
     def _get_lang_file(self, lang: Optional[str], *, create: bool = True) -> Path:
@@ -421,36 +626,26 @@ class I18N:
         if not create:
             return default_file
 
-        try:
-            self.base_path.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(
-                dir=default_file.parent, prefix=_LANG_STAGE_PREFIX
-            ) as temporary:
-                staged = Path(temporary) / default_file.name
-                with staged.open("w", encoding=self.encoder) as stream:
-                    json.dump(
-                        dict(_DEFAULT_MESSAGES),
-                        stream,
-                        ensure_ascii=False,
-                        indent=_JSON_INDENT,
-                    )
-                _publish_missing(staged, default_file)
-        except OSError as exc:
-            logging.getLogger(DEFAULT_LOGGER_NAME).warning(
-                "Cannot create language file %s: %s", default_file, exc
-            )
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=default_file.parent, prefix=_LANG_STAGE_PREFIX
+        ) as temporary:
+            staged = Path(temporary) / default_file.name
+            with staged.open("w", encoding=self.encoder) as stream:
+                json.dump(
+                    dict(_DEFAULT_MESSAGES),
+                    stream,
+                    ensure_ascii=False,
+                    indent=_JSON_INDENT,
+                )
+            _publish_missing(staged, default_file)
 
         return default_file
 
     def _detect(self) -> str:
-        """Read the system locale's language code, falling back to the default on failure."""
-        try:
-            lang, _ = locale.getdefaultlocale()
-            if lang:
-                return lang.partition(_LOCALE_SEPARATOR)[0]
-        except (ValueError, TypeError):
-            pass
-        return self.default_lang
+        """Read LANG only, independently of installed locales and LC_* overrides."""
+        match = _LOCALE_NAME.fullmatch(os.environ.get(_LANG_ENV, ""))
+        return match.group("language").lower() if match else self.default_lang
 
     def load(self, lang: Optional[str] = None, *, create: bool = True, logger=None):
         """Merge English defaults, user fallback, shipped locale and user locale.
@@ -459,12 +654,16 @@ class I18N:
         previous language. Set create=False for CLI queries that must not write files.
         """
         logger = logger or logging.getLogger(DEFAULT_LOGGER_NAME)
-        selected = self.current_lang if lang is None else lang
+        selected = self._detect() if lang is None else lang
         # Start fresh on each switch: old translations must not leak into a new locale.
         messages = _Messages(_DEFAULT_MESSAGES)
         selected_path = self._language_path(selected)
         default_path = self._language_path(self.default_lang)
-        self._get_lang_file(selected, create=create)
+        diagnostics = []
+        try:
+            self._get_lang_file(selected, create=create)
+        except OSError as error:
+            diagnostics.append((Message.I18N_CREATE_ERROR, default_path, error))
         # User English remains the fallback for untranslated keys. A shipped
         # locale then supplies its translations, and the selected user file wins.
         language = (
@@ -482,13 +681,23 @@ class I18N:
                 with path.open("r", encoding=self.encoder) as f:
                     translated = json.load(f)
                 if not isinstance(translated, dict):
-                    raise ValueError(_INVALID_MESSAGES)
+                    raise _TranslationError(Message.I18N_MESSAGES_ERROR)
                 messages.update(translated)
             except (OSError, ValueError) as exc:
-                logger.warning("Cannot load language file %s: %s", path, exc)
+                diagnostics.append((Message.I18N_LOAD_ERROR, path, exc))
         with self._lock:
+            messages.translate = self.get
             self._messages = messages
             self.current_lang = selected
+            # Report in this load's language, even if an earlier fallback file
+            # failed before the shipped locale could be read.
+            for message, path, error in diagnostics:
+                detail = (
+                    self.get(error.message, **error.values)
+                    if isinstance(error, _TranslationError)
+                    else str(error)
+                )
+                logger.warning(self.get(message, path=path, error=detail))
 
     def update(self, messages: Dict[str, str]) -> None:
         """Add or override individual messages while holding the lock."""

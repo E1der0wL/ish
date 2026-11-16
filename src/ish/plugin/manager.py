@@ -51,7 +51,7 @@ _EXTRA_MARKER = "extra"
 def _metadata_string(value: object) -> str:
     """Require a literal string for a declared text field."""
     if not isinstance(value, str):
-        raise TypeError("expected a string")
+        raise TypeError(i18n.get(Message.PM_EXPECT_STRING))
     return value
 
 
@@ -60,7 +60,7 @@ def _metadata_list(value: object) -> list[str]:
     if not isinstance(value, (list, tuple)) or not all(
         isinstance(item, str) for item in value
     ):
-        raise TypeError("expected a list or tuple of strings")
+        raise TypeError(i18n.get(Message.PM_EXPECT_STRINGS))
     return list(value)
 
 
@@ -91,7 +91,7 @@ class PluginInfo:
         if meta is None:
             return None
         if not isinstance(meta, Mapping):
-            raise TypeError(f"{PLUGIN_META} must be a mapping")
+            raise TypeError(i18n.get(Message.PM_META_MAPPING, field=PLUGIN_META))
         if not meta:
             return None
         values = {}
@@ -251,7 +251,7 @@ class PluginManager:
             or "/" in name
             or "\\" in name
         ):
-            raise ValueError("A plugin name must identify one visible source directory")
+            raise ValueError(i18n.get(Message.PM_NAME_INVALID))
         return self.script_dir / name
 
     def _get_plugin_meta(self, path: Path) -> object:
@@ -272,7 +272,9 @@ class PluginManager:
                 try:
                     return ast.literal_eval(node.value)
                 except (ValueError, TypeError) as exc:
-                    raise TypeError(f"{PLUGIN_META} must be literal") from exc
+                    raise TypeError(
+                        i18n.get(Message.PM_META_LITERAL, field=PLUGIN_META)
+                    ) from exc
         return None
 
     def _is_version_allowed(
@@ -286,7 +288,12 @@ class PluginManager:
             return allowed.contains(installed)
         except (InvalidSpecifier, InvalidVersion) as exc:
             self.logger.warning(
-                "Invalid version requirement %r for %r: %s", spec, installed, exc
+                i18n.get(
+                    Message.PM_VERSION_INVALID,
+                    requirement=spec,
+                    version=installed,
+                    error=exc,
+                )
             )
             return False
 
@@ -363,7 +370,9 @@ class PluginManager:
         try:
             return self._is_library_available(library) or self._install_library(library)
         except InvalidRequirement as exc:
-            self.logger.warning("Invalid Python requirement %r: %s", library, exc)
+            self.logger.warning(
+                i18n.get(Message.PM_REQUIREMENT_INVALID, requirement=library, error=exc)
+            )
             return False
 
     def _dependency_constraints(self) -> list[str]:
@@ -424,9 +433,7 @@ class PluginManager:
                 if not self._is_library_available(
                     library, import_parents=False, installed=True
                 ):
-                    raise RuntimeError(
-                        "Installed dependency does not provide the requested import and version"
-                    )
+                    raise RuntimeError(i18n.get(Message.PM_INSTALLED_INVALID))
             self._installed_libs.add(specification)
             return True
         except Exception as exc:
@@ -450,14 +457,14 @@ class PluginManager:
             sys.modules[full_module_name], root
         ):
             raise ImportError(
-                f"Plugin entry {full_module_name!r} conflicts with an existing module"
+                i18n.get(Message.PM_ENTRY_CONFLICT, name=full_module_name)
             )
         if full_module_name != plugin_name and plugin_name in sys.modules:
             parent = sys.modules[plugin_name]
             paths = parent.__dict__.get("__path__", ()) if parent is not None else ()
             if not any(Path(path).resolve() == root for path in paths):
                 raise ImportError(
-                    f"Plugin namespace {plugin_name!r} is owned by another package"
+                    i18n.get(Message.PM_NAMESPACE_CONFLICT, name=plugin_name)
                 )
 
         spec = importlib.util.spec_from_file_location(full_module_name, plugin_file)
@@ -576,7 +583,7 @@ class PluginManager:
         errors and continue loading other plugins. An empty selection runs none.
         """
         if isinstance(names, (str, bytes)):
-            raise TypeError("Selected plugins must be a sequence of names")
+            raise TypeError(i18n.get(Message.PM_SELECTION_INVALID))
         if str(self.lib_dir) not in sys.path:
             sys.path.insert(0, str(self.lib_dir))
 
@@ -617,8 +624,10 @@ class PluginManager:
             except Exception:
                 format_exc = str(traceback.format_exc())
                 target_path = str(self.lib_dir)
-                log_sys_path = f"sys.path count: {len(sys.path)}\n" + "\n".join(
-                    [f"  - {p}" for p in sys.path]
+                log_sys_path = i18n.get(
+                    Message.PM_DEBUG_PATHS,
+                    count=len(sys.path),
+                    paths="\n".join(f"  - {p}" for p in sys.path),
                 )
                 lib_dir_exists = self.lib_dir.exists()
                 lib_dir_contents = ""
@@ -629,25 +638,28 @@ class PluginManager:
                             f"  - {f.name}" for f in dir_contents
                         )
                     except Exception:
-                        lib_dir_contents = "Error reading directory"
+                        lib_dir_contents = i18n.get(Message.PM_DEBUG_DIRECTORY_READ)
 
-                log_lib_dir = (
-                    f"Plugin Lib Dir exists: {lib_dir_exists}\n"
-                    f"Plugin Lib Dir path: {target_path}\n"
-                    f"Plugin Lib Dir contents (top {_DEBUG_FILE_LIMIT}): {lib_dir_contents}"
+                log_lib_dir = i18n.get(
+                    Message.PM_DEBUG_LIBRARY,
+                    exists=lib_dir_exists,
+                    path=target_path,
+                    limit=_DEBUG_FILE_LIMIT,
+                    contents=lib_dir_contents,
                 )
-                log_python_info = (
-                    f"Python Executable: {self.python_exe}\n"
-                    f"Python Version: {sys.version}"
+                log_python_info = i18n.get(
+                    Message.PM_DEBUG_PYTHON,
+                    executable=self.python_exe,
+                    version=sys.version,
                 )
                 errors = [
-                    "\n[Debug Info]",
+                    "\n[" + i18n.get(Message.PM_DEBUG_TITLE) + "]",
                     log_python_info,
-                    "\n[Sys Path]",
+                    "\n[" + i18n.get(Message.PM_DEBUG_SYS_PATH) + "]",
                     log_sys_path,
-                    "\n[Plugin Lib Dir]",
+                    "\n[" + i18n.get(Message.PM_DEBUG_LIB_DIR) + "]",
                     log_lib_dir,
-                    "\n[Traceback]",
+                    "\n[" + i18n.get(Message.PM_DEBUG_TRACEBACK) + "]",
                     format_exc,
                     "\n---",
                 ]

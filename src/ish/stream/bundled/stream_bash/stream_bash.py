@@ -6,6 +6,7 @@ import shlex
 import sys
 from pathlib import Path
 
+from ish.lang import Message, i18n
 from ish.stream import request
 from ish.stream.scripts import render
 
@@ -31,9 +32,7 @@ def setup(api):
 def build(argv, env, directory: Path, nonce, popup_socket, *, script_dir=None):
     """Prepare one non-login interactive Bash without changing user rc files."""
     if tuple(argv[1:]) not in SUPPORTED_ARGS:
-        raise ValueError(
-            "Bash prompt decorations require a non-login interactive shell"
-        )
+        raise ValueError(i18n.get(Message.STREAM_BASH_STARTUP))
     startup = render(
         "bash.sh",
         {
@@ -42,6 +41,7 @@ def build(argv, env, directory: Path, nonce, popup_socket, *, script_dir=None):
             "@PYTHON@": shlex.quote(sys.executable),
             "@HELPER@": shlex.quote(str(Path(request.__file__))),
             "@SOCKET@": shlex.quote(popup_socket or ""),
+            "@VERSION_NOTICE@": shlex.quote(i18n.get(Message.STREAM_BASH_VERSION)),
         },
         script_dir,
     )

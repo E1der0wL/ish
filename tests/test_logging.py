@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ish.config import config
+from ish.lang import i18n
 from ish.log import get_logger, register_logger, session_logging
 
 
@@ -185,6 +186,38 @@ class LoggingTests(unittest.TestCase):
                 self.fail("invalid level was accepted")
         self.assertFalse(path.parent.exists())
         self.assertEqual(self.logger.handlers, [])
+
+    def test_language_pack_controls_logging_failures_without_live_console_output(self):
+        """Use custom translated diagnostics while preserving raw exception details."""
+        messages = dict(i18n.message)
+        self.addCleanup(setattr, i18n, "message", messages)
+        i18n.update(
+            {
+                "log_level_error": "잘못된 수준: {value}",
+                "log_output_error": "저장 실패: {error}",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "잘못된 수준: TRACE"):
+            with session_logging(name=self.name, level="TRACE"):
+                self.fail("invalid level was accepted")
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with session_logging(
+                name=self.name, path=self.root / "translated.log"
+            ) as log:
+                handler = next(
+                    item
+                    for item in log.logger.handlers
+                    if isinstance(item, logging.FileHandler)
+                )
+                with patch.object(
+                    handler.stream, "write", side_effect=OSError("disk full")
+                ):
+                    log.logger.error("plugin detail")
+                self.assertEqual(output.getvalue(), "")
+        self.assertIn("저장 실패: disk full", output.getvalue())
+        self.assertIn("plugin detail", output.getvalue())
+        self.assertNotIn("Log output failed", output.getvalue())
 
     def test_runtime_file_failure_does_not_write_into_live_terminal(self):
         """A failed file write is deferred instead of stdlib's stderr traceback."""

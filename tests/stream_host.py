@@ -28,6 +28,8 @@ from stream_plugins import plugin_options
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT = b"STREAM_PRIMARY> "
 BAR = b"ish stream | native shell | F2 popup"
+LOCALIZED_BAR = {"en": BAR, "ko": "ish | 기본 셸 | F2 팝업".encode()}
+POPUP_TITLE = {"en": b"Plugin popup", "ko": "플러그인 팝업".encode()}
 TEST_SECONDS = 45
 GATE_SECONDS = 600
 READ_BYTES = 65536
@@ -61,6 +63,8 @@ class HostRun:
         plugin_dir=None,
         config_file=None,
         extra_args=(),
+        language="en",
+        lang_env="C.UTF-8",
     ):
         """Prepare isolated shell state and evidence without starting another GUI."""
         self.directory = directory.resolve()
@@ -75,6 +79,9 @@ class HostRun:
         self.plugin_dir = plugin_dir
         self.config_file = config_file
         self.extra_args = tuple(extra_args)
+        self.bar = LOCALIZED_BAR[language]
+        self.popup_title = POPUP_TITLE[language]
+        self.lang_env = lang_env
         self.fd = self.pid = None
         self.stage = 0
         self.commands = 0
@@ -145,7 +152,7 @@ class HostRun:
             environment.update(
                 HOME=str(self.home),
                 PYTHONPATH=str(ROOT / "src") + os.pathsep + str(ROOT / "tests"),
-                LANG="C.UTF-8",
+                LANG=self.lang_env,
             )
             os.execvpe(argv[0], argv, environment)
         os.set_blocking(self.fd, False)
@@ -173,6 +180,7 @@ class HostRun:
                 if self.config_file is not None
                 else None,
                 "argv": argv,
+                "LANG": self.lang_env,
                 "pid": self.pid,
                 "input_method": "scripted bytes into outer PTY; host responses relayed",
             },
@@ -258,25 +266,31 @@ class HostRun:
         after = self.output.index(observed, offset) + len(observed)
         self.expect(PROMPT, after)
         if self.demo:
-            self.expect(BAR, after)
+            self.expect(self.bar, after)
 
     def popup(self):
         """Exercise the shared sample while allowing focused matrix key checks."""
         offset = len(self.output)
         self.send(b"\x1bOQ")
-        self.expect(b"Plugin popup", offset)
+        self.expect(self.popup_title, offset)
         self.send("팝업 값".encode())
         self.gate("popup")
         close_offset = len(self.output)
         self.send(b"\r")
-        self.expect(BAR, close_offset)
+        self.expect(self.bar, close_offset)
+
+    def check_language(self):
+        """Confirm language selection leaves the native program's LANG unchanged."""
+        self.command("/usr/bin/printenv LANG > lang-result")
+        assert (self.home / "lang-result").read_text() == self.lang_env + "\n"
 
     def scenario(self):
         """Expose each screen for independent GUI inspection and assert actual files."""
         self.expect(PROMPT)
         if self.demo:
-            self.expect(BAR)
+            self.expect(self.bar)
         self.gate("primary-bar" if self.demo else "primary-without-ui")
+        self.check_language()
         if self.demo:
             self.popup()
         offset = len(self.output)
@@ -382,7 +396,13 @@ class HostRun:
         self.result.update(
             status="passed",
             returncode=returncode,
-            native_files=["loop-result", "heredoc-result", "vim-result", "host-result"],
+            native_files=[
+                "loop-result",
+                "heredoc-result",
+                "vim-result",
+                "host-result",
+                "lang-result",
+            ],
             sizes=self.sizes,
             resized=any(size != self.sizes[0] for size in self.sizes),
         )

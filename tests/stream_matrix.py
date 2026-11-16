@@ -15,7 +15,7 @@ import time
 import traceback
 from pathlib import Path
 
-from stream_host import BAR, HostRun
+from stream_host import HostRun
 from stream_plugins import SHELL_PLUGINS, copy_plugins
 
 SHELLS = ("tcsh", "bash", "zsh")
@@ -144,7 +144,7 @@ class AutomaticRun(HostRun):
         """Observe a new semantic P even when ZLE reuses existing prompt cells."""
         self.wait(
             lambda: (
-                "Shell event kind=P"
+                "셸 이벤트 kind=P"
                 in (self.directory / "session.log").read_text()[offset:]
             ),
             "primary event after popup return",
@@ -163,7 +163,7 @@ class AutomaticRun(HostRun):
         self.result.update(
             status="passed",
             returncode=code,
-            native_files=[native_file],
+            native_files=[native_file, "lang-result"],
             sizes=self.sizes,
         )
 
@@ -180,7 +180,7 @@ class SettingsRun(AutomaticRun):
         """Record Alt editing, bounded ESC return and the final native consumer."""
         offset = len(self.output)
         self.send(F2)
-        self.expect(b"Plugin popup", offset)
+        self.expect(self.popup_title, offset)
         log_offset = len((self.directory / "session.log").read_text())
         self.send("팝업 값 one two".encode() + b"\x1bbX\r")
         value = self.home / "popup-value"
@@ -189,7 +189,7 @@ class SettingsRun(AutomaticRun):
         self.primary_after(log_offset)
         offset = len(self.output)
         self.send(F2)
-        self.expect(b"Plugin popup", offset)
+        self.expect(self.popup_title, offset)
         self.send(b"touch escape-leak")
         log_offset = len((self.directory / "session.log").read_text())
         started = time.monotonic()
@@ -230,7 +230,8 @@ class AsyncFailureRun(AutomaticRun):
 
     def scenario(self):
         """Prove native recovery, discarded popup input and deferred diagnostics."""
-        self.expect(BAR)
+        self.expect(self.bar)
+        self.check_language()
         self.gate("primary-before-async-failure")
         offset = len(self.output)
         self.send(F2)
@@ -242,7 +243,7 @@ class AsyncFailureRun(AutomaticRun):
         def returned():
             records = (self.directory / "session.log").read_text()
             _, failed, following = records.partition(FAILURE)
-            return bool(failed and "Shell event kind=P" in following)
+            return bool(failed and "셸 이벤트 kind=P" in following)
 
         self.wait(returned, "primary event after async failure")
         self.demo = False
@@ -261,7 +262,8 @@ class FactoryTaskRun(AutomaticRun):
 
     def scenario(self):
         """Keep the second popup editable after the first factory task fails."""
-        self.expect(BAR)
+        self.expect(self.bar)
+        self.check_language()
         offset = len(self.output)
         self.send(F2)
         self.expect(b"FACTORY POPUP 1", offset)
@@ -335,11 +337,7 @@ def main(argv=None):
             config_file = (
                 write_settings(case, plugins) if scenario == "plugins" else None
             )
-            extra = (
-                ()
-                if config_file
-                else ("--lang", "ko", "--home", str(case / "settings"))
-            )
+            extra = () if config_file else ("--home", str(case / "settings"))
             if selected and config_file is None:
                 extra += (
                     "--log-level",
@@ -356,6 +354,8 @@ def main(argv=None):
                 config_file=config_file,
                 extra_args=extra,
                 require_resize=resize,
+                language="ko",
+                lang_env="C.UTF-8" if config_file else "ko_KR.UTF-8",
             )
             resize_pending = resize_pending and not resize
             try:
@@ -363,8 +363,8 @@ def main(argv=None):
                 runner.scenario()
                 if selected:
                     records = (case / "session.log").read_text()
-                    assert "Session exit status=0" in records
-                    assert "Popup focus=True" in records
+                    assert "세션 종료 status=0" in records
+                    assert "팝업 focus=True" in records
                     assert "STREAM_VIM_RESULT" not in records
                 else:
                     assert not (case / "settings").exists()

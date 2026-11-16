@@ -4,11 +4,12 @@ from prompt_toolkit.layout import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
 
+from ish.lang import Message, i18n
 from ish.stream.ui import PopupView
 
 PLUGIN_META = {"version": "1.0.0", "description": "Native handoff demonstration popup"}
 STREAM_API = 1
-POPUP_TITLE = "Plugin popup | Enter accepts | Esc cancels"
+POPUP_MESSAGE = Message.STREAM_SAMPLE_POPUP
 TITLE_STYLE = "bold"
 
 
@@ -27,7 +28,11 @@ def create(accept):
     )
     content = HSplit(
         [
-            Window(FormattedTextControl(POPUP_TITLE), height=1, style=TITLE_STYLE),
+            Window(
+                FormattedTextControl(i18n.get(POPUP_MESSAGE)),
+                height=1,
+                style=TITLE_STYLE,
+            ),
             field,
         ]
     )

@@ -7,6 +7,7 @@ import select
 import sys
 import unittest
 
+from ish.lang import i18n
 from ish.runtime.fdio import FDWriter
 from ish.terminal.session import Session
 
@@ -31,6 +32,28 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.session = None
         self.slave = None
         self.addAsyncCleanup(self.stop)
+
+    async def test_language_pack_controls_transport_failures(self):
+        """Report translated queue errors without altering native bytes or delivery."""
+        messages = dict(i18n.message)
+        self.addCleanup(setattr, i18n, "message", messages)
+        i18n.update(
+            {
+                "writer_closed": "닫힌 출력 경로",
+                "input_limit": "시작 입력 한도 초과",
+            }
+        )
+        writer = FDWriter(asyncio.get_running_loop(), -1)
+        writer.close()
+        with self.assertRaisesRegex(RuntimeError, "닫힌 출력 경로"):
+            writer.write(b"untouched native bytes")
+        self.session = Session(
+            [], os.getcwd(), self.received, self.exited, self.errors.append
+        )
+        self.session.send(b"x" * OVERSIZED_INPUT)
+        self.assertEqual(len(self.errors), 1)
+        self.assertEqual(str(self.errors[0]), "시작 입력 한도 초과")
+        self.assertEqual(self.session.pending_input, b"")
 
     def start(self, script):
         """Execute one transient native process on the production controlling PTY."""

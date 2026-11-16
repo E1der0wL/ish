@@ -9,6 +9,8 @@ from collections import deque
 from operator import index
 from typing import Callable
 
+from ish.lang import Message, i18n
+
 _DEFAULT_QUEUE_BYTES = 4 * 1024 * 1024
 _FLUSH_BYTES = 64 * 1024
 _FLUSH_ATTEMPTS = 16
@@ -34,7 +36,7 @@ class InputBytes(bytes):
     def _prefix_size(data: bytes, length: int) -> int:
         size = index(length)
         if not 0 <= size <= len(data):
-            raise ValueError("Native prefix is outside the input payload")
+            raise ValueError(i18n.get(Message.INPUT_PREFIX_ERROR))
         return size
 
     @staticmethod
@@ -88,12 +90,12 @@ class FDWriter:
         remainder of partial writes.
         """
         if self.closed:
-            raise RuntimeError("Writer is closed")
+            raise RuntimeError(i18n.get(Message.WRITER_CLOSED))
         if self.error:
             raise self.error
         if data:
             if self.pending_bytes + len(data) > self.max_pending_bytes:
-                raise BufferError("Pending terminal writes exceed the byte limit")
+                raise BufferError(i18n.get(Message.WRITE_LIMIT))
             # A tagged handoff is immutable too. Converting it to plain bytes
             # would copy the entire payload solely to queue a read-only view.
             payload = data if type(data) is InputBytes else bytes(data)
@@ -142,7 +144,7 @@ class FDWriter:
                 except BlockingIOError:
                     break
                 if written == 0:
-                    raise OSError(errno.EIO, "write returned zero bytes")
+                    raise OSError(errno.EIO, i18n.get(Message.WRITE_EMPTY))
                 budget -= written
                 self.pending_bytes -= written
                 if written == len(data):
@@ -193,7 +195,7 @@ class FDWriter:
         if self.error:
             raise self.error
         if self.closed:
-            raise RuntimeError("Writer is closed")
+            raise RuntimeError(i18n.get(Message.WRITER_CLOSED))
 
     def close(self) -> None:
         """Cancel waiters and monitoring and discard the queue without closing the FD."""

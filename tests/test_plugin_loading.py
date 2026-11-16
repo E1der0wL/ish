@@ -3,12 +3,35 @@
 import os
 import py_compile
 
+from ish.lang import i18n
 from ish.plugin.manager import PluginManager
 from plugin_fixture import PluginFixture
 
 
 class LoadingTests(PluginFixture):
     """Keep one shared loader while selecting which user code may run."""
+
+    def test_korean_metadata_diagnostics_do_not_execute_invalid_plugin(self):
+        """Actual loading translates its own error frame and keeps metadata inert."""
+        previous = i18n.current_lang, i18n.base_path, i18n.message
+        self.addCleanup(setattr, i18n, "current_lang", previous[0])
+        self.addCleanup(setattr, i18n, "base_path", previous[1])
+        self.addCleanup(setattr, i18n, "message", previous[2])
+        i18n.base_path = self.root / "lang"
+        i18n.load("ko", create=False)
+        directory = self.plugin("fixture_invalid")
+        entry = directory / "__init__.py"
+        entry.write_text(entry.read_text().replace("'version': '1.0'", "'version': 10"))
+        with self.assertLogs(self.manager.logger, level="DEBUG") as captured:
+            self.manager.load(["fixture_invalid"])
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("문자열이 필요합니다", diagnostic)
+        self.assertIn("[디버깅 정보]", diagnostic)
+        self.assertIn("[모듈 탐색 경로]", diagnostic)
+        self.assertIn("PLUGIN_META.version", diagnostic)
+        self.assertNotIn("[Debug Info]", diagnostic)
+        self.assertIsNone(self.manager.get("fixture_invalid"))
+        self.assertEqual(self.executed(), [])
 
     def test_selected_plugins_run_in_requested_order_once(self):
         """Unselected modules do not execute; duplicate selections reuse the module."""

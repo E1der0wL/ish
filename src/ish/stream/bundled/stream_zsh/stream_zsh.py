@@ -6,6 +6,7 @@ import shlex
 import sys
 from pathlib import Path
 
+from ish.lang import Message, i18n
 from ish.stream import request
 from ish.stream.scripts import render
 
@@ -31,7 +32,7 @@ def setup(api):
 def build(argv, env, directory: Path, nonce, popup_socket, *, script_dir=None):
     """Preserve user startup paths and attach the selected external ZLE scripts."""
     if tuple(argv[1:]) not in SUPPORTED_ARGS:
-        raise ValueError("zsh prompt decorations require non-login interactive startup")
+        raise ValueError(i18n.get(Message.STREAM_ZSH_STARTUP))
     private = directory / "zsh"
     script = private / "widgets.zsh"
     source = render(

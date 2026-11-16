@@ -56,7 +56,7 @@ mkdir -p "$HOME/ish"
 `~/ish/.ishrc.py` 예:
 
 ```python
-config.lang = "ko"
+config.lang = None  # LANG 자동 감지. 한국어로 고정하려면 "ko"
 config.shell = "bash"
 config.log_level = "WARNING"
 config.escape_delay = 0.05
@@ -70,7 +70,7 @@ config.escape_delay = 0.05
 
 | 설정 | 의미 |
 | --- | --- |
-| `config.lang` | ish 안내 언어. 예: `"ko"`, `"en"`. 셸·프로그램의 언어는 바꾸지 않습니다. |
+| `config.lang` | ish 안내 언어. 예: `"ko"`, `"en"`. 기본 `None`은 `LANG` 자동 감지입니다. 셸·프로그램의 언어는 바꾸지 않습니다. |
 | `config.shell` | 셸 이름 또는 실행 파일 경로. |
 | `config.shell_args` | 셸 시작 인수 목록. 기본 `['-i']`를 대체합니다. |
 | `config.cwd` | 셸 시작 디렉터리. |
@@ -92,6 +92,30 @@ ish --shell tcsh                  # 이번 실행의 셸만 변경
 ```
 
 `--no-plugins`와 `--plugin`은 함께 쓸 수 없습니다. `.ishrc.py`는 시작 시 실행하는 Python 파일입니다. 문법 오류나 잘못된 설정은 셸을 시작하기 전에 오류로 알리며, 일부 값만 적용한 세션을 시작하지 않습니다.
+
+## 언어 설정과 언어팩
+
+언어 선택 순서는 **명시한 설정 → `LANG` 자동 감지 → 영어 기본값**입니다. 명시한 값 중에서는 CLI의 `--lang`이 `.ishrc.py`의 `config.lang`보다 우선합니다. `config.lang = None`이거나 설정하지 않으면 `LANG=ko_KR.UTF-8` 등을 읽습니다. 다른 locale 환경변수(`LC_ALL`, `LC_MESSAGES`, `LANGUAGE`)는 ish 안내 언어를 덮어쓰지 않습니다. `LANG`이 없거나 비어 있거나 `C`·`POSIX` 또는 잘못된 값이면 영어를 사용합니다. OS에 해당 locale이 설치되어 있을 필요는 없습니다.
+
+```sh
+LANG=ko_KR.UTF-8 ish --no-rc       # LANG으로 한국어 자동 선택
+ish --lang en                     # 이번 실행은 영어로 고정
+LANG=ko_KR.UTF-8 ish --help        # 설정 코드를 실행하지 않고 한국어 도움말
+```
+
+영어·한국어는 기본 제공됩니다. `<home>/lang/<언어 코드>.json`에 UTF-8 JSON 객체를 저장하면 해당 문구를 바꿀 수 있습니다. 기본 home은 `~/ish`이며, 예를 들어 `~/ish/lang/ko.json`에 다음을 저장합니다.
+
+```json
+{
+    "stream_description": "내 셸을 그대로 사용하는 ish"
+}
+```
+
+영어 기본 문구, 사용자 `en.json`, 기본 제공 번역, 선택한 사용자 언어팩 순서로 덮어씁니다. 번역이 없는 키는 이전 단계의 문구를 유지합니다. 번역의 `{error}` 같은 자리표시자는 원문의 이름을 유지해야 합니다. 잘못된 파일이나 형식은 진단하고 사용할 수 있는 기본 문구로 대체합니다. 언어팩과 설정 변경은 새 세션부터 적용되며 파일을 자동으로 만들거나 덮어쓰지 않습니다.
+
+언어팩은 ish가 작성한 도움말·오류·진단·로그와 제공하는 샘플 UI에 적용됩니다. 셸 출력, 외부 프로그램·라이브러리의 원래 오류 내용, 명령어·경로·프로토콜 필드는 그대로 보존합니다. 직접 작성한 플러그인의 문구도 공통 `ish.lang.i18n`을 사용해야 언어팩을 따릅니다.
+
+조회 명령과 설정 파일을 읽기 전의 인수·TTY 오류는 rc를 실행하지 않으므로 `--lang` → `LANG` → 영어 순서로 표시합니다.
 
 ## 하단 바와 팝업 켜기
 
@@ -144,7 +168,7 @@ ish --log-file --log-level INFO
 ish --log-file "$HOME/ish/session.log" --log-level DEBUG
 ```
 
-- `--help`, `--version`, `--diagnose`는 **설정 Python 코드·플러그인·셸을 실행하지 않고**, 설정·로그 파일도 만들지 않습니다. 진단은 CLI와 기본값을 보여주므로 `.ishrc.py` 적용 결과 확인용은 아닙니다. 조회 언어는 `--lang ko`처럼 직접 지정하세요.
+- `--help`, `--version`, `--diagnose`는 **설정 Python 코드·플러그인·셸을 실행하지 않고**, 설정·로그 파일도 만들지 않습니다. 진단은 CLI와 기본값을 보여주므로 `.ishrc.py` 적용 결과 확인용은 아닙니다. 조회 언어는 `--lang` → `LANG` → 영어 순서로 선택합니다.
 - `--login`은 기본 `-i` 대신 `-l` 하나를 셸에 전달합니다. `--shell-arg`와 함께 쓸 수 없습니다. 명시한 `--shell-arg` 목록도 기본 `-i`를 대체합니다.
 - 현재 UI provider는 일반 non-login interactive 시작을 지원합니다. 로그인이나 지원하지 않는 시작 인수를 선택하면 원래 인수로 UI 없이 셸을 시작합니다.
 - `--home`은 ish 설정 경로만 바꾸고 셸의 사용자 `HOME`을 바꾸지 않습니다. `-l CODE`는 언어 옵션이며 로그인 옵션은 `--login`입니다.

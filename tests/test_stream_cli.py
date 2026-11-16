@@ -35,6 +35,8 @@ F2 = b"\x1bOQ"
 PASTE_BYTES = 6 * 1024 * 1024
 PRESSURE_BYTES = 2 * 1024 * 1024
 WRITE_BYTES = 65536
+READ_BYTES = 65536
+SHORT_READ_BYTES = 32
 CPR_QUERY = b"\x1b[6n"
 
 
@@ -53,10 +55,12 @@ class StreamProcess:
         plugin_dir=None,
         library_dir=None,
         extra_args=(),
+        read_bytes=READ_BYTES,
     ):
         """Start an isolated user configuration and a real PTY child process."""
         self.directory = directory
         self.demo = demo
+        self.read_bytes = read_bytes
         self.output = bytearray()
         self.screen = pyte.Screen(80, 24)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -105,7 +109,7 @@ class StreamProcess:
         if not select.select([self.fd], [], [], timeout)[0]:
             return b""
         try:
-            data = os.read(self.fd, 65536)
+            data = os.read(self.fd, self.read_bytes)
         except OSError as error:
             if error.errno != errno.EIO:
                 raise
@@ -273,9 +277,15 @@ class StreamCliTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
 
-    def start(self, *, demo=False, startup=""):
+    def start(self, *, demo=False, startup="", extra_args=(), read_bytes=READ_BYTES):
         """Register cleanup before waiting for the native primary prompt."""
-        process = StreamProcess(self.directory, demo=demo, startup=startup)
+        process = StreamProcess(
+            self.directory,
+            demo=demo,
+            startup=startup,
+            extra_args=extra_args,
+            read_bytes=read_bytes,
+        )
         self.addCleanup(process.stop)
         process.expect(PROMPT)
         return process
@@ -516,18 +526,37 @@ class StreamCliTests(unittest.TestCase):
 
     def test_popup_input_is_not_a_shell_command(self):
         """The actual PTK popup consumes its text and Escape without executing it."""
-        process = self.start(demo=True)
+        log = self.directory / "popup.log"
+        process = self.start(
+            demo=True,
+            extra_args=("--lang", "en", "--log-file", str(log), "--log-level", "DEBUG"),
+            read_bytes=SHORT_READ_BYTES,
+        )
         process.expect(b"ish stream | native shell | F2 popup")
         offset = len(process.output)
         process.send(F2)
         process.expect(b"Plugin popup", offset)
         process.send(b"touch popup-leak")
         process.expect(b"popup-leak", offset)
+        log_offset = len(log.read_text())
         process.send(b"\x1b")
-        # An explicit PTK Escape is parsed before the next command, which starts
-        # only after its closed-popup bar is redrawn in the same output stream.
-        close_offset = len(process.output)
-        process.expect(b"ish stream | native shell | F2 popup", close_offset)
+
+        # Short reads leave the editing frame's bar unread when its text arrives.
+        # That bar cannot prove Escape was handled. Observe focus release and the
+        # subsequent native return before sending a distinct command, not Alt+e.
+        def returned():
+            events = log.read_text()[log_offset:]
+            _, released, events = events.partition("Popup focus=False\n")
+            _, primary, events = events.partition("Shell event kind=P serial=")
+            return bool(
+                released
+                and primary
+                and "Popup request stage=complete serial=" in events
+            )
+
+        process.wait(
+            returned, "popup focus release and completed native primary return"
+        )
         process.command("echo done > after-popup")
         process.expect_file(self.directory / "after-popup", "done\n")
         self.assertEqual((self.directory / "after-popup").read_text(), "done\n")

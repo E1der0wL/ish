@@ -27,7 +27,6 @@ SETTINGS_DEADLINE = 20
 SETTINGS_DRIVER = """
 import sys
 from pathlib import Path
-from stream_host import BAR
 from stream_matrix import SETTINGS_PLUGIN, SettingsRun, write_settings
 from stream_plugins import copy_plugins
 
@@ -37,10 +36,11 @@ plugins = copy_plugins(root / "plugins")
 (plugins / "recorded_popup/recorded_popup.py").write_text(SETTINGS_PLUGIN)
 case = root / "case"
 runner = SettingsRun(case, True, sys.argv[2], plugin_dir=plugins,
-                     config_file=write_settings(case, plugins))
+                     config_file=write_settings(case, plugins), language="ko")
 try:
     runner.start()
-    runner.expect(BAR)
+    runner.expect(runner.bar)
+    runner.check_language()
     runner.popup()
     runner.finish("escape-result")
 finally:

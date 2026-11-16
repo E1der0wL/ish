@@ -119,7 +119,7 @@ class App:
 
     def _child_exited(self, status):
         """Retire input and popup focus while Session drains the child's final output."""
-        self.logger.debug("Child exit status=%s; draining output", status)
+        self.logger.debug(i18n.get(Message.STREAM_CHILD_EXIT, status=status))
         self.stopping = True
         self.loop.remove_reader(0)
         if self.key_timer:
@@ -134,7 +134,9 @@ class App:
         self._release_request()
 
     def _event(self, kind, serial):
-        self.logger.debug("Shell event kind=%s serial=%s", kind, serial)
+        self.logger.debug(
+            i18n.get(Message.STREAM_SHELL_EVENT, kind=kind, serial=serial)
+        )
         if self.stopping:
             return
         if kind == Event.HIDE:
@@ -201,7 +203,11 @@ class App:
             if not primary or not request.complete():
                 request.cancel()
             self.logger.debug(
-                "Popup request stage=%s serial=%s", request.stage, request.serial
+                i18n.get(
+                    Message.STREAM_POPUP_REQUEST,
+                    stage=request.stage,
+                    serial=request.serial,
+                )
             )
             if not self.stopping:
                 self._pause_input("request", False)
@@ -324,7 +330,7 @@ class App:
         self._write(data if self.popup else SAVE + data + RESTORE)
 
     def _focus(self, popup):
-        self.logger.debug("Popup focus=%s", popup)
+        self.logger.debug(i18n.get(Message.STREAM_POPUP_FOCUS, focus=popup))
         if popup:
             self._pause("popup", True)
             self._write(SAVE)
@@ -443,7 +449,9 @@ class App:
         size = os.get_terminal_size(1)
         self.cols, self.rows = size.columns, size.lines
         self.session.resize(self.cols, self.rows)
-        self.logger.debug("Terminal resize columns=%s rows=%s", self.cols, self.rows)
+        self.logger.debug(
+            i18n.get(Message.STREAM_RESIZE, columns=self.cols, rows=self.rows)
+        )
         if self.panel:
             self.panel.resize(max(1, self.cols), PANEL_ROWS)
         # A resize revokes the current decoration. It returns at the next
@@ -547,9 +555,11 @@ class App:
         try:
             argv, env = await self._prepare(argv, env)
             self.logger.info(
-                "Session start shell=%s plugins=%s",
-                Path(argv[0]).name,
-                len(self.plugin_names),
+                i18n.get(
+                    Message.STREAM_SESSION_START,
+                    shell=Path(argv[0]).name,
+                    plugins=len(self.plugin_names),
+                )
             )
             if self.report:
                 self.report()
@@ -582,7 +592,7 @@ class App:
                 )
                 self.loop.add_signal_handler(signum, callback)
             result = await self.done
-            self.logger.info("Session exit status=%s", result)
+            self.logger.info(i18n.get(Message.STREAM_SESSION_EXIT, status=result))
             return result
         finally:
             try:
