@@ -10,6 +10,8 @@ import re
 import shlex
 import shutil
 import sys
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from logging.handlers import MemoryHandler
 from pathlib import Path
 
@@ -161,6 +163,24 @@ class Parser(argparse.ArgumentParser):
         )
 
 
+@dataclass(frozen=True)
+class Startup:
+    """Supply entry-point policy while sharing read-only parsing and precedence."""
+
+    program: str = PROGRAM
+    description: Message = Message.STREAM_DESCRIPTION
+    version: Message = Message.STREAM_VERSION
+    login_help: Message = Message.STREAM_LOGIN_HELP
+    options: tuple = OPTIONS
+    paths: tuple = PATH_OPTIONS
+    settings: type[Settings] = Settings
+    load: Callable[[Path], Settings] = load
+    diagnose: Callable[[argparse.Namespace], None] | None = None
+    field_mergers: Mapping[str, Callable[[object, object], object]] = field(
+        default_factory=dict
+    )
+
+
 def _path(value):
     return Path(value).expanduser().resolve()
 
@@ -172,13 +192,14 @@ def report_logs(records, logger):
             logger.handle(record)
 
 
-def parse(argv=None):
+def parse(argv=None, *, startup=None):
     """Resolve CLI over ish rc settings; queries never execute the Python rc."""
+    startup = startup or Startup()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Only the explicit language is interpreted first. Invalid unrelated options
     # must still use a later --lang, without running the arbitrary Python rc.
     language = Parser(
-        prog=PROGRAM, add_help=False, allow_abbrev=False, exit_on_error=False
+        prog=startup.program, add_help=False, allow_abbrev=False, exit_on_error=False
     )
     language.add_argument("--lang", "-l")
     first = argparse.Namespace(lang=None, home=None)
@@ -188,7 +209,7 @@ def parse(argv=None):
         # The complete bootstrap below retains the original failure and order.
         pass
     bootstrap = Parser(
-        prog=PROGRAM, add_help=False, allow_abbrev=False, exit_on_error=False
+        prog=startup.program, add_help=False, allow_abbrev=False, exit_on_error=False
     )
     bootstrap.add_argument("--home", type=Path)
     bootstrap.add_argument("--lang", "-l")
@@ -223,8 +244,8 @@ def parse(argv=None):
     if bootstrap_error is not None:
         bootstrap.error(str(bootstrap_error))
     parser = Parser(
-        prog=PROGRAM,
-        description=i18n.get(Message.STREAM_DESCRIPTION),
+        prog=startup.program,
+        description=i18n.get(startup.description),
         add_help=False,
         allow_abbrev=False,
         formatter_class=Formatter,
@@ -237,16 +258,22 @@ def parse(argv=None):
         action="store_true",
         help=i18n.get(Message.STREAM_NO_PLUGINS_HELP),
     )
-    for names, message, settings in OPTIONS:
+    for names, message, settings in startup.options:
         settings = dict(settings)
         if names == ("--log-file",):
             settings["const"] = config.LOG_FILE
         target = plugins if names == ("--plugin",) else parser
-        target.add_argument(*names, help=i18n.get(message), **settings)
+        target.add_argument(
+            *names,
+            help=(
+                i18n.get(message, path=config.PLUGIN_SCRIPT_DIR)
+                if message is not None
+                else argparse.SUPPRESS
+            ),
+            **settings,
+        )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--login", action="store_true", help=i18n.get(Message.STREAM_LOGIN_HELP)
-    )
+    mode.add_argument("--login", action="store_true", help=i18n.get(startup.login_help))
     mode.add_argument(
         "--shell-arg",
         action="append",
@@ -259,9 +286,13 @@ def parse(argv=None):
         # Reject a non-terminal launch before running arbitrary user initialization.
         if not information:
             terminal(parser)
-        selected = Settings() if information or args.no_rc else load(config.RC_FILE)
+        selected = (
+            startup.settings()
+            if information or args.no_rc
+            else startup.load(config.RC_FILE)
+        )
         _rc_language(selected, first.lang, startup_logger, records)
-        for name in PATH_OPTIONS:
+        for name in startup.paths:
             value = getattr(args, name)
             if value is not None:
                 setattr(args, name, _path(value))
@@ -271,6 +302,9 @@ def parse(argv=None):
             option = "plugin" if name == "plugins" else name
             value = getattr(args, option, None)
             if value is not None:
+                merge = startup.field_mergers.get(name)
+                if merge is not None:
+                    value = merge(getattr(selected, name), value)
                 setattr(selected, name, value)
         if args.login:
             selected.shell_args = list(LOGIN_ARGS)
@@ -301,10 +335,10 @@ def parse(argv=None):
         parser.print_help()
         return parser, args, True
     if args.version:
-        print(i18n.get(Message.STREAM_VERSION, version=__version__))
+        print(i18n.get(startup.version, version=__version__))
         return parser, args, True
     if args.diagnose:
-        diagnose(args)
+        (startup.diagnose or diagnose)(args)
         return parser, args, True
     return parser, args, False
 

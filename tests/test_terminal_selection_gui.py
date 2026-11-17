@@ -55,7 +55,7 @@ class SelectionGuiTests(unittest.TestCase):
                     "-o",
                     "clipboard_control=write-clipboard write-primary read-clipboard read-primary",
                 ]
-                command += ["--clipboard", "off"]
+                command += ["--clipboard", "off", "--mouse", "on"]
             return original(command, *args, **kwargs)
 
         name = self._testMethodName

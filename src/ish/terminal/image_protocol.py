@@ -104,6 +104,7 @@ class Images:
         """Keep only image transfer state around the single native VT owner."""
         self.terminal = terminal
         self.errors = []
+        self.error_count = 0
         self.cancel()
 
     def cancel(self):
@@ -117,6 +118,7 @@ class Images:
             self._iterm(body[5:])
         except (ValueError, OSError, binascii.Error) as error:
             self.cancel()
+            self.error_count += 1
             self.errors.append(str(error))
             del self.errors[:-MAX_ERRORS]
 

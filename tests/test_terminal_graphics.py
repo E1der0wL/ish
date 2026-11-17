@@ -530,7 +530,6 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         with create_app_session(input=self.pipe, output=self.output):
             with patch("ish.terminal.app.create_input", return_value=self.pipe):
                 self.owner = TerminalApp("/bin/sh", Path(__file__).resolve().parents[1])
-        self.render()
         self.owner.host.begin_probe(12, 6, query_id=2**31 + 17)
         for reply in (
             "\x1b[6;2;2t",
@@ -539,6 +538,8 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(self.owner.host.control(reply))
         self.owner.host.finish_probe()
+        self.owner.presentation_ready = True
+        self.render()
         self.assertTrue(self.owner.profile.kitty_graphics)
         self.owner.vt.resize(12, 6, 2, 2)
         self.owner.vt.set_graphics(True)
@@ -611,6 +612,7 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
             [("I", "301")],
         )
         self.assertTrue(self.renderer.graphics_error)
+        self.assertEqual(self.renderer.graphics_failure_count, 1)
         self.assertEqual(self.screen().display[5].strip(), "QUOTA")
         self.write_label("TEXT LIVES")
         with patch.object(
@@ -625,6 +627,7 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored[0][0]["i"], "302")
         self.assertEqual(restored[0][1], bytes((0, 0, 255, 255)) * 16)
         self.assertIsNone(self.renderer.graphics_error)
+        self.assertEqual(self.renderer.graphics_failure_count, 1)
 
     async def test_broken_native_pixels_propagate_instead_of_becoming_quota(self):
         """Structural native failures remain visible at the renderer boundary."""
@@ -644,11 +647,13 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uploads(self.render())[0][0]["i"], "301")
         self.reject(9001)
         self.assertIsNone(self.renderer.graphics_error)
+        self.assertEqual(self.renderer.graphics_failure_count, 0)
         self.assertTrue([c for c, _ in packets(self.render()) if c.get("a") == "p"])
         message = "EINVAL:" + "x" * 400
         self.reject(301, message)
         self.assertEqual(self.renderer.graphics_error, message[:256])
         self.reject(301)
+        self.assertEqual(self.renderer.graphics_failure_count, 1)
         self.write_label("HOST FAILED")
         failed = self.render()
         self.assert_no_graphics(failed)
@@ -670,7 +675,9 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uploads(self.render())[0][0]["i"], "302")
         self.reject(301)  # Delayed duplicate from the retired generation.
         self.assertIsNone(self.renderer.graphics_error)
+        self.assertEqual(self.renderer.graphics_failure_count, 1)
         self.reject(302)
+        self.assertEqual(self.renderer.graphics_failure_count, 2)
         self.assert_no_graphics(self.render())
         self.show_image(color=(0, 255, 0, 255))
         self.assertEqual(uploads(self.render())[0][0]["i"], "303")
@@ -702,10 +709,9 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
 
         self.show_image()
         self.assertEqual(uploads(self.render())[0][0]["i"], "301")
-        broker = HostBroker()
+        broker = HostBroker(features={"iterm_graphics": "on"})
         broker.begin_probe(12, 6, query_id=2**31 + 18)
         broker.control("\x1b[6;2;2t")
-        broker.control("\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\")
         broker.finish_probe()
         self.owner.host = broker
         switched = self.render()
@@ -726,10 +732,9 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         """Removing overlapping glyphs must release a capability-limited image scene."""
         from ish.terminal.host import HostBroker
 
-        broker = HostBroker()
+        broker = HostBroker(features={"iterm_graphics": "on"})
         broker.begin_probe(12, 6, query_id=2**31 + 18)
         broker.control("\x1b[6;2;2t")
-        broker.control("\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\")
         broker.finish_probe()
         self.owner.host = broker
         self.show_image(z=-1)
@@ -750,10 +755,9 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         """Real native overline survives instead of being covered by an outer PNG."""
         from ish.terminal.host import HostBroker
 
-        broker = HostBroker()
+        broker = HostBroker(features={"iterm_graphics": "on"})
         broker.begin_probe(12, 6, query_id=2**31 + 18)
         broker.control("\x1b[6;2;2t")
-        broker.control("\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\")
         broker.finish_probe()
         self.owner.host = broker
         self.show_image(z=-1)

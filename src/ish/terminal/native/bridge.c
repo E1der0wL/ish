@@ -13,6 +13,10 @@
 #define ISH_MAX_BUFFER (32u * 1024u * 1024u)
 #define ISH_LIMIT (-100)
 #define ISH_MEMORY (-101)
+#define ISH_PROCESSING (-102)
+#define ISH_SEARCH_STEPS 64u
+#define ISH_SEARCH_BYTES 4096u
+#define ISH_IDENTITY_BYTES 128u
 #define ISH_COLOR_FG 1u
 #define ISH_COLOR_BG 2u
 #define ISH_KITTY_PLACEHOLDER 0x10EEEEu
@@ -31,6 +35,13 @@ static const GhosttyMouseButton MOUSE_BUTTONS[] = {
     GHOSTTY_MOUSE_BUTTON_RIGHT, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE,
     GHOSTTY_MOUSE_BUTTON_SIX, GHOSTTY_MOUSE_BUTTON_SEVEN
 };
+/* xterm's keypad separator, indexed by the bridge SHIFT/CTRL/ALT bits.
+ * libghostty 1.0.1 has the enhanced key identity but no legacy table entry. */
+static const char KEYPAD_SEPARATOR_TEXT[] = ",";
+static const char *KEYPAD_SEPARATOR_APP[] = {
+    "\x1bOl", "\x1bO2l", "\x1bO5l", "\x1bO6l",
+    "\x1bO3l", "\x1bO4l", "\x1bO7l", "\x1bO8l"
+};
 
 /* These are dependencies of this bridge, not an advertisement of all the
  * features present in libghostty. Stripped builds must fail before allocation. */
@@ -41,6 +52,7 @@ static const struct {
     {GHOSTTY_BUILD_INFO_KITTY_GRAPHICS, "kitty_graphics"},
     {GHOSTTY_BUILD_INFO_FEATURE_FORMATTER, "formatter"},
     {GHOSTTY_BUILD_INFO_FEATURE_SELECTION, "selection"},
+    {GHOSTTY_BUILD_INFO_FEATURE_SEARCH, "search"},
     {GHOSTTY_BUILD_INFO_FEATURE_RENDER_STATE, "render_state"},
     {GHOSTTY_BUILD_INFO_FEATURE_INPUT_ENCODE, "input_encode"},
     {GHOSTTY_BUILD_INFO_FEATURE_COLOR, "color"},
@@ -71,10 +83,11 @@ typedef struct {
     GhosttyMouseEncoder mouse_encoder;
     GhosttyMouseEvent mouse_event;
     GhosttyFormatter formatter;
+    GhosttySearch search;
     GhosttySelectionGesture gesture;
     GhosttyTrackedGridRef anchor;
     GhosttyTerminalScreen anchor_screen;
-    Buffer output, replies, grapheme, link, effects;
+    Buffer output, replies, grapheme, link, effects, identity;
     Buffer held_frame, held_images;
     bool held;
     uint64_t hold_serial;
@@ -168,6 +181,23 @@ static void pwd_changed(GhosttyTerminal terminal, void *userdata) {
 int ish_vt_png_decoder(GhosttySysDecodePngFn callback) {
     return ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)callback);
 }
+int ish_vt_log(GhosttySysLogFn callback) {
+    return ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, (const void *)callback);
+}
+static GhosttyString xtversion(GhosttyTerminal terminal, void *userdata) {
+    (void)terminal;
+    Terminal *state = userdata;
+    return (GhosttyString){.ptr = state->identity.data, .len = state->identity.len};
+}
+int ish_vt_identity(Terminal *state, const uint8_t *name, size_t name_len,
+                    const uint8_t *version, size_t version_len) {
+    if (!state || !name || !version || name_len > ISH_IDENTITY_BYTES || version_len > ISH_IDENTITY_BYTES) return ISH_LIMIT;
+    GhosttyString term = {.ptr = name, .len = name_len};
+    CHECK(ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &term));
+    state->identity.len = 0;
+    CHECK(append(&state->identity, version, version_len));
+    return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_XTVERSION, (const void *)xtversion);
+}
 void *ish_vt_image_alloc(const GhosttyAllocator *allocator, size_t size) {
     return size <= ISH_MAX_BUFFER ? ghostty_alloc(allocator, size) : NULL;
 }
@@ -189,6 +219,7 @@ void ish_vt_free(Terminal *state) {
     ghostty_tracked_grid_ref_free(state->anchor);
     ghostty_selection_gesture_free(state->gesture, state->terminal);
     ghostty_formatter_free(state->formatter);
+    ghostty_search_free(state->search);
     ghostty_mouse_event_free(state->mouse_event);
     ghostty_mouse_encoder_free(state->mouse_encoder);
     ghostty_key_event_free(state->event);
@@ -199,7 +230,7 @@ void ish_vt_free(Terminal *state) {
     ghostty_render_state_free(state->render);
     ghostty_terminal_free(state->terminal);
     free(state->output.data); free(state->replies.data); free(state->grapheme.data);
-    free(state->link.data); free(state->effects.data);
+    free(state->link.data); free(state->effects.data); free(state->identity.data);
     free(state->held_frame.data); free(state->held_images.data);
     free(state);
 }
@@ -220,6 +251,7 @@ Terminal *ish_vt_new(unsigned cols, unsigned rows) {
         ghostty_mouse_event_new(NULL, &state->mouse_event) ||
         ghostty_selection_gesture_new(NULL, &state->gesture) ||
         ghostty_formatter_terminal_new(NULL, &state->formatter, state->terminal) ||
+        ghostty_search_new(NULL, &state->search, state->terminal) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_USERDATA, state) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)write_pty) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SIZE, (const void *)report_size) ||
@@ -247,7 +279,62 @@ int ish_vt_feed(Terminal *state, const uint8_t *data, size_t len) {
     state->colors_dirty = true;
     ghostty_terminal_vt_write(state->terminal, data, len);
     state->colors_dirty = true;
+    bool failed = false;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_VT_PROCESSING_ERROR, &failed));
+    if (failed) return ISH_PROCESSING;
     return state->replies.error ? state->replies.error : state->hold_error;
+}
+int ish_vt_processing_error(Terminal *state) {
+    if (!state) return ISH_LIMIT;
+    bool failed = false;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_VT_PROCESSING_ERROR, &failed));
+    return failed;
+}
+int ish_vt_keyboard_flags(Terminal *state, uint32_t *out) {
+    if (!state || !out) return ISH_LIMIT;
+    GhosttyKittyKeyFlags flags = 0;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS, &flags));
+    *out = flags;
+    return 0;
+}
+int ish_vt_default_cursor(Terminal *state, unsigned shape, bool blink) {
+    if (!state || shape > GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW) return ISH_LIMIT;
+    GhosttyCursorStyle style = (GhosttyCursorStyle)shape;
+    CHECK(ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &style));
+    return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
+}
+int ish_vt_search_set(Terminal *state, const uint8_t *text, size_t len) {
+    if (!state || (!text && len) || len > ISH_SEARCH_BYTES) return ISH_LIMIT;
+    GhosttyString needle = {.ptr = text, .len = len};
+    return ghostty_search_set(state->search, GHOSTTY_SEARCH_OPT_NEEDLE, &needle);
+}
+int ish_vt_search_step(Terminal *state, unsigned budget, unsigned *status, uint64_t *count) {
+    if (!state || !status || !count || !budget || budget > ISH_SEARCH_STEPS) return ISH_LIMIT;
+    GhosttySearchStatus progress;
+    CHECK(ghostty_search_feed(state->search));
+    for (unsigned i = 0; i < budget; i++) {
+        CHECK(ghostty_search_tick(state->search, &progress));
+        if (progress == GHOSTTY_SEARCH_STATUS_COMPLETE) break;
+        if (progress == GHOSTTY_SEARCH_STATUS_FEED_REQUIRED) CHECK(ghostty_search_feed(state->search));
+    }
+    size_t found;
+    CHECK(ghostty_search_get(state->search, GHOSTTY_SEARCH_DATA_TOTAL_MATCHES, &found));
+    *status = progress; *count = found;
+    return 0;
+}
+int ish_vt_search_select(Terminal *state, bool previous, uint64_t *index) {
+    if (!state || !index) return ISH_LIMIT;
+    *index = UINT64_MAX;
+    int result = previous ? ghostty_search_select_prev(state->search) : ghostty_search_select_next(state->search);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    CHECK(result);
+    GhosttySelection selection;
+    size_t selected;
+    CHECK(ghostty_search_get(state->search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &selection));
+    CHECK(ghostty_search_get(state->search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &selected));
+    CHECK(ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection));
+    *index = selected;
+    return 0;
 }
 int ish_vt_appearance(Terminal *state, const uint8_t *colors, size_t len, int scheme) {
     if (!state || !colors || len != ISH_APPEARANCE_BYTES || scheme < -1 || scheme > 1) return ISH_LIMIT;
@@ -728,7 +815,49 @@ static const NamedKey NAMED_KEYS[] = {
     {"f1", GHOSTTY_KEY_F1}, {"f2", GHOSTTY_KEY_F2}, {"f3", GHOSTTY_KEY_F3},
     {"f4", GHOSTTY_KEY_F4}, {"f5", GHOSTTY_KEY_F5}, {"f6", GHOSTTY_KEY_F6},
     {"f7", GHOSTTY_KEY_F7}, {"f8", GHOSTTY_KEY_F8}, {"f9", GHOSTTY_KEY_F9},
-    {"f10", GHOSTTY_KEY_F10}, {"f11", GHOSTTY_KEY_F11}, {"f12", GHOSTTY_KEY_F12}
+    {"f10", GHOSTTY_KEY_F10}, {"f11", GHOSTTY_KEY_F11}, {"f12", GHOSTTY_KEY_F12},
+    {"f13", GHOSTTY_KEY_F13},
+    {"f14", GHOSTTY_KEY_F14},
+    {"f15", GHOSTTY_KEY_F15},
+    {"f16", GHOSTTY_KEY_F16},
+    {"f17", GHOSTTY_KEY_F17},
+    {"f18", GHOSTTY_KEY_F18},
+    {"f19", GHOSTTY_KEY_F19},
+    {"f20", GHOSTTY_KEY_F20},
+    {"f21", GHOSTTY_KEY_F21},
+    {"f22", GHOSTTY_KEY_F22},
+    {"f23", GHOSTTY_KEY_F23},
+    {"f24", GHOSTTY_KEY_F24},
+    {"f25", GHOSTTY_KEY_F25},
+    {"kp0", GHOSTTY_KEY_NUMPAD_0},
+    {"kp1", GHOSTTY_KEY_NUMPAD_1},
+    {"kp2", GHOSTTY_KEY_NUMPAD_2},
+    {"kp3", GHOSTTY_KEY_NUMPAD_3},
+    {"kp4", GHOSTTY_KEY_NUMPAD_4},
+    {"kp5", GHOSTTY_KEY_NUMPAD_5},
+    {"kp6", GHOSTTY_KEY_NUMPAD_6},
+    {"kp7", GHOSTTY_KEY_NUMPAD_7},
+    {"kp8", GHOSTTY_KEY_NUMPAD_8},
+    {"kp9", GHOSTTY_KEY_NUMPAD_9},
+    {"kpdecimal", GHOSTTY_KEY_NUMPAD_DECIMAL},
+    {"kpdivide", GHOSTTY_KEY_NUMPAD_DIVIDE},
+    {"kpmultiply", GHOSTTY_KEY_NUMPAD_MULTIPLY},
+    {"kpsubtract", GHOSTTY_KEY_NUMPAD_SUBTRACT},
+    {"kpadd", GHOSTTY_KEY_NUMPAD_ADD},
+    {"kpenter", GHOSTTY_KEY_NUMPAD_ENTER},
+    {"kpequal", GHOSTTY_KEY_NUMPAD_EQUAL},
+    {"kpseparator", GHOSTTY_KEY_NUMPAD_SEPARATOR},
+    {"kpleft", GHOSTTY_KEY_NUMPAD_LEFT},
+    {"kpright", GHOSTTY_KEY_NUMPAD_RIGHT},
+    {"kpup", GHOSTTY_KEY_NUMPAD_UP},
+    {"kpdown", GHOSTTY_KEY_NUMPAD_DOWN},
+    {"kppageup", GHOSTTY_KEY_NUMPAD_PAGE_UP},
+    {"kppagedown", GHOSTTY_KEY_NUMPAD_PAGE_DOWN},
+    {"kphome", GHOSTTY_KEY_NUMPAD_HOME},
+    {"kpend", GHOSTTY_KEY_NUMPAD_END},
+    {"kpinsert", GHOSTTY_KEY_NUMPAD_INSERT},
+    {"kpdelete", GHOSTTY_KEY_NUMPAD_DELETE},
+    {"kpbegin", GHOSTTY_KEY_NUMPAD_BEGIN},
 };
 static GhosttyKey physical_key(uint32_t point) {
     if (point >= 'A' && point <= 'Z') point += 'a' - 'A';
@@ -743,6 +872,21 @@ static GhosttyKey physical_key(uint32_t point) {
         case ';': return GHOSTTY_KEY_SEMICOLON; case '\'': return GHOSTTY_KEY_QUOTE;
         case '`': return GHOSTTY_KEY_BACKQUOTE; default: return GHOSTTY_KEY_UNIDENTIFIED;
     }
+}
+static int keypad_separator(Terminal *state, unsigned modifiers, unsigned action) {
+    if (action == GHOSTTY_KEY_ACTION_RELEASE) return 0;
+    uint32_t flags = 0;
+    CHECK(ish_vt_keyboard_flags(state, &flags));
+    if (flags) return 0;
+    GhosttyTerminalModeConfig application = {.mode = GHOSTTY_MODE_KEYPAD_KEYS};
+    GhosttyTerminalModeConfig numlock = {.mode = GHOSTTY_MODE_IGNORE_KEYPAD_WITH_NUMLOCK};
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MODE, &application));
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_MODE, &numlock));
+    /* Match the native legacy keypad rule. Mode 1035 chooses numeric keys;
+     * physical lock state is not inferred from a host's ambiguous text input. */
+    const char *sequence = application.value && !numlock.value
+        ? KEYPAD_SEPARATOR_APP[modifiers] : KEYPAD_SEPARATOR_TEXT;
+    return append(&state->output, sequence, strlen(sequence));
 }
 int ish_vt_key(Terminal *state, const char *name, const uint8_t *text, size_t text_len,
                uint32_t point, unsigned modifiers, unsigned action, const uint8_t **out, size_t *len) {
@@ -765,7 +909,12 @@ int ish_vt_key(Terminal *state, const char *name, const uint8_t *text, size_t te
         size_t needed = buffer->len; buffer->len = 0; CHECK(reserve(buffer, needed));
         result = ghostty_key_encoder_encode(state->encoder, state->event, buffer->data, buffer->cap, &buffer->len);
     }
-    CHECK(result); *out = buffer->data; *len = buffer->len;
+    CHECK(result);
+    /* Prefer native encoding, including future native separator support. No
+     * duplicate mode state or replacement of negotiated keyboard output. */
+    if (!buffer->len && key == GHOSTTY_KEY_NUMPAD_SEPARATOR)
+        CHECK(keypad_separator(state, modifiers, action));
+    *out = buffer->data; *len = buffer->len;
     return 0;
 }
 static bool read_paste(void *userdata, GhosttyString mime, GhosttyWriter writer) {
@@ -935,4 +1084,24 @@ int ish_vt_selection_text(Terminal *state, const uint8_t **out, size_t *len) {
     CHECK(result); CHECK(cleared); CHECK(buffer->error);
     *out = buffer->data; *len = buffer->len;
     return 0;
+}
+
+/* Classify an extension namespace without feeding or mutating a live terminal.
+ * Known commands remain native-owned even when a supplied body is malformed. */
+int ish_vt_osc_unknown(const unsigned char *body, size_t len) {
+    if (!body || !len || len > ISH_MAX_BUFFER) return ISH_LIMIT;
+    GhosttyOscParser parser = NULL;
+    int status = ghostty_osc_new(NULL, &parser);
+    if (status != GHOSTTY_SUCCESS) return ISH_MEMORY;
+    size_t limit = len;
+    status = ghostty_osc_set(parser, GHOSTTY_OSC_OPT_UNKNOWN_MAX_BYTES, &limit);
+    if (status != GHOSTTY_SUCCESS) {
+        ghostty_osc_free(parser);
+        return ISH_LIMIT;
+    }
+    for (size_t i = 0; i < len; ++i) ghostty_osc_next(parser, body[i]);
+    GhosttyOscCommand command = ghostty_osc_end(parser, 0x07);
+    bool unknown = ghostty_osc_command_type(command) == GHOSTTY_OSC_COMMAND_UNKNOWN;
+    ghostty_osc_free(parser);
+    return unknown ? 1 : 0;
 }

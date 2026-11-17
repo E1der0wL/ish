@@ -1,5 +1,27 @@
 # ish 작업 규칙
 
+## 이 worktree의 실험 범위
+
+- 호스트 기능 정책은 `terminal.features`가 소유한다. 기능마다 on/off를 제공하고 실제 지원 질의를 구현한 항목만 auto를 허용한다. 사용자 정책·관찰한 지원 응답·실제 선택 profile·이미 변경한 상태를 구분한다. on으로 관찰 결과를 위조하지 않고 크기·복원 필수 조건을 유지한다. 호스트 이름은 일반 기능 허용 근거로 사용하지 않으며 검증된 개별 차이 보정만 hosts 경계에 둔다.
+- `codex/hookless-vt` / `ish-hookless-vt/ish`에서 기존 `ish-vt`를 재사용한다. `experiment/prompt-stream`, `experiment/ghostty-ptk`, `refactor/editor-request`, main의 브랜치·폴더·환경을 변경하지 않는다.
+- 이번 사용자 요청이 아래 stream 전용 정책보다 우선한다. `ish`의 기존 stream 진입점은 보존하고, 별도 `ish-vt`에서 libghostty-vt + PTK 화면 합성을 검증한다. tmux나 Zellij를 실행 의존성으로 추가하지 않는다.
+- 기본형에는 추가 UI·UI 전용 단축키·셸 hook이 없다. 명시적으로 선택한 외부 Python 플러그인만 하단 행과 전역 팝업 단축키를 등록한다. 내부 history의 Shift+PageUp/Down과 UI 단축키는 구분한다. 제품 `--demo` 옵션은 추가하지 않는다.
+- 마우스 정책은 off/auto/on이며 기본은 auto다. off는 프로그램·플러그인 요청보다 우선하여 호스트 선택을 유지한다. auto는 native mouse mode 또는 명시적인 클릭 UI 요청에서만 capture한다. keyboard-only popup은 capture를 요청하지 않는다. tracking과 1016 좌표 형식을 구분하고 모드 전환·resize·종료 시 단일 소유자에서 정리한다.
+- 프로토콜 보완 모듈은 기존 PluginManager와 ProtocolRegistry를 사용한다. 세션 첫 입력 전에 담당자를 고정하고 selector 충돌·native 선점을 거부한다. 실패한 입력을 다른 해석기로 재전달하지 않는다. 공개 등록은 검증된 미지원 OSC numeric namespace부터 제공하며 APC/DCS/CSI 전체 지원으로 확대 해석하지 않는다.
+- 외부 출력·키·클립보드 보완 모듈은 모두 기존 PluginManager의 단일 plugin_dir와 config.vt.plugins로 관리한다. 기능별 검색 경로나 별도 로더를 추가하지 않는다. plugin_lib_dir는 기존 공통 의존성 경로이며 모듈 검색 경로가 아니다. Python 모듈 변경은 새 세션부터 적용하고 실행 중 담당자를 교체하지 않는다.
+- 출력 OSC 등록과 호스트 키 등록은 별도 계약이다. 키 확장은 완성된 미소유 시퀀스를 기존 공통 키로 변환하는 제한된 등록만 제공한다. 본체가 제어문 분리·응답 예약·협상·포커스·PTY 쓰기를 소유하며 기존 키·응답·붙여넣기 영역 선점과 등록 충돌을 거부한다. 외부 모듈에 writer나 임의 원문 입력 재전달 API를 제공하지 않는다.
+- 지원하는 문자·키·붙여넣기의 내용·순서·출처를 보존한다. 터미널 응답과 구별할 수 없는 신호 및 미지원 제어 시퀀스를 사용자 키로 추측하지 않으며, 시간 경과나 화면 문자열로 모호성을 해소하지 않는다. 단축키 미등록과 입력 형식 미지원을 구분하고 제한되는 형식을 진단·문서·독립 회귀에 명시한다.
+- 프로그램 클립보드 접근의 기본값은 write이며 read-write는 명시적인 설정으로 켠다. ClipboardBroker가 허용 정책·요청 identity·취소·응답을 소유하고 보완 provider는 실제 OS/X11 전송과 자원 수명을 담당한다. 명시한 대상이 실패하면 다른 데스크톱이나 내부 캐시로 대체하지 않는다. 호스트 프로토콜 지원과 로컬 provider 가용성을 같은 capability로 위장하지 않으며 입력·클립보드 내용은 일반 로그에 남기지 않는다.
+- libghostty가 화면·커서·history를 계속 소유한다. 보완 모듈은 완전한 native 입력과 순서가 있는 PTY 응답만 반환하며 호스트 writer를 갖지 않는다. 새 native 지원은 동일 계약 테스트를 통과한 후 보완 모듈을 대체한다. clipboard 정책·호스트 표현 등 ish의 책임은 유지한다.
+- 공통 .ishrc.py의 config.vt 사전만 VT 플러그인·마우스·history 정책을 선택한다. config.plugins는 stream 전용으로 유지한다. 조회 옵션은 rc·plugin·native engine을 실행하거나 파일을 생성하지 않는다. native 로그 원문은 저장하지 않고 severity·프로토콜 실패 횟수만 진단한다.
+- 셸·프로그램 출력은 libghostty-vt의 화면 상태에만 반영하고 하나의 PTK renderer가 셸 화면과 플러그인 UI를 합성한다. 화면·스크롤백·선택 상태는 libghostty-vt, 포커스는 Application, PTY 수명과 쓰기 큐는 Session이 소유한다.
+- ish-vt가 변경한 터미널 상태는 관찰한 시작값으로 복원한다. 제목은 명시적인 예외로, 자식의 제목 변경을 기존 writer로 전달하고 종료·중지 때 원래 제목으로 되돌리지 않는다. 제목 조회나 title stack을 변경 허용 조건으로 요구하지 않는다.
+- SIGKILL·호스트 소멸 등 예외적인 강제 종료에서의 완전 복원은 추가 구현 목표에서 제외한다. 기존 정상 종료·처리 가능한 오류·중지 시 정리는 유지한다. 본체 터미널이 먼저 소비한 단축키는 ish의 입력 지원 결함으로 보고하지 않는다.
+- 셸 rc, PROMPT_COMMAND, precmd, ZLE 및 프롬프트 문자열을 ish가 변경하거나 상태 감지에 사용하지 않는다. 명령줄·continuation·heredoc은 native 셸, 실행 중 프로그램의 stdin은 기존 PTY가 담당한다.
+- 전용 팝업 키는 셸·프로그램 어디에서든 ish가 소비한다. 팝업 이후 입력만 팝업에 전달한다. 이전에 PTY에 보낸 입력의 회수나 실행 중 프로세스 정지를 보장하지 않는다. 팝업 결과를 자동으로 셸 명령으로 실행하지 않는다.
+- 기존 PluginManager가 Python 로딩·의존성을 담당한다. VT 표면 등록 API와 공통 설정·번역·로그를 재사용하며 별도 Python 모듈 로더를 만들지 않는다.
+- `tools/check_terminal.py`로 필수 회귀의 환경·모듈 누락·빈 테스트·skip을 실패로 처리한다. 실제 Windows Terminal/WSL 검증은 자동 PTY 회귀 및 선택적 Kitty GUI 테스트와 구분한다. 이번 범위는 Bash/zsh/tcsh, 기본형/플러그인, heredoc, Vim, resize이며 검증하지 않은 호스트·이미지 기능의 완전 지원을 선언하지 않는다.
+
 ## 범위와 목표
 
 - 이 브랜치는 experiment/prompt-stream에서 native 셸 출력 직접 전달과 primary 프롬프트 전용 PTK UI를 실험한다. 기존 experiment/ghostty-ptk 폴더와 브랜치를 수정하지 않는다.

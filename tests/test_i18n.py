@@ -25,7 +25,7 @@ PRODUCT_SOURCES = (
     "src/ish/runtime/diagnostics.py",
     "src/ish/runtime/startup.py",
     "src/ish/runtime/fdio.py",
-    "src/ish/terminal/session.py",
+    "src/ish/terminal",
     "examples/stream_plugins/stream_bar/stream_bar.py",
     "examples/stream_plugins/stream_popup/stream_popup.py",
 )
@@ -146,6 +146,71 @@ class LanguageTests(unittest.TestCase):
             self.language.get(Message.STREAM_SHELL_ERROR, shell="missing"),
             "Shell executable not found: missing",
         )
+
+    def test_terminal_native_failures_use_the_selected_language(self):
+        """Construction errors translate without requiring a native library."""
+        from types import SimpleNamespace
+
+        from ish.terminal.vt import Terminal, TerminalError
+
+        self.language.load("ko", create=False)
+        library = SimpleNamespace(_ish_engine=None, ish_vt_new=lambda *_: 0)
+        with (
+            patch("ish.terminal.vt.i18n", self.language),
+            patch("ish.terminal.vt._load", return_value=library),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "터미널 크기가 262144셀 한도를 초과"
+            ):
+                Terminal(262145, 1, lambda _: None)
+            with self.assertRaisesRegex(TerminalError, "터미널을 할당할 수 없습니다"):
+                Terminal(10, 4, lambda _: None)
+
+    def test_terminal_diagnostics_omit_host_and_decoder_error_text(self):
+        """Normal logs use trusted translations, not child-controlled strings."""
+        from types import SimpleNamespace
+
+        from ish.terminal.diagnostics import report_session
+
+        self.language.load("ko", create=False)
+        application = SimpleNamespace(
+            vt=SimpleNamespace(
+                framing_drops=0, protocol_failures=(), image_failure_count=2
+            ),
+            app=SimpleNamespace(
+                renderer=SimpleNamespace(
+                    graphics_error="PRIVATE_HOST_REPLY", graphics_failure_count=3
+                )
+            ),
+            host=SimpleNamespace(
+                feature_status={
+                    "hyperlinks": SimpleNamespace(
+                        policy="off",
+                        support="unqueried",
+                        active=False,
+                        reason="policy-off",
+                    )
+                },
+                dropped_controls=4,
+                graphics_reason="PRIVATE_HOST_REASON",
+                profile=SimpleNamespace(image_protocol=None),
+            ),
+            clipboard=SimpleNamespace(failures=5),
+        )
+        logger = logging.getLogger("vt-diagnostics-test")
+        with (
+            patch("ish.lang.i18n", self.language),
+            self.assertLogs(logger, level="INFO") as captured,
+        ):
+            report_session(application, logger)
+        output = "\n".join(captured.output)
+        self.assertIn("이미지 입력 거부: 오류 2개(본문 제외)", output)
+        self.assertIn("이미지 출력 실패: 오류 3개(호스트 응답 및 본문 제외)", output)
+        self.assertIn(
+            "지원하는 호스트 이미지 출력 프로토콜을 확인하지 못했습니다", output
+        )
+        self.assertNotIn("PRIVATE_HOST_REPLY", output)
+        self.assertNotIn("PRIVATE_HOST_REASON", output)
 
     def test_current_product_messages_have_complete_korean_contracts(self):
         """Consumer references require Korean entries with the same named fields."""

@@ -133,12 +133,12 @@ def _image_scene(frame, origin, clip, occluders):
 
 
 class DisabledPresenter:
-    """Keep unsupported output inert without reading native image assets."""
+    """Keep unselected output inert without reading native image assets."""
 
     protocol = None
 
     def scene_key(self, frame, *, origin=(0, 0), clip=None, occluders=()) -> tuple:
-        """No scene can enable an unverified host protocol."""
+        """No scene can bypass the broker's output selection."""
         return ()
 
     def plan(self, frame, image_lookup, *, origin=(0, 0), clip=None, occluders=()):
@@ -513,7 +513,7 @@ class GraphicsPresenter:
 
 
 class RasterPresenter:
-    """Compose one bounded raster for verified hosts without image resource IDs.
+    """Compose one bounded raster for selected output without image resource IDs.
 
     These protocols need pixel retransmission after text rendering. Encoded data
     is cached until the image scene changes; ECH removes old coverage and asks
@@ -710,7 +710,7 @@ class RasterPresenter:
 
 
 def create_presenter(protocol: str | None) -> Presenter:
-    """Select verified host output independently of native input providers.
+    """Instantiate the broker's selected output independently of native input providers.
 
     This is the only selection point. A replacement can retire a backend and
     its encoder once the Presenter wire/occlusion/cleanup tests pass unchanged.

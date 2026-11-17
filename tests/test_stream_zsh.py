@@ -448,15 +448,20 @@ bindkey '\eOR' failing-widget
                 shell.send(b"\x1bOR")
                 shell.until((root / "widget-log").exists)
                 shell.submit("\n")
+                # The previous widget's P marker and the next prompt text may
+                # arrive before this submission's user init hook runs. Wait for
+                # its actual file result, not an unrelated redraw/marker pair.
+                shell.until(lambda: (root / "init-log").read_bytes().count(b"\n") >= 3)
                 results.append(
                     (
                         (root / "init-log").read_bytes(),
                         (root / "widget-log").read_bytes(),
                     )
                 )
-        self.assertEqual(*results)
-        self.assertIn(b"1:on\n", results[0][0])
-        self.assertEqual(results[0][1], b"failing-widget:on\n")
+        self.assertEqual(
+            results,
+            [(b"0:on\n1:on\n1:on\n", b"failing-widget:on\n")] * 2,
+        )
 
 
 if __name__ == "__main__":

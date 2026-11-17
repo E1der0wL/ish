@@ -13,6 +13,8 @@ import time
 import unittest
 from pathlib import Path
 
+from terminal_plugin import plugin_options
+
 ROOT = Path(__file__).resolve().parents[1]
 KITTY = ROOT / ".cache/terminal-test/kitty/bin/kitty"
 KITTEN = KITTY.with_name("kitten")
@@ -137,7 +139,7 @@ class TerminalGuiTests(unittest.TestCase):
             str(self.dump),
         ]
         if self._testMethodName != "test_base_has_no_plugin_ui_or_reserved_keys":
-            command += ["--plugin", "terminal_plugin:setup"]
+            command += plugin_options(self.directory)
         self.process = subprocess.Popen(
             command,
             env=self.env,

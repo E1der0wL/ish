@@ -9,8 +9,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ish.lang import Message, i18n
+
 from .vt import ALT, CTRL, SHIFT
 
+DEFAULT_MOUSE = "auto"
+MOUSE_POLICIES = ("off", "auto", "on")
 MAX_COORDINATE = 65_535
 LEGACY_PREFIX = "\x1b[M"
 LEGACY_LENGTH = 6
@@ -27,6 +31,19 @@ BYTE_MAX = 255
 SURROGATE_MIN = 0xDC80
 SURROGATE_MAX = 0xDCFF
 SURROGATE_OFFSET = 0xDC00
+
+
+def validate_mouse_policy(policy):
+    """Validate the same capture contract for startup and live UI consumers."""
+    if policy not in MOUSE_POLICIES:
+        raise ValueError(
+            i18n.get(
+                Message.VT_SETTING_CHOICE,
+                name="mouse",
+                choices=", ".join(MOUSE_POLICIES),
+            )
+        )
+    return policy
 
 
 @dataclass(frozen=True)

@@ -573,6 +573,7 @@ class PrimaryInputTests(unittest.IsolatedAsyncioTestCase):
         import test_terminal_composition as composition
 
         await composition.TerminalCompositionTests.asyncSetUp(self)
+        self.owner.set_mouse_policy("on")
         self.owner.host.begin_probe(12, 6)
         self.owner.host.control("\x1bP>|kitty(0.50.0)\x1b\\")
         self.owner.host.control("\x1b[?5522;2$y")

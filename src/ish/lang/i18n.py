@@ -476,6 +476,289 @@ class Message(StrEnum):
     STREAM_SAMPLE_BAR = auto(), "ish stream | native shell | F2 popup"
     STREAM_SAMPLE_POPUP = auto(), "Plugin popup | Enter accepts | Esc cancels"
 
+    # Hookless VT plugin selection and optional sample UI.
+    VT_PLUGIN_HELP = (
+        auto(),
+        "Load terminal plugin NAME; repeat to select more (none by default).",
+    )
+    VT_PLUGIN_DIR_HELP = (
+        auto(),
+        "Read selected terminal plugins from DIR (default: {path}).",
+    )
+    VT_PLUGIN_ONCE = auto(), "Terminal plugins can only be loaded once"
+    VT_PLUGIN_MISSING = auto(), "Cannot load terminal plugin: {name}"
+    VT_PLUGIN_API = auto(), "Unsupported terminal plugin API: {name}"
+    VT_PLUGIN_SETUP = auto(), "Terminal plugin has no setup function: {name}"
+    VT_PLUGIN_CLOSED = auto(), "Plugin UI is closed"
+    VT_PLUGIN_KEY = auto(), "Terminal UI shortcuts reserve one key, not input prefixes"
+    VT_BAR_HEIGHT = auto(), "Invalid bar height"
+    VT_POPUP_UNAVAILABLE = auto(), "Cannot open another popup"
+    VT_POPUP_GEOMETRY = auto(), "Popup geometry must be positive"
+    VT_SAMPLE_BAR = auto(), "ish | native terminal | F2 popup"
+    VT_DESCRIPTION = (
+        auto(),
+        "Run a native shell in a hookless libghostty-vt + PTK terminal; no UI plugins by default.",
+    )
+    VT_VERSION = auto(), "ish-vt {version} (separate VT experiment)"
+    VT_LOGIN_HELP = (
+        auto(),
+        "Start the native shell with -l; shell startup files remain unchanged.",
+    )
+    VT_MOUSE_HELP = (
+        auto(),
+        "Mouse capture: off, auto (child or plugin request), or on (including local selection). Default: auto.",
+    )
+    VT_CLIPBOARD_HELP = (
+        auto(),
+        "Child clipboard access: off, write, or read-write (default: write; host permissions apply).",
+    )
+    VT_SCROLLBACK_LINES_HELP = (
+        auto(),
+        "Approximate native history line limit (default: 10000; page granularity).",
+    )
+    VT_SCROLLBACK_BYTES_HELP = (
+        auto(),
+        "Native history byte limit (default: 33554432; zero disables history).",
+    )
+    VT_SETTING_CHOICE = auto(), "{name} must be one of: {choices}"
+    VT_SETTING_LIMIT = auto(), "{name} must be an integer from 0 to {maximum}"
+    VT_SETTING_NAMESPACE = auto(), "config.vt must be a dictionary of VT settings"
+    VT_SETTING_UNKNOWN = auto(), "Unknown config.vt setting: {name}"
+    VT_FEATURES_MAPPING = (
+        auto(),
+        "config.vt.features must be a dictionary of feature names and on/off/auto policies",
+    )
+    VT_FEATURE_ASSIGNMENT = auto(), "Feature selection must use NAME=on|off|auto"
+    VT_FEATURE_HELP = (
+        auto(),
+        "Set one host feature to on, off, or auto; repeat for multiple features. CLI overrides the matching config.vt.features entry. Auto uses implemented support queries only. clipboard_protocol selects OSC5522 host transport, not clipboard access permission.",
+    )
+    VT_DIAGNOSE_FEATURES = auto(), "Requested feature policies (host not probed)"
+    VT_FEATURE_STATUS = (
+        auto(),
+        "{name}: policy={policy}, support={support}, active={active}, reason={reason}",
+    )
+    VT_DIAGNOSE_TITLE = auto(), "ish-vt environment diagnostics"
+    VT_DIAGNOSE_SCOPE = (
+        auto(),
+        "Read-only configuration report: rc, plugins, shell and native library are not executed; host features are not probed. This is separate from ish's stream path.",
+    )
+    VT_DIAGNOSE_NAMESPACE = auto(), "VT settings namespace"
+    VT_DIAGNOSE_MOUSE = auto(), "Mouse capture"
+    VT_CURSOR_DEFAULT = auto(), "Invalid default cursor shape or blink setting"
+    VT_LIBRARY_LOAD = (
+        auto(),
+        "Cannot load {path}. Run tools/build_ghostty_vt.py in Linux/WSL, or set {variable} to the built libish_vt.so. {error}",
+    )
+    VT_ENGINE_REBUILD = auto(), "Rebuild with tools/build_ghostty_vt.py."
+    VT_ENGINE_ENTRY = auto(), "Missing native metadata entry point {name}. {rebuild}"
+    VT_ENGINE_VERSION = auto(), "Invalid native version from {name}. {rebuild}"
+    VT_ENGINE_ABI = (
+        auto(),
+        "Native bridge ABI {actual!r} does not match required ABI {expected}. {rebuild}",
+    )
+    VT_ENGINE_UNVERIFIED = (
+        auto(),
+        "Unverified libghostty-vt artifact: headers={headers}, runtime={version}; this build requires {expected}. {rebuild}",
+    )
+    VT_ENGINE_FEATURE = auto(), "Native build lacks required feature {name}. {rebuild}"
+    VT_FRAMING_DROPS = (
+        auto(),
+        "Oversized terminal controls discarded: {count} (payload omitted)",
+    )
+    VT_DIAGNOSE_COLOR_DEPTH = auto(), "Color depth policy"
+    VT_COLOR_DEPTH_HELP = (
+        auto(),
+        "Output color depth: inherit, 1, 4, 8, or 24 bits (default: inherit PTK/environment settings; this does not probe host support).",
+    )
+    VT_DIAGNOSE_CLIPBOARD = auto(), "Child clipboard access"
+    VT_CLIPBOARD_LOCKED = (
+        auto(),
+        "Clipboard providers must be registered before the session starts",
+    )
+    VT_CLIPBOARD_DUPLICATE = auto(), "Only one clipboard provider can be selected"
+    VT_CLIPBOARD_DELIVERY = auto(), "Clipboard response delivery failed"
+    VT_CLIPBOARD_PROVIDER = (
+        auto(),
+        "Clipboard provider must define async read/write/aclose and close methods",
+    )
+    VT_CLIPBOARD_FAILURES = (
+        auto(),
+        "Clipboard connection failures: {count} (contents omitted)",
+    )
+    VT_KEY_MAP_LATE = (
+        auto(),
+        "Terminal key mappings are fixed before the first host input.",
+    )
+    VT_KEY_MAP_NAME = auto(), "Invalid or duplicate terminal key mapping name."
+    VT_KEY_MAP_LIMIT = (
+        auto(),
+        "Terminal key mappings exceed the registration limit or are empty.",
+    )
+    VT_KEY_MAP_SEQUENCE = (
+        auto(),
+        "Terminal key mappings require complete numeric CSI ~ sequences.",
+    )
+    VT_KEY_MAP_RESERVED = (
+        auto(),
+        "Terminal key mapping overlaps a native key or reserved control sequence.",
+    )
+    VT_KEY_MAP_CONFLICT = (
+        auto(),
+        "Terminal key mapping is already owned by another registration.",
+    )
+    VT_KEY_MAP_EVENT = (
+        auto(),
+        "Terminal key mappings require a supported, consistent press event.",
+    )
+    VT_INPUT_DROPS = (
+        auto(),
+        "Unsupported host controls discarded: {count} (contents omitted)",
+    )
+    VT_DIAGNOSE_SCROLLBACK_LINES = auto(), "History line limit"
+    VT_DIAGNOSE_SCROLLBACK_BYTES = auto(), "History byte limit"
+    VT_DIAGNOSE_ENGINE = auto(), "Required native engine version"
+    VT_DIAGNOSE_ABI = auto(), "Required native bridge ABI"
+    VT_DIAGNOSE_LIBRARY = auto(), "Native library path"
+    VT_DIAGNOSE_LIBRARY_PRESENT = auto(), "Native library file exists (not loaded)"
+    VT_SESSION_START = auto(), "VT session start shell={shell} plugins={plugins}"
+    VT_SESSION_EXIT = auto(), "VT session exit status={status}"
+    VT_SESSION_ERROR = auto(), "ish-vt session failed: {error}"
+    VT_NATIVE_LOGS = (
+        auto(),
+        "Native diagnostics (payloads omitted): error={error}, warning={warning}, info={info}, debug={debug}",
+    )
+    VT_SEARCH_BUDGET = auto(), "Search budget must be between 1 and 64"
+    VT_STATE_LOST = auto(), "libghostty-vt could not preserve terminal state"
+    VT_SEARCH_TITLE = auto(), "Search scrollback"
+    VT_SEARCH_HINT = auto(), "Enter: older · Ctrl+P: newer · Esc: close"
+    VT_SEARCH_COUNT = auto(), "{count} matches"
+    VT_SEARCH_ERROR = auto(), "Search failed: {error}"
+    VT_PROTOCOL_LATE = auto(), "Protocols must be registered before terminal input"
+    VT_PROTOCOL_NAME = auto(), "Invalid protocol name"
+    VT_PROTOCOL_SELECTORS = (
+        auto(),
+        "Expected a control-string kind and tuple of prefixes",
+    )
+    VT_PROTOCOL_PREFIXES = auto(), "Invalid protocol prefixes"
+    VT_PROTOCOL_OVERLAP = auto(), "Overlapping protocol prefixes"
+    VT_PROTOCOL_LIMIT = auto(), "Too many protocol registrations"
+    VT_PROTOCOL_CONFLICT = auto(), "Protocol registration conflicts with {name}"
+    VT_PROTOCOL_PROVIDER = auto(), "Invalid protocol provider"
+    VT_PROTOCOL_FACTORY = auto(), "Protocol adapter requires a factory"
+    VT_PROTOCOL_METHODS = (
+        auto(),
+        "Protocol adapter must implement handle, cancel and close",
+    )
+    VT_PROTOCOL_CLOSED = auto(), "Protocol registry is closed"
+    VT_PROTOCOL_SYNC = auto(), "Protocol lifecycle callbacks must be synchronous"
+    VT_PROTOCOL_RESULT_TYPE = auto(), "Protocol handler must return ProtocolResult"
+    VT_PROTOCOL_RESULT = auto(), "Invalid protocol result"
+    VT_PROTOCOL_FAILURE = (
+        auto(),
+        "Protocol adapter failed: {name} ({count} errors; payload omitted)",
+    )
+    VT_PROTOCOL_REPLY = auto(), "Protocol replies require a session writer"
+    VT_PROTOCOL_OSC = auto(), "External protocols require numeric OSC namespaces"
+    VT_PROTOCOL_NUMBER = auto(), "Expected an exact numeric OSC prefix such as b'7400;'"
+    VT_PROTOCOL_NATIVE = (
+        auto(),
+        "Native or invalid OSC namespaces cannot be intercepted",
+    )
+    VT_PLUGIN_MOUSE = auto(), "mouse must be bool"
+    VT_INPUT_CLOSED = auto(), "Terminal input is closed"
+    VT_CLIPBOARD_LATE = auto(), "Clipboard must be attached before terminal input"
+    VT_DIMENSIONS = auto(), "Terminal dimensions exceed {limit} cells: {cols}x{rows}"
+    VT_BRIDGE_ERROR = auto(), "libghostty-vt bridge failed (status {status})"
+    VT_ALLOCATION_ERROR = auto(), "Cannot allocate libghostty-vt terminal"
+    VT_CLOSED = auto(), "Terminal is closed"
+    VT_NATIVE_BUFFER = auto(), "Invalid native buffer"
+    VT_CELL_DIMENSIONS = (
+        auto(),
+        "Cell pixel dimensions must both be zero or positive 16-bit values",
+    )
+    VT_NATIVE_ROW = auto(), "Invalid native row size"
+    VT_NATIVE_CELL = auto(), "Truncated native cell"
+    VT_NATIVE_IMAGES = auto(), "Truncated native image list"
+    VT_NATIVE_FRAME = auto(), "Unexpected native frame data"
+    VT_COLOR_SCHEME = auto(), "Invalid terminal color scheme"
+    VT_PALETTE_SIZE = auto(), "Appearance palette must contain 256 entries"
+    VT_RGB_COLOR = auto(), "Appearance colors must be RGB byte triples"
+    VT_IMAGE_LIMIT = auto(), "Image storage limit exceeds the bounded native buffer"
+    VT_IMAGE_GEOMETRY = auto(), "Graphics require confirmed cell pixel dimensions"
+    VT_IMAGE_DECODER = auto(), "PNG images require Pillow"
+    VT_IMAGE_ID = auto(), "Image ID exceeds unsigned 32-bit range"
+    VT_NATIVE_IMAGE = auto(), "Invalid native image payload"
+    VT_ANIMATION_TIME = auto(), "Animation timestamp exceeds unsigned 64-bit range"
+    VT_NATIVE_EFFECT = auto(), "Invalid native effect"
+    VT_HISTORY_LIMIT = (
+        auto(),
+        "Scrollback limits must be nonnegative signed 64-bit values",
+    )
+    VT_SCROLL_DELTA = auto(), "Scroll delta exceeds signed 64-bit range"
+    VT_MOUSE_EVENT = auto(), "Unknown mouse action or button"
+    VT_MOUSE_MODIFIERS = auto(), "Unsupported mouse modifiers"
+    VT_MOUSE_COORDINATES = auto(), "Mouse coordinates exceed signed 32-bit range"
+    VT_MOUSE_GEOMETRY = auto(), "Pixel mouse requires confirmed cell geometry"
+    VT_MOUSE_PIXELS = auto(), "Mouse pixels exceed signed 32-bit range"
+    VT_SELECTION_POINT = auto(), "Selection point is outside the viewport"
+    VT_SELECTION_ACTION = auto(), "Unknown selection action"
+    VT_SELECTION_COORDINATES = (
+        auto(),
+        "Selection coordinates exceed signed 32-bit range",
+    )
+    VT_SELECTION_POINTER = auto(), "Invalid selection pointer position"
+    VT_SELECTION_TIME = auto(), "Invalid selection event time"
+    VT_REPEAT_CLICK = auto(), "Invalid repeat-click policy"
+    VT_KEY_ACTION = auto(), "Unknown key action"
+    VT_KEY_MODIFIERS = auto(), "Unsupported key modifiers"
+    VT_INPUT_LIMIT = auto(), "Input is too large"
+    VT_KEY_COUNT = auto(), "Modifiers and key actions require one key"
+    VT_PASTE_LIMIT = auto(), "Paste is too large"
+    VT_DIAGNOSE_CONTROLS = auto(), "Unsupported control policy"
+    VT_CONTROL_POLICY = (
+        auto(),
+        "No general pass-through; native parsing and registered adapters only. Not every unsupported control is reported.",
+    )
+    VT_DIAGNOSE_HOST = auto(), "Host capability policy"
+    VT_HOST_POLICY = (
+        auto(),
+        "Feature policy, observed support and active behavior are separate. Auto uses implemented queries only; on requests use without proving support. Clipboard access also requires permission and a selected provider or usable host protocol; --clipboard does not enable host support.",
+    )
+    VT_GRAPHICS_STATUS = auto(), "Image output: {reason}"
+    VT_GRAPHICS_AVAILABLE = (
+        auto(),
+        "using the selected output protocol with measured cell dimensions",
+    )
+    VT_GRAPHICS_DISABLED = auto(), "image output protocols are disabled by policy"
+    VT_GRAPHICS_UNAVAILABLE = (
+        auto(),
+        "no supported host image output protocol was confirmed",
+    )
+    VT_GRAPHICS_GEOMETRY = (
+        auto(),
+        "cell pixel dimensions are unavailable; image output is disabled",
+    )
+    VT_GRAPHICS_PROBE = (
+        auto(),
+        "host negotiation did not finish; image output is disabled",
+    )
+    VT_IMAGE_FAILURES = auto(), "Image input rejected: {count} errors (payload omitted)"
+    VT_IMAGE_OUTPUT_ERROR = (
+        auto(),
+        "Image output failed: {count} errors (host response and payload omitted)",
+    )
+    VT_HOST_PROBE_ONCE = (
+        auto(),
+        "Host capabilities may be probed only once per connection",
+    )
+    VT_HOST_DIMENSIONS = auto(), "Invalid host dimensions"
+    VT_HOST_PIXELS = auto(), "Invalid host pixel dimensions"
+    VT_GRAPHICS_QUERY_ID = auto(), "Invalid graphics query identity"
+    VT_CURSOR_RGB = auto(), "Invalid cursor RGB color"
+    VT_HOST_INPUT = auto(), "HostInput requires an unwrapped PTK VT input"
+    VT_EFFECT_LIMIT = auto(), "Pending terminal effects exceed the byte limit"
+
 
 _DEFAULT_MESSAGES = MappingProxyType({item.value: item.english for item in Message})
 _MESSAGE_FIELDS = {

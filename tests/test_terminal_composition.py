@@ -1,12 +1,17 @@
 """Exercise the native grid through PTK's real layout, diff and input paths."""
 
 import asyncio
+import inspect
 import io
 import os
 import re
+import signal
 import socket
 import sys
+import tempfile
 import unittest
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,7 +33,7 @@ DEADLINE = 5
 class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
     """Check emitted terminal bytes and final consumers, not renderer internals."""
 
-    async def asyncSetUp(self):
+    async def asyncSetUp(self, *, features=None):
         """Capture actual Vt100 output and provide an actual PTK pipe input."""
         from ish.terminal.app import TerminalApp
 
@@ -44,7 +49,9 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         )
         with create_app_session(input=self.pipe, output=self.output):
             with patch("ish.terminal.app.create_input", return_value=self.pipe):
-                self.owner = TerminalApp("/bin/sh", ROOT)
+                self.owner = TerminalApp("/bin/sh", ROOT, features=features)
+        # This fixture exercises composition after optional startup observation.
+        self.owner.presentation_ready = True
         self.task = None
         self.render()
 
@@ -58,6 +65,42 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         await self.owner.session.close()
         self.owner.vt.close()
         self.pipe_context.__exit__(None, None, None)
+
+    async def test_termination_during_suspend_handoff_does_not_stop_the_process(self):
+        """A queued stop cannot overtake termination while PTK hands off input."""
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        @asynccontextmanager
+        async def delayed_handoff():
+            entered.set()
+            await release.wait()
+            yield
+
+        with (
+            patch("ish.terminal.app.in_terminal", delayed_handoff),
+            patch("ish.terminal.app.os.kill") as kill,
+        ):
+            task = asyncio.create_task(self.owner._suspend())
+            await asyncio.wait_for(entered.wait(), DEADLINE)
+            self.owner.stop(signal.SIGTERM)
+            release.set()
+            await asyncio.wait_for(task, DEADLINE)
+            kill.assert_not_called()
+
+    async def test_repeated_reset_does_not_overwrite_restored_cursor_modes(self):
+        """The first cleanup restores hidden/blinking state; later resets are inert."""
+        self.owner.host.begin_probe(12, 6)
+        self.owner.host.control("\x1b[?25;2$y")
+        self.owner.host.control("\x1b[?12;1$y")
+        self.owner.host.finish_probe()
+        self.render()
+        self.owner.app.renderer.reset()
+        first = self.stream.getvalue()
+        self.assertIn("\x1b[?25l", first)
+        self.assertIn("\x1b[?12h", first)
+        self.owner.app.renderer.reset()
+        self.output.flush()
+        self.assertEqual(self.stream.getvalue(), first)
 
     def render(self):
         """Run PTK's public renderer and return only this presentation's bytes."""
@@ -84,9 +127,9 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(ready.wait(), DEADLINE)
 
     def rich_host(self):
-        """Select supported styles through the broker's actual version reply."""
+        """Observe input protocol support without requiring a terminal identity."""
         self.owner.host.begin_probe(12, 6)
-        self.owner.host.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        self.owner.host.control("\x1b[?0u")
         self.owner.host.finish_probe()
 
     async def test_default_is_full_native_grid_without_surfaces_or_reserved_keys(self):
@@ -310,10 +353,183 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.task.done())
         self.assertEqual(bytes(self.owner.session.pending_input), b"")
 
+    async def test_retired_popup_task_cannot_close_a_new_popup(self):
+        """A late task keeps its diagnostic without changing another editor's result."""
+        await self.start_input()
+        first = self.owner.plugins.show_popup(
+            TextArea(multiline=False), width=8, height=2
+        )
+        gate = asyncio.Event()
+
+        async def fail():
+            await gate.wait()
+            raise ValueError("retired lookup failed")
+
+        task = self.owner.plugins.create_task(fail())
+        self.owner.plugins.close_popup(first, "finished")
+        editor = TextArea(multiline=False)
+        second = self.owner.plugins.show_popup(editor, width=8, height=2)
+        gate.set()
+        await asyncio.wait_for(task, DEADLINE)
+        self.assertEqual(await first.result, "finished")
+        self.assertFalse(second.result.done())
+        self.assertIs(self.owner.app.layout.current_control, editor.control)
+        self.assertEqual(
+            self.owner.plugins.errors, ["ValueError: retired lookup failed"]
+        )
+        self.owner.plugins.close_popup(second)
+
+    async def test_async_shortcut_descendant_retains_its_original_popup(self):
+        """Returning from a handler cannot let its descendant cancel a later editor."""
+        await self.start_input()
+        gate = asyncio.Event()
+        opened = asyncio.get_running_loop().create_future()
+
+        async def fail():
+            await gate.wait()
+            raise RuntimeError("retired descendant failed")
+
+        @self.owner.plugins.bind("f2")
+        async def open_popup(event):
+            first = self.owner.plugins.show_popup(
+                TextArea(multiline=False), width=8, height=2
+            )
+            task = self.owner.plugins.create_task(fail())
+            opened.set_result((first, task))
+
+        self.pipe.send_text("\x1bOQ")
+        first, task = await asyncio.wait_for(opened, DEADLINE)
+        self.owner.plugins.close_popup(first)
+        editor = TextArea(multiline=False)
+        second = self.owner.plugins.show_popup(editor, width=8, height=2)
+        gate.set()
+        await asyncio.wait_for(task, DEADLINE)
+        self.assertFalse(second.result.done())
+        self.assertIs(self.owner.app.layout.current_control, editor.control)
+        self.assertEqual(
+            self.owner.plugins.errors, ["RuntimeError: retired descendant failed"]
+        )
+        self.owner.plugins.close_popup(second)
+
+    async def test_task_cancelled_before_first_turn_closes_its_coroutine(self):
+        """Immediate shutdown must not leak a supplied, never-awaited coroutine."""
+
+        async def operation():
+            raise AssertionError("A cancelled operation must never start")
+
+        coroutine = operation()
+        task = self.owner.plugins.create_task(coroutine)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(inspect.getcoroutinestate(coroutine), inspect.CORO_CLOSED)
+
+    async def test_default_plugins_do_not_create_a_manager_or_directories(self):
+        """Selecting no plugin leaves the existing shared manager completely unused."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("ish.plugin.manager.PluginManager") as manager:
+                self.owner.plugins.load(
+                    [], directory=root / "scripts", library_dir=root / "libraries"
+                )
+            manager.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(self.owner.plugins.bindings.bindings, [])
+
+    async def test_selected_plugins_load_once_and_await_cleanup(self):
+        """Names select existing PluginManager packages; unselected code never executes."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("selected", "unselected"):
+                package = root / "scripts" / name
+                package.mkdir(parents=True)
+                source = (
+                    'PLUGIN_META = {"version": "1", "requirements": [], "dependencies": []}\n'
+                    "TERMINAL_API = 1\n"
+                    "import asyncio\n"
+                    "calls = []\n"
+                    "def setup(api):\n"
+                    '    calls.append("setup")\n'
+                    "    async def cleanup():\n"
+                    "        await asyncio.sleep(0)\n"
+                    '        calls.append("cleanup")\n'
+                    "    return cleanup\n"
+                )
+                if name == "unselected":
+                    source += 'raise AssertionError("Unselected plugin was imported")\n'
+                (package / (name + ".py")).write_text(source)
+            self.owner.plugins.load(
+                ["selected", "selected"],
+                directory=root / "scripts",
+                library_dir=root / "libraries",
+            )
+            selected = self.owner.plugins.get("selected")
+            self.assertEqual(selected.calls, ["setup"])
+            self.assertIsNone(self.owner.plugins.get("unselected"))
+            await self.owner.plugins.close()
+            self.assertEqual(selected.calls, ["setup", "cleanup"])
+            await self.owner.plugins.close()
+            self.assertEqual(selected.calls, ["setup", "cleanup"])
+
+    async def test_wrong_plugin_api_is_rejected_before_setup(self):
+        """An incompatible plugin cannot install keys or side effects in this UI."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "bad_api"
+            package.mkdir()
+            marker = root / "setup-ran"
+            (package / "bad_api.py").write_text(
+                'PLUGIN_META = {"version": "1", "requirements": [], "dependencies": []}\n'
+                "TERMINAL_API = 999\n"
+                "from pathlib import Path\n"
+                f"def setup(api):\n    Path({str(marker)!r}).touch()\n"
+            )
+            with self.assertRaises(ValueError):
+                self.owner.plugins.load(
+                    ["bad_api"], directory=root, library_dir=root / "libraries"
+                )
+            self.assertFalse(marker.exists())
+            self.assertEqual(self.owner.plugins.bindings.bindings, [])
+
+    async def test_shipped_popup_accept_cancel_and_global_toggle(self):
+        """The shipped plugins use real PTK input without leaking typed text to stdin."""
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner.plugins.load(
+                ["terminal_bar", "terminal_popup"],
+                directory=ROOT / "examples" / "terminal_plugins",
+                library_dir=Path(directory) / "libraries",
+            )
+            opened = asyncio.Event()
+
+            def rendered(_):
+                if self.owner.plugins.popups:
+                    opened.set()
+
+            self.owner.app.after_render += rendered
+            await self.start_input()
+            self.assertEqual(self.owner.size, (12, 5))
+            for close_key, expected in (
+                ("\r", "sample 한 글"),
+                ("\x1b", None),
+                ("\x1bOQ", None),
+            ):
+                with self.subTest(close_key=repr(close_key)):
+                    opened.clear()
+                    self.pipe.send_text("\x1bOQ")
+                    await asyncio.wait_for(opened.wait(), DEADLINE)
+                    popup = self.owner.plugins.popups[0]
+                    self.pipe.send_text("sample 한 글" + close_key)
+                    value = await asyncio.wait_for(popup.result, DEADLINE)
+                    self.assertEqual(value, expected)
+                    self.assertIs(
+                        self.owner.app.layout.current_control, self.owner.control
+                    )
+                    self.assertEqual(bytes(self.owner.session.pending_input), b"")
+
     async def test_pixel_mouse_survives_real_ptk_input_and_popup_release(self):
         """PTK's cell routing cannot discard the child's precise 1016 coordinates."""
         self.owner.host.begin_probe(12, 6)
-        self.owner.host.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        self.owner.host.control("\x1b[?1016;2$y")
         self.owner.host.control("\x1b[6;20;10t")
         self.owner.host.finish_probe()
         self.owner.vt.resize(12, 6, cell_width=10, cell_height=20)
@@ -344,6 +560,101 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
                 b"\x1b[<0;47;93M\x1b[<32;58;95M\x1b[<0;58;95m",
             )
             self.owner.plugins.close_popup(popup)
+
+    async def test_keypad_and_extended_functions_preserve_child_modes(self):
+        """Physical enhanced keys use native keypad/cursor modes, not popup aliases."""
+        self.rich_host()
+        await self.start_input()
+        self.owner.app.renderer.enter_input_modes()
+        wire = "\x1b[57399u\x1b[57414u\x1b[57417u\x1b[57376u\x1b[57388u"
+        cases = (
+            (b"", b"0\r\x1b[D\x1b[25~\x1b[46~"),
+            (b"\x1b=", b"0\r\x1b[D\x1b[25~\x1b[46~"),
+            (
+                b"\x1b[?1035l\x1b[?1h",
+                b"\x1bOp\x1bOM\x1bOD\x1b[25~\x1b[46~",
+            ),
+            (b"\x1b[>3u", wire.encode()),
+        )
+        send = self.owner.session.send
+        for modes, expected in cases:
+            with self.subTest(modes=modes):
+                self.owner._output(modes)
+                self.owner.session.pending_input.clear()
+                received = asyncio.Event()
+
+                def observe(data, expected=expected, received=received):
+                    send(data)
+                    if bytes(self.owner.session.pending_input).endswith(expected[-7:]):
+                        received.set()
+
+                self.owner.session.send = observe
+                self.pipe.send_text(wire)
+                await asyncio.wait_for(received.wait(), DEADLINE)
+                self.assertEqual(bytes(self.owner.session.pending_input), expected)
+        self.owner.session.send = send
+
+    async def key_then_popup(self, *, enhanced, before=b"", after=b""):
+        """Inject a physical arrow through PTK, then inspect native popup handoff."""
+        if enhanced:
+            self.rich_host()
+        await self.start_input()
+        self.owner.app.renderer.enter_input_modes()
+        self.owner.vt.feed(before)
+        received = asyncio.Event()
+        send = self.owner.session.send
+
+        def observe(data):
+            send(data)
+            if data:
+                received.set()
+
+        self.owner.session.send = observe
+        self.pipe.send_text("\x1b[A")
+        await asyncio.wait_for(received.wait(), DEADLINE)
+        self.owner.vt.feed(after)
+        popup = self.owner.plugins.show_popup(
+            TextArea(multiline=False), width=8, height=2
+        )
+        self.owner.plugins.close_popup(popup)
+        return bytes(self.owner.session.pending_input)
+
+    async def test_legacy_host_cannot_fabricate_release_when_child_requests_events(
+        self,
+    ):
+        """A conventional host reports a keystroke, never a held physical key."""
+        data = await self.key_then_popup(enhanced=False, before=b"\x1b[>3u")
+        self.assertEqual(data, b"\x1b[1;1:1A")
+
+    async def test_later_child_protocol_does_not_release_an_earlier_legacy_key(self):
+        """Enabling child event reports cannot reinterpret an earlier keypress."""
+        data = await self.key_then_popup(enhanced=True, after=b"\x1b[>3u")
+        self.assertEqual(data, b"\x1b[A")
+
+    async def test_enhanced_host_and_child_finish_a_delivered_press_before_popup(self):
+        """Only matching source and consumer event contracts require a release."""
+        data = await self.key_then_popup(enhanced=True, before=b"\x1b[>3u")
+        self.assertEqual(data, b"\x1b[1;1:1A\x1b[1;1:3A")
+
+    async def test_directory_effect_normalizes_absolute_paths_and_preserves_uris(self):
+        """OSC9/1337 paths become OSC7 URIs without re-encoding existing URI escapes."""
+        cases = (
+            (
+                "\x1b]1337;CurrentDir=/tmp/한 글%dir\x07".encode(),
+                f"file://{socket.gethostname()}/tmp/%ED%95%9C%20%EA%B8%80%25dir",
+            ),
+            (
+                b"\x1b]9;9;/tmp/other dir\x07",
+                f"file://{socket.gethostname()}/tmp/other%20dir",
+            ),
+            (b"\x1b]7;file://remote/a%20b\x07", "file://remote/a%20b"),
+        )
+        for data, expected in cases:
+            with self.subTest(data=data):
+                self.owner._output(data)
+                self.assertIn(f"\x1b]7;{expected}\x1b\\", self.render())
+        self.owner._output(b"\x1b]1337;CurrentDir=relative\x07")
+        self.assertNotIn("\x1b]7;relative", self.render())
 
     async def test_closing_popup_while_host_unfocused_never_claims_native_focus(self):
         """A popup cannot fabricate focus-in after the outer terminal lost focus."""
@@ -380,7 +691,7 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_lost_pixel_geometry_releases_capture_once_before_popup(self):
         """Resize finishes native capture before removing the needed pixel scale."""
         self.owner.host.begin_probe(12, 6)
-        self.owner.host.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        self.owner.host.control("\x1b[?1016;2$y")
         self.owner.host.control("\x1b[6;20;10t")
         self.owner.host.finish_probe()
         self.owner.vt.resize(12, 6, cell_width=10, cell_height=20)
@@ -523,7 +834,7 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         await self.check_alt_key_popup_open(mixed_prefix=True)
 
     async def test_failed_final_layout_still_restores_owned_host_metadata(self):
-        """Final PTK drawing failure cannot retain child title, cwd or cursor color."""
+        """Final layout failure retains the title while restoring cwd and cursor."""
         from prompt_toolkit.input.vt100_parser import Vt100Parser
 
         from ish.terminal.host import HostParser
@@ -585,15 +896,236 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         wire = self.stream.getvalue()
         restore_cwd = f"\x1b]7;file://{socket.gethostname()}/launch%20dir\x1b\\"
         for sequence in (
-            "\x1b[23;2t",
             "\x1b[?2031l",
             "\x1b]21;cursor=\x1b\\",
             restore_cwd,
         ):
             self.assertEqual(wire.count(sequence), 1, repr(sequence))
-        self.assertGreater(wire.index("\x1b[23;2t"), wire.index("CHILD-TITLE"))
+        self.assertEqual(wire.count("\x1b]2;CHILD-TITLE\x07"), 1)
+        for sequence in ("\x1b[21t", "\x1b[22;2t", "\x1b[23;2t"):
+            self.assertNotIn(sequence, wire)
         self.assertGreater(wire.index(restore_cwd), wire.index("file:///child"))
         self.assertTrue(self.owner.session.closed)
+
+    async def test_titles_are_published_without_host_identification_and_retained(self):
+        """Native OSC titles reach PTK's writer on unknown hosts and survive reset."""
+        self.owner.host.begin_probe(12, 6)
+        self.owner.host.finish_probe()
+        for title in ("첫 제목", "LAST TITLE"):
+            self.owner._output(f"\x1b]2;{title}\x07".encode())
+            self.assertIn(f"\x1b]2;{title}\x07", self.render())
+        self.owner.app.renderer.reset()
+        self.output.flush()
+        wire = self.stream.getvalue()
+        self.assertEqual(
+            re.findall(r"\x1b\]2;([^\x07\x1b]*)\x07", wire),
+            ["첫 제목", "LAST TITLE"],
+        )
+        for sequence in ("\x1b[21t", "\x1b[22;2t", "\x1b[23;2t"):
+            self.assertNotIn(sequence, wire)
+
+    async def test_selected_search_popup_routes_real_keys_to_native_history(self):
+        """Ctrl+F/Enter/Ctrl+P/Escape select history without sending editor input."""
+        self.owner.plugins.load(
+            ("terminal_search",), directory=ROOT / "examples/terminal_plugins"
+        )
+        self.owner.vt.feed(b"old needle\r\n" + b"filler\r\n" * 10 + b"new needle\r\n")
+        self.render()
+        selected = []
+        select = self.owner.plugins.select_match
+
+        def observe(*, previous=False):
+            result = select(previous=previous)
+            selected.append(result)
+            return result
+
+        changed = asyncio.Event()
+        self.owner.app.after_render += lambda _: changed.set()
+
+        async def require(predicate):
+            async def ready():
+                while not predicate():
+                    changed.clear()
+                    if not predicate():
+                        await changed.wait()
+
+            await asyncio.wait_for(ready(), DEADLINE)
+
+        await self.start_input()
+        with patch.object(self.owner.plugins, "select_match", side_effect=observe):
+            self.pipe.send_bytes(b"\x06")
+            await require(lambda: bool(self.owner.plugins.popups))
+            self.pipe.send_text("needle\r")
+            await require(lambda: len(selected) == 1)
+            self.assertEqual(self.owner.vt.selection_text(), "needle")
+            self.pipe.send_bytes(b"\r")
+            await require(lambda: len(selected) == 2)
+            self.pipe.send_bytes(b"\x10")
+            await require(lambda: len(selected) == 3)
+            self.assertEqual(selected, [0, 1, 0])
+            self.pipe.send_bytes(b"\x1b")
+            await require(lambda: not self.owner.plugins.popups)
+        self.assertEqual(self.owner.vt.selection_text(), "")
+        self.assertEqual(bytes(self.owner.session.pending_input), b"")
+        self.assertEqual(self.owner.plugins.errors, [])
+        self.assertIs(self.owner.app.layout.current_control, self.owner.control)
+
+
+@unittest.skipUnless(os.name == "posix", "Native VT and PTK output require POSIX")
+class FormattingPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Verify optional output choices through actual native cells and PTK wire."""
+
+    async def open(self, features=None, *, replies=""):
+        """Reuse the real renderer fixture with a fixed policy for this session."""
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+
+        from ish.terminal.host import HostParser
+
+        await TerminalCompositionTests.asyncSetUp(self, features=features)
+        self.owner.host.begin_probe(12, 6)
+        keys = []
+        HostParser(Vt100Parser(keys.append), self.owner.host).feed(replies)
+        for key in keys:
+            self.owner.host.handle_control(key)
+        self.owner.host.finish_probe()
+
+    async def asyncTearDown(self):
+        """Close the same fixture even when a formatting assertion fails."""
+        if hasattr(self, "owner"):
+            await TerminalCompositionTests.asyncTearDown(self)
+
+    def render(self):
+        """Observe the bytes emitted by the existing PTK renderer."""
+        return TerminalCompositionTests.render(self)
+
+    def rich_cell(self):
+        """Supply literal native link, underline color/style and overline requests."""
+        self.owner.vt.feed(
+            b"\x1b]8;;https://format.example/\x1b\\"
+            b"\x1b[4:3m\x1b[58:2::7:8:9m\x1b[53mN\x1b[0m\x1b]8;;\x1b\\"
+        )
+
+    async def check_enabled(self, features):
+        """A host name is unnecessary for explicitly selected formatting wire."""
+        await self.open(features)
+        self.rich_cell()
+        popup = self.owner.plugins.show_popup(
+            Window(FormattedTextControl([("underline", "P")], focusable=True)),
+            left=1,
+            top=0,
+            width=1,
+            height=1,
+        )
+        wire = self.render()
+        for sequence in (
+            "\x1b]8;;https://format.example/\x1b\\",
+            "\x1b[4:3m",
+            "\x1b[58:2::7:8:9m",
+            "\x1b[53m",
+            "\x1b[4:1mP",
+        ):
+            self.assertIn(sequence, wire)
+        self.assertGreater(wire.rfind("\x1b]8;;\x1b\\"), wire.index("N"))
+        self.assertIn("\x1b[55m", wire[wire.index("N") : wire.index("P")])
+        self.assertEqual(self.owner.host.adapter.name, "unknown")
+        self.owner.plugins.close_popup(popup)
+
+    async def test_default_formats_reach_native_cells_without_host_identity(self):
+        """The default choices preserve native formatting on an unidentified host."""
+        await self.check_enabled(None)
+
+    async def test_explicit_formats_reach_native_cells_without_host_identity(self):
+        """The explicit on choices use the same output path as the defaults."""
+        await self.check_enabled(
+            {"hyperlinks": "on", "extended_styles": "on", "overline": "on"}
+        )
+
+    async def test_disabled_formats_emit_neither_content_nor_optional_cleanup(self):
+        """Unused optional formats remain absent through first paint and final reset."""
+        await self.open(
+            {"hyperlinks": "off", "extended_styles": "off", "overline": "off"}
+        )
+        self.rich_cell()
+        popup = self.owner.plugins.show_popup(
+            Window(FormattedTextControl("P", focusable=True)),
+            left=1,
+            top=0,
+            width=1,
+            height=1,
+        )
+        self.render()
+        self.owner.plugins.close_popup(popup)
+        self.render()
+        self.owner.app.renderer.reset()
+        self.output.flush()
+        wire = self.stream.getvalue()
+        self.assertIn("N", wire)
+        self.assertIn("P", wire)
+        for sequence in (
+            "\x1b]8;",
+            "\x1b[4:",
+            "\x1b[58:",
+            "\x1b[59m",
+            "\x1b[53m",
+            "\x1b[55m",
+        ):
+            self.assertNotIn(sequence, wire)
+
+    async def test_styles_do_not_enable_disabled_overline_or_links(self):
+        """Independent underline selection cannot activate other optional formats."""
+        await self.open(
+            {"hyperlinks": "off", "extended_styles": "on", "overline": "off"}
+        )
+        self.rich_cell()
+        wire = self.render()
+        self.assertIn("\x1b[4:3m", wire)
+        self.assertIn("\x1b[58:2::7:8:9m", wire)
+        for sequence in ("\x1b]8;", "\x1b[53m", "\x1b[55m"):
+            self.assertNotIn(sequence, wire)
+
+    async def test_overline_does_not_enable_disabled_underline_extension(self):
+        """Overline does not authorize underline color or colon-style output."""
+        await self.open(
+            {"hyperlinks": "off", "extended_styles": "off", "overline": "on"}
+        )
+        self.rich_cell()
+        wire = self.render()
+        self.assertIn("\x1b[53mN", wire)
+        self.assertIn("\x1b[55m", wire)
+        for sequence in ("\x1b]8;", "\x1b[4:", "\x1b[58:", "\x1b[59m"):
+            self.assertNotIn(sequence, wire)
+
+    async def test_cleanup_remembers_written_formats_when_profile_is_revoked(self):
+        """Cleanup uses actual writer ownership even if an execution profile is lost."""
+        await self.open()
+        self.rich_cell()
+        self.render()
+        # Fault-inject a lost execution profile, not a supported live policy edit.
+        self.owner.host.profile = replace(
+            self.owner.profile, hyperlinks=False, extended_styles=False, overline=False
+        )
+        before = self.stream.tell()
+        self.owner.app.renderer.reset()
+        self.output.flush()
+        wire = self.stream.getvalue()[before:]
+        for sequence in ("\x1b]8;;\x1b\\", "\x1b[59m", "\x1b[55m"):
+            self.assertIn(sequence, wire)
+        self.assertNotIn("https://format.example/", wire)
+
+    async def test_written_cursor_color_restores_even_when_execution_is_disabled(self):
+        """The original observation, not the current output choice, owns cleanup."""
+        await self.open(replies="\x1b]12;rgb:11/22/33\x1b\\")
+        self.owner.vt.feed(b"\x1b]12;#aabbcc\x07N")
+        self.assertIn("\x1b]12;rgb:aa/bb/cc\x1b\\", self.render())
+        self.owner.host.profile = replace(
+            self.owner.profile, cursor_color_control=False
+        )
+        before = self.stream.tell()
+        self.owner.app.renderer.reset()
+        self.output.flush()
+        wire = self.stream.getvalue()[before:]
+        self.assertEqual(wire.count("\x1b]12;rgb:11/22/33\x1b\\"), 1)
+        self.assertNotIn("\x1b]12;rgb:aa/bb/cc\x1b\\", wire)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
-"""Run the experimental terminal pane without changing the existing ish CLI."""
+"""Run the separate hookless VT entry point with shared startup services."""
 
-import argparse
 import asyncio
-import os
-import shutil
 import signal
 import sys
-from pathlib import Path
+
+from ish.lang import Message, i18n
+from ish.log import session_logging
+
+from .startup import command, parse, report_logs
 
 STOP_SIGNALS = ("SIGTERM", "SIGHUP")
 
@@ -20,6 +21,8 @@ async def run_terminal(app):
             signum = getattr(signal, name)
             previous[signum] = signal.getsignal(signum)
             loop.add_signal_handler(signum, app.stop, signum)
+        previous[signal.SIGTSTP] = signal.getsignal(signal.SIGTSTP)
+        loop.add_signal_handler(signal.SIGTSTP, app.suspend)
         return await app.run()
     finally:
         for signum, handler in previous.items():
@@ -27,53 +30,59 @@ async def run_terminal(app):
             signal.signal(signum, handler)
 
 
-def main():
+def main(argv=None):
     """Select a native interactive shell and start the PTK terminal application."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shell", default="tcsh", help="native shell executable")
-    parser.add_argument("--cwd", type=Path, default=Path.cwd())
-    parser.add_argument(
-        "--clipboard",
-        choices=("off", "write", "read-write"),
-        default="write",
-        help="child clipboard access (default: write; host permissions still apply)",
-    )
-    parser.add_argument(
-        "--plugin",
-        action="append",
-        default=[],
-        metavar="MODULE:SETUP",
-        help="load an explicit terminal UI plugin (none by default)",
-    )
-    parser.add_argument(
-        "--dump-state",
-        type=Path,
-        help="write opt-in screen diagnostics (contains terminal text)",
-    )
-    args = parser.parse_args()
-    if os.name != "posix":
-        parser.error("This experiment currently requires Linux/WSL and a POSIX PTY")
-    shell = shutil.which(args.shell)
-    if shell is None:
-        parser.error(f"Shell executable not found: {args.shell}")
-    if not args.cwd.is_dir():
-        parser.error(f"Working directory not found: {args.cwd}")
-    from .app import TerminalApp
-
     try:
-        result = asyncio.run(
-            run_terminal(
-                TerminalApp(
-                    shell,
+        parser, args, finished = parse(argv)
+        if finished:
+            return 0
+        shell = command(parser, args)
+        # PluginManager shares the normal logger. Its diagnostics must not write
+        # into the PTK screen while a selected plugin runs or is being cleaned up.
+        with session_logging(level=args.log_level, path=args.log_file) as log:
+            report_logs(args.log_records, log.logger)
+            app = None
+            try:
+                from .app import TerminalApp
+
+                log.logger.info(
+                    i18n.get(
+                        Message.VT_SESSION_START,
+                        shell=shell[0],
+                        plugins=len(args.plugin),
+                    )
+                )
+                app = TerminalApp(
+                    shell[0],
                     args.cwd,
+                    shell_args=shell[1:],
                     dump_state=args.dump_state,
                     plugins=args.plugin,
+                    plugin_dir=args.plugin_dir,
+                    library_dir=args.plugin_lib_dir,
                     clipboard=args.clipboard,
+                    mouse=args.mouse,
+                    color_depth=args.color_depth,
+                    features=args.features,
+                    escape_delay=args.escape_delay,
+                    scrollback_lines=args.scrollback_lines,
+                    scrollback_bytes=args.scrollback_bytes,
                 )
-            )
-        )
-    except (OSError, RuntimeError) as exc:
-        print(f"ish-vt: {exc}", file=sys.stderr)
+                result = asyncio.run(run_terminal(app))
+                log.logger.info(i18n.get(Message.VT_SESSION_EXIT, status=result))
+            except (OSError, RuntimeError, TypeError, ValueError, BufferError) as exc:
+                log.logger.error(i18n.get(Message.VT_SESSION_ERROR, error=exc))
+                return 1
+            finally:
+                # Native records are counts only. Report after PTK restores the
+                # host, still inside the deferred shared logging lifetime.
+                from .diagnostics import report, report_session
+
+                if app is not None:
+                    report_session(app, log.logger)
+                report()
+    except (OSError, RuntimeError, TypeError, ValueError, BufferError) as exc:
+        print(i18n.get(Message.VT_SESSION_ERROR, error=exc), file=sys.stderr)
         return 1
     return result if result >= 0 else 128 - result
 

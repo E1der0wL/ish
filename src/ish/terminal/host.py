@@ -11,13 +11,23 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
+import socket
+import termios
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from types import MappingProxyType
+from urllib.parse import quote
 
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyPress
 from prompt_toolkit.keys import Keys
 
+from ish.lang import Message, i18n
+
+from .features import FEATURES, FeatureState, observation, resolve
+from .features import validate as validate_features
 from .hosts import UNKNOWN, HostAdapter, identify_host
 from .mouse import decode_mouse
 from .vt import ALT, CTRL, SHIFT
@@ -27,19 +37,46 @@ ST = ESC + "\\"
 PASTE_START = ESC + "[200~"
 PASTE_END = ESC + "[201~"
 MAX_CONTROL = 64 * 1024
+MAX_KEY_MAPPINGS = 16
+MAX_MAPPED_KEYS = 256
+MAX_KEY_SEQUENCE = 32
+KEY_MAPPING_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+MAPPED_KEY_SEQUENCE = re.compile(r"\x1b\[[1-9][0-9]{0,5}(?:;[1-8])?~\Z")
 MAX_DIMENSION = 65_535
 MAX_CELL_PIXELS = 4096
-MAX_TITLE = 1024
 MAX_GRAPHICS_ID = 2**32 - 1
 MIN_PROBE_ID = 2**31
 CSI_FINAL = re.compile(r"[\x40-\x7e]")
+CSI_INPUT_BREAK = re.compile(r"[\x00-\x1f\x7f]")
 CONTROL_START = re.compile(r"[\x1b\x90\x9b\x9d\x9e\x9f]")
 C1_PREFIXES = {"\x90": "P", "\x9b": "[", "\x9d": "]", "\x9e": "^", "\x9f": "_"}
 SIZE_REPORT = re.compile(r"\x1b\[([46]);([0-9]{1,5});([0-9]{1,5})t\Z")
 SYNC_REPORT = re.compile(r"\x1b\[\?2026;([0-4])\$y\Z")
 CLIPBOARD_REPORT = re.compile(r"\x1b\[\?5522;([0-4])\$y\Z")
+KEYBOARD_REPORT = re.compile(r"\x1b\[\?([0-9]{1,2})u\Z")
 SCHEME_MODE_REPORT = re.compile(r"\x1b\[\?2031;([0-4])\$y\Z")
 SCHEME_REPORT = re.compile(r"\x1b\[\?997;([12])n\Z")
+MODE_REPORT = re.compile(r"\x1b\[\?([0-9]{1,4});([0-4])\$y\Z")
+# These are the outer modes changed by PTK or this adapter. Unknown reports do
+# not imply a reset mode. Only a concrete observed value can be restored.
+RESTORE_MODES = (
+    1,
+    6,
+    7,
+    12,
+    25,
+    1000,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1015,
+    1016,
+    2004,
+    2026,
+)
+MOUSE_MODES = (1000, 1002, 1003, 1005, 1006, 1015, 1016)
 RGB_REPORT = re.compile(
     r"rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})\Z"
 )
@@ -52,9 +89,35 @@ GRAPHICS_REJECTED = "host-did-not-acknowledge-kitty"
 GRAPHICS_NO_SIZE = "verified-cell-size-unavailable"
 GRAPHICS_RESIZED = "cell-size-unavailable-after-resize"
 GRAPHICS_CANCELLED = "host-probe-cancelled"
+GRAPHICS_DISABLED = "image-protocols-disabled"
+REASON_ACTIVE = ""
+REASON_OFF = "policy-off"
+REASON_CANCELLED = "probe-cancelled"
+REASON_PENDING = "probe-pending"
+REASON_REJECTED = "support-rejected"
+REASON_UNKNOWN = "support-unconfirmed"
+REASON_IMAGE_SELECTED = "other-image-protocol-selected"
+REASON_CELL_SIZE = "cell-size-unavailable"
+REASON_CURSOR_STATE = "cursor-state-unavailable"
+REASON_SCHEME_STATE = "initial-scheme-unavailable"
+REASON_MODE_STATE = "initial-mode-unavailable"
 KEYBOARD_FLAGS = 3  # Disambiguation and event types; no all-key/associated-text claim.
+CURSOR_STYLE_REPORT = re.compile(r"\x1bP([01])\$r([0-9]*) q\x1b\\\Z")
+ATTRIBUTES_REPORT = re.compile(r"\x1bP([01])\$r([0-9:;]{0,512})m\x1b\\\Z")
+CURSOR_STYLES = {
+    1: ("block", True),
+    2: ("block", False),
+    3: ("underline", True),
+    4: ("underline", False),
+    5: ("bar", True),
+    6: ("bar", False),
+}
 KEY_ACTIONS = {1: "press", 2: "repeat", 3: "release"}
 KEY_REPORT = re.compile(r"\x1b\[([0-9:;]*)([u~ABCDFHPQS])\Z")
+# Conventional CSI function/navigation keys do not require enhanced-keyboard
+# negotiation. R is deliberately absent: legacy modified F3 can collide with
+# CPR, and a delayed cursor report must never become a new key event.
+LEGACY_KEY_REPORT = re.compile(r"\x1b\[[0-9]{0,3}(?:;[1-8])?[~ABCDFHPQS]\Z")
 PIXEL_MOUSE_REPORT = re.compile(
     r"\x1b\[<([0-9]{1,3});([0-9]{1,5});([0-9]{1,5})([Mm])\Z"
 )
@@ -77,20 +140,53 @@ FUNCTION_KEYS = {
     57355: "pagedown",
     57356: "home",
     57357: "end",
-    **{57363 + number: f"f{number}" for number in range(1, 13)},
-    # Disambiguation also changes non-text keypad encodings. Preserve their
-    # ordinary navigation meaning without claiming native keypad distinction.
-    57414: "enter",
-    57417: "left",
-    57418: "right",
-    57419: "up",
-    57420: "down",
-    57421: "pageup",
-    57422: "pagedown",
-    57423: "home",
-    57424: "end",
-    57425: "insert",
-    57426: "delete",
+    **{57363 + number: f"f{number}" for number in range(1, 26)},
+    **{57399 + number: f"kp{number}" for number in range(10)},
+    57409: "kpdecimal",
+    57410: "kpdivide",
+    57411: "kpmultiply",
+    57412: "kpsubtract",
+    57413: "kpadd",
+    57414: "kpenter",
+    57415: "kpequal",
+    57416: "kpseparator",
+    57417: "kpleft",
+    57418: "kpright",
+    57419: "kpup",
+    57420: "kpdown",
+    57421: "kppageup",
+    57422: "kppagedown",
+    57423: "kphome",
+    57424: "kpend",
+    57425: "kpinsert",
+    57426: "kpdelete",
+    57427: "kpbegin",
+}
+KEYPAD_LEGACY = {
+    **{f"kp{number}": str(number) for number in range(10)},
+    "kpdecimal": ".",
+    "kpdivide": "/",
+    "kpmultiply": "*",
+    "kpsubtract": "-",
+    "kpadd": "+",
+    "kpenter": "enter",
+    "kpequal": "=",
+    "kpseparator": ",",
+    **{
+        "kp" + key: key
+        for key in (
+            "left",
+            "right",
+            "up",
+            "down",
+            "pageup",
+            "pagedown",
+            "home",
+            "end",
+            "insert",
+            "delete",
+        )
+    },
 }
 LETTER_KEYS = {
     "A": 57352,
@@ -138,7 +234,7 @@ NAMED_KEYS = {
     "pagedown": Keys.PageDown,
     "home": Keys.Home,
     "end": Keys.End,
-    **{f"f{number}": Keys(f"f{number}") for number in range(1, 13)},
+    **{f"f{number}": Keys(f"f{number}") for number in range(1, 25)},
 }
 NAMED_TEXT = {"escape": ESC, "enter": "\r", "tab": "\t", "backspace": "\x7f"}
 CONTROL_TEXT = {
@@ -203,8 +299,25 @@ class HostAppearance:
 
 
 @dataclass(frozen=True, slots=True)
+class HostCursorStyle:
+    """One concrete DECRQSS observation; zero/default is deliberately unrepresented."""
+
+    code: int
+
+    @property
+    def shape(self):
+        """Interpret the host wire value at its owning boundary."""
+        return CURSOR_STYLES[self.code][0]
+
+    @property
+    def blink(self):
+        """Keep blink tied to the same observed cursor value."""
+        return CURSOR_STYLES[self.code][1]
+
+
+@dataclass(frozen=True, slots=True)
 class HostProfile:
-    """Capabilities verified for this outer presentation connection."""
+    """Effective presentation choices; support observations remain in the broker."""
 
     kitty_graphics: bool = False
     hyperlinks: bool = False
@@ -216,17 +329,14 @@ class HostProfile:
     enhanced_keyboard: bool = False
     extended_styles: bool = False
     pixel_mouse: bool = False
-    true_color: bool = False
     clipboard_protocol: bool = False
     image_protocol: str | None = None
     appearance: HostAppearance = HostAppearance()
     initial_appearance: HostAppearance = HostAppearance()
-    title_stack: bool = False
     scheme_notifications: bool = False
     cursor_color_control: bool = False
     overline: bool = False
-    initial_title: str | None = None
-    title_control: bool = False
+    initial_cursor_style: HostCursorStyle | None = None
 
     @property
     def has_cell_size(self) -> bool:
@@ -240,8 +350,8 @@ class StructuredKey:
 
     Modifiers use the native bridge's SHIFT/CTRL/ALT bits. Lock modifiers are
     not physical key identities, and Super/Hyper/Meta or unmapped functional
-    keys are outside this deliberately bounded contract. Keypad navigation is
-    normalized to ordinary navigation while ``codepoint`` keeps its identity.
+    keys are outside this deliberately bounded contract. Keypad identities stay
+    native; only the popup fallback converts them to ordinary editing keys.
     """
 
     key: str
@@ -251,6 +361,104 @@ class StructuredKey:
     text: str | None = None
     shifted: int | None = None
     base: int | None = None
+    # Capture the source contract at receipt. A later host negotiation cannot
+    # turn a queued conventional keystroke into a physical press/release pair.
+    release_events: bool = False
+
+
+class KeyMappings:
+    """Own exact optional press mappings, fixed before the first host input.
+
+    The public namespace is intentionally limited to unclaimed numeric CSI ~
+    sequences. It cannot replace replies, paste framing, mouse reports or an
+    existing PTK/native key, and it cannot generate event reporting semantics.
+    """
+
+    def __init__(self):
+        """Start with no selected optional mappings and no retained host input."""
+        self._events = {}
+        self._owners = {}
+        self._sealed = False
+
+    @property
+    def registrations(self) -> dict[str, int]:
+        """Expose names and counts, never mutable maps or captured wire input."""
+        return dict(self._owners)
+
+    def seal(self) -> None:
+        """Freeze the registry even when the first input is only a query reply."""
+        self._sealed = True
+
+    def register(self, name: str, mappings: Mapping[str, StructuredKey]) -> None:
+        """Validate the whole registration before committing an immutable copy."""
+        if self._sealed:
+            raise RuntimeError(i18n.get(Message.VT_KEY_MAP_LATE))
+        if (
+            not isinstance(name, str)
+            or KEY_MAPPING_NAME.fullmatch(name) is None
+            or name in self._owners
+        ):
+            raise ValueError(i18n.get(Message.VT_KEY_MAP_NAME))
+        if (
+            not isinstance(mappings, Mapping)
+            or not mappings
+            or len(self._owners) >= MAX_KEY_MAPPINGS
+            or len(self._events) + len(mappings) > MAX_MAPPED_KEYS
+        ):
+            raise ValueError(i18n.get(Message.VT_KEY_MAP_LIMIT))
+        validated = {}
+        for sequence, event in mappings.items():
+            if (
+                not isinstance(sequence, str)
+                or len(sequence) > MAX_KEY_SEQUENCE
+                or MAPPED_KEY_SEQUENCE.fullmatch(sequence) is None
+            ):
+                raise ValueError(i18n.get(Message.VT_KEY_MAP_SEQUENCE))
+            if (
+                sequence in (PASTE_START, PASTE_END)
+                or int(sequence[2:].split(";", 1)[0].rstrip("~")) in (200, 201)
+                or sequence in ANSI_SEQUENCES
+                or decode_key(sequence) is not None
+            ):
+                raise ValueError(i18n.get(Message.VT_KEY_MAP_RESERVED))
+            if sequence in self._events:
+                raise ValueError(i18n.get(Message.VT_KEY_MAP_CONFLICT))
+            if not self._valid_event(event):
+                raise ValueError(i18n.get(Message.VT_KEY_MAP_EVENT))
+            validated[sequence] = event
+        self._events.update(validated)
+        self._owners[name] = len(validated)
+
+    @staticmethod
+    def _valid_event(event) -> bool:
+        if (
+            type(event) is not StructuredKey
+            or type(event.key) is not str
+            or type(event.codepoint) is not int
+            or type(event.modifiers) is not int
+            or not 0 <= event.modifiers <= 7
+            or event.action != "press"
+            or event.release_events is not False
+            or any(
+                value is not None for value in (event.text, event.shifted, event.base)
+            )
+        ):
+            return False
+        native_name = FUNCTION_KEYS.get(event.codepoint)
+        if native_name is not None:
+            return native_name == event.key
+        return (
+            len(event.key) == 1
+            and event.codepoint == ord(event.key)
+            and _scalar(event.codepoint)
+            and event.codepoint >= 32
+            and not 127 <= event.codepoint < 160
+            and not 57344 <= event.codepoint <= 63743
+        )
+
+    def get(self, sequence: str) -> StructuredKey | None:
+        """A missing route remains a control; no decoder callback is executed."""
+        return self._events.get(sequence)
 
 
 @dataclass(slots=True)
@@ -373,15 +581,15 @@ def _legacy_keys(event: StructuredKey) -> list[KeyPress]:
         return [KeyPress(Keys.Ignore, "")]
     modifiers = event.modifiers
     prefix = [KeyPress(Keys.Escape, ESC)] if modifiers & ALT else []
-    if event.key in NAMED_KEYS:
-        key = NAMED_KEYS[event.key]
-        text = NAMED_TEXT.get(event.key, "")
-        if event.key == "tab" and modifiers & SHIFT:
+    name = KEYPAD_LEGACY.get(event.key, event.key)
+    if name in NAMED_KEYS:
+        key = NAMED_KEYS[name]
+        text = NAMED_TEXT.get(name, "")
+        if name == "tab" and modifiers & SHIFT:
             key = Keys.BackTab
-        elif event.key == "escape" and modifiers & SHIFT:
+        elif name == "escape" and modifiers & SHIFT:
             key = Keys.ShiftEscape
-        elif event.key not in NAMED_TEXT:
-            name = event.key
+        elif name not in NAMED_TEXT:
             if name.startswith("f") and modifiers & SHIFT:
                 name = f"f{int(name[1:]) + 12}"
             else:
@@ -392,8 +600,10 @@ def _legacy_keys(event: StructuredKey) -> list[KeyPress]:
             except ValueError:
                 return [KeyPress(Keys.Ignore, "")]
         return prefix + [KeyPress(key, text)]
+    if len(name) != 1:
+        return [KeyPress(Keys.Ignore, "")]
     if modifiers & CTRL:
-        character = event.key.lower()
+        character = name.lower()
         text = CONTROL_TEXT.get(character, "")
         if "a" <= character <= "z":
             text = chr(ord(character) - ord("a") + 1)
@@ -415,7 +625,7 @@ def _legacy_keys(event: StructuredKey) -> list[KeyPress]:
         return prefix + [KeyPress(key, text)]
     text = event.text
     if text is None:
-        text = chr(event.shifted) if modifiers & SHIFT and event.shifted else event.key
+        text = chr(event.shifted) if modifiers & SHIFT and event.shifted else name
         if modifiers & SHIFT and "a" <= text <= "z":
             text = text.upper()
     return prefix + [KeyPress(character, character) for character in text]
@@ -428,17 +638,29 @@ def scrub_environment(environment: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def directory_uri(value: str) -> str | None:
+    """Normalize native absolute paths without guessing a relative directory."""
+    if value.startswith("/"):
+        return "file://" + socket.gethostname() + quote(value, safe="/")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    if value.startswith("file://"):
+        return value
+    return None
+
+
 class HostBroker:
     """Collect one bounded probe and consume subsequent host control replies.
 
     ``ready`` concerns only the optional host capability probe. Callers may wait
-    with a deadline and call ``finish_probe`` to retain a conservative profile.
+    with a deadline and call ``finish_probe`` to resolve policy and observations.
     No timeout grants input ownership or implies that a shell is ready.
     """
 
     def __init__(
         self,
         *,
+        features: dict[str, str] | None = None,
         on_focus: Callable[[bool], None] | None = None,
         on_graphics_error: Callable[[int, str], None] | None = None,
         on_key: Callable[[StructuredKey], bool] | None = None,
@@ -446,6 +668,7 @@ class HostBroker:
         on_appearance: Callable[[HostAppearance], None] | None = None,
     ):
         """Keep host state independent of the child VT and PTY lifetime."""
+        self.features = MappingProxyType(validate_features(features))
         self.profile = HostProfile()
         self.graphics_reason = GRAPHICS_PENDING
         self.ready = asyncio.Event()
@@ -456,6 +679,8 @@ class HostBroker:
         self.on_appearance = on_appearance
         self.input_modes_active = False
         self.pixel_mouse_active = False
+        self._keys = KeyMappings()
+        self.dropped_controls = 0
         self._started = False
         self._closed = False
         self._query_id = None
@@ -463,7 +688,15 @@ class HostBroker:
         self._kitty_seen = self._kitty_ok = False
         self._sync_seen = self._sync_ok = False
         self._clipboard_seen = self._clipboard_ok = False
+        self._keyboard_flags = None
         self._version_seen = False
+        self._cursor_style_seen = False
+        self._initial_cursor_style = None
+        self._attributes_seen = False
+        self._initial_attributes = None
+        self._attributes_changed = False
+        self._mode_values = {}
+        self._changed_modes = set()
         self._adapter = UNKNOWN
         self._appearance = HostAppearance()
         self._color_seen = set()
@@ -472,9 +705,6 @@ class HostBroker:
         self._scheme_mode = None
         self._appearance_epoch = 0
         self._metadata_active = False
-        self._title_saved = False
-        self._title_fallback = False
-        self._initial_title = None
         self._theme_enabled = False
         self._cell = self._pixels = None
         self._accept_size_reports = True
@@ -488,21 +718,112 @@ class HostBroker:
 
     @property
     def adapter(self) -> HostAdapter:
-        """Expose fixed host policy separately from the active capability profile."""
+        """Expose known interpretation quirks separately from effective features."""
         return self._adapter
+
+    def _support(self) -> dict[str, bool | None]:
+        """Describe queried capabilities without turning user choices into evidence."""
+        pixel = self._mode_values.get(1016)
+        scheme = None if self._scheme_mode is None else self._scheme_mode in (1, 2, 3)
+        return {
+            "kitty_graphics": self._kitty_ok if self._kitty_seen else None,
+            "synchronized_output": self._sync_ok if self._sync_seen else None,
+            "clipboard_protocol": self._clipboard_ok if self._clipboard_seen else None,
+            "enhanced_keyboard": True if self._keyboard_flags is not None else None,
+            "pixel_mouse": pixel in (1, 2) if pixel is not None else None,
+            "scheme_notifications": scheme,
+        }
+
+    def _feature_values(self, width: int, height: int) -> dict[str, bool]:
+        """Resolve once from policy and observations, including hard prerequisites."""
+        support = self._support()
+        enabled = {
+            name: not self._cancelled and resolve(policy, support.get(name))
+            for name, policy in self.features.items()
+        }
+        geometry = width > 0 and height > 0
+        for name in ("kitty_graphics", "iterm_graphics", "pixel_mouse"):
+            enabled[name] &= geometry
+        # Exactly one backend owns image presentation. Explicit iTerm selection
+        # wins over Kitty, without changing the independent Kitty observation.
+        enabled["kitty_graphics"] &= not enabled["iterm_graphics"]
+        enabled["cursor_color"] &= (
+            self._appearance.cursor is not None
+            or self._appearance.cursor_dynamic is True
+        ) and (not self._adapter.extended_cursor or self._cursor_extended_seen)
+        enabled["scheme_notifications"] &= (
+            self._scheme_mode in (1, 2, 3) and self._scheme_seen
+        )
+        return enabled
+
+    @property
+    def feature_status(self) -> dict[str, FeatureState]:
+        """Expose requested policy, observed support and effective selection separately."""
+        support = self._support()
+        effective = {
+            name: getattr(self.profile, name)
+            for name in FEATURES
+            if hasattr(self.profile, name)
+        }
+        effective["cursor_color"] = self.profile.cursor_color_control
+        effective["iterm_graphics"] = self.profile.image_protocol == "iterm"
+        states = {}
+        for name, policy in self.features.items():
+            active = effective[name]
+            evidence = observation(name, support.get(name))
+            if not self._started and FEATURES[name].query is not None:
+                evidence = "unqueried"
+            if active:
+                reason = REASON_ACTIVE
+            elif policy == "off":
+                reason = REASON_OFF
+            elif self._cancelled:
+                reason = REASON_CANCELLED
+            elif not self._closed:
+                reason = REASON_PENDING
+            elif not resolve(policy, support.get(name)):
+                reason = (
+                    REASON_REJECTED if support.get(name) is False else REASON_UNKNOWN
+                )
+            elif name in ("kitty_graphics", "iterm_graphics", "pixel_mouse"):
+                reason = (
+                    REASON_IMAGE_SELECTED
+                    if name == "kitty_graphics"
+                    and self.profile.image_protocol == "iterm"
+                    else REASON_CELL_SIZE
+                )
+            elif name == "cursor_color":
+                reason = REASON_CURSOR_STATE
+            elif name == "scheme_notifications" and not self._scheme_seen:
+                reason = REASON_SCHEME_STATE
+            else:
+                reason = REASON_MODE_STATE
+            states[name] = FeatureState(policy, evidence, active, reason)
+        return states
+
+    @property
+    def key_mappings(self) -> dict[str, int]:
+        """Return payload-free optional input registrations for diagnostics."""
+        return self._keys.registrations
+
+    def register_keys(self, name: str, mappings: Mapping[str, StructuredKey]) -> None:
+        """Register a bounded exact map through the session's only input broker."""
+        self._keys.register(name, mappings)
+
+    def seal_keys(self) -> None:
+        """Close registration before input, independently of host probe readiness."""
+        self._keys.seal()
 
     def begin_probe(self, cols: int, rows: int, *, query_id: int | None = None) -> str:
         """Register an upper-half identity, disjoint from presenter image IDs."""
         if self._started or self._closed:
-            raise RuntimeError(
-                "Host capabilities may be probed only once per connection"
-            )
+            raise RuntimeError(i18n.get(Message.VT_HOST_PROBE_ONCE))
         if not 0 < cols <= MAX_DIMENSION or not 0 < rows <= MAX_DIMENSION:
-            raise ValueError("Invalid host dimensions")
+            raise ValueError(i18n.get(Message.VT_HOST_DIMENSIONS))
         if query_id is None:
             query_id = secrets.randbelow(MIN_PROBE_ID) + MIN_PROBE_ID
         if not MIN_PROBE_ID <= query_id <= MAX_GRAPHICS_ID:
-            raise ValueError("Invalid graphics query identity")
+            raise ValueError(i18n.get(Message.VT_GRAPHICS_QUERY_ID))
         self._started = True
         self._appearance_epoch += 1
         self._cols, self._rows = cols, rows
@@ -510,12 +831,51 @@ class HostBroker:
         self._probe_grid = cols, rows
         self._query_id = query_id
         return (
-            f"{ESC}[16t{ESC}[14t{ESC}[?2026$p{ESC}[?5522$p{ESC}[?2031$p{ESC}[?996n{ESC}[>q{ESC}[21t"
+            f"{ESC}P$q q{ST}{ESC}[16t{ESC}[14t{ESC}[?2026$p{ESC}[?5522$p{ESC}[?2031$p{ESC}[?996n{ESC}[?u{ESC}[>q"
             + "".join(f"{ESC}]{number};?{ST}" for number in COLOR_NAMES)
             + f"{ESC}]21;cursor=?{ST}"
             + "".join(f"{ESC}]4;{number};?{ST}" for number in range(PALETTE_SIZE))
             + f"{ESC}_Ga=q,i={query_id},s=1,v=1,f=24,t=d;AAAA{ST}"
+            + "".join(f"{ESC}[?{mode}$p" for mode in RESTORE_MODES if mode != 2026)
+            + f"{ESC}P$qm{ST}"
         )
+
+    def change_modes(self, *modes: int) -> None:
+        """Record only modes written by this connection's outer renderer."""
+        self._changed_modes.update(modes)
+
+    def restore_modes(self, *, before_screen=False) -> str:
+        """Restore observed values after PTK cleanup; never guess missing replies."""
+        # DECOM writes reposition the cursor. Restore it on the alternate
+        # screen before 1049 restores the primary cursor, never afterwards.
+        modes = {mode for mode in self._changed_modes if (mode == 6) == before_screen}
+        self._changed_modes.difference_update(modes)
+        # Tracking modes are mutually exclusive on hosts such as Windows
+        # Terminal: resetting another mode can cancel the active one. Apply
+        # all observed off values before restoring any observed on value.
+        return "".join(
+            f"{ESC}[?{mode}{'h' if value == 1 else 'l'}"
+            for value in (2, 1)
+            for mode in RESTORE_MODES
+            if mode in modes and self._mode_values.get(mode) == value
+        )
+
+    def enter_modes(self) -> str:
+        """Normalize inherited input capture and origin for the owned screen."""
+        modes = (6, *MOUSE_MODES)
+        self.change_modes(*modes)
+        return "".join(f"{ESC}[?{mode}l" for mode in modes)
+
+    def change_attributes(self) -> None:
+        """Record renderer use of SGR separately from the native screen state."""
+        self._attributes_changed = True
+
+    def restore_attributes(self) -> str:
+        """Restore a concrete initial SGR report after the final PTK reset."""
+        changed, self._attributes_changed = self._attributes_changed, False
+        if changed and self._initial_attributes is not None:
+            return f"{ESC}[{self._initial_attributes}m"
+        return ""
 
     def _geometry(self) -> tuple[int, int]:
         if self._cell is not None:
@@ -539,43 +899,30 @@ class HostBroker:
                 self._appearance = replace(self._appearance, cursor=None)
             width, height = self._geometry()
             pixels = self._pixels or (0, 0)
+            enabled = self._feature_values(width, height)
             self.profile = HostProfile(
-                kitty_graphics=self._kitty_ok and width > 0 and height > 0,
-                hyperlinks=adapter.hyperlinks,
-                synchronized_output=self._sync_ok,
+                kitty_graphics=enabled["kitty_graphics"],
+                hyperlinks=enabled["hyperlinks"],
+                synchronized_output=enabled["synchronized_output"],
                 cell_width=width,
                 cell_height=height,
                 pixel_width=pixels[0],
                 pixel_height=pixels[1],
-                enhanced_keyboard=adapter.enhanced_keyboard,
-                extended_styles=adapter.extended_styles,
-                pixel_mouse=adapter.pixel_mouse and width > 0 and height > 0,
-                true_color=adapter.true_color,
-                clipboard_protocol=self._clipboard_ok,
+                enhanced_keyboard=enabled["enhanced_keyboard"],
+                extended_styles=enabled["extended_styles"],
+                pixel_mouse=enabled["pixel_mouse"],
+                clipboard_protocol=enabled["clipboard_protocol"],
                 image_protocol=self._image_protocol(width, height),
                 appearance=self._appearance,
                 initial_appearance=self._appearance,
-                title_stack=adapter.title_stack,
-                scheme_notifications=self._scheme_mode in (1, 2, 3)
-                and self._scheme_seen,
-                cursor_color_control=adapter.cursor_color
-                and (
-                    self._appearance.cursor is not None
-                    or self._appearance.cursor_dynamic is True
-                ),
-                overline=adapter.overline,
-                initial_title=self._initial_title,
-                title_control=adapter.title_stack or self._initial_title is not None,
+                scheme_notifications=enabled["scheme_notifications"],
+                cursor_color_control=enabled["cursor_color"],
+                overline=enabled["overline"],
+                initial_cursor_style=self._initial_cursor_style,
             )
             self._closed = True
             self._appearance_epoch += 1
-            self.graphics_reason = (
-                ""
-                if self.profile.image_protocol
-                else GRAPHICS_NO_SIZE
-                if self._kitty_ok
-                else GRAPHICS_REJECTED
-            )
+            self.graphics_reason = self._graphics_status()
             self.ready.set()
         return self.profile
 
@@ -600,16 +947,37 @@ class HostBroker:
     def _image_protocol(self, width, height):
         if not width or not height or self._cancelled:
             return None
-        return self._adapter.graphics(kitty_ack=self._kitty_ok)
+        enabled = self._feature_values(width, height)
+        return (
+            "iterm"
+            if enabled["iterm_graphics"]
+            else "kitty"
+            if enabled["kitty_graphics"]
+            else None
+        )
+
+    def _graphics_status(self, *, resized=False) -> str:
+        """Explain selection failure without treating disabled policy as host rejection."""
+        if self._cancelled:
+            return GRAPHICS_CANCELLED
+        if not self._closed:
+            return GRAPHICS_PENDING
+        if self.profile.image_protocol:
+            return ""
+        names = ("kitty_graphics", "iterm_graphics")
+        if all(self.features[name] == "off" for name in names):
+            return GRAPHICS_DISABLED
+        support = self._support()
+        if any(resolve(self.features[name], support.get(name)) for name in names):
+            return GRAPHICS_RESIZED if resized else GRAPHICS_NO_SIZE
+        return GRAPHICS_REJECTED
 
     def cancel_probe(self) -> HostProfile:
         """Close negotiation with no optional capabilities, consuming late replies."""
         if not self._closed:
             self._closed = True
             self._cancelled = True
-            self._kitty_ok = self._sync_ok = False
             self._adapter = UNKNOWN
-            self._clipboard_ok = False
             self._appearance_epoch += 1
             self.profile = HostProfile()
             self.graphics_reason = GRAPHICS_CANCELLED
@@ -622,29 +990,24 @@ class HostBroker:
             and self._sync_seen
             and self._version_seen
             and self._clipboard_seen
+            and self._keyboard_flags is not None
             and self._scheme_mode is not None
             and (self._scheme_seen or self._scheme_mode in (0, 4))
             and len(self._color_seen) == PALETTE_SIZE + len(COLOR_NAMES)
             and (self._cell or self._pixels)
+            and all(mode in self._mode_values for mode in RESTORE_MODES)
+            and self._attributes_seen
+            and self._cursor_style_seen
         ):
             self.ready.set()
 
     def enter_metadata_modes(self) -> str:
-        """Save a verified host title and enable observed scheme notifications.
-
-        OSC 7 has no portable query for the host's previous cwd. This method
-        never claims that the process cwd is a queried terminal metadata value.
-        """
+        """Enable observed scheme notifications for the active presentation."""
         if not self._closed or self._cancelled or self._metadata_active:
             return ""
         self._metadata_active = True
         self._appearance_epoch += 1
         sequences = []
-        if self.profile.title_stack:
-            sequences.append(f"{ESC}[22;2t")
-            self._title_saved = True
-        elif self.profile.initial_title is not None:
-            self._title_fallback = True
         if self.profile.scheme_notifications and self._scheme_mode == 2:
             sequences.append(f"{ESC}[?2031h")
             self._theme_enabled = True
@@ -658,18 +1021,10 @@ class HostBroker:
         if self._theme_enabled:
             sequences.append(f"{ESC}[?2031l")
             self._theme_enabled = False
-        if self._title_saved:
-            sequences.append(f"{ESC}[23;2t")
-            self._title_saved = False
-        elif self._title_fallback:
-            sequences.append(f"{ESC}]2;{self.profile.initial_title}{ST}")
-            self._title_fallback = False
         return "".join(sequences)
 
     def restore_cursor(self) -> str:
         """Encode a saved concrete or explicitly dynamic cursor, if observed."""
-        if not self.profile.cursor_color_control:
-            return ""
         original = self.profile.initial_appearance
         if original.cursor_dynamic is True:
             return f"{ESC}]21;cursor={ST}"
@@ -678,12 +1033,17 @@ class HostBroker:
             return f"{ESC}]12;rgb:{red:02x}/{green:02x}/{blue:02x}{ST}"
         return ""
 
+    def restore_cursor_shape(self) -> str:
+        """Restore the concrete session-start observation, not an inferred default."""
+        original = self.profile.initial_cursor_style
+        return f"{ESC}[{original.code} q" if original is not None else ""
+
     def set_cursor_color(self, color: tuple[int, int, int]) -> str:
         """Normalize an explicitly requested cursor color only with safe restoration."""
         if len(color) != 3 or any(
             type(value) is not int or not 0 <= value <= 255 for value in color
         ):
-            raise ValueError("Invalid cursor RGB color")
+            raise ValueError(i18n.get(Message.VT_CURSOR_RGB))
         if not self.profile.cursor_color_control:
             return ""
         red, green, blue = color
@@ -719,15 +1079,6 @@ class HostBroker:
             return
         ending = 2 if sequence.endswith(ST) else 1 if sequence.endswith("\x07") else 0
         if not ending:
-            return
-        if sequence.startswith(ESC + "]l"):
-            title = sequence[3:-ending]
-            if (
-                self._initial_title is None
-                and len(title) <= MAX_TITLE
-                and not any(ord(char) < 32 or 127 <= ord(char) < 160 for char in title)
-            ):
-                self._initial_title = title
             return
         parts = sequence[2:-ending].split(";")
         if parts[0] == "21":
@@ -781,8 +1132,8 @@ class HostBroker:
         self._appearance = replace(self._appearance, palette=tuple(palette), **values)
         self._changed()
 
-    def enter_input_modes(self) -> str:
-        """Reconcile verified input modes after PTK enables its cell mouse mode.
+    def enter_input_modes(self, *, mouse=True) -> str:
+        """Reconcile selected input modes after PTK enables its cell mouse mode.
 
         Call after the first PTK render and after a geometry profile change.
         Pixel mode supersedes cell encoding; loss of measured geometry restores
@@ -794,13 +1145,21 @@ class HostBroker:
         if self.profile.enhanced_keyboard and not self.input_modes_active:
             self.input_modes_active = True
             sequences.append(f"{ESC}[>{KEYBOARD_FLAGS}u")
-        if self.profile.pixel_mouse and not self.pixel_mouse_active:
-            self.pixel_mouse_active = True
-            sequences.append(f"{ESC}[?1016h")
-        elif not self.profile.pixel_mouse and self.pixel_mouse_active:
-            self.pixel_mouse_active = False
-            sequences.append(f"{ESC}[?1016l{ESC}[?1006h")
+        sequences.append(self.mouse_mode(mouse))
         return "".join(sequences)
+
+    def mouse_mode(self, enabled: bool) -> str:
+        """Match pixel encoding to PTK's actual capture without enabling tracking."""
+        if not self._closed:
+            return ""
+        if enabled and self.profile.pixel_mouse and not self.pixel_mouse_active:
+            self.pixel_mouse_active = True
+            self.change_modes(1016)
+            return f"{ESC}[?1016h"
+        if (not enabled or not self.profile.pixel_mouse) and self.pixel_mouse_active:
+            self.pixel_mouse_active = False
+            return f"{ESC}[?1016l" + (f"{ESC}[?1006h" if enabled else "")
+        return ""
 
     def leave_input_modes(self) -> str:
         """Undo exactly the input modes this broker enabled before leaving the screen."""
@@ -886,12 +1245,12 @@ class HostBroker:
         no new identity-free terminal query is issued.
         """
         if not 0 < cols <= MAX_DIMENSION or not 0 < rows <= MAX_DIMENSION:
-            raise ValueError("Invalid host dimensions")
+            raise ValueError(i18n.get(Message.VT_HOST_DIMENSIONS))
         if (
             not 0 <= pixel_width <= MAX_DIMENSION
             or not 0 <= pixel_height <= MAX_DIMENSION
         ):
-            raise ValueError("Invalid host pixel dimensions")
+            raise ValueError(i18n.get(Message.VT_HOST_PIXELS))
         measured = cols, rows, pixel_width, pixel_height
         if measured == self._kernel_size:
             return self.profile
@@ -919,28 +1278,21 @@ class HostBroker:
             self._cell = pixel_width // cols, pixel_height // rows
             self._pixels = pixel_width, pixel_height
             self._accept_size_reports = False
+            enabled = self._feature_values(*self._cell)
             self.profile = replace(
                 self.profile,
-                kitty_graphics=self._closed and self._kitty_ok and not self._cancelled,
+                kitty_graphics=self._closed and enabled["kitty_graphics"],
                 cell_width=self._cell[0],
                 cell_height=self._cell[1],
                 pixel_width=pixel_width,
                 pixel_height=pixel_height,
-                pixel_mouse=self._closed
-                and self._adapter.pixel_mouse
-                and not self._cancelled,
+                pixel_mouse=self._closed and enabled["pixel_mouse"],
                 image_protocol=self._image_protocol(*self._cell)
                 if self._closed
                 else None,
             )
             if self._closed:
-                self.graphics_reason = (
-                    ""
-                    if self.profile.image_protocol
-                    else GRAPHICS_CANCELLED
-                    if self._cancelled
-                    else GRAPHICS_REJECTED
-                )
+                self.graphics_reason = self._graphics_status()
             self._changed()
         elif not self._closed and not changed and self._accept_size_reports:
             # Some real hosts include a window border in TIOCGWINSZ pixels.
@@ -960,11 +1312,49 @@ class HostBroker:
                 pixel_mouse=False,
                 image_protocol=None,
             )
-            self.graphics_reason = GRAPHICS_RESIZED
+            self.graphics_reason = self._graphics_status(resized=True)
         return self.profile
 
     def control(self, sequence: str) -> bool:
         """Consume a complete control reply; return false only for keyboard traffic."""
+        keyboard = KEYBOARD_REPORT.fullmatch(sequence)
+        if keyboard:
+            flags = int(keyboard[1])
+            if (
+                self._started
+                and not self._closed
+                and self._keyboard_flags is None
+                and flags <= 31
+            ):
+                self._keyboard_flags = flags
+                self._changed()
+            return True
+        attributes = ATTRIBUTES_REPORT.fullmatch(sequence)
+        if attributes:
+            if self._started and not self._closed and not self._attributes_seen:
+                self._attributes_seen = True
+                if attributes[1] == "1":
+                    self._initial_attributes = attributes[2] or "0"
+                self._changed()
+            return True
+        mode = MODE_REPORT.fullmatch(sequence)
+        if mode and int(mode[1]) in RESTORE_MODES:
+            number, value = map(int, mode.groups())
+            if self._started and not self._closed and number not in self._mode_values:
+                self._mode_values[number] = value
+                self._changed()
+            # 2026 also supplies the existing presentation capability below.
+            if number != 2026:
+                return True
+        cursor_style = CURSOR_STYLE_REPORT.fullmatch(sequence)
+        if cursor_style:
+            if self._started and not self._closed and not self._cursor_style_seen:
+                self._cursor_style_seen = True
+                status, value = cursor_style.groups()
+                if status == "1" and value in ("1", "2", "3", "4", "5", "6"):
+                    self._initial_cursor_style = HostCursorStyle(int(value))
+                self._changed()
+            return True
         if sequence.startswith((ESC + "]52;", ESC + "]5522;")):
             # HostParser queues replies that may produce child input. Direct
             # control ingestion must not bypass that ordered dispatch boundary.
@@ -1096,24 +1486,46 @@ class HostParser:
         self.parser.flush()
 
     def _key(self, sequence: str) -> bool:
-        if not self.broker.input_modes_active:
+        if sequence.startswith(ESC + "[?") and sequence.endswith("u"):
+            # Status replies describe a protocol; they are never key events,
+            # even while its input encoding is active or the reply is invalid.
             return False
+        mapped = self.broker._keys.get(sequence)
+        if mapped is not None:
+            self._emit_key(mapped)
+            return True
+        enhanced = self.broker.input_modes_active
+        if not enhanced and LEGACY_KEY_REPORT.fullmatch(sequence) is None:
+            # Unnegotiated extended reports remain control traffic, never
+            # manufactured keystrokes or their decimal parameter text.
+            unsupported = sequence.endswith("u") or (
+                sequence.startswith(ESC + "[") and ":" in sequence
+            )
+            self.broker.dropped_controls += int(unsupported)
+            return unsupported
         event = decode_key(sequence)
         if event is None:
             # Unknown event-type reports must not fall back to PTK's unmatched
             # escape handling, which would insert their decimal parameters.
-            return (
+            unsupported = enhanced and (
                 sequence.endswith("u")
                 or (sequence.startswith(ESC + "[") and ":" in sequence)
                 or KEY_REPORT.fullmatch(sequence) is not None
             )
+            self.broker.dropped_controls += int(unsupported)
+            return unsupported
+        event = replace(event, release_events=enhanced)
+        self._emit_key(event)
+        return True
+
+    def _emit_key(self, event: StructuredKey) -> None:
+        """Reuse one route for native forwarding and PTK popup fallback."""
         self.parser.flush()
         route = _KeyRoute(event)
         for keypress in _legacy_keys(event):
             keypress.structured_key = event
             keypress._host_key_route = route
             self.parser.feed_key_callback(keypress)
-        return True
 
     def _mouse(self, sequence: str) -> bool:
         if not self.broker.pixel_mouse_active or not sequence.startswith(ESC + "[<"):
@@ -1163,7 +1575,6 @@ class HostParser:
                 ESC + "]12;",
                 ESC + "]21;",
                 ESC + "[?997;",
-                ESC + "]l",
             )
         ):
             return False
@@ -1177,6 +1588,14 @@ class HostParser:
 
     def _drain_discard(self) -> bool:
         for index, character in enumerate(self._pending):
+            if self._discard == "csi" and CSI_INPUT_BREAK.fullmatch(character):
+                # Even an oversized/incomplete report cannot retain real
+                # interrupt, EOF or submit keys. CAN/SUB cancel silently;
+                # other C0 input resumes through the normal PTK key parser.
+                self._pending = self._pending[index + int(character in "\x18\x1a") :]
+                self._discard = None
+                self._discard_escape = False
+                return True
             ended = (
                 bool(CSI_FINAL.fullmatch(character))
                 if self._discard == "csi"
@@ -1195,6 +1614,8 @@ class HostParser:
 
     def feed(self, data: str) -> None:
         """Accept arbitrary reader fragments while preserving key/paste order."""
+        if data:
+            self.broker.seal_keys()
         self._pending += data
         while self._pending:
             if self._discard is not None:
@@ -1230,12 +1651,30 @@ class HostParser:
             kind = self._pending[1]
             if kind == "[":
                 final = CSI_FINAL.search(self._pending, 2)
+                boundary = CSI_INPUT_BREAK.search(self._pending, 2)
+                if boundary is not None:
+                    if final is None or boundary.start() < final.start():
+                        consume = boundary[0] in "\x18\x1a"
+                        self._pending = self._pending[boundary.start() + int(consume) :]
+                        self.broker.dropped_controls += 1
+                        continue
                 if final is None:
                     if len(self._pending) > MAX_CONTROL:
                         self._pending = ""
                         self._discard = "csi"
+                        self.broker.dropped_controls += 1
                     break
                 end = final.end()
+                # X10 mouse has three coordinate characters after CSI M;
+                # Linux console keys use CSI [ plus their actual final byte.
+                if self._pending.startswith(ESC + "[M"):
+                    if len(self._pending) < 6:
+                        break
+                    end = 6
+                elif self._pending.startswith(ESC + "[["):
+                    if len(self._pending) < 4:
+                        break
+                    end = 4
             elif kind in ("]", "P", "_", "^"):
                 endings = []
                 end_st = self._pending.find(ST, 2)
@@ -1253,6 +1692,7 @@ class HostParser:
                         self._discard_escape = self._pending.endswith(ESC)
                         self._pending = ""
                         self._discard = "osc" if kind == "]" else "string"
+                        self.broker.dropped_controls += 1
                     break
                 end = min(endings)
             else:
@@ -1265,6 +1705,15 @@ class HostParser:
             if sequence == PASTE_START:
                 self._paste = True
                 self.parser.feed(sequence)
+            elif len(sequence) > MAX_CONTROL:
+                self.broker.dropped_controls += 1
+            elif sequence.startswith(ESC + "[M"):
+                # Coordinates may end with response final letters such as n;
+                # their meaning belongs to the complete legacy mouse record.
+                if self.parser._get_match(sequence) == Keys.Vt100MouseEvent:
+                    self.parser.feed(sequence)
+                else:
+                    self.broker.dropped_controls += 1
             elif self._focus(sequence):
                 continue
             elif len(sequence) <= MAX_CONTROL and self._clipboard(sequence):
@@ -1276,7 +1725,13 @@ class HostParser:
             elif len(sequence) <= MAX_CONTROL and self._key(sequence):
                 continue
             elif len(sequence) <= MAX_CONTROL and not self.broker.control(sequence):
-                self.parser.feed(sequence)
+                # PTK's unmatched CSI fallback can emit decimal parameters as
+                # ordinary typing. Only its exact known key/mouse/CPR match is
+                # eligible; unclaimed extension controls remain controls.
+                if self.parser._get_match(sequence) is not None:
+                    self.parser.feed(sequence)
+                else:
+                    self.broker.dropped_controls += 1
 
 
 class HostInput(Input):
@@ -1290,11 +1745,12 @@ class HostInput(Input):
         """Attach to the version-pinned VT parser without creating an input source."""
         parser = getattr(source, "vt100_parser", None)
         if parser is None or isinstance(parser, HostParser):
-            raise TypeError("HostInput requires an unwrapped PTK VT input")
+            raise TypeError(i18n.get(Message.VT_HOST_INPUT))
         self.source = source
         self._parser = parser
         self.parser = HostParser(parser, broker)
         source.vt100_parser = self.parser
+        self._initial_termios = None
 
     def fileno(self):
         """Retain the existing descriptor."""
@@ -1321,13 +1777,30 @@ class HostInput(Input):
         """Expose the original EOF state."""
         return self.source.closed
 
+    @contextmanager
     def raw_mode(self):
-        """Retain PTK's terminal mode restoration context."""
-        return self.source.raw_mode()
+        """Retain PTK cleanup and capture the actual initial TTY settings once."""
+        if self._initial_termios is None:
+            try:
+                self._initial_termios = termios.tcgetattr(self.fileno())
+            except (OSError, termios.error):
+                pass  # Non-TTY inputs retain PTK's original no-op behavior.
+        with self.source.raw_mode():
+            yield
 
+    @contextmanager
     def cooked_mode(self):
-        """Retain PTK's cooked mode context."""
-        return self.source.cooked_mode()
+        """Temporarily restore the saved TTY, not a guessed cooked default."""
+        if self._initial_termios is None:
+            with self.source.cooked_mode():
+                yield
+        else:
+            current = termios.tcgetattr(self.fileno())
+            try:
+                termios.tcsetattr(self.fileno(), termios.TCSANOW, self._initial_termios)
+                yield
+            finally:
+                termios.tcsetattr(self.fileno(), termios.TCSANOW, current)
 
     def attach(self, input_ready_callback):
         """Register the existing reader once."""

@@ -13,11 +13,12 @@ from collections.abc import Callable
 from ish.lang import Message, i18n
 from ish.runtime.fdio import FDWriter
 
+from .identity import PROGRAM, TERM
+
 READ_BYTES = 65536
 READ_BUDGET = 256 * 1024
 SHUTDOWN_SECONDS = 2
 SHUTDOWN_INTERVAL = 0.05
-TERM = "xterm-256color"
 MAX_PENDING_INPUT = 4 * 1024 * 1024
 
 
@@ -67,7 +68,7 @@ class Session:
             from .host import scrub_environment
 
             env = scrub_environment(os.environ)
-            env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM="ish-vt")
+            env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM=PROGRAM)
         else:
             env = dict(self.env)
         self.pid, self.fd = pty.fork()

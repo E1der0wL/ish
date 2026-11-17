@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from terminal_plugin import plugin_options
+
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".cache/terminal-test"
 EVIDENCE = CACHE / "evidence"
@@ -104,8 +106,7 @@ class LegacyGuiTests(unittest.TestCase):
             str(self.directory),
             "--dump-state",
             str(self.dump),
-            "--plugin",
-            "terminal_plugin:setup",
+            *plugin_options(self.directory),
         ]
         if self.host == "xterm":
             command = [

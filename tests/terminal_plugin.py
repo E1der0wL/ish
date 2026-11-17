@@ -6,6 +6,25 @@ from pathlib import Path
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.widgets import TextArea
 
+PLUGIN_META = {"version": "1", "requirements": [], "dependencies": []}
+TERMINAL_API = 1
+
+
+def plugin_options(directory):
+    """Install this opt-in fixture through the public PluginManager file layout."""
+    scripts = directory / "plugins"
+    package = scripts / "terminal_test"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "terminal_test.py").write_bytes(Path(__file__).read_bytes())
+    return [
+        "--plugin-dir",
+        str(scripts),
+        "--library-dir",
+        str(directory / "libraries"),
+        "--plugin",
+        "terminal_test",
+    ]
+
 
 def setup(plugins):
     """Install a movable opaque popup only when the test requests this plugin."""

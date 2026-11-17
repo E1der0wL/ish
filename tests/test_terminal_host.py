@@ -2,16 +2,20 @@
 
 import asyncio
 import io
+import json
 import os
+import tempfile
+import termios
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Size
-from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.input import create_input, create_pipe_input
 from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.vt100 import Vt100_Output
@@ -51,10 +55,30 @@ class HostProbeTests(unittest.TestCase):
         """No optional capability is enabled by sending a query."""
         self.assertEqual(
             self.query,
-            "\x1b[16t\x1b[14t\x1b[?2026$p\x1b[?5522$p\x1b[?2031$p\x1b[?996n\x1b[>q\x1b[21t"
+            "\x1bP$q q\x1b\\\x1b[16t\x1b[14t\x1b[?2026$p\x1b[?5522$p\x1b[?2031$p\x1b[?996n\x1b[?u\x1b[>q"
             "\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]21;cursor=?\x1b\\"
             + "".join(f"\x1b]4;{index};?\x1b\\" for index in range(256))
-            + "\x1b_Ga=q,i=2147515049,s=1,v=1,f=24,t=d;AAAA\x1b\\",
+            + "\x1b_Ga=q,i=2147515049,s=1,v=1,f=24,t=d;AAAA\x1b\\"
+            + "".join(
+                f"\x1b[?{mode}$p"
+                for mode in (
+                    1,
+                    6,
+                    7,
+                    12,
+                    25,
+                    1000,
+                    1002,
+                    1003,
+                    1004,
+                    1005,
+                    1006,
+                    1015,
+                    1016,
+                    2004,
+                )
+            )
+            + "\x1bP$qm\x1b\\",
         )
         self.assertEqual(self.broker.profile, HostProfile())
         with self.assertRaises(FrozenInstanceError):
@@ -72,6 +96,8 @@ class HostProbeTests(unittest.TestCase):
             "\x1b[4;600;1000t",
             "\x1b[?2026;2$y",
             "\x1b[?5522;2$y",
+            "\x1b[?0u",
+            "\x1b[?1016;2$y",
             "\x1b[?62;4;6;22c",
             "\x1bP>|kitty(0.50.0)\x1b\\",
             "\x1b_Gi=2147515049;OK\x1b\\",
@@ -82,22 +108,19 @@ class HostProbeTests(unittest.TestCase):
         self.assertEqual(
             profile,
             HostProfile(
-                True,
-                True,
-                True,
-                10,
-                20,
-                1000,
-                600,
-                True,
-                True,
-                True,
-                True,
-                True,
-                "kitty",
-                title_stack=True,
+                kitty_graphics=True,
+                hyperlinks=True,
+                synchronized_output=True,
+                cell_width=10,
+                cell_height=20,
+                pixel_width=1000,
+                pixel_height=600,
+                enhanced_keyboard=True,
+                extended_styles=True,
+                pixel_mouse=True,
+                clipboard_protocol=True,
+                image_protocol="kitty",
                 overline=True,
-                title_control=True,
             ),
         )
         self.assertEqual(self.keys, [])
@@ -195,6 +218,40 @@ class HostProbeTests(unittest.TestCase):
         self.feed("\x1b")
         self.assertEqual([key.key for key in self.keys], [Keys.Escape])
 
+    def test_conventional_modified_function_keys_need_no_enhanced_handshake(self):
+        """Known CSI keys retain identities even when the host has no Kitty mode."""
+        self.broker.finish_probe()
+        self.feed("\x1b[13;2~\x1b[13;5~\x1b[1;3P")
+        self.assertFalse(self.broker.input_modes_active)
+        self.assertEqual(
+            [key.structured_key for key in self.keys],
+            [
+                StructuredKey("f3", 57366, 1),
+                StructuredKey("f3", 57366, 2),
+                StructuredKey("f1", 57364, 4),
+                StructuredKey("f1", 57364, 4),
+            ],
+        )
+        received = []
+        self.broker.on_key = lambda event: received.append(event) or True
+        for key in self.keys:
+            self.assertTrue(self.broker.handle_key(key))
+        self.assertEqual(
+            received,
+            [
+                StructuredKey("f3", 57366, 1),
+                StructuredKey("f3", 57366, 2),
+                StructuredKey("f1", 57364, 4),
+            ],
+        )
+
+    def test_legacy_key_support_does_not_guess_cpr_or_enable_extended_events(self):
+        """Ambiguous R replies stay CPR, and unnegotiated CSI-u is control traffic."""
+        self.broker.finish_probe()
+        self.feed("\x1b[1;2R\x1b[97;5u\x1b[13;5:3~")
+        self.assertEqual([key.key for key in self.keys], [Keys.CPRResponse])
+        self.assertFalse(hasattr(self.keys[0], "structured_key"))
+
     def test_focus_and_graphics_errors_have_distinct_control_consumers(self):
         """Errors and focus events reach handlers, never the command input buffer."""
         focus, errors = [], []
@@ -264,11 +321,11 @@ class HostProbeTests(unittest.TestCase):
         self.assertEqual(self.keys[0].key, Keys.BracketedPaste)
         self.assertEqual(self.keys[0].data, "\x9b6;20;10t")
 
-    def test_verified_kitty_version_enables_links_without_guessing_other_hosts(self):
-        """Only a live, recognized XTVERSION reply selects Kitty's link capability."""
+    def test_link_policy_is_independent_of_host_identity(self):
+        """Link output defaults on, while an explicit off survives host identification."""
         self.feed("\x1bP>|kitty(0.50.0)\x1b\\")
         self.assertTrue(self.broker.finish_probe().hyperlinks)
-        other = HostBroker()
+        other = HostBroker(features={"hyperlinks": "off"})
         other.begin_probe(80, 24)
         other.control("\x1bP>|XTerm(400)\x1b\\")
         self.assertFalse(other.finish_probe().hyperlinks)
@@ -286,11 +343,11 @@ class HostProbeTests(unittest.TestCase):
         self.assertFalse(other.profile.clipboard_protocol)
 
     def test_host_policy_does_not_replace_protocol_observations(self):
-        """A version enables known behavior while graphics/clipboard need replies."""
+        """A version cannot replace keyboard, graphics or clipboard support replies."""
         self.feed("\x1bP>|kitty(0.50.0)\x1b\\\x1b[6;20;10t")
         profile = self.broker.finish_probe()
         self.assertEqual(self.broker.adapter.name, "kitty")
-        self.assertTrue(profile.enhanced_keyboard)
+        self.assertFalse(profile.enhanced_keyboard)
         self.assertFalse(profile.kitty_graphics)
         self.assertFalse(profile.clipboard_protocol)
         self.assertIsNone(profile.image_protocol)
@@ -307,16 +364,15 @@ class HostProbeTests(unittest.TestCase):
         self.assertTrue(profile.clipboard_protocol)
         self.assertEqual(profile.image_protocol, "kitty")
         self.assertFalse(profile.enhanced_keyboard)
-        self.assertFalse(profile.extended_styles)
-        self.assertFalse(profile.title_stack)
+        self.assertTrue(profile.extended_styles)
 
-    def test_host_policy_keeps_exact_verified_version_gates(self):
-        """Neighboring versions get only independently acknowledged capabilities."""
-        for version, name, image, title in (
-            ("XTerm(407)", "xterm", "kitty", True),
-            ("XTerm(408)", "unknown", "kitty", False),
-            ("WezTerm 20240203-110809-5046fc22", "wezterm", "iterm", False),
-            ("WezTerm 20240203-110809-5046fc23", "unknown", "kitty", False),
+    def test_host_names_only_select_quirks_and_never_image_protocols(self):
+        """Version changes cannot replace feature policy and independent replies."""
+        for version, name, image in (
+            ("XTerm(407)", "xterm", "kitty"),
+            ("XTerm(408)", "unknown", "kitty"),
+            ("WezTerm 20240203-110809-5046fc22", "wezterm", "kitty"),
+            ("WezTerm 20240203-110809-5046fc23", "unknown", "kitty"),
         ):
             with self.subTest(version=version):
                 broker = HostBroker()
@@ -327,7 +383,6 @@ class HostProbeTests(unittest.TestCase):
                 profile = broker.finish_probe()
                 self.assertEqual(broker.adapter.name, name)
                 self.assertEqual(profile.image_protocol, image)
-                self.assertEqual(profile.title_stack, title)
 
     def test_duplicate_and_cancelled_versions_cannot_change_host_policy(self):
         """Only the first in-flight identity counts; cancellation discards policy."""
@@ -355,7 +410,6 @@ class HostProbeTests(unittest.TestCase):
         )
         self.assertIsNone(self.broker.finish_probe().image_protocol)
         self.assertFalse(self.broker.profile.kitty_graphics)
-        self.assertTrue(self.broker.profile.title_stack)
         self.assertIsNone(self.broker.refresh_geometry(101, 30, 0, 0).image_protocol)
         self.assertIsNone(
             self.broker.refresh_geometry(101, 30, 1010, 600).image_protocol
@@ -406,7 +460,7 @@ class HostProbeTests(unittest.TestCase):
 
     def test_xterm_inset_policy_is_not_applied_to_other_identified_hosts(self):
         """A similar kernel/query difference cannot authorize a generic host correction."""
-        broker = HostBroker()
+        broker = HostBroker(features={"iterm_graphics": "on"})
         broker.refresh_geometry(80, 24, 804, 484)
         broker.begin_probe(80, 24)
         broker.control("\x1b[6;20;10t")
@@ -428,13 +482,15 @@ class HostProbeTests(unittest.TestCase):
             broker.control("\x1b[6;20;10t")
             self.assertIsNone(broker.finish_probe().image_protocol)
 
-    def test_verified_wezterm_adapter_uses_iterm_protocol_with_geometry(self):
-        """The explicitly tested WezTerm build chooses its iTerm image transport."""
-        self.feed(
-            "\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\\x1b[6;22;10t\x1b_Gi=2147515049;OK\x1b\\"
-        )
-        self.assertEqual(self.broker.finish_probe().image_protocol, "iterm")
-        self.assertTrue(self.broker.profile.kitty_graphics)
+    def test_explicit_iterm_selection_wins_without_a_host_name(self):
+        """One measured image backend is selected, without fabricating a Kitty ACK."""
+        broker = HostBroker(features={"iterm_graphics": "on"})
+        broker.begin_probe(100, 30, query_id=2147515049)
+        broker.control("\x1b[6;22;10t")
+        broker.control("\x1b_Gi=2147515049;OK\x1b\\")
+        self.assertEqual(broker.finish_probe().image_protocol, "iterm")
+        self.assertFalse(broker.profile.kitty_graphics)
+        self.assertEqual(broker.feature_status["kitty_graphics"].support, "supported")
 
     def test_retired_graphics_query_is_not_sent_and_late_reports_are_consumed(self):
         """No SIXEL negotiation remains, including accidental keyboard leakage."""
@@ -496,6 +552,32 @@ class HostProbeTests(unittest.TestCase):
 class HostInputTests(unittest.IsolatedAsyncioTestCase):
     """Exercise the existing PTK descriptor, parser, and attachment together."""
 
+    async def test_temporary_handoff_uses_initial_termios_not_cooked_defaults(self):
+        """Non-default echo/flow/output settings survive suspend and final close."""
+        master, slave = os.openpty()
+        try:
+            original = termios.tcgetattr(slave)
+            original[0] &= ~termios.IXON
+            original[1] &= ~termios.OPOST
+            original[3] &= ~termios.ECHO
+            termios.tcsetattr(slave, termios.TCSANOW, original)
+            with os.fdopen(os.dup(slave), "r") as stream:
+                source = create_input(stdin=stream)
+                wrapped = HostInput(source, HostBroker())
+                try:
+                    with wrapped.raw_mode():
+                        raw = termios.tcgetattr(slave)
+                        self.assertNotEqual(raw, original)
+                        with wrapped.cooked_mode():
+                            self.assertEqual(termios.tcgetattr(slave), original)
+                        self.assertEqual(termios.tcgetattr(slave), raw)
+                    self.assertEqual(termios.tcgetattr(slave), original)
+                finally:
+                    wrapped.close()
+        finally:
+            os.close(master)
+            os.close(slave)
+
     async def test_one_reader_delivers_keys_and_consumes_fragmented_control(self):
         """The real descriptor reader consumes responses before PTK key delivery."""
         with create_pipe_input() as source:
@@ -544,6 +626,8 @@ class HostInputTests(unittest.IsolatedAsyncioTestCase):
             )
             broker.begin_probe(80, 24)
             broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+            broker.control("\x1b[?0u")
+            broker.control("\x1b[?1016;2$y")
             broker.finish_probe()
             broker.enter_input_modes()
             input = HostInput(source, broker)
@@ -567,6 +651,8 @@ class HostInputTests(unittest.IsolatedAsyncioTestCase):
             )
             broker.begin_probe(80, 24)
             broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+            broker.control("\x1b[?0u")
+            broker.control("\x1b[?1016;2$y")
             broker.finish_probe()
             broker.enter_input_modes()
             input = HostInput(source, broker)
@@ -617,6 +703,8 @@ class HostInputTests(unittest.IsolatedAsyncioTestCase):
             broker = HostBroker()
             broker.begin_probe(100, 30)
             broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+            broker.control("\x1b[?0u")
+            broker.control("\x1b[?1016;2$y")
             broker.control("\x1b[6;20;10t")
             broker.finish_probe()
             broker.enter_input_modes()
@@ -640,6 +728,8 @@ class HostInputTests(unittest.IsolatedAsyncioTestCase):
             broker = HostBroker()
             broker.begin_probe(100, 30)
             broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+            broker.control("\x1b[?0u")
+            broker.control("\x1b[?1016;2$y")
             broker.control("\x1b[6;20;10t")
             broker.finish_probe()
             broker.enter_input_modes()
@@ -678,12 +768,17 @@ class HostRendererTests(unittest.IsolatedAsyncioTestCase):
         with create_pipe_input() as source:
             with create_app_session(input=source, output=output):
                 with patch("ish.terminal.app.create_input", return_value=source):
-                    owner = TerminalApp("/bin/sh", Path(__file__).resolve().parents[1])
+                    owner = TerminalApp(
+                        "/bin/sh", Path(__file__).resolve().parents[1], mouse="on"
+                    )
             try:
                 owner.host.begin_probe(12, 6)
                 owner.host.control("\x1bP>|kitty(0.50.0)\x1b\\")
+                owner.host.control("\x1b[?0u")
+                owner.host.control("\x1b[?1016;2$y")
                 owner.host.control("\x1b[6;20;10t")
                 owner.host.finish_probe()
+                owner.presentation_ready = True
                 with set_app(owner.app):
                     owner.app.renderer.render(owner.app, owner.app.layout)
                 owner.app.renderer.enter_input_modes()
@@ -693,7 +788,12 @@ class HostRendererTests(unittest.IsolatedAsyncioTestCase):
                 output.flush()
                 reset_wire = stream.getvalue()[start:]
                 for sequence in ("\x1b[<u", "\x1b[?1016l", "\x1b[?1004l"):
-                    self.assertEqual(reset_wire.count(sequence), 1)
+                    # Pixel reset exits our encoding before screen departure;
+                    # the observed initial reset is restored after PTK cleanup.
+                    self.assertEqual(
+                        reset_wire.count(sequence),
+                        2 if sequence == "\x1b[?1016l" else 1,
+                    )
                     self.assertLess(
                         reset_wire.index(sequence), reset_wire.index("\x1b[?1049l")
                     )
@@ -712,10 +812,12 @@ class HostPixelMouseTests(unittest.TestCase):
     """Keep host pixels exact while exposing physical cell positions to PTK widgets."""
 
     def setUp(self):
-        """Establish a known Kitty adapter and explicitly reported 10 by 20 cells."""
+        """Observe keyboard/pixel support and independently reported 10 by 20 cells."""
         self.broker = HostBroker()
         self.broker.begin_probe(100, 30)
         self.broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        self.broker.control("\x1b[?0u")
+        self.broker.control("\x1b[?1016;2$y")
         self.broker.control("\x1b[6;20;10t")
         self.broker.finish_probe()
         self.keys = []
@@ -724,7 +826,6 @@ class HostPixelMouseTests(unittest.TestCase):
     def test_pixel_mode_is_enabled_after_cell_mode_and_reset_explicitly(self):
         """Pixel format is an independent capability with explicit setup and cleanup."""
         self.assertTrue(self.broker.profile.pixel_mouse)
-        self.assertTrue(self.broker.profile.true_color)
         self.assertEqual(self.broker.enter_input_modes(), "\x1b[>3u\x1b[?1016h")
         self.assertEqual(self.broker.enter_input_modes(), "")
         self.assertEqual(self.broker.leave_input_modes(), "\x1b[?1016l\x1b[<u")
@@ -783,10 +884,12 @@ class HostKeyboardTests(unittest.TestCase):
     """Map a bounded enhanced-key subset without bypassing PTK's ordered queue."""
 
     def setUp(self):
-        """Enable only the profile of a positively identified Kitty host."""
+        """Enable the protocol only after its literal status reply."""
         self.broker = HostBroker()
         self.broker.begin_probe(80, 24)
         self.broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        self.broker.control("\x1b[?0u")
+        self.broker.control("\x1b[?1016;2$y")
         self.broker.finish_probe()
         self.keys = []
         self.parser = HostParser(Vt100Parser(self.keys.append), self.broker)
@@ -801,7 +904,25 @@ class HostKeyboardTests(unittest.TestCase):
         unknown.finish_probe()
         self.assertEqual(unknown.enter_input_modes(), "")
         self.assertFalse(unknown.profile.enhanced_keyboard)
-        self.assertFalse(unknown.profile.extended_styles)
+        self.assertTrue(unknown.profile.extended_styles)
+
+    def test_queued_keys_keep_the_release_contract_observed_at_receipt(self):
+        """Negotiation between receipt and PTK dispatch cannot change a key's source."""
+        received = []
+        self.broker.on_key = lambda key: received.append(key) or True
+        self.parser.feed("\x1b[A")
+        self.broker.enter_input_modes()
+        self.broker.handle_key(self.keys.pop())
+        self.parser.feed("\x1b[A")
+        self.broker.leave_input_modes()
+        self.broker.handle_key(self.keys.pop())
+        self.assertEqual(
+            received,
+            [
+                StructuredKey("up", 57352),
+                StructuredKey("up", 57352, release_events=True),
+            ],
+        )
 
     def test_wire_modifiers_actions_and_alternates_remain_explicit(self):
         """Normalize modifier bits while retaining observed logical key alternatives."""
@@ -825,17 +946,21 @@ class HostKeyboardTests(unittest.TestCase):
         self.assertEqual(self.keys[0].data, "\x03")
         self.assertEqual(self.keys[2].structured_key.action, "repeat")
 
-    def test_keypad_navigation_keeps_ordinary_editing_without_physical_key_claim(self):
-        """Enabling disambiguation must not discard keypad Enter and cursor movement."""
+    def test_keypad_identity_survives_ordinary_popup_editing_fallback(self):
+        """The child retains physical keypad identities while popup widgets use PTK keys."""
         self.broker.enter_input_modes()
         self.parser.feed("\x1b[57414u\x1b[57417;5:2u")
         self.assertEqual(
             [key.key for key in self.keys], [Keys.ControlM, Keys.ControlLeft]
         )
         self.assertEqual(self.keys[0].data, "\r")
-        self.assertEqual(self.keys[0].structured_key, StructuredKey("enter", 57414))
         self.assertEqual(
-            self.keys[1].structured_key, StructuredKey("left", 57417, 2, "repeat")
+            self.keys[0].structured_key,
+            StructuredKey("kpenter", 57414, release_events=True),
+        )
+        self.assertEqual(
+            self.keys[1].structured_key,
+            StructuredKey("kpleft", 57417, 2, "repeat", release_events=True),
         )
 
     def test_alt_fallback_is_one_native_dispatch_and_two_legacy_popup_keys(self):
@@ -848,7 +973,7 @@ class HostKeyboardTests(unittest.TestCase):
         self.assertEqual(
             [self.broker.handle_key(key) for key in self.keys], [True, True]
         )
-        self.assertEqual(received, [StructuredKey("up", 57352, 4)])
+        self.assertEqual(received, [StructuredKey("up", 57352, 4, release_events=True)])
 
     def test_ui_consumption_claims_all_tokens_of_one_structured_alt_event(self):
         """An Escape shortcut cannot leak its Alt sibling after changing focus."""
@@ -896,7 +1021,9 @@ class HostKeyboardTests(unittest.TestCase):
         self.assertEqual(received, [])
         self.assertEqual(len(self.keys), 1)
         self.assertTrue(self.broker.handle_key(self.keys[0]))
-        self.assertEqual(received, [StructuredKey("a", 97, 2, "repeat")])
+        self.assertEqual(
+            received, [StructuredKey("a", 97, 2, "repeat", release_events=True)]
+        )
 
     def test_pasted_csi_u_and_ordinary_unicode_remain_unstructured_text(self):
         """A paste does not become physical events even when enhanced mode is enabled."""
@@ -991,7 +1118,7 @@ class HostAppearanceTests(unittest.TestCase):
             "\x1b]10;rgb:11/22/33\x07\x1b]4;0;rgb:00/00/00\x07"
         )
         initial = self.broker.finish_probe().appearance
-        self.assertEqual(self.broker.enter_metadata_modes(), "\x1b[22;2t\x1b[?2031h")
+        self.assertEqual(self.broker.enter_metadata_modes(), "\x1b[?2031h")
         self.assertEqual(self.broker.enter_metadata_modes(), "")
         self.parser.feed("a\x1b[?997;2nb")
         self.assertEqual(self.changes, [])
@@ -1006,7 +1133,7 @@ class HostAppearanceTests(unittest.TestCase):
         self.assertIs(self.broker.profile.initial_appearance, initial)
         self.dispatch("\x1b]10;rgb:44/55/66\x07")
         self.assertIsNone(self.broker.profile.appearance.foreground)
-        self.assertEqual(self.broker.leave_metadata_modes(), "\x1b[?2031l\x1b[23;2t")
+        self.assertEqual(self.broker.leave_metadata_modes(), "\x1b[?2031l")
         self.assertEqual(self.broker.leave_metadata_modes(), "")
         self.dispatch("\x1b[?997;1n")
         self.assertEqual(self.broker.profile.appearance.scheme, "light")
@@ -1045,43 +1172,32 @@ class HostAppearanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.broker.set_cursor_color((1, 2, 256))
 
-    def test_title_stack_and_queried_fallback_follow_exact_host_policy(self):
-        """WezTerm's tested release ignores title stacks; observed title can restore."""
-        for version, stacked, overline in (
-            ("kitty(0.50.0)", True, True),
-            ("XTerm(407)", True, False),
-            ("WezTerm 20240203-110809-5046fc22", False, True),
-            ("XTerm(999)", False, False),
+    def test_metadata_lifecycle_does_not_query_save_or_restore_titles(self):
+        """Title persistence is a shared policy, independent of host capability."""
+        for version, overline in (
+            ("kitty(0.50.0)", True),
+            ("XTerm(407)", True),
+            ("WezTerm 20240203-110809-5046fc22", True),
+            ("XTerm(999)", True),
         ):
             with self.subTest(version=version):
                 broker = HostBroker()
-                broker.begin_probe(80, 24)
+                self.assertNotIn("\x1b[21t", broker.begin_probe(80, 24))
                 broker.control(f"\x1bP>|{version}\x1b\\")
+                self.assertTrue(broker.control("\x1b]l원래 제목\x1b\\"))
                 profile = broker.finish_probe()
-                self.assertEqual(profile.title_stack, stacked)
-                self.assertEqual(profile.title_control, stacked)
                 self.assertEqual(profile.overline, overline)
-                self.assertEqual(
-                    broker.enter_metadata_modes(), "\x1b[22;2t" if stacked else ""
-                )
-                self.assertEqual(
-                    broker.leave_metadata_modes(), "\x1b[23;2t" if stacked else ""
-                )
-        self.dispatch(
-            "\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\\x1b]l원래 제목\x1b\\"
-        )
-        self.assertTrue(self.broker.finish_probe().title_control)
-        self.assertEqual(self.broker.enter_metadata_modes(), "")
-        self.assertEqual(self.broker.leave_metadata_modes(), "\x1b]2;원래 제목\x1b\\")
-        self.assertEqual(self.broker.leave_metadata_modes(), "")
+                self.assertEqual(broker.enter_metadata_modes(), "")
+                self.assertEqual(broker.leave_metadata_modes(), "")
+                self.assertEqual(broker.leave_metadata_modes(), "")
 
-    def test_title_reply_is_bounded_sanitized_and_cannot_arrive_after_commit(self):
-        """Untrusted control bytes or late titles never enter restoration output."""
+    def test_unsolicited_title_replies_never_become_input_or_restore_output(self):
+        """Former title replies are discarded before and after initial observation."""
         self.dispatch("\x1b]lbad\x00title\x07")
         self.dispatch("\x1b]l" + "x" * 1025 + "\x07")
-        self.assertFalse(self.broker.finish_probe().title_control)
+        self.broker.finish_probe()
         self.dispatch("\x1b]llate\x07")
-        self.assertIsNone(self.broker.profile.initial_title)
+        self.assertEqual(self.keys, [])
         self.assertEqual(self.broker.enter_metadata_modes(), "")
         self.assertEqual(self.broker.leave_metadata_modes(), "")
 
@@ -1089,10 +1205,30 @@ class HostAppearanceTests(unittest.TestCase):
         """Readiness here is complete optional observations, never shell readiness."""
         self.dispatch(
             "\x1b[6;20;10t\x1b[?2026;0$y\x1b[?5522;0$y\x1b[?2031;0$y"
-            "\x1bP>|XTerm(407)\x1b\\"
+            "\x1bP>|XTerm(407)\x1b\\\x1b[?0u"
             + f"\x1b_Gi={self.broker._query_id};EINVAL:unsupported\x1b\\"
             + "\x1b]10;rgb:ff/ff/ff;rgb:00/00/00;rgb:ff/ff/ff\x07"
             + "".join(f"\x1b]4;{index};rgb:00/00/00\x07" for index in range(256))
+            + "".join(
+                f"\x1b[?{mode};0$y"
+                for mode in (
+                    1,
+                    6,
+                    7,
+                    12,
+                    25,
+                    1000,
+                    1002,
+                    1003,
+                    1004,
+                    1005,
+                    1006,
+                    1015,
+                    1016,
+                    2004,
+                )
+            )
+            + "\x1bP0$rm\x1b\\\x1bP0$r q\x1b\\"
         )
         self.assertTrue(self.broker.ready.is_set())
         self.assertIsNone(self.broker.finish_probe().appearance.scheme)
@@ -1170,6 +1306,303 @@ class HostAppearanceReaderTests(unittest.TestCase):
                 self.assertTrue(broker.handle_control(key))
             self.assertEqual(broker.profile.appearance.scheme, "light")
             self.assertEqual(observed, ["a", "light", "b", "\x1b[?997;1n"])
+
+
+class HostHarnessTests(unittest.TestCase):
+    """Actual-host evidence must fail on restoration or initialization errors."""
+
+    def test_unrestored_host_cannot_publish_a_passed_result(self):
+        """Successful native files cannot hide a failed host terminal restoration."""
+        import terminal_host
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw-sizes").write_text("[[80, 24]]")
+            terminal = SimpleNamespace(
+                status=0,
+                root=root,
+                sizes=[[80, 24]],
+                fd=5,
+                attrs=["child saved"],
+                saved_host=["host saved"],
+                close=Mock(),
+            )
+            scenario = SimpleNamespace(run=Mock(), files=[])
+            with (
+                patch.object(terminal_host, "HostTerminal", return_value=terminal),
+                patch.object(terminal_host, "Scenario", return_value=scenario),
+                patch.object(
+                    terminal_host.termios,
+                    "tcgetattr",
+                    side_effect=lambda fd: (
+                        ["host changed"] if fd == 0 else ["child saved"]
+                    ),
+                ),
+            ):
+                result = terminal_host.HostRun(root, "bash", False).run()
+            self.assertEqual(result["status"], "failed")
+            self.assertFalse(result["host_termios_restored"])
+            self.assertEqual(
+                json.loads((root / "result.json").read_text())["status"], "failed"
+            )
+            terminal.close.assert_called_once()
+
+    def test_host_initialization_error_restores_and_closes_the_created_pty(self):
+        """Failure after spawning must clean up even before HostRun owns the object."""
+        import terminal_host
+
+        def spawned(owner, root, **kwargs):
+            owner.output = bytearray(b"captured output")
+            owner.pid = 123
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(terminal_host.HooklessTerminal, "__init__", spawned),
+                patch.object(terminal_host.HooklessTerminal, "close") as close,
+                patch.object(
+                    terminal_host.termios, "tcgetattr", return_value=["saved"]
+                ),
+                patch.object(
+                    terminal_host.termios, "tcgetwinsize", return_value=(24, 80)
+                ),
+                patch.object(terminal_host.termios, "tcsetattr") as restore,
+                patch.object(terminal_host.signal, "signal"),
+                patch.object(
+                    terminal_host.tty, "setraw", side_effect=OSError("raw mode failed")
+                ),
+                self.assertRaisesRegex(OSError, "raw mode failed"),
+            ):
+                terminal_host.HostTerminal(root, shell="bash", plugins=False)
+            close.assert_called_once()
+            restore.assert_called_once_with(0, terminal_host.termios.TCSANOW, ["saved"])
+            self.assertEqual((root / "output.bin").read_bytes(), b"captured output")
+
+
+class HostFeatureTests(unittest.TestCase):
+    """Separate feature choices from replies and mandatory presentation facts."""
+
+    def probe(self, features=None, *replies):
+        """Use literal host replies through the actual framed input dispatch."""
+        broker = HostBroker(features=features)
+        broker.begin_probe(80, 24, query_id=2147515049)
+        keys = []
+        parser = HostParser(Vt100Parser(keys.append), broker)
+        for reply in replies:
+            parser.feed(reply)
+        parser.flush()
+        for key in keys:
+            self.assertTrue(broker.handle_control(key))
+        broker.finish_probe()
+        return broker
+
+    def test_policy_is_copied_and_unqueried_features_never_claim_support(self):
+        """Changing the caller's dictionary cannot silently change a running profile."""
+        choices = {"hyperlinks": "off"}
+        broker = HostBroker(features=choices)
+        choices["hyperlinks"] = "on"
+        with self.assertRaises(TypeError):
+            broker.features["hyperlinks"] = "on"
+        broker.begin_probe(80, 24)
+        broker.control("\x1bP>|kitty(0.50.0)\x1b\\")
+        broker.finish_probe()
+        state = broker.feature_status
+        self.assertEqual(
+            (
+                state["hyperlinks"].policy,
+                state["hyperlinks"].support,
+                state["hyperlinks"].active,
+                state["hyperlinks"].reason,
+            ),
+            ("off", "unqueried", False, "policy-off"),
+        )
+        self.assertEqual(state["extended_styles"].support, "unqueried")
+        self.assertTrue(state["extended_styles"].active)
+        self.assertEqual(state["enhanced_keyboard"].support, "unknown")
+        self.assertFalse(state["enhanced_keyboard"].active)
+
+    def test_auto_requires_independent_protocol_replies_without_a_host_name(self):
+        """Queried features stay unknown until their exact protocol evidence arrives."""
+        names = (
+            "kitty_graphics",
+            "synchronized_output",
+            "enhanced_keyboard",
+            "pixel_mouse",
+            "clipboard_protocol",
+            "scheme_notifications",
+        )
+        unknown = self.probe()
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(unknown.feature_status[name].support, "unknown")
+                self.assertFalse(unknown.feature_status[name].active)
+        known = self.probe(
+            None,
+            "\x1b[6;20;10t\x1b_Gi=2147515049;OK\x1b\\",
+            "\x1b[?2026;2$y\x1b[?0u\x1b[?1016;2$y\x1b[?5522;2$y",
+            "\x1b[?2031;2$y\x1b[?997;1n",
+        )
+        self.assertEqual(known.adapter.name, "unknown")
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(known.feature_status[name].support, "supported")
+                self.assertTrue(known.feature_status[name].active)
+
+    def test_on_retains_negative_evidence_and_does_not_create_geometry(self):
+        """A forced protocol is a request, never a forged positive observation."""
+        broker = self.probe(
+            {
+                "kitty_graphics": "on",
+                "pixel_mouse": "on",
+                "clipboard_protocol": "on",
+                "synchronized_output": "on",
+            },
+            "\x1b_Gi=2147515049;EINVAL:unsupported\x1b\\",
+            "\x1b[?1016;0$y\x1b[?5522;4$y\x1b[?2026;0$y",
+        )
+        for name in (
+            "kitty_graphics",
+            "pixel_mouse",
+            "clipboard_protocol",
+            "synchronized_output",
+        ):
+            self.assertEqual(broker.feature_status[name].support, "unsupported")
+        self.assertFalse(broker.profile.kitty_graphics)
+        self.assertFalse(broker.profile.pixel_mouse)
+        self.assertTrue(broker.profile.clipboard_protocol)
+        self.assertTrue(broker.profile.synchronized_output)
+        self.assertEqual(broker.graphics_reason, "verified-cell-size-unavailable")
+        broker.refresh_geometry(80, 24, 800, 480)
+        self.assertTrue(broker.profile.kitty_graphics)
+        self.assertTrue(broker.profile.pixel_mouse)
+        self.assertEqual(broker.feature_status["kitty_graphics"].support, "unsupported")
+        self.assertEqual(broker.graphics_reason, "")
+
+    def test_off_survives_positive_replies_and_geometry_refresh(self):
+        """Valid replies and later resize cannot re-enable a disabled feature."""
+        names = (
+            "hyperlinks",
+            "extended_styles",
+            "overline",
+            "cursor_color",
+            "iterm_graphics",
+            "kitty_graphics",
+            "synchronized_output",
+            "enhanced_keyboard",
+            "pixel_mouse",
+            "clipboard_protocol",
+            "scheme_notifications",
+        )
+        broker = self.probe(
+            dict.fromkeys(names, "off"),
+            "\x1b[6;20;10t\x1b_Gi=2147515049;OK\x1b\\",
+            "\x1b[?2026;2$y\x1b[?0u\x1b[?1016;2$y\x1b[?5522;2$y",
+            "\x1b[?2031;2$y\x1b[?997;1n\x1b]12;rgb:11/22/33\x07",
+        )
+        for size in ((90, 25, 0, 0), (90, 25, 900, 500)):
+            broker.refresh_geometry(*size)
+            self.assertTrue(
+                all(not state.active for state in broker.feature_status.values())
+            )
+            self.assertEqual(broker.enter_input_modes(), "")
+            self.assertEqual(broker.enter_metadata_modes(), "")
+            self.assertEqual(broker.set_cursor_color((1, 2, 3)), "")
+            self.assertEqual(broker.graphics_reason, "image-protocols-disabled")
+        self.assertEqual(broker.feature_status["pixel_mouse"].support, "supported")
+
+    def test_iterm_requires_explicit_selection_and_measured_cell_size(self):
+        """iTerm has no support probe, and cannot replace missing size with a guess."""
+        broker = self.probe({"iterm_graphics": "on"})
+        self.assertEqual(broker.feature_status["iterm_graphics"].support, "unqueried")
+        self.assertFalse(broker.feature_status["iterm_graphics"].active)
+        self.assertEqual(broker.graphics_reason, "verified-cell-size-unavailable")
+        broker.refresh_geometry(80, 24, 800, 480)
+        self.assertEqual(broker.profile.image_protocol, "iterm")
+        self.assertFalse(broker.profile.kitty_graphics)
+        broker.refresh_geometry(90, 25, 0, 0)
+        self.assertIsNone(broker.profile.image_protocol)
+        self.assertEqual(broker.graphics_reason, "cell-size-unavailable-after-resize")
+
+    def test_keyboard_query_rejects_unsolicited_invalid_late_and_cancelled_reports(
+        self,
+    ):
+        """Only a valid in-flight status authorizes the existing keyboard push/pop."""
+        broker = HostBroker()
+        broker.control("\x1b[?0u")
+        broker.begin_probe(80, 24)
+        for invalid in ("\x1b[?32u", "\x1b[?999u", "\x1b[?-1u", "\x1b[?1;2u"):
+            self.assertTrue(broker.control(invalid))
+        self.assertFalse(broker.finish_probe().enhanced_keyboard)
+        broker.control("\x1b[?0u")
+        self.assertFalse(broker.profile.enhanced_keyboard)
+        self.assertEqual(broker.feature_status["enhanced_keyboard"].support, "unknown")
+        for flags in (0, 1, 3, 31):
+            with self.subTest(flags=flags):
+                valid = self.probe(None, f"\x1b[?{flags}u")
+                self.assertEqual(valid.enter_input_modes(), "\x1b[>3u")
+                self.assertEqual(valid.enter_input_modes(), "")
+                self.assertEqual(valid.leave_input_modes(), "\x1b[<u")
+                self.assertEqual(valid.leave_input_modes(), "")
+        cancelled = HostBroker()
+        cancelled.begin_probe(80, 24)
+        cancelled.cancel_probe()
+        cancelled.control("\x1b[?0u")
+        self.assertFalse(cancelled.profile.enhanced_keyboard)
+        self.assertEqual(cancelled.enter_input_modes(), "")
+
+    def test_keyboard_response_fragments_preserve_real_keys_and_literal_paste(self):
+        """Keyboard status never reaches user bindings, including after activation."""
+        reply = "\x1b[?0u"
+        for split in range(2, len(reply)):
+            broker, keys = HostBroker(), []
+            broker.begin_probe(80, 24)
+            parser = HostParser(Vt100Parser(keys.append), broker)
+            parser.feed("a" + reply[:split])
+            parser.flush()
+            parser.feed(reply[split:] + "b")
+            self.assertEqual([key.data for key in keys], ["a", "b"])
+            self.assertTrue(broker.finish_probe().enhanced_keyboard)
+            broker.enter_input_modes()
+            parser.feed("\x1b[?31u" + "\x1b[200~" + reply + "\x1b[201~")
+            self.assertEqual([key.data for key in keys], ["a", "b", reply])
+            self.assertEqual(keys[-1].key, Keys.BracketedPaste)
+
+    def test_on_cannot_replace_missing_cursor_and_scheme_start_values(self):
+        """Restoration and identity-free notification boundaries remain prerequisites."""
+        broker = self.probe(
+            {"cursor_color": "on", "scheme_notifications": "on"},
+            "\x1b[?2031;2$y",
+        )
+        self.assertEqual(
+            broker.feature_status["scheme_notifications"].support, "supported"
+        )
+        self.assertEqual(
+            broker.feature_status["scheme_notifications"].reason,
+            "initial-scheme-unavailable",
+        )
+        self.assertEqual(
+            broker.feature_status["cursor_color"].reason, "cursor-state-unavailable"
+        )
+        self.assertEqual(broker.enter_metadata_modes(), "")
+        self.assertEqual(broker.set_cursor_color((1, 2, 3)), "")
+
+    def test_cancelled_probe_keeps_evidence_without_reactivating_features(self):
+        """Cancellation stops use without turning an earlier ACK into a rejection."""
+        broker = HostBroker(features={"kitty_graphics": "on"})
+        broker.begin_probe(80, 24, query_id=2147515049)
+        broker.control("\x1b_Gi=2147515049;OK\x1b\\")
+        broker.control("\x1b[?0u")
+        broker.cancel_probe()
+        broker.refresh_geometry(80, 24, 800, 480)
+        self.assertEqual(broker.feature_status["kitty_graphics"].support, "supported")
+        self.assertEqual(
+            broker.feature_status["enhanced_keyboard"].support, "supported"
+        )
+        self.assertTrue(
+            all(not state.active for state in broker.feature_status.values())
+        )
+        self.assertEqual(broker.graphics_reason, "host-probe-cancelled")
+        self.assertEqual(broker.enter_input_modes(), "")
 
 
 if __name__ == "__main__":

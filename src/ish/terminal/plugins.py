@@ -7,8 +7,8 @@ dispatcher. No plugin, surface, or shortcut is installed by default.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import inspect
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from itertools import count
@@ -28,6 +28,9 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.screen import WritePosition
 
+from ish.lang import Message, i18n
+
+API_VERSION = 1
 MAX_POPUPS = 16
 MAX_BAR_ROWS = 8
 MAX_ERRORS = 16
@@ -78,6 +81,14 @@ class Popup:
     floating: Float
     result: asyncio.Future
     previous_focus: object
+    mouse: bool = False
+
+
+@dataclass
+class _TaskScope:
+    """Retain the first popup owned by a callback and its asynchronous descendants."""
+
+    popup: Popup | None = None
 
 
 class Plugins:
@@ -86,15 +97,21 @@ class Plugins:
     def __init__(self, owner, terminal):
         """Start with a full terminal and no additional UI or reserved keys."""
         self.owner = owner
+        self.manager = None
         self.bindings = KeyBindings()
         self.opaque_positions: list[WritePosition] = []
         self.popups: list[Popup] = []
         self._ids = count(1)
         self._bar = Window(height=0)
         self._bar_rows = 0
+        self._bar_mouse = False
         self._tasks = set()
         self._cleanups = []
         self._closed = False
+        self._loaded = False
+        self._search_serial = 0
+        self._search_task = None
+        self._scope = ContextVar("terminal_plugin_scope", default=None)
         self.errors = []
         self.body = FloatContainer(
             content=HSplit(
@@ -113,32 +130,135 @@ class Plugins:
         """Replace, rather than accumulate, the current frame's surface bounds."""
         self.opaque_positions.clear()
 
-    def load(self, references):
-        """Load only explicitly requested module:function plugin entry points."""
-        for reference in references:
-            module, separator, attribute = reference.partition(":")
-            if not separator or not module or not attribute.isidentifier():
-                raise ValueError("A terminal plugin must be module:setup")
-            setup = getattr(importlib.import_module(module), attribute)
+    def load(self, names, *, directory=None, library_dir=None):
+        """Reuse PluginManager for selected names, metadata and dependencies only."""
+        if self._loaded or self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_ONCE))
+        self._loaded = True
+        names = tuple(dict.fromkeys(names))
+        if not names:
+            return
+        from ish.plugin.manager import PluginManager
+
+        self.manager = PluginManager(script_dir=directory, lib_dir=library_dir)
+        self.manager.load(names=names)
+        for name in names:
+            module = self.manager.get(name)
+            if module is None:
+                raise ValueError(i18n.get(Message.VT_PLUGIN_MISSING, name=name))
+            version = getattr(module, "TERMINAL_API", None)
+            if type(version) is not int or version != API_VERSION:
+                raise ValueError(i18n.get(Message.VT_PLUGIN_API, name=name))
+            setup = getattr(module, "setup", None)
+            if not callable(setup):
+                raise TypeError(i18n.get(Message.VT_PLUGIN_SETUP, name=name))
             cleanup = setup(self)
             if cleanup is not None:
                 if not callable(cleanup):
-                    raise TypeError(
-                        "Plugin setup must return a cleanup callable or None"
-                    )
+                    raise TypeError(i18n.get(Message.STREAM_PLUGIN_CLEANUP))
                 self._cleanups.append(cleanup)
+
+    def get(self, name):
+        """Read an already loaded dependency from the shared plugin registry."""
+        return self.manager.get(name) if self.manager is not None else None
+
+    def register_protocol(self, name, *, kind, prefixes, factory):
+        """Register a synchronous supplemental OSC codec before shell input.
+
+        A factory returns handle/cancel/close methods; handle returns
+        ish.terminal.extensions.ProtocolResult. It receives no terminal writer.
+        Existing native commands and overlapping namespaces are rejected.
+        """
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        return self.owner.vt.register_protocol(
+            name, kind=kind, prefixes=prefixes, factory=factory
+        )
+
+    def register_keys(self, name, mappings):
+        """Register additional host keys without taking input or writer ownership."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        return self.owner.host.register_keys(name, mappings)
+
+    def register_clipboard(self, name, factory):
+        """Select one OS clipboard connection; the broker retains request policy."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        return self.owner.clipboard.register_provider(name, factory=factory)
+
+    @property
+    def mouse_required(self):
+        """Only explicitly selected, currently visible surfaces request capture."""
+        return (self._bar_rows > 0 and self._bar_mouse) or any(
+            popup.mouse for popup in self.popups
+        )
+
+    async def search(self, text):
+        """Search native history cooperatively without changing input focus.
+
+        A later search cancels this request. Results and screen anchors remain
+        native-owned; this token identifies only the caller waiting for them.
+        """
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        self._cancel_search()
+        serial = self._search_serial
+        task = self._search_task = asyncio.current_task()
+        try:
+            self.owner.vt.set_search(text)
+            while not self._closed and serial == self._search_serial:
+                complete, count = self.owner.vt.search_step()
+                if complete:
+                    self.owner.app.invalidate()
+                    return count
+                await asyncio.sleep(0)
+            raise asyncio.CancelledError
+        finally:
+            if self._search_task is task:
+                self._search_task = None
+
+    def _cancel_search(self):
+        self._search_serial += 1
+        previous, self._search_task = self._search_task, None
+        if previous is not None and not previous.done():
+            if previous is not asyncio.current_task():
+                previous.cancel()
+
+    def clear_search(self):
+        """Cancel outstanding search work and restore the native selection."""
+        self._cancel_search()
+        if not self._closed:
+            self.owner.vt.set_search("")
+            self.owner.vt.clear_selection()
+            self.owner.app.invalidate()
+
+    def invalidate(self):
+        """Request a redraw without handing a plugin the host writer."""
+        if not self._closed:
+            self.owner.app.invalidate()
+
+    def select_match(self, *, previous=False):
+        """Move the native viewport/selection, retaining the caller's focus."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        index = self.owner.vt.select_match(previous=previous)
+        self.owner.app.invalidate()
+        return index
 
     def bind(self, *keys):
         """Register an explicit plugin shortcut, enabled only while loaded."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
         if len(keys) != 1:
-            raise ValueError(
-                "Terminal UI shortcuts reserve one key, not input prefixes"
-            )
+            raise ValueError(i18n.get(Message.VT_PLUGIN_KEY))
         register = self.bindings.add(*keys, eager=True)
 
         def decorate(handler):
             @wraps(handler)
             def guarded(event):
+                scope = _TaskScope(self.popups[-1] if self.popups else None)
+                token = self._scope.set(scope)
                 try:
                     for key in event.key_sequence:
                         self.owner.host.consume_key(key)
@@ -146,26 +266,33 @@ class Plugins:
                     if inspect.isawaitable(result):
                         self.create_task(result)
                 except Exception as error:
-                    self._record_error(error)
+                    self._record_error(error, scope)
+                finally:
+                    self._scope.reset(token)
 
             return register(guarded)
 
         return decorate
 
-    def _record_error(self, error):
+    def _record_error(self, error, scope=None):
         self.errors.append(f"{type(error).__name__}: {error}")
         del self.errors[:-MAX_ERRORS]
-        if self.popups:
-            self.close_popup(self.popups[0])
+        # An old task can finish after its popup closes. Its diagnostic remains
+        # useful, but it no longer owns another popup's focus or result.
+        if scope is not None and scope.popup in self.popups:
+            self.close_popup(scope.popup)
         self.owner.app.invalidate()
 
-    def set_bar(self, content=None, *, rows=1):
+    def set_bar(self, content=None, *, rows=1, mouse=False):
         """Reserve a bounded bottom region; removing it restores the full grid."""
         if self._closed:
-            raise RuntimeError("Plugin UI is closed")
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
         if not 1 <= rows <= MAX_BAR_ROWS:
-            raise ValueError("Invalid bar height")
+            raise ValueError(i18n.get(Message.VT_BAR_HEIGHT))
+        if type(mouse) is not bool:
+            raise TypeError(i18n.get(Message.VT_PLUGIN_MOUSE))
         self._bar_rows = rows if content is not None else 0
+        self._bar_mouse = mouse if content is not None else False
         self._bar = (
             HSplit(
                 [to_container(content)],
@@ -178,12 +305,16 @@ class Plugins:
         )
         self.owner.app.invalidate()
 
-    def show_popup(self, content, *, width=40, height=8, left=None, top=None):
+    def show_popup(
+        self, content, *, width=40, height=8, left=None, top=None, mouse=False
+    ):
         """Open an opaque PTK surface and give its widgets exclusive focus."""
         if self._closed or len(self.popups) >= MAX_POPUPS:
-            raise RuntimeError("Cannot open another popup")
+            raise RuntimeError(i18n.get(Message.VT_POPUP_UNAVAILABLE))
         if width < 1 or height < 1 or any(v is not None and v < 0 for v in (left, top)):
-            raise ValueError("Popup geometry must be positive")
+            raise ValueError(i18n.get(Message.VT_POPUP_GEOMETRY))
+        if type(mouse) is not bool:
+            raise TypeError(i18n.get(Message.VT_PLUGIN_MOUSE))
         app = self.owner.app
         surface = Surface(content, self)
         floating = Float(
@@ -194,10 +325,14 @@ class Plugins:
             floating,
             asyncio.get_running_loop().create_future(),
             app.layout.current_window,
+            mouse,
         )
         self.owner.release_capture()
         self.owner.focus_terminal(False)
         self.popups.append(popup)
+        scope = self._scope.get()
+        if scope is not None and scope.popup not in self.popups:
+            scope.popup = popup
         self.body.floats.append(floating)
         app.layout.focus(surface)
         app.invalidate()
@@ -231,23 +366,39 @@ class Plugins:
     def create_task(self, coroutine):
         """Tie an asynchronous UI operation to the application lifetime."""
         if self._closed:
-            coroutine.close()
-            raise RuntimeError("Plugin UI is closed")
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        scope = self._scope.get() or _TaskScope(
+            self.popups[-1] if self.popups else None
+        )
 
         async def guarded():
+            token = self._scope.set(scope)
             try:
                 return await coroutine
             except Exception as error:
-                self._record_error(error)
+                self._record_error(error, scope)
+            finally:
+                self._scope.reset(token)
 
         task = self.owner.app.create_background_task(guarded())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        # A task cancelled before its first turn never awaits the supplied
+        # coroutine. Closing it also covers that shutdown boundary.
+        if inspect.iscoroutine(coroutine):
+            task.add_done_callback(lambda task: coroutine.close())
         return task
 
     async def close(self):
         """Cancel pending results and release plugin resources on application exit."""
+        if self._closed:
+            return
         self._closed = True
+        self._cancel_search()
+        self._bar_rows = 0
+        self._bar_mouse = False
         for popup in self.popups:
             if not popup.result.done():
                 popup.result.cancel()
@@ -260,7 +411,9 @@ class Plugins:
             await asyncio.gather(*tasks, return_exceptions=True)
         for cleanup in reversed(self._cleanups):
             try:
-                cleanup()
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
             except Exception as error:
                 self._record_error(error)
         self._cleanups.clear()

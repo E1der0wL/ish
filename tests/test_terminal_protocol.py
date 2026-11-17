@@ -1,5 +1,6 @@
 """Check child wire framing against independent literal byte records."""
 
+import base64
 import unittest
 
 from ish.terminal.protocol import ProtocolStream
@@ -58,16 +59,14 @@ class ProtocolStreamTests(unittest.TestCase):
         self.assertEqual(events, [b"before", b"1337;File=inline=1:AAAA", b"after"])
 
     def test_utf8_continuations_are_not_c1_controls(self):
-        """Raw C1 works while the same bytes inside encoded characters stay data."""
+        """Ground is UTF-8-only, including standalone C1 bytes, like the native engine."""
         text = "ÝÜЯП".encode()
         data = text + b"\x9d2;" + text + b"\x9c" + text
         for split in range(len(data) + 1):
             _, events, wire, _ = self.record(data, splits=(split,))
             self.assertEqual(wire, data)
             controls = [event for event in events if event[0] != "text"]
-            self.assertEqual(
-                controls, [("osc", b"2;" + text, b"\x9d2;" + text + b"\x9c")]
-            )
+            self.assertEqual(controls, [])
 
     def test_oversized_payload_is_discarded_through_fragmented_terminator(self):
         """A bounded parser never reinterprets the end of a large image as text."""
@@ -80,11 +79,11 @@ class ProtocolStreamTests(unittest.TestCase):
         self.assertEqual(cancelled, [True])
 
     def test_cancel_and_replacement_escape_recover_without_payload_leak(self):
-        """CAN, SUB and a new escape abort only the unfinished control string."""
+        """Native cancellation sees buffered headers; adapters never receive them."""
         _, events, wire, cancelled = self.record(
             b"\x1b]52;c;secret\x18ok\x1bPqbad\x1b[2Jnext"
         )
-        self.assertEqual(wire, b"\x18ok\x1b[2Jnext")
+        self.assertEqual(wire, b"\x1b]52;c;secret\x18ok\x1bPqbad\x1b\x18\x1b[2Jnext")
         self.assertEqual(len(cancelled), 2)
         self.assertEqual(
             [(e[0], e[1]) for e in events if e[0] != "text"], [("csi", b"2J")]
@@ -96,6 +95,196 @@ class ProtocolStreamTests(unittest.TestCase):
         stream.close()
         self.assertEqual(wire, b"visible")
         self.assertEqual(cancelled, [True])
+
+    def test_c1_restart_retains_exact_original_record_for_adapter(self):
+        """Native-equivalent re-entry never changes the codec's original wire."""
+        records = []
+        stream = ProtocolStream(
+            lambda _: None, lambda control: records.append(control) or True
+        )
+        stream.feed(b"\x1b[1\x9d9911;HIT\x07")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].raw, b"\x9d9911;HIT\x07")
+        self.assertEqual(records[0].body, b"9911;HIT")
+
+    def test_limit_rejects_record_but_keeps_independent_c0_and_counts_once(self):
+        """Oversize diagnostics contain no payload and recovery cannot emit its tail."""
+        output = []
+        stream = ProtocolStream(output.append, lambda _: False, max_string_bytes=12)
+        stream.feed(b"\x1b\x07]9911;" + b"secret" * 20 + b"\x1b\\Z")
+        self.assertEqual(b"".join(output), b"\x07Z")
+        self.assertEqual(stream.dropped, 1)
+        stream.feed(b"\x1b_" + b"\x9f" * 100 + b"\x1b\\Q")
+        self.assertEqual(stream.dropped, 2)
+        self.assertTrue(b"".join(output).endswith(b"ZQ"))
+
+
+class NativeFramingTests(unittest.TestCase):
+    """Assert native observable results and adapter boundaries at every read split."""
+
+    @staticmethod
+    def lines(terminal):
+        """Read native text without deriving expected results from its codec."""
+        return [
+            "".join(value for _, value in row).rstrip()
+            for row in terminal.frame().lines
+        ]
+
+    def test_cancellation_keeps_native_c0_effects_and_dcs_unhook_replies(self):
+        """Every split preserves literal line positions, bells and DECRQSS replies."""
+        from ish.terminal.vt import Terminal
+
+        cases = (
+            (b"A\x1b[\n12\x18Z", ["A", " Z", "", ""], b"", []),
+            (b"A\x1b[\t12\x1b[31mZ", ["A       Z", "", "", ""], b"", []),
+            (b"A\x1b[\x0712\x1aZ", ["AZ", "", "", ""], b"", ["bell"]),
+            (b"\x1bP$qm\x18Z", ["Z", "", "", ""], b"\x1bP1$r0m\x1b\\", []),
+            (b"\x1bP$qm\x1aZ", ["Z", "", "", ""], b"\x1bP1$r0m\x1b\\", []),
+            (b"\x1bP$qm\x1b[31mZ", ["Z", "", "", ""], b"\x1bP1$r0m\x1b\\", []),
+        )
+        for wire, lines, reply, effects in cases:
+            for split in range(len(wire) + 1):
+                replies = []
+                with (
+                    self.subTest(wire=wire, split=split),
+                    Terminal(20, 4, replies.append) as term,
+                ):
+                    term.feed(wire[:split])
+                    term.feed(wire[split:])
+                    self.assertEqual(self.lines(term), lines)
+                    self.assertEqual(b"".join(replies), reply)
+                    self.assertEqual(
+                        [effect.kind for effect in term.drain_events()], effects
+                    )
+
+    def test_independent_c0_executes_before_an_unfinished_control_completes(self):
+        """A client need not finish or cancel CSI before LF and BEL take effect."""
+        from ish.terminal.vt import Terminal
+
+        with Terminal(20, 4, lambda _: None) as term:
+            term.feed(b"A\x1b[\n\x07")
+            self.assertEqual((term.frame().cursor_x, term.frame().cursor_y), (1, 1))
+            self.assertEqual([effect.kind for effect in term.drain_events()], ["bell"])
+            term.feed(b"12\x18Z")
+            self.assertEqual(self.lines(term), ["A", " Z", "", ""])
+            self.assertEqual(term.drain_events(), ())
+
+    def test_c1_payload_is_never_promoted_to_an_osc_extension(self):
+        """Only actual OSC boundaries may call a registered converter."""
+        from ish.terminal.extensions import ProtocolResult
+        from ish.terminal.vt import Terminal
+
+        cases = (
+            (b"\x1bPqBODY\x9c\x9d9911;HIT\x07\x1b\\Z", [], ["Z", "", "", ""]),
+            (b"\x1bP:BODY\x9c\x9d9911;HIT\x07\x1b\\Z", [], ["Z", "", "", ""]),
+            (b"\x9d9911;HIT\x07Z", [], ["\ufffd9911;HITZ", "", "", ""]),
+            (b"\x1bP\x9d9911;HIT\x07Z", [b"9911;HIT"], ["XZ", "", "", ""]),
+            (b"\x1b_G\x1b\x9fabc\x1b\\Z", [], ["Z", "", "", ""]),
+            (b"A\x1b\n]9911;HIT\x07Z", [b"9911;HIT"], ["A", " XZ", "", ""]),
+        )
+        for wire, expected, lines in cases:
+            for split in range(len(wire) + 1):
+                seen = []
+
+                class Adapter:
+                    def handle(self, control, seen=seen):
+                        seen.append(control.body)
+                        return ProtocolResult(native=b"X")
+
+                    def cancel(self):
+                        pass
+
+                    def close(self):
+                        pass
+
+                with (
+                    self.subTest(wire=wire, split=split),
+                    Terminal(20, 4, lambda _: None) as term,
+                ):
+                    term.register_protocol(
+                        "probe", kind="osc", prefixes=(b"9911;",), factory=Adapter
+                    )
+                    term.feed(wire[:split])
+                    term.feed(wire[split:])
+                    self.assertEqual(seen, expected)
+                    self.assertEqual(self.lines(term), lines)
+
+    def test_consumed_osc_interrupts_native_utf8_prefix_at_its_original_byte(self):
+        """A hidden control cannot join UTF-8 bytes that the child kept separate."""
+        from ish.terminal.extensions import ProtocolResult
+        from ish.terminal.vt import Terminal
+
+        class Adapter:
+            def handle(self, control):
+                return ProtocolResult()
+
+            def cancel(self):
+                pass
+
+            def close(self):
+                pass
+
+        for prefix, tail in (
+            (b"\xc2", b"\x80"),
+            (b"\xe7\x95", b"\x8c"),
+            (b"\xf0\x9f", b"\x99\x82"),
+        ):
+            wire = prefix + b"\x1b]9911;HIT\x07" + tail
+            for split in range(len(wire) + 1):
+                with (
+                    self.subTest(prefix=prefix, split=split),
+                    Terminal(20, 4, lambda _: None) as term,
+                ):
+                    term.register_protocol(
+                        "probe", kind="osc", prefixes=(b"9911;",), factory=Adapter
+                    )
+                    term.feed(wire[:split])
+                    term.feed(wire[split:])
+                    self.assertEqual(self.lines(term)[0], "\ufffd" * (len(tail) + 1))
+            with Terminal(20, 4, lambda _: None) as term:
+                term.feed(prefix)
+                self.assertEqual(self.lines(term)[0], "")
+                term.feed(b"")
+                term.feed(b"\x1b")
+                self.assertEqual(self.lines(term)[0], "\ufffd")
+
+    def test_clipboard_capture_keeps_original_controls_and_cancel_discards_transfer(
+        self,
+    ):
+        """Opaque copy data keeps C0 byte order and never executes as native output."""
+        from ish.terminal.clipboard import ClipboardBroker
+        from ish.terminal.host import HostProfile
+        from ish.terminal.vt import Terminal
+
+        start = b"\x1b]1337;CopyToClipboard=\x07"
+        finish = b"\x1b]1337;EndCopy\x07Z"
+        body = b"left\x1b\n[31mright"
+        for cancelled in (False, True):
+            wire = start + body + (b"\x1b[12\x18hidden" if cancelled else b"") + finish
+            for split in range(len(wire) + 1):
+                writes = []
+                with (
+                    self.subTest(cancelled=cancelled, split=split),
+                    Terminal(20, 4, lambda _: None) as term,
+                ):
+                    broker = ClipboardBroker(
+                        reply=lambda _: None,
+                        emit=writes.append,
+                        profile=lambda: HostProfile(),
+                    )
+                    term.clipboard = broker
+                    term.feed(wire[:split])
+                    term.feed(wire[split:])
+                    self.assertEqual(self.lines(term), ["Z", "", "", ""])
+                    self.assertEqual(
+                        writes,
+                        []
+                        if cancelled
+                        else [
+                            "\x1b]52;c;" + base64.b64encode(body).decode() + "\x1b\\"
+                        ],
+                    )
+                    broker.close()
 
 
 if __name__ == "__main__":

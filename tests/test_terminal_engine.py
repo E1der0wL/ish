@@ -10,12 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from ish.lang.i18n import I18N
 from ish.terminal.engine import EngineError, check_library
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def artifact(*, abi=1, headers=b"1.0.1", version=b"1.0.1", missing=None):
+def artifact(*, abi=4, headers=b"1.0.1", version=b"1.0.1", missing=None):
     """Expose independently chosen metadata without emulating terminal state."""
     return SimpleNamespace(
         ish_vt_abi=Mock(return_value=abi),
@@ -35,16 +36,43 @@ class EngineTests(unittest.TestCase):
         """Engine input support does not imply an iTerm decoder or a host backend."""
         library = artifact()
         info = check_library(library)
-        self.assertEqual(info.bridge_abi, 1)
+        self.assertEqual(info.bridge_abi, 4)
         self.assertEqual(info.header_version, "1.0.1")
         self.assertEqual(info.version, "1.0.1")
         self.assertEqual(info.native_inputs, ("kitty",))
         library.ish_vt_new.assert_not_called()
 
+    def test_owned_native_failures_use_the_selected_language(self):
+        """Rebuild guidance is translated while ABI values and identifiers survive."""
+        with tempfile.TemporaryDirectory(prefix="ish-engine-language-") as directory:
+            language = I18N()
+            language.base_path = Path(directory) / "absent"
+            language.load("ko", create=False)
+            cases = (
+                (SimpleNamespace(), "메타데이터 진입점 ish_vt_abi"),
+                (artifact(abi=3), "필요한 ABI 4"),
+                (artifact(version=b"\xff"), "native 버전이 올바르지"),
+                (artifact(headers=b"1.1.0"), "검증되지 않은 libghostty-vt"),
+                (artifact(missing=b"kitty_graphics"), "필요한 기능 kitty_graphics"),
+            )
+            with patch("ish.terminal.engine.i18n", language):
+                for library, expected in cases:
+                    with (
+                        self.subTest(expected=expected),
+                        self.assertRaises(EngineError) as raised,
+                    ):
+                        check_library(library)
+                    self.assertIn(expected, str(raised.exception))
+                    self.assertIn(
+                        "tools/build_ghostty_vt.py로 다시 빌드하세요",
+                        str(raised.exception),
+                    )
+            self.assertFalse(language.base_path.exists())
+
     def test_abi_rejection_precedes_other_calls(self):
         """No metadata or state ABI is invoked after the bridge number differs."""
         library = artifact(abi=9)
-        with self.assertRaisesRegex(EngineError, "ABI 9.*required ABI 1"):
+        with self.assertRaisesRegex(EngineError, "ABI 9.*required ABI 4"):
             check_library(library)
         for name in (
             "ish_vt_headers",
@@ -103,7 +131,7 @@ class EngineTests(unittest.TestCase):
         info = check_library(library)
         self.assertEqual(
             (info.bridge_abi, info.header_version, info.version, info.native_inputs),
-            (1, "1.0.1", "1.0.1", ("kitty",)),
+            (4, "1.0.1", "1.0.1", ("kitty",)),
         )
 
 

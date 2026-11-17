@@ -170,7 +170,7 @@ def lint(selected):
         )
 
 
-def regression(selected):
+def regression(selected, *, validate=None):
     """Run independent existing tests, rejecting empty modules and skipped cases."""
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
@@ -179,6 +179,15 @@ def regression(selected):
         if not tests.countTestCases():
             raise RuntimeError(f"Test module collected no tests: {name}")
         suite.addTests(tests)
+    if validate is not None:
+        try:
+            validate(suite)
+        except RuntimeError:
+            # Preserve collection tracebacks when an evidence check rejects a
+            # failed import before the runner can execute its _FailedTest.
+            for error in loader.errors:
+                print(error, file=sys.stderr)
+            raise
     print(f"Running {suite.countTestCases()} tests; skips fail this check.", flush=True)
     result = unittest.TextTestRunner(verbosity=2, resultclass=StrictResult).run(suite)
     return 0 if result.wasSuccessful() else 1

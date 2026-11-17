@@ -1,5 +1,7 @@
 # ish 2.0.0
 
+이 worktree의 `codex/hookless-vt` 실험은 별도 **`ish-vt`** 명령에서 셸 hook 없는 libghostty-vt + PTK 화면을 제공합니다. 기본형에는 추가 UI가 없고, 선택한 플러그인만 상시 하단 바와 전역 팝업을 켭니다. 실행법·범위·검증은 [hook 없는 VT 실험](docs/HOOKLESS_VT.md)을 참고하세요. 아래 `ish` 명령의 stream 동작은 유지합니다.
+
 **ish는 기존 셸의 편집과 터미널 출력을 유지하면서, 프롬프트 대기 중에만 선택한 Python 플러그인의 UI를 표시합니다.**
 
 - 명령줄, 보조 프롬프트, heredoc, 자동완성은 Bash·zsh·tcsh 등 실행한 셸이 처리합니다.
@@ -198,5 +200,6 @@ uv run --no-sync python tests/stream_matrix.py .cache/host-new-run --require-res
 - [Python 플러그인 API와 실패 처리](docs/STREAM_PLUGINS.md)
 - [직접 전달 구조와 셸 연동 계약](docs/PROMPT_STREAM.md)
 - [별도 ish-vt 실험](docs/TERMINAL_EXPERIMENT.md): libghostty-vt 기반 에뮬레이션과 별도 플러그인 API
+- [ish-vt 설정과 클립보드·마우스 정책](docs/VT_USAGE.md), [기능별 켜기·끄기·지원 질의](docs/VT_FEATURE_POLICY.md), [단일 경로의 출력·키·클립보드 보완 모듈](docs/VT_PROTOCOL_PLUGINS.md), [기본 검증 범위](docs/VT_BASELINE_RESULT.md), [보완 모듈 검증](docs/VT_SUPPLEMENTS_RESULT.md), [terminfo 대조](docs/VT_TERMINFO_RESULT.md), [종료·중지 복원](docs/VT_RESTORATION.md)
 
 이전 실험명 `ish-stream`이 **ish 2.0.0**입니다. 배포 패키지와 Python 모듈 이름 `ish`·`ish.stream`, 개발 검사 파일의 `stream` 이름은 유지합니다. 이전 버전용 실행 명령이나 설정 호환 기능은 제공하지 않습니다.

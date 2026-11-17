@@ -18,12 +18,16 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from ish.lang import Message, i18n
+
 from .engine import EngineError, check_library
+from .identity import IDENTITY, TERM, key_bytes
 from .inputs import InputPipeline
 
 SHIFT = 1
 CTRL = 2
 ALT = 4
+KEY_REPORT_EVENTS = 2
 MAX_CELLS = 262_144
 MAX_BUFFER = 32 * 1024 * 1024
 DEFAULT_SCROLLBACK_LINES = 10_000
@@ -87,7 +91,27 @@ SPECIAL_KEYS = frozenset(
         "enter",
         "tab",
         "escape",
-        *(f"f{number}" for number in range(1, 13)),
+        *(f"f{number}" for number in range(1, 26)),
+        *(f"kp{number}" for number in range(10)),
+        "kpdecimal",
+        "kpdivide",
+        "kpmultiply",
+        "kpsubtract",
+        "kpadd",
+        "kpenter",
+        "kpequal",
+        "kpseparator",
+        "kpleft",
+        "kpright",
+        "kpup",
+        "kpdown",
+        "kppageup",
+        "kppagedown",
+        "kphome",
+        "kpend",
+        "kpinsert",
+        "kpdelete",
+        "kpbegin",
     }
 )
 
@@ -273,12 +297,16 @@ class TerminalError(RuntimeError):
 
 def _dimensions(cols: int, rows: int) -> None:
     if not 0 < cols <= 65_535 or not 0 < rows <= 65_535 or cols * rows > MAX_CELLS:
-        raise ValueError(f"Terminal dimensions exceed {MAX_CELLS} cells: {cols}x{rows}")
+        raise ValueError(
+            i18n.get(Message.VT_DIMENSIONS, limit=MAX_CELLS, cols=cols, rows=rows)
+        )
 
 
 def _check(status: int) -> None:
     if status:
-        raise TerminalError(f"libghostty-vt bridge failed (status {status})")
+        if status == -102:
+            raise TerminalError(i18n.get(Message.VT_STATE_LOST))
+        raise TerminalError(i18n.get(Message.VT_BRIDGE_ERROR, status=status))
 
 
 @lru_cache(maxsize=4096)
@@ -306,13 +334,16 @@ def _style(
 
 @lru_cache(maxsize=1)
 def _load() -> ctypes.CDLL:
+    from .diagnostics import LogCallback, capture
+
     path = Path(os.environ.get(LIBRARY_ENV, DEFAULT_LIBRARY))
     try:
         library = ctypes.CDLL(str(path))
     except OSError as error:
         raise TerminalError(
-            f"Cannot load {path}. Run tools/build_ghostty_vt.py in Linux/WSL, "
-            f"or set {LIBRARY_ENV} to the built libish_vt.so."
+            i18n.get(
+                Message.VT_LIBRARY_LOAD, path=path, variable=LIBRARY_ENV, error=error
+            )
         ) from error
     try:
         library._ish_engine = check_library(library)
@@ -326,6 +357,32 @@ def _load() -> ctypes.CDLL:
         "ish_vt_new": ([unsigned, unsigned], pointer),
         "ish_vt_free": ([pointer], None),
         "ish_vt_feed": ([pointer, ctypes.c_char_p, size], ctypes.c_int),
+        "ish_vt_log": ([LogCallback], ctypes.c_int),
+        "ish_vt_processing_error": ([pointer], ctypes.c_int),
+        "ish_vt_keyboard_flags": (
+            [pointer, ctypes.POINTER(ctypes.c_uint32)],
+            ctypes.c_int,
+        ),
+        "ish_vt_default_cursor": ([pointer, unsigned, ctypes.c_bool], ctypes.c_int),
+        "ish_vt_identity": (
+            [pointer, ctypes.c_char_p, size, ctypes.c_char_p, size],
+            ctypes.c_int,
+        ),
+        "ish_vt_search_set": ([pointer, ctypes.c_char_p, size], ctypes.c_int),
+        "ish_vt_search_step": (
+            [
+                pointer,
+                unsigned,
+                ctypes.POINTER(unsigned),
+                ctypes.POINTER(ctypes.c_uint64),
+            ],
+            ctypes.c_int,
+        ),
+        "ish_vt_search_select": (
+            [pointer, ctypes.c_bool, ctypes.POINTER(ctypes.c_uint64)],
+            ctypes.c_int,
+        ),
+        "ish_vt_osc_unknown": ([ctypes.c_char_p, size], ctypes.c_int),
         "ish_vt_resize": (
             [pointer, unsigned, unsigned, unsigned, unsigned],
             ctypes.c_int,
@@ -414,6 +471,7 @@ def _load() -> ctypes.CDLL:
         function.argtypes = arguments
         function.restype = result
     _install_png_decoder(library)
+    _check(library.ish_vt_log(capture))
     return library
 
 
@@ -435,7 +493,7 @@ class Terminal:
         self.engine = self._library._ish_engine
         self._handle = self._library.ish_vt_new(cols, rows)
         if not self._handle:
-            raise TerminalError("Cannot allocate libghostty-vt terminal")
+            raise TerminalError(i18n.get(Message.VT_ALLOCATION_ERROR))
         self._reply = reply
         self.cols = cols
         self.rows = rows
@@ -443,15 +501,39 @@ class Terminal:
         self.graphics_enabled = False
         self._inputs = None
         try:
-            self._inputs = InputPipeline(self, self.engine)
+            name, version = TERM.encode("ascii"), IDENTITY.encode("ascii")
+            _check(
+                self._library.ish_vt_identity(
+                    self._handle, name, len(name), version, len(version)
+                )
+            )
+            self._inputs = InputPipeline(self, self.engine, reply=self._reply)
             self.set_scrollback_limit(scrollback_lines, scrollback_bytes)
         except Exception:
             self.close()
             raise
 
+    def is_unknown_osc(self, body: bytes) -> bool:
+        """Ask the pinned parser whether an OSC number has no native owner."""
+        self._open()
+        result = self._library.ish_vt_osc_unknown(body, len(body))
+        if result < 0:
+            _check(result)
+        return result == 1
+
+    def set_default_cursor(self, shape: str, *, blink: bool) -> None:
+        """Set the native DECSCUSR reset defaults without changing the live cursor."""
+        if shape not in CURSOR_SHAPES or type(blink) is not bool:
+            raise ValueError(i18n.get(Message.VT_CURSOR_DEFAULT))
+        _check(
+            self._library.ish_vt_default_cursor(
+                self._open(), CURSOR_SHAPES.index(shape), blink
+            )
+        )
+
     def _open(self) -> int:
         if not self._handle:
-            raise TerminalError("Terminal is closed")
+            raise TerminalError(i18n.get(Message.VT_CLOSED))
         return self._handle
 
     def _bytes(self, name: str, *arguments: object) -> bytes:
@@ -463,7 +545,7 @@ class Terminal:
             )
         )
         if size.value > MAX_BUFFER or (size.value and not pointer.value):
-            raise TerminalError("Invalid native buffer")
+            raise TerminalError(i18n.get(Message.VT_NATIVE_BUFFER))
         return ctypes.string_at(pointer, size.value) if size.value else b""
 
     def _deliver_replies(self) -> None:
@@ -481,6 +563,61 @@ class Terminal:
         _check(self._library.ish_vt_feed(self._open(), data, len(data)))
         self._deliver_replies()
 
+    def register_protocol(self, name, *, kind, prefixes, factory):
+        """Register a session-owned extension before the first input byte."""
+        self._open()
+        self._inputs.register(name, kind=kind, prefixes=prefixes, factory=factory)
+
+    @property
+    def protocol_errors(self):
+        """Read bounded extension diagnostics without exposing handlers."""
+        return self._inputs.protocol_errors
+
+    @property
+    def framing_drops(self):
+        """Read the count of rejected oversized records, never their contents."""
+        return self._inputs.framing_drops
+
+    @property
+    def protocol_failures(self):
+        """Read protocol identifiers and counts without recording child payloads."""
+        return self._inputs.protocol_failures
+
+    @property
+    def processing_error(self):
+        """Read the engine's sticky semantic-failure flag."""
+        result = self._library.ish_vt_processing_error(self._open())
+        if result < 0:
+            _check(result)
+        return bool(result)
+
+    def set_search(self, text: str) -> None:
+        """Search native active screen and history without creating another grid."""
+        data = text.encode("utf-8")
+        _check(self._library.ish_vt_search_set(self._open(), data, len(data)))
+
+    def search_step(self, budget: int = 8) -> tuple[bool, int]:
+        """Make bounded progress; the caller yields between incomplete steps."""
+        if type(budget) is not int or not 1 <= budget <= 64:
+            raise ValueError(i18n.get(Message.VT_SEARCH_BUDGET))
+        status, count = ctypes.c_uint(), ctypes.c_uint64()
+        _check(
+            self._library.ish_vt_search_step(
+                self._open(), budget, ctypes.byref(status), ctypes.byref(count)
+            )
+        )
+        return status.value == 2, count.value
+
+    def select_match(self, *, previous: bool = False) -> int | None:
+        """Select a native match and scroll it into view; next moves into history."""
+        index = ctypes.c_uint64()
+        _check(
+            self._library.ish_vt_search_select(
+                self._open(), previous, ctypes.byref(index)
+            )
+        )
+        return None if index.value == (1 << 64) - 1 else index.value
+
     @property
     def input_routes(self):
         """Expose implementation choices without leaking provider objects."""
@@ -490,6 +627,11 @@ class Terminal:
     def image_errors(self):
         """Read supplemental image diagnostics through the common boundary."""
         return self._inputs.image_errors
+
+    @property
+    def image_failure_count(self):
+        """Read rejected shim-image counts independently of retained details."""
+        return self._inputs.image_failure_count
 
     @property
     def clipboard(self):
@@ -516,9 +658,7 @@ class Terminal:
             or not 0 <= cell_height <= 65_535
             or bool(cell_width) != bool(cell_height)
         ):
-            raise ValueError(
-                "Cell pixel dimensions must both be zero or positive 16-bit values"
-            )
+            raise ValueError(i18n.get(Message.VT_CELL_DIMENSIONS))
         _check(
             self._library.ish_vt_resize(
                 self._open(), cols, rows, cell_width, cell_height
@@ -560,7 +700,7 @@ class Terminal:
             (count,) = COUNT.unpack_from(data, offset)
             offset += COUNT.size
             if count > cols:
-                raise TerminalError("Invalid native row size")
+                raise TerminalError(i18n.get(Message.VT_NATIVE_ROW))
             runs: list[tuple[str, str]] = []
             fragments: list[str] = []
             previous_style = ""
@@ -591,7 +731,7 @@ class Terminal:
                     or x + width > cols
                     or width not in (1, 2)
                 ):
-                    raise TerminalError("Truncated native cell")
+                    raise TerminalError(i18n.get(Message.VT_NATIVE_CELL))
                 text = data[offset:end].decode("utf-8")
                 hyperlink = (
                     data[end : end + link_length].decode("utf-8", errors="replace")
@@ -627,12 +767,12 @@ class Terminal:
             cell_rows.append(tuple(native_cells))
         images = []
         if image_count > (len(data) - offset) // PLACEMENT.size:
-            raise TerminalError("Truncated native image list")
+            raise TerminalError(i18n.get(Message.VT_NATIVE_IMAGES))
         for _ in range(image_count):
             images.append(Placement(*PLACEMENT.unpack_from(data, offset)))
             offset += PLACEMENT.size
         if offset != len(data):
-            raise TerminalError("Unexpected native frame data")
+            raise TerminalError(i18n.get(Message.VT_NATIVE_FRAME))
         return Frame(
             lines,
             cursor_x,
@@ -676,10 +816,10 @@ class Terminal:
                 for name in ("foreground", "background", "cursor", "palette", "scheme")
             )
         if scheme not in (None, "light", "dark"):
-            raise ValueError("Invalid terminal color scheme")
+            raise ValueError(i18n.get(Message.VT_COLOR_SCHEME))
         palette = (None,) * 256 if palette is None else tuple(palette)
         if len(palette) != 256:
-            raise ValueError("Appearance palette must contain 256 entries")
+            raise ValueError(i18n.get(Message.VT_PALETTE_SIZE))
         encoded = bytearray()
         for color in (foreground, background, cursor, *palette):
             if color is None:
@@ -688,7 +828,7 @@ class Terminal:
             if len(color) != 3 or not all(
                 isinstance(channel, int) and 0 <= channel <= 255 for channel in color
             ):
-                raise ValueError("Appearance colors must be RGB byte triples")
+                raise ValueError(i18n.get(Message.VT_RGB_COLOR))
             encoded.extend((1, *color))
         data = bytes(encoded)
         _check(
@@ -701,14 +841,14 @@ class Terminal:
     def set_graphics(self, enabled: bool, max_bytes: int = DEFAULT_IMAGE_BYTES) -> None:
         """Enable only after the outer renderer confirms a supported image path."""
         if not 0 < max_bytes <= MAX_BUFFER:
-            raise ValueError("Image storage limit exceeds the bounded native buffer")
+            raise ValueError(i18n.get(Message.VT_IMAGE_LIMIT))
         if enabled:
             if not self.cell_width or not self.cell_height:
-                raise ValueError("Graphics require confirmed cell pixel dimensions")
+                raise ValueError(i18n.get(Message.VT_IMAGE_GEOMETRY))
             try:
                 from PIL import Image as _PillowImage  # noqa: F401
             except ImportError as error:
-                raise TerminalError("PNG images require Pillow") from error
+                raise TerminalError(i18n.get(Message.VT_IMAGE_DECODER)) from error
         _check(self._library.ish_vt_graphics(self._open(), max_bytes if enabled else 0))
         self.graphics_enabled = bool(enabled)
         if not enabled:
@@ -727,19 +867,19 @@ class Terminal:
     def image(self, image_id: int) -> Image | None:
         """Copy decoded pixels on demand, never on every cell redraw."""
         if not 0 <= image_id < 2**32:
-            raise ValueError("Image ID exceeds unsigned 32-bit range")
+            raise ValueError(i18n.get(Message.VT_IMAGE_ID))
         data = self._bytes("ish_vt_image", image_id)
         if not data:
             return None
         width, height, generation = IMAGE_HEADER.unpack_from(data)
         if len(data) != IMAGE_HEADER.size + width * height * 4:
-            raise TerminalError("Invalid native image payload")
+            raise TerminalError(i18n.get(Message.VT_NATIVE_IMAGE))
         return Image(image_id, generation, width, height, data[IMAGE_HEADER.size :])
 
     def tick(self, now_ms: int) -> int | None:
         """Advance native image playback once and return its next deadline."""
         if not 0 <= now_ms < 2**64:
-            raise ValueError("Animation timestamp exceeds unsigned 64-bit range")
+            raise ValueError(i18n.get(Message.VT_ANIMATION_TIME))
         deadline = ctypes.c_uint64()
         _check(self._library.ish_vt_tick(self._open(), now_ms, ctypes.byref(deadline)))
         return None if deadline.value == 2**64 - 1 else deadline.value
@@ -757,7 +897,7 @@ class Terminal:
             kind, length = EFFECT_HEADER.unpack_from(data, offset)
             offset += EFFECT_HEADER.size
             if offset + length > len(data) or kind not in EFFECT_KINDS:
-                raise TerminalError("Invalid native effect")
+                raise TerminalError(i18n.get(Message.VT_NATIVE_EFFECT))
             events.append(Effect(EFFECT_KINDS[kind], data[offset : offset + length]))
             offset += length
         return tuple(events)
@@ -806,15 +946,13 @@ class Terminal:
     ) -> None:
         """Set native approximate page-based limits; zero bytes erases history."""
         if not 0 <= lines < 2**63 or not 0 <= max_bytes < 2**63:
-            raise ValueError(
-                "Scrollback limits must be nonnegative signed 64-bit values"
-            )
+            raise ValueError(i18n.get(Message.VT_HISTORY_LIMIT))
         _check(self._library.ish_vt_scrollback_limit(self._open(), lines, max_bytes))
 
     def scroll(self, rows: int) -> None:
         """Move the native viewport by physical rows; negative values move up."""
         if not -(2**63) <= rows < 2**63:
-            raise ValueError("Scroll delta exceeds signed 64-bit range")
+            raise ValueError(i18n.get(Message.VT_SCROLL_DELTA))
         _check(self._library.ish_vt_scroll(self._open(), 2, rows))
 
     def scroll_top(self) -> None:
@@ -841,17 +979,17 @@ class Terminal:
         coordinates and confirmed cell geometry. A cell centre is not evidence.
         """
         if action not in MOUSE_ACTIONS or button not in MOUSE_BUTTONS:
-            raise ValueError("Unknown mouse action or button")
+            raise ValueError(i18n.get(Message.VT_MOUSE_EVENT))
         if modifiers & ~(SHIFT | CTRL | ALT):
-            raise ValueError("Unsupported mouse modifiers")
+            raise ValueError(i18n.get(Message.VT_MOUSE_MODIFIERS))
         if not -(2**31) <= x < 2**31 or not -(2**31) <= y < 2**31:
-            raise ValueError("Mouse coordinates exceed signed 32-bit range")
+            raise ValueError(i18n.get(Message.VT_MOUSE_COORDINATES))
         pixel_x, pixel_y = pixel_position if pixel_position is not None else (0, 0)
         if pixel_position is not None:
             if not self.cell_width or not self.cell_height:
-                raise ValueError("Pixel mouse requires confirmed cell geometry")
+                raise ValueError(i18n.get(Message.VT_MOUSE_GEOMETRY))
             if not -(2**31) <= pixel_x < 2**31 or not -(2**31) <= pixel_y < 2**31:
-                raise ValueError("Mouse pixels exceed signed 32-bit range")
+                raise ValueError(i18n.get(Message.VT_MOUSE_PIXELS))
         return self._bytes(
             "ish_vt_mouse",
             MOUSE_ACTIONS[action],
@@ -866,7 +1004,7 @@ class Terminal:
 
     def _selection_point(self, x: int, y: int) -> None:
         if not 0 <= x < self.cols or not 0 <= y < self.rows:
-            raise ValueError("Selection point is outside the viewport")
+            raise ValueError(i18n.get(Message.VT_SELECTION_POINT))
 
     def selection(
         self,
@@ -888,22 +1026,22 @@ class Terminal:
         Reset cancels the gesture while preserving the installed selection.
         """
         if action not in SELECTION_ACTIONS:
-            raise ValueError("Unknown selection action")
+            raise ValueError(i18n.get(Message.VT_SELECTION_ACTION))
         if not all(
             isinstance(value, int) and -(2**31) <= value < 2**31 for value in (x, y)
         ):
-            raise ValueError("Selection coordinates exceed signed 32-bit range")
+            raise ValueError(i18n.get(Message.VT_SELECTION_COORDINATES))
         position = (x + 0.5, y + 0.5) if position is None else position
         if len(position) != 2 or not all(math.isfinite(value) for value in position):
-            raise ValueError("Invalid selection pointer position")
+            raise ValueError(i18n.get(Message.VT_SELECTION_POINTER))
         if time_ns is not None and not 0 <= time_ns < 2**64:
-            raise ValueError("Invalid selection event time")
+            raise ValueError(i18n.get(Message.VT_SELECTION_TIME))
         if (
             not 0 <= repeat_interval_ns < 2**64
             or not math.isfinite(repeat_distance)
             or repeat_distance < 0
         ):
-            raise ValueError("Invalid repeat-click policy")
+            raise ValueError(i18n.get(Message.VT_REPEAT_CLICK))
         result = (ctypes.c_uint32 * 4)()
         _check(
             self._library.ish_vt_selection(
@@ -945,6 +1083,13 @@ class Terminal:
         """Copy current selected text using native unwrap/format semantics."""
         return self._bytes("ish_vt_selection_text").decode("utf-8")
 
+    @property
+    def keyboard_flags(self) -> int:
+        """Read active native flags, including per-screen keyboard push/pop state."""
+        flags = ctypes.c_uint32()
+        _check(self._library.ish_vt_keyboard_flags(self._open(), ctypes.byref(flags)))
+        return flags.value
+
     def encode_key(
         self, key: str, modifiers: int = 0, *, action: str = "press"
     ) -> bytes:
@@ -956,18 +1101,23 @@ class Terminal:
         """
         self._open()
         if action not in KEY_ACTIONS:
-            raise ValueError("Unknown key action")
+            raise ValueError(i18n.get(Message.VT_KEY_ACTION))
         native_action = KEY_ACTIONS[action]
         if modifiers & ~(SHIFT | CTRL | ALT):
-            raise ValueError("Unsupported key modifiers")
+            raise ValueError(i18n.get(Message.VT_KEY_MODIFIERS))
         text = key.encode("utf-8")
         if len(text) > MAX_BUFFER:
-            raise ValueError("Input is too large")
+            raise ValueError(i18n.get(Message.VT_INPUT_LIMIT))
         if key in SPECIAL_KEYS:
-            return self._bytes("ish_vt_key", text, b"", 0, 0, modifiers, native_action)
+            encoded = self._bytes(
+                "ish_vt_key", text, b"", 0, 0, modifiers, native_action
+            )
+            if key == "f3" and self.keyboard_flags == 0:
+                return key_bytes(key, encoded)
+            return encoded
         if len(key) != 1:
             if modifiers or action != "press":
-                raise ValueError("Modifiers and key actions require one key")
+                raise ValueError(i18n.get(Message.VT_KEY_COUNT))
             return text
         point = ord(key)
         if point < 32 or point == 127:
@@ -982,7 +1132,7 @@ class Terminal:
         """Encode an explicit user paste, honoring native bracketed-paste mode."""
         data = text.encode("utf-8") if isinstance(text, str) else text
         if len(data) > MAX_BUFFER:
-            raise ValueError("Paste is too large")
+            raise ValueError(i18n.get(Message.VT_PASTE_LIMIT))
         return self._bytes("ish_vt_paste", data, len(data))
 
     def close(self) -> None:

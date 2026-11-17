@@ -10,10 +10,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import errno
+import inspect
 import re
 import secrets
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from ish.lang import Message, i18n
 
 OSC = "\x1b]"
 ST = "\x1b\\"
@@ -24,12 +29,20 @@ MAX_MIMES = 256
 CHUNK_BYTES = 4096
 WRITE_CHUNK_BYTES = 4095  # Non-final MIME chunks never contain base64 padding.
 REQUEST_TIMEOUT = 30.0
+MAX_QUEUED_REQUESTS = 64
+MAX_QUEUED_BYTES = 4 * MAX_TEXT
 IDENTITY = re.compile(r"[^a-zA-Z0-9_+.-]")
 BASE64 = re.compile(rb"[A-Za-z0-9+/]*={0,2}\Z")
 MIME = re.compile(r"[!-~]{1,255}\Z")
 WRITE_ERRORS = frozenset(("EIO", "EINVAL", "ENOSYS", "EPERM", "EBUSY", "EFBIG"))
 READ_ERRORS = frozenset(("ENOSYS", "EPERM", "EBUSY"))
 TEXT_MIME = "text/plain"
+PROVIDER_ERRORS = {
+    errno.ENOSYS: "ENOSYS",
+    errno.EPERM: "EPERM",
+    errno.EACCES: "EPERM",
+    errno.EFBIG: "EFBIG",
+}
 
 
 def _encode(data: bytes) -> str:
@@ -103,14 +116,19 @@ class Transfer:
     committed: bool = False
     timer: object = None
     consume: Callable[[str], None] | None = None
+    local: bool = False
+    task: asyncio.Task | None = None
 
 
 class ClipboardBroker:
     """Apply explicit policy and route one clipboard transaction at a time."""
 
-    def __init__(self, *, reply, emit, profile, allow_read=False, allow_write=True):
+    def __init__(
+        self, *, reply, emit, profile, allow_read=False, allow_write=True, failed=None
+    ):
         """Connect separate child-reply and renderer-output sinks under explicit policy."""
         self.reply, self.emit, self.profile = reply, emit, profile
+        self.failed = failed
         self.allow_read, self.allow_write = allow_read, allow_write
         self.pending: Transfer | None = None
         self.idle = asyncio.Event()
@@ -122,6 +140,130 @@ class ClipboardBroker:
         self._capture_valid = False
         self._discard_write = False
         self._queued_copy = None
+        self._factory = None
+        self._provider_name = None
+        self._provider = None
+        self._sealed = False
+        self._tasks = set()
+        self._provider_lock = asyncio.Lock()
+        self._deferred = deque()
+        self._deferred_bytes = 0
+        self.failures = 0
+
+    def register_provider(self, name, *, factory):
+        """Select one external text provider before any session input is accepted."""
+        if self._sealed or self._closed:
+            raise RuntimeError(i18n.get(Message.VT_CLIPBOARD_LOCKED))
+        if self._factory is not None:
+            raise ValueError(i18n.get(Message.VT_CLIPBOARD_DUPLICATE))
+        if not isinstance(name, str) or not name or not callable(factory):
+            raise TypeError(i18n.get(Message.VT_CLIPBOARD_PROVIDER))
+        self._factory = factory
+        self._provider_name = name
+
+    @property
+    def provider_name(self):
+        """Report only the selected module identity, never clipboard contents."""
+        return self._provider_name
+
+    def seal(self):
+        """Construct the selected provider once, without transferring clipboard data."""
+        if self._sealed or self._closed:
+            return
+        self._sealed = True
+        if self._factory is None:
+            return
+        provider = self._factory()
+        valid = callable(getattr(provider, "close", None)) and all(
+            inspect.iscoroutinefunction(getattr(provider, method, None))
+            for method in ("read", "write", "aclose")
+        )
+        if not valid:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+            raise TypeError(i18n.get(Message.VT_CLIPBOARD_PROVIDER))
+        self._provider = provider
+
+    def _start_provider(self, transfer, text=None):
+        transfer.local = True
+        transfer.task = asyncio.create_task(self._run_provider(transfer, text))
+        self._tasks.add(transfer.task)
+        transfer.task.add_done_callback(self._provider_done)
+
+    def _provider_done(self, task):
+        self._tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            if self.failed is not None:
+                self.failed(error)
+            else:
+                task.get_loop().call_exception_handler(
+                    {
+                        "message": i18n.get(Message.VT_CLIPBOARD_DELIVERY),
+                        "exception": error,
+                    }
+                )
+
+    def _defer(self, operation, data, selection="c", explicit=False):
+        if (
+            len(self._deferred) >= MAX_QUEUED_REQUESTS
+            or self._deferred_bytes + len(data) > MAX_QUEUED_BYTES
+        ):
+            self.failures += 1
+            return False
+        self._deferred.append((operation, bytes(data), selection, explicit))
+        self._deferred_bytes += len(data)
+        return True
+
+    async def _run_provider(self, transfer, text):
+        """Keep asynchronous completion correlated even after cancellation or reset."""
+        try:
+            async with self._provider_lock:
+                if self._closed or self.pending is not transfer:
+                    return
+                if transfer.operation == "write":
+                    if await self._provider.write(text) is not None:
+                        raise ValueError
+                    data = b""
+                else:
+                    value = await self._provider.read()
+                    if not isinstance(value, str) or len(value) > MAX_TEXT:
+                        raise ValueError
+                    data = value.encode("utf-8")
+                    if len(data) > MAX_TEXT:
+                        raise ValueError
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.failures += 1
+            if not self._closed and self.pending is transfer:
+                code = getattr(error, "errno", None)
+                status = PROVIDER_ERRORS.get(code, "EIO")
+                self._fail(status)
+            return
+        if self._closed or self.pending is not transfer:
+            return
+        self._finish()
+        # Response delivery is an application transport operation. Its errors
+        # must reach the application, not masquerade as a provider failure.
+        if transfer.protocol == "copy":
+            return
+        if transfer.protocol == "52":
+            self.reply(
+                f"{OSC}52;{transfer.selection};{_encode(data)}{ST}".encode("ascii")
+            )
+            return
+        if transfer.operation == "read":
+            self._status("read", "OK", child_id=transfer.child_id)
+            mime = TEXT_MIME
+            fields = {"type": "read", "status": "DATA", "mime": _encode(mime.encode())}
+            if transfer.child_id:
+                fields["id"] = transfer.child_id
+            for offset in range(0, max(1, len(data)), CHUNK_BYTES):
+                self.reply(
+                    _packet(fields, data[offset : offset + CHUNK_BYTES]).encode("ascii")
+                )
+        self._status(transfer.operation, "DONE", child_id=transfer.child_id)
 
     def _new(self, operation, **values):
         self._serial += 1
@@ -138,12 +280,23 @@ class ClipboardBroker:
 
     def _finish(self):
         transfer, self.pending = self.pending, None
-        self.idle.set()
         if transfer is not None and transfer.timer is not None:
             transfer.timer.cancel()
+        if transfer is not None and transfer.task is not None:
+            if transfer.task is not asyncio.current_task():
+                transfer.task.cancel()
+        while self._deferred and self.pending is None and not self._closed:
+            operation, data, selection, explicit = self._deferred.popleft()
+            self._deferred_bytes -= len(data)
+            if operation == "osc":
+                self._osc52(data)
+            else:
+                self.write_text(data, selection, explicit=explicit)
         queued, self._queued_copy = self._queued_copy, None
         if queued is not None:
             self.write_text(*queued, explicit=True)
+        if self.pending is None:
+            self.idle.set()
         return transfer
 
     def _status(self, operation, status, *, child_id="", location="clipboard"):
@@ -160,7 +313,7 @@ class ClipboardBroker:
             return
         if transfer.operation == "write":
             self._discard_write = True
-        if transfer.protocol == "user":
+        if transfer.protocol in ("user", "copy"):
             return
         if transfer.protocol == "52":
             self.reply(f"{OSC}52;{transfer.selection};{ST}".encode("ascii"))
@@ -189,14 +342,40 @@ class ClipboardBroker:
 
     def reset(self):
         """Release capture ownership only at an explicit terminal reset boundary."""
+        self._queued_copy = None
+        self._deferred.clear()
+        self._deferred_bytes = 0
         self.cancel()
         self._capture = None
 
     def close(self):
         """Release timers and consume future late host replies without replying."""
+        if self._closed:
+            return
         self._closed = True
+        self._queued_copy = None
+        self._deferred.clear()
+        self._deferred_bytes = 0
         self._finish()
         self._capture = None
+        for task in self._tasks:
+            task.cancel()
+        if self._provider is not None:
+            try:
+                self._provider.close()
+            except Exception:
+                self.failures += 1
+
+    async def aclose(self):
+        """Reap provider workers without letting a failed provider skip restoration."""
+        self.close()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._provider is not None:
+            try:
+                await self._provider.aclose()
+            except Exception:
+                self.failures += 1
 
     @property
     def capturing(self):
@@ -217,7 +396,10 @@ class ClipboardBroker:
 
     def copy_selection(self, data: bytes) -> bool:
         """Keep an explicit user's copy separate from child clipboard permissions."""
-        return self.write_text(data, "cp", explicit=True)
+        self.seal()
+        return self.write_text(
+            data, "c" if self._provider is not None else "cp", explicit=True
+        )
 
     def read_primary(self, consume: Callable[[str], None]) -> str | None:
         """Read system PRIMARY for one user action, independently of child policy.
@@ -227,8 +409,10 @@ class ClipboardBroker:
         Busy child transactions are preserved rather than queued behind new input.
         """
         self.cancel_paste()
+        self.seal()
         if (
             self._closed
+            or self._provider is not None
             or not self.profile().clipboard_protocol
             or self.pending is not None
         ):
@@ -252,6 +436,7 @@ class ClipboardBroker:
 
     def write_text(self, data: bytes, selection="c", *, explicit=False) -> bool:
         """Queue normalized OSC 52 for explicit selection copy or child text writes."""
+        self.seal()
         if (
             self._closed
             or (not explicit and not self.allow_write)
@@ -259,17 +444,35 @@ class ClipboardBroker:
             or any(char not in "cpqs01234567" for char in selection)
         ):
             return False
+        if self._provider is not None:
+            if selection not in ("", "c"):
+                return False
+            try:
+                text = data.decode("utf-8")
+            except UnicodeError:
+                return False
         # An independent text write must not race a host Kitty transaction.
         if self.pending is not None:
+            if self._provider is not None and (
+                explicit or self.pending.protocol == "copy"
+            ):
+                return self._defer("copy", data, selection, explicit)
             if explicit:
                 self._queued_copy = (bytes(data), selection)
                 return True
             return False
-        self.emit(f"{OSC}52;{selection};{_encode(data)}{ST}")
+        if self._provider is not None:
+            transfer = self._new("write", protocol="copy", committed=True, local=True)
+            self._start_provider(transfer, text)
+        else:
+            self.emit(f"{OSC}52;{selection};{_encode(data)}{ST}")
         return True
 
     def child_osc(self, body: bytes) -> bool:
         """Consume supported complete OSC bodies, without forwarding original bytes."""
+        self.seal()
+        if self._closed:
+            return body.startswith((b"52;", b"5522;", b"1337;Copy"))
         if self.capturing:
             if body == b"1337;EndCopy":
                 data = bytes(self._capture)
@@ -331,6 +534,12 @@ class ClipboardBroker:
             return
         if any(char not in "cpqs01234567" for char in selection):
             return
+        if self._provider is not None and self.pending is not None:
+            allowed = self.allow_read if payload == b"?" else self.allow_write
+            queued = allowed and selection in ("", "c") and self._defer("osc", body)
+            if not queued and payload == b"?":
+                self.reply(f"{OSC}52;{selection};{ST}".encode("ascii"))
+            return
         if payload != b"?":
             if len(payload) > (MAX_TEXT + 2) // 3 * 4:
                 return
@@ -344,9 +553,10 @@ class ClipboardBroker:
         # Correlate reads using Kitty IDs. Never issue an identity-free host read.
         if (
             not self.allow_read
-            or not self.profile().clipboard_protocol
+            or (self._provider is None and not self.profile().clipboard_protocol)
             or self.pending is not None
             or selection not in ("", "c", "p", "s")
+            or (self._provider is not None and selection not in ("", "c"))
         ):
             self.reply(f"{OSC}52;{selection};{ST}".encode("ascii"))
             return
@@ -358,7 +568,10 @@ class ClipboardBroker:
             location=location,
             requested=(TEXT_MIME,),
         )
-        self.emit(_packet(self._host_metadata(transfer), TEXT_MIME.encode()))
+        if self._provider is not None:
+            self._start_provider(transfer)
+        else:
+            self.emit(_packet(self._host_metadata(transfer), TEXT_MIME.encode()))
 
     def _host_metadata(self, transfer):
         metadata = {"type": transfer.operation, "id": transfer.host_id}
@@ -396,7 +609,17 @@ class ClipboardBroker:
             "EPERM"
             if not allowed
             else "ENOSYS"
-            if not self.profile().clipboard_protocol
+            if (
+                (self._provider is None and not self.profile().clipboard_protocol)
+                or (
+                    self._provider is not None
+                    and (
+                        location != "clipboard"
+                        or (operation == "read" and requested != (TEXT_MIME,))
+                        or extra
+                    )
+                )
+            )
             else "EBUSY"
             if self.pending is not None
             else None
@@ -410,6 +633,11 @@ class ClipboardBroker:
             operation, child_id=child_id, location=location, requested=requested
         )
         self._discard_write = False
+        if self._provider is not None:
+            transfer.local = True
+            if operation == "read":
+                self._start_provider(transfer)
+            return
         outgoing = self._host_metadata(transfer)
         outgoing.update(extra)
         self.emit(
@@ -434,11 +662,22 @@ class ClipboardBroker:
         if operation == "wdata" and "mime" not in metadata:
             if payload or transfer.carry:
                 raise ValueError("Incomplete clipboard data")
+            if transfer.local:
+                if transfer.mime != TEXT_MIME:
+                    self._fail("ENOSYS")
+                    return
+                text = transfer.text.decode("utf-8")
+                transfer.committed = True
+                self._start_provider(transfer, text)
+                return
             self._flush_tail(transfer)
             transfer.committed = True
             self.emit(_packet({"type": "wdata", "id": transfer.host_id}))
             return
         mime = _mime(_text(metadata.get("mime", "")))
+        if transfer.local and (operation != "wdata" or mime != TEXT_MIME):
+            self._fail("ENOSYS")
+            return
         if operation == "walias":
             aliases = _decode(payload, limit=MAX_METADATA).decode("utf-8").split()
             if not aliases or len(aliases) > MAX_MIMES:
@@ -473,10 +712,13 @@ class ClipboardBroker:
         head, transfer.carry = combined[:count], combined[count:]
         if b"=" in head and transfer.carry:
             raise ValueError("Data follows terminal padding")
-        decoded = _decode(head, limit=MAX_BYTES)
+        decoded = _decode(head, limit=MAX_TEXT if transfer.local else MAX_BYTES)
         transfer.total += len(decoded)
-        if transfer.total > MAX_BYTES:
+        if transfer.total > (MAX_TEXT if transfer.local else MAX_BYTES):
             self._fail("EFBIG")
+            return
+        if transfer.local:
+            transfer.text.extend(decoded)
             return
         outgoing = {
             "type": "wdata",
@@ -517,7 +759,7 @@ class ClipboardBroker:
         if sequence.startswith(OSC + "52;"):
             return True  # No identity-free host read is ever issued.
         transfer = self.pending
-        if self._closed or transfer is None:
+        if self._closed or transfer is None or transfer.local:
             return True
         ending = 2 if sequence.endswith(ST) else 1 if sequence.endswith("\x07") else 0
         if not ending:

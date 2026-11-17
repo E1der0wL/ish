@@ -80,6 +80,9 @@ class Settings:
     log_file: Path | None = None
     log_level: str = DEFAULT_LOG_LEVEL
     escape_delay: float = ESCAPE_DELAY
+    # A separate namespace lets both entry points read the same Python rc.
+    # Stream never interprets VT policy or loads its selected plugins.
+    vt: dict = field(default_factory=dict)
 
     def validate(self, base: Path):
         """Normalize file-relative paths and reject misspelled or invalid choices."""

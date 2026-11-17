@@ -1,4 +1,4 @@
-"""Verify title, cursor, cwd and terminal mode restoration in a real Kitty host."""
+"""Verify retained title and restored cursor, cwd and modes in a real Kitty host."""
 
 import json
 import os
@@ -58,9 +58,6 @@ class TerminalBasicsGuiTests(unittest.TestCase):
 
     def exercise(self, signum=None):
         """Change presentation inside a native program, then inspect its parent's host."""
-        self.wait(
-            lambda: self.state()["host"]["title_stack"], "observed title-stack host"
-        )
         command = shlex.join(
             [
                 sys.executable,
@@ -92,8 +89,8 @@ class TerminalBasicsGuiTests(unittest.TestCase):
         self.assertTrue(result["termios_restored"])
         self.assertEqual(result["after"], result["before"])
         self.wait(
-            lambda: self.window()["title"] == "ISH_PARENT_TITLE",
-            "parent title restored",
+            lambda: self.window()["title"] == "ISH_CHILD_TITLE",
+            "last application title retained",
         )
         self.assertEqual(self.window()["cwd"], parent["cwd"])
         self.screenshot(self._testMethodName + ".png")

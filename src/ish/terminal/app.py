@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
-import socket
+import os
+import signal
 import struct
 import termios
 import time
@@ -13,28 +14,51 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import get_app_session, set_app
+from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.cursor_shapes import CursorShape, DynamicCursorShapeConfig
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
+from prompt_toolkit.key_binding.bindings.mouse import load_mouse_bindings
 from prompt_toolkit.key_binding.key_processor import KeyProcessor
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.output import ColorDepth
 
+from ish.lang import Message, i18n
+from ish.stream.settings import ESCAPE_DELAY, INTERACTIVE_ARGS, validate_escape_delay
+
+from . import diagnostics
 from .clipboard import ClipboardBroker
-from .host import HostBroker, HostInput
-from .mouse import decode_mouse
+from .host import HostBroker, HostInput, directory_uri
+from .mouse import DEFAULT_MOUSE, decode_mouse, validate_mouse_policy
 from .plugins import Plugins
-from .rendering import Composition, NativeWindow, TerminalRenderer
+from .rendering import Composition, NativeWindow, RestoringOutput, TerminalRenderer
 from .selection import SelectionController
 from .session import Session
-from .vt import ALT, CTRL, SHIFT, SPECIAL_KEYS, Terminal
+from .settings import (
+    CLIPBOARD_POLICIES,
+    COLOR_DEPTHS,
+    DEFAULT_CLIPBOARD,
+    DEFAULT_COLOR_DEPTH,
+    validate_color_depth,
+)
+from .vt import (
+    ALT,
+    CTRL,
+    DEFAULT_SCROLLBACK_BYTES,
+    DEFAULT_SCROLLBACK_LINES,
+    KEY_REPORT_EVENTS,
+    SHIFT,
+    SPECIAL_KEYS,
+    Terminal,
+)
 
 DEFAULT_SIZE = (80, 24)
 FRAME_INTERVAL = 1 / 60
-INPUT_TIMEOUT = 0.05
 WHEEL_ROWS = 3
 MAX_EFFECT_BYTES = 96 * 1024 * 1024
 PROBE_SECONDS = 0.75
@@ -67,8 +91,24 @@ class InputProcessor(KeyProcessor):
         self.owner = owner
         super().__init__(previous._bindings)
 
+    def feed(self, key_press, first=False):
+        """Consume unsolicited reports before matching any key-binding prefix."""
+        if key_press.key != Keys.CPRResponse:
+            super().feed(key_press, first=first)
+
+    def feed_multiple(self, key_presses, first=False):
+        """Keep adjacent real keys when a host report arrives in the same batch."""
+        super().feed_multiple(
+            [key for key in key_presses if key.key != Keys.CPRResponse], first=first
+        )
+
     def _call_handler(self, handler, key_sequence):
         """Claim only this handler's sequence, never other keys still buffered."""
+        if not self.owner.mouse_captured and any(
+            key.key == Keys.Vt100MouseEvent for key in key_sequence
+        ):
+            # Reports already queued before capture ended cannot click a new UI.
+            return
         if any(self.owner.host.key_consumed(key) for key in key_sequence):
             # A prior handler can have changed focus halfway through Alt's
             # legacy fallback. Remove that physical key and requeue unrelated
@@ -107,6 +147,11 @@ class TerminalControl(UIControl):
         self.bindings.add(Keys.Ignore, eager=True)(self._key)
         self.bindings.add("s-pageup", eager=True)(self._page)
         self.bindings.add("s-pagedown", eager=True)(self._page)
+        self._widget_mouse = (
+            load_mouse_bindings()
+            .get_bindings_for_keys((Keys.Vt100MouseEvent,))[0]
+            .handler
+        )
 
     def is_focusable(self):
         """The native terminal is the sole input target in the base application."""
@@ -135,6 +180,16 @@ class TerminalControl(UIControl):
                 pixels = getattr(event.key_sequence[-1], "pixel_position", None)
                 position = self.owner.window.position
                 if position is not None:
+                    inside = (
+                        position.xpos <= mouse.x < position.xpos + position.width
+                        and position.ypos <= mouse.y < position.ypos + position.height
+                    )
+                    if (
+                        not inside
+                        and not self.owner.selection.active
+                        and not self.owner.native_buttons
+                    ):
+                        return self._widget_mouse(event)
                     mouse = replace(
                         mouse, x=mouse.x - position.xpos, y=mouse.y - position.ypos
                     )
@@ -221,7 +276,16 @@ class TerminalApp:
         *,
         dump_state: Path | None = None,
         plugins=(),
-        clipboard="write",
+        plugin_dir=None,
+        library_dir=None,
+        clipboard=DEFAULT_CLIPBOARD,
+        mouse=DEFAULT_MOUSE,
+        color_depth=DEFAULT_COLOR_DEPTH,
+        features=None,
+        shell_args=INTERACTIVE_ARGS,
+        escape_delay=ESCAPE_DELAY,
+        scrollback_lines=DEFAULT_SCROLLBACK_LINES,
+        scrollback_bytes=DEFAULT_SCROLLBACK_BYTES,
     ):
         """Create one full-size terminal pane with no built-in overlays."""
         self.dump_state = dump_state
@@ -230,8 +294,20 @@ class TerminalApp:
         self.size = DEFAULT_SIZE
         self.pressed_buttons = []
         self.native_buttons = {}
-        if clipboard not in ("off", "write", "read-write"):
-            raise ValueError("Invalid clipboard policy")
+        self.mouse_policy = validate_mouse_policy(mouse)
+        self.color_depth_policy = validate_color_depth(color_depth)
+        preferred_color_depth = (
+            COLOR_DEPTHS[self.color_depth_policy] or ColorDepth.from_env()
+        )
+        escape_delay = validate_escape_delay(escape_delay)
+        if clipboard not in CLIPBOARD_POLICIES:
+            raise ValueError(
+                i18n.get(
+                    Message.VT_SETTING_CHOICE,
+                    name="clipboard",
+                    choices=", ".join(CLIPBOARD_POLICIES),
+                )
+            )
         self.control_output = []
         self.control_bytes = 0
         self.effects = {}
@@ -243,8 +319,12 @@ class TerminalApp:
         self.child_result = None
         self.finish_task = None
         self.stopping = False
-        self.plugin_references = tuple(plugins)
+        self.presentation_ready = False
+        self.suspend_task = None
+        self.plugin_names = tuple(plugins)
+        self.plugin_dir, self.library_dir = plugin_dir, library_dir
         self.host = HostBroker(
+            features=features,
             on_focus=self._host_focus,
             on_graphics_error=self._graphics_error,
             on_key=self._host_key,
@@ -253,15 +333,21 @@ class TerminalApp:
         )
         self.input = HostInput(create_input(), self.host)
         self.session = Session(
-            [shell, "-i"], str(cwd), self._output, self._exited, self._failed
+            [shell, *shell_args], str(cwd), self._output, self._exited, self._failed
         )
-        self.vt = Terminal(*self.size, reply=self.session.send)
+        self.vt = Terminal(
+            *self.size,
+            reply=self.session.send,
+            scrollback_lines=scrollback_lines,
+            scrollback_bytes=scrollback_bytes,
+        )
         self.clipboard = ClipboardBroker(
             reply=self.session.send,
             emit=self._queue_control,
             profile=lambda: self.profile,
             allow_read=clipboard == "read-write",
             allow_write=clipboard != "off",
+            failed=self._failed,
         )
         self.vt.clipboard = self.clipboard
         self.control = TerminalControl(self)
@@ -274,29 +360,51 @@ class TerminalApp:
                 Composition(self.plugins.body, self), focused_element=self.window
             ),
             input=self.input,
+            output=RestoringOutput(get_app_session().output, self),
             key_bindings=merge_key_bindings([controls, self.plugins.bindings]),
             cursor=DynamicCursorShapeConfig(self._cursor_shape),
-            color_depth=lambda: (
-                ColorDepth.DEPTH_24_BIT
-                if getattr(self.profile, "true_color", False)
-                else None
-            ),
+            color_depth=preferred_color_depth,
             full_screen=True,
-            mouse_support=True,
+            mouse_support=Condition(lambda: self.mouse_enabled),
             min_redraw_interval=FRAME_INTERVAL,
             after_render=self._after_render,
         )
         self.app.key_processor = InputProcessor(self, self.app.key_processor)
         self.app.renderer = TerminalRenderer(self, self.app.renderer)
-        self.app.ttimeoutlen = INPUT_TIMEOUT
+        self.app.ttimeoutlen = escape_delay
         self.selection = SelectionController(
             self.vt, changed=self.app.invalidate, copied=self.copy_selection
         )
 
     @property
     def profile(self):
-        """Read host facts from their sole owner, the host adapter."""
+        """Read effective presentation choices from their sole owner."""
         return self.host.profile
+
+    @property
+    def mouse_enabled(self):
+        """Choose capture from explicit policy, native modes and opted-in surfaces."""
+        if self.stopping or self.mouse_policy == "off":
+            return False
+        return (
+            self.mouse_policy == "on"
+            or self.plugins.mouse_required
+            or (self.app.layout.has_focus(self.window) and self.vt.mouse_reporting)
+        )
+
+    @property
+    def mouse_captured(self):
+        """Accept reports only while both policy and the outer writer own capture."""
+        return self.mouse_enabled and self.app.renderer.mouse_captured
+
+    def set_mouse_policy(self, policy):
+        """End the current gesture before changing its input consumer."""
+        policy = validate_mouse_policy(policy)
+        if policy == self.mouse_policy:
+            return
+        self.release_mouse_capture(clear=True)
+        self.mouse_policy = policy
+        self.app.invalidate()
 
     def _appearance(self, appearance):
         """Apply observed defaults while the native engine retains child overrides."""
@@ -312,6 +420,10 @@ class TerminalApp:
 
     def _cursor_shape(self):
         """Display the focused VT cursor without changing popup editor policy."""
+        if self.session.pid is None:
+            # First paint precedes probing. Do not overwrite the value being
+            # queried; the child starts only after the observation is committed.
+            return CursorShape._NEVER_CHANGE
         frame = self.control.frame
         if frame is None or self.plugins.popups:
             return CursorShape.BEAM
@@ -357,7 +469,10 @@ class TerminalApp:
         self.session.send(data)
         if key.action == "release":
             self.pressed_keys.pop(key.codepoint, None)
-        elif data:
+        elif data and key.release_events and self.vt.keyboard_flags & KEY_REPORT_EVENTS:
+            # A delivered legacy stroke has no pending physical release. Both
+            # its source and its consumer must have requested event reporting
+            # when the press was delivered, not only when a popup opens later.
             self.pressed_keys[key.codepoint] = key
         return True
 
@@ -372,9 +487,15 @@ class TerminalApp:
     def release_capture(self):
         """Finish delivered presses and cancel local drags before losing focus."""
         self.release_keys()
+        self.release_mouse_capture()
+
+    def release_mouse_capture(self, *, clear=False):
+        """Finish mouse presses and local timers without consuming keyboard input."""
         self._release_mouse()
         self.pressed_buttons.clear()
         self.selection.reset()
+        if clear:
+            self.vt.clear_selection()
         self.clipboard.cancel_paste()
 
     def _graphics_error(self, image_id, message):
@@ -397,25 +518,32 @@ class TerminalApp:
         """Negotiate optional output before enabling it in the child emulator."""
         try:
             size = self.app.output.get_size()
-            self.app.output.write_raw(
-                "\x1b7" + self.host.begin_probe(size.columns, size.rows) + "\x1b8"
-            )
+            self.app.output.write_raw(self.host.begin_probe(size.columns, size.rows))
             self.app.output.flush()
             try:
                 await asyncio.wait_for(self.host.ready.wait(), PROBE_SECONDS)
             except TimeoutError:
                 pass  # Conservative host capability fallback, never shell readiness.
             self.host.finish_probe()
+            self.presentation_ready = True
+            initial_cursor = self.profile.initial_cursor_style
+            if initial_cursor is not None:
+                self.vt.set_default_cursor(
+                    initial_cursor.shape, blink=initial_cursor.blink
+                )
+                # DEFAULT_CURSOR_* applies on reset only. Initialize once before
+                # the PTY starts, never by resetting a running child's cursor.
+                self.vt.feed_raw(b"\x1b[0 q")
             self._appearance(self.profile.appearance)
             self.host.refresh_geometry(*self._geometry())
             self.vt.resize(
                 *self.size, self.profile.cell_width, self.profile.cell_height
             )
             self.vt.set_graphics(self.profile.image_protocol is not None)
-            self.app.renderer.enter_input_modes()
-            self.app.output.flush()
+            # Resolve selected bar geometry before the child's first terminal
+            # query. The pre-probe redraw was intentionally suppressed.
+            self.app._redraw()
             self.session.start(*self.size)
-            self.plugins.load(self.plugin_references)
             self.app.renderer.invalidate_screen()
             self.app.invalidate()
         except Exception as exc:
@@ -483,6 +611,8 @@ class TerminalApp:
 
     def mouse(self, event, *, pixel_position=None):
         """Route mouse input using VT modes and the visible viewport, never shell state."""
+        if not self.mouse_captured:
+            return
         x, y = event.x, event.y
         pointer = None
         if pixel_position is not None and self.profile.has_cell_size:
@@ -697,12 +827,42 @@ class TerminalApp:
         if self.app.is_running and not self.app.is_done:
             self.app.exit(result=128 + signum)
 
+    def suspend(self):
+        """Schedule one outer suspension without sending Ctrl+Z to the child."""
+        if (
+            self.stopping
+            or not self.presentation_ready
+            or not self.app.is_running
+            or self.app.is_done
+            or self.suspend_task is not None
+        ):
+            return
+        self.suspend_task = self.app.create_background_task(self._suspend())
+
+    async def _suspend(self):
+        """Reuse PTK's terminal handoff and redraw around an OS process stop."""
+        try:
+            self.release_capture()
+            self.clipboard.cancel_paste()
+            self.session.set_output_enabled(False)
+            with set_app(self.app):
+                async with in_terminal():
+                    # SIGSTOP cannot be ignored by an orphaned process group.
+                    # The caught TSTP request has already restored the host.
+                    if not self.stopping and not self.app.is_done:
+                        os.kill(os.getpid(), signal.SIGSTOP)
+            self.app.renderer.invalidate_screen()
+            self.app.invalidate()
+        except Exception as error:
+            self._failed(error)
+        finally:
+            self.session.set_output_enabled(True)
+            self.suspend_task = None
+
     def restore_cwd(self, output):
         """Restore the known launch directory, separately from the child --cwd."""
         if self.cwd_changed:
-            uri = self.launch_cwd.as_uri().replace(
-                "file://", "file://" + socket.gethostname(), 1
-            )
+            uri = directory_uri(str(self.launch_cwd))
             output.write_raw(f"\x1b]7;{uri}\x1b\\")
             self.cwd_changed = False
 
@@ -717,17 +877,22 @@ class TerminalApp:
             if effect.kind == "bell":
                 output.bell()
             elif not any(ord(c) < 32 or ord(c) == 127 for c in value):
-                if effect.kind == "title" and self.profile.title_control:
+                if effect.kind == "title":
+                    # Titles intentionally outlive the session. The host may
+                    # ignore application titles; no restoration capability is
+                    # required to publish this user-selected effect policy.
                     output.set_title(value)
                 elif effect.kind == "pwd":
-                    output.write_raw(f"\x1b]7;{value}\x1b\\")
-                    self.cwd_changed = True
+                    uri = directory_uri(value)
+                    if uri is not None:
+                        output.write_raw(f"\x1b]7;{uri}\x1b\\")
+                        self.cwd_changed = True
         self.effects.clear()
 
     def _queue_control(self, sequence):
         """Queue normalized adapter output for the sole terminal renderer."""
         if self.control_bytes + len(sequence) > MAX_EFFECT_BYTES:
-            raise BufferError("Pending terminal effects exceed the byte limit")
+            raise BufferError(i18n.get(Message.VT_EFFECT_LIMIT))
         self.control_output.append(sequence)
         self.control_bytes += len(sequence)
         self.app.invalidate()
@@ -747,12 +912,24 @@ class TerminalApp:
             "viewport_offset": frame.viewport_offset,
             "scrollback_rows": frame.scrollback_rows,
             "mouse_reporting": self.vt.mouse_reporting,
+            "mouse_policy": self.mouse_policy,
+            "color_depth_policy": self.color_depth_policy,
+            "color_depth": self.app.color_depth.value,
+            "mouse_capture": self.mouse_captured,
             "child_pid": self.session.pid,
             "host": asdict(self.profile),
+            "features": {
+                name: asdict(state) for name, state in self.host.feature_status.items()
+            },
             "graphics_reason": self.host.graphics_reason,
             "graphics_error": self.app.renderer.graphics_error,
             "engine": asdict(self.vt.engine),
             "input_routes": asdict(self.vt.input_routes),
+            "native_processing_error": self.vt.processing_error,
+            "native_log_counts": diagnostics.snapshot(),
+            "protocol_errors": self.vt.protocol_errors,
+            "protocol_failures": self.vt.protocol_failures,
+            "framing_drops": self.vt.framing_drops,
             "host_adapter": self.host.adapter.name,
             "graphics_enabled": self.vt.graphics_enabled,
             "image_errors": self.vt.image_errors,
@@ -761,6 +938,10 @@ class TerminalApp:
                 "write": self.clipboard.allow_write,
             },
             "clipboard_pending": self.clipboard.pending is not None,
+            "clipboard_provider": self.clipboard.provider_name,
+            "clipboard_failures": self.clipboard.failures,
+            "key_mappings": self.host.key_mappings,
+            "host_control_drops": self.host.dropped_controls,
             "plugin_errors": self.plugins.errors,
             "images": [asdict(image) for image in frame.images],
             "popups": [
@@ -774,14 +955,21 @@ class TerminalApp:
 
     async def run(self) -> int:
         """Run the full-screen UI and restore the host terminal on every exit path."""
-        size = self.app.output.get_size()
-        self.resize(max(1, size.columns), max(1, size.rows))
         try:
+            self.plugins.load(
+                self.plugin_names,
+                directory=self.plugin_dir,
+                library_dir=self.library_dir,
+            )
+            self.clipboard.seal()
+            size = self.app.output.get_size()
+            self.resize(max(1, size.columns), max(1, size.rows))
             return await self.app.run_async(
                 pre_run=lambda: self.app.create_background_task(self._start()),
                 set_exception_handler=False,
             )
         finally:
+            self.clipboard.close()
             self.selection.close()
             if self.animation is not None:
                 self.animation.cancel()
@@ -794,11 +982,15 @@ class TerminalApp:
                     await self.session.close()
                 finally:
                     self.clipboard.close()
-                    self.vt.close()
                     try:
-                        self.app.renderer.leave_input_modes()
-                        self.app.renderer.restore_cursor()
-                        self.app.renderer.restore_metadata()
-                        self.app.output.flush()
+                        await self.clipboard.aclose()
                     finally:
-                        self.input.close()
+                        self.vt.close()
+                        try:
+                            self.app.renderer.leave_input_modes()
+                            self.app.renderer.restore_cursor()
+                            self.app.renderer.restore_cursor_shape()
+                            self.app.renderer.restore_metadata()
+                            self.app.output.flush()
+                        finally:
+                            self.input.close()
