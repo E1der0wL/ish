@@ -146,6 +146,7 @@ share/python-wheels/
 !/docs/VT_RESTORATION.md
 !/docs/VT_TEST_CONTRACTS.md
 !/docs/VT_FEATURE_POLICY.md
+!/docs/DEVELOPMENT.md
 /.codex-remote-attachments/
 *.egg-info/
 .installed.cfg

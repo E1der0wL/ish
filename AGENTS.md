@@ -1,9 +1,15 @@
 # ish 작업 규칙
 
-## 이 worktree의 실험 범위
+## 정식 작업 위치
+
+- 정식 개발 저장소는 `D:/Developments/ish`이며 WSL 경로는 `/mnt/d/Developments/ish`다. 독립적인 `.git`을 사용하고 현재 작업 브랜치는 `codex/hookless-vt`다. 이후 코드 변경과 검증은 이 위치에서 진행한다.
+- 이전 `C:/Users/user/.codex/worktrees/ish-hookless-vt/ish`는 백업과 과거 검증 기록으로 보존한다. 기존 main·stream·다른 실험 worktree는 수정하지 않는다. 아래 과거 worktree 설명보다 이 작업 위치 규칙이 우선한다.
+- 이동 자체로 실행 진입점이나 릴리스 상태가 바뀌지는 않는다. `ish-vt`는 VT 경로, `ish`는 기존 stream 경로를 유지한다. 정식 작업 위치와 검증 범위는 [개발 안내](docs/DEVELOPMENT.md)를 따른다.
+
+## VT 구현 범위
 
 - 호스트 기능 정책은 `terminal.features`가 소유한다. 기능마다 on/off를 제공하고 실제 지원 질의를 구현한 항목만 auto를 허용한다. 사용자 정책·관찰한 지원 응답·실제 선택 profile·이미 변경한 상태를 구분한다. on으로 관찰 결과를 위조하지 않고 크기·복원 필수 조건을 유지한다. 호스트 이름은 일반 기능 허용 근거로 사용하지 않으며 검증된 개별 차이 보정만 hosts 경계에 둔다.
-- `codex/hookless-vt` / `ish-hookless-vt/ish`에서 기존 `ish-vt`를 재사용한다. `experiment/prompt-stream`, `experiment/ghostty-ptk`, `refactor/editor-request`, main의 브랜치·폴더·환경을 변경하지 않는다.
+- `codex/hookless-vt`에서 기존 `ish-vt`를 재사용한다. `experiment/prompt-stream`, `experiment/ghostty-ptk`, `refactor/editor-request`, 기존 main의 브랜치·폴더·환경을 변경하지 않는다.
 - 이번 사용자 요청이 아래 stream 전용 정책보다 우선한다. `ish`의 기존 stream 진입점은 보존하고, 별도 `ish-vt`에서 libghostty-vt + PTK 화면 합성을 검증한다. tmux나 Zellij를 실행 의존성으로 추가하지 않는다.
 - 기본형에는 추가 UI·UI 전용 단축키·셸 hook이 없다. 명시적으로 선택한 외부 Python 플러그인만 하단 행과 전역 팝업 단축키를 등록한다. 내부 history의 Shift+PageUp/Down과 UI 단축키는 구분한다. 제품 `--demo` 옵션은 추가하지 않는다.
 - 마우스 정책은 off/auto/on이며 기본은 auto다. off는 프로그램·플러그인 요청보다 우선하여 호스트 선택을 유지한다. auto는 native mouse mode 또는 명시적인 클릭 UI 요청에서만 capture한다. keyboard-only popup은 capture를 요청하지 않는다. tracking과 1016 좌표 형식을 구분하고 모드 전환·resize·종료 시 단일 소유자에서 정리한다.
