@@ -17,40 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .vt import Terminal
 
-MAX_SOURCE_BYTES = 16 * 1024 * 1024
-MAX_ENCODED_BYTES = (MAX_SOURCE_BYTES + 2) // 3 * 4
-MAX_PIXEL_BYTES = 16 * 1024 * 1024
-MAX_HEADER_BYTES = 4096
-MAX_PART_BYTES = 1024 * 1024
-MAX_ERRORS = 16
-RASTER_FORMATS = frozenset(("PNG", "JPEG", "GIF", "WEBP", "BMP", "TIFF", "ICO", "PPM"))
-KITTY_CHUNK_BYTES = 3072
-PLACEHOLDER = "\U0010eeee"
 DIMENSION = re.compile(rb"([0-9]{1,6})(px|%)?\Z")
-# Numeric protocol table from Kitty's rowcolumn-diacritics.txt (Unicode 6 data).
-# https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
-DIACRITICS = tuple(
-    chr(int(value, 16))
-    for value in (
-        "0305 030D 030E 0310 0312 033D 033E 033F 0346 034A 034B 034C 0350 0351 0352 0357 035B "
-        "0363 0364 0365 0366 0367 0368 0369 036A 036B 036C 036D 036E 036F 0483 0484 0485 0486 0487 "
-        "0592 0593 0594 0595 0597 0598 0599 059C 059D 059E 059F 05A0 05A1 05A8 05A9 05AB 05AC 05AF 05C4 "
-        "0610 0611 0612 0613 0614 0615 0616 0617 0657 0658 0659 065A 065B 065D 065E 06D6 06D7 06D8 "
-        "06D9 06DA 06DB 06DC 06DF 06E0 06E1 06E2 06E4 06E7 06E8 06EB 06EC 0730 0732 0733 0735 0736 "
-        "073A 073D 073F 0740 0741 0743 0745 0747 0749 074A 07EB 07EC 07ED 07EE 07EF 07F0 07F1 07F3 "
-        "0816 0817 0818 0819 081B 081C 081D 081E 081F 0820 0821 0822 0823 0825 0826 0827 0829 082A "
-        "082B 082C 082D 0951 0953 0954 0F82 0F83 0F86 0F87 135D 135E 135F 17DD 193A 1A17 1A75 1A76 "
-        "1A77 1A78 1A79 1A7A 1A7B 1A7C 1B6B 1B6D 1B6E 1B6F 1B70 1B71 1B72 1B73 1CD0 1CD1 1CD2 "
-        "1CDA 1CDB 1CE0 1DC0 1DC1 1DC3 1DC4 1DC5 1DC6 1DC7 1DC8 1DC9 1DCB 1DCC 1DD1 1DD2 1DD3 "
-        "1DD4 1DD5 1DD6 1DD7 1DD8 1DD9 1DDA 1DDB 1DDC 1DDD 1DDE 1DDF 1DE0 1DE1 1DE2 1DE3 1DE4 "
-        "1DE5 1DE6 1DFE 20D0 20D1 20D4 20D5 20D6 20D7 20DB 20DC 20E1 20E7 20E9 20F0 2CEF 2CF0 "
-        "2CF1 2DE0 2DE1 2DE2 2DE3 2DE4 2DE5 2DE6 2DE7 2DE8 2DE9 2DEA 2DEB 2DEC 2DED 2DEE 2DEF "
-        "2DF0 2DF1 2DF2 2DF3 2DF4 2DF5 2DF6 2DF7 2DF8 2DF9 2DFA 2DFB 2DFC 2DFD 2DFE 2DFF A66F "
-        "A67C A67D A6F0 A6F1 A8E0 A8E1 A8E2 A8E3 A8E4 A8E5 A8E6 A8E7 A8E8 A8E9 A8EA A8EB A8EC "
-        "A8ED A8EE A8EF A8F0 A8F1 AAB0 AAB2 AAB3 AAB7 AAB8 AABE AABF AAC1 FE20 FE21 FE22 FE23 FE24 "
-        "FE25 FE26 10A0F 10A38 1D185 1D186 1D187 1D188 1D189 1D1AA 1D1AB 1D1AC 1D1AD 1D242 1D243 1D244"
-    ).split()
-)
 
 
 def _color(code, value):
@@ -100,6 +67,42 @@ class Images:
     its public API; the host output presenters are independent of that change.
     """
 
+    MAX_SOURCE_BYTES = 16 * 1024 * 1024
+    MAX_ENCODED_BYTES = (MAX_SOURCE_BYTES + 2) // 3 * 4
+    MAX_PIXEL_BYTES = 16 * 1024 * 1024
+    MAX_HEADER_BYTES = 4096
+    MAX_PART_BYTES = 1024 * 1024
+    MAX_ERRORS = 16
+    RASTER_FORMATS = frozenset(
+        ("PNG", "JPEG", "GIF", "WEBP", "BMP", "TIFF", "ICO", "PPM")
+    )
+    KITTY_CHUNK_BYTES = 3072
+    PLACEHOLDER = "\U0010eeee"
+    # Numeric protocol table from Kitty's rowcolumn-diacritics.txt (Unicode 6 data).
+    # https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+    DIACRITICS = tuple(
+        chr(int(value, 16))
+        for value in (
+            "0305 030D 030E 0310 0312 033D 033E 033F 0346 034A 034B 034C 0350 0351 0352 0357 035B "
+            "0363 0364 0365 0366 0367 0368 0369 036A 036B 036C 036D 036E 036F 0483 0484 0485 0486 0487 "
+            "0592 0593 0594 0595 0597 0598 0599 059C 059D 059E 059F 05A0 05A1 05A8 05A9 05AB 05AC 05AF 05C4 "
+            "0610 0611 0612 0613 0614 0615 0616 0617 0657 0658 0659 065A 065B 065D 065E 06D6 06D7 06D8 "
+            "06D9 06DA 06DB 06DC 06DF 06E0 06E1 06E2 06E4 06E7 06E8 06EB 06EC 0730 0732 0733 0735 0736 "
+            "073A 073D 073F 0740 0741 0743 0745 0747 0749 074A 07EB 07EC 07ED 07EE 07EF 07F0 07F1 07F3 "
+            "0816 0817 0818 0819 081B 081C 081D 081E 081F 0820 0821 0822 0823 0825 0826 0827 0829 082A "
+            "082B 082C 082D 0951 0953 0954 0F82 0F83 0F86 0F87 135D 135E 135F 17DD 193A 1A17 1A75 1A76 "
+            "1A77 1A78 1A79 1A7A 1A7B 1A7C 1B6B 1B6D 1B6E 1B6F 1B70 1B71 1B72 1B73 1CD0 1CD1 1CD2 "
+            "1CDA 1CDB 1CE0 1DC0 1DC1 1DC3 1DC4 1DC5 1DC6 1DC7 1DC8 1DC9 1DCB 1DCC 1DD1 1DD2 1DD3 "
+            "1DD4 1DD5 1DD6 1DD7 1DD8 1DD9 1DDA 1DDB 1DDC 1DDD 1DDE 1DDF 1DE0 1DE1 1DE2 1DE3 1DE4 "
+            "1DE5 1DE6 1DFE 20D0 20D1 20D4 20D5 20D6 20D7 20DB 20DC 20E1 20E7 20E9 20F0 2CEF 2CF0 "
+            "2CF1 2DE0 2DE1 2DE2 2DE3 2DE4 2DE5 2DE6 2DE7 2DE8 2DE9 2DEA 2DEB 2DEC 2DED 2DEE 2DEF "
+            "2DF0 2DF1 2DF2 2DF3 2DF4 2DF5 2DF6 2DF7 2DF8 2DF9 2DFA 2DFB 2DFC 2DFD 2DFE 2DFF A66F "
+            "A67C A67D A6F0 A6F1 A8E0 A8E1 A8E2 A8E3 A8E4 A8E5 A8E6 A8E7 A8E8 A8E9 A8EA A8EB A8EC "
+            "A8ED A8EE A8EF A8F0 A8F1 AAB0 AAB2 AAB3 AAB7 AAB8 AABE AABF AAC1 FE20 FE21 FE22 FE23 FE24 "
+            "FE25 FE26 10A0F 10A38 1D185 1D186 1D187 1D188 1D189 1D1AA 1D1AB 1D1AC 1D1AD 1D242 1D243 1D244"
+        ).split()
+    )
+
     def __init__(self, terminal: Terminal):
         """Keep only image transfer state around the single native VT owner."""
         self.terminal = terminal
@@ -120,7 +123,7 @@ class Images:
             self.cancel()
             self.error_count += 1
             self.errors.append(str(error))
-            del self.errors[:-MAX_ERRORS]
+            del self.errors[: -self.MAX_ERRORS]
 
     def _iterm(self, body):
         if body.startswith(b"File="):
@@ -132,15 +135,15 @@ class Images:
         elif body.startswith(b"MultipartFile="):
             self.cancel()
             self._header = body[len(b"MultipartFile=") :]
-            if len(self._header) > MAX_HEADER_BYTES:
+            if len(self._header) > self.MAX_HEADER_BYTES:
                 raise ValueError("Inline image header exceeds limit")
         elif body.startswith(b"FilePart="):
             if self._header is None:
                 return
             part = body[len(b"FilePart=") :]
             if (
-                len(part) > MAX_PART_BYTES
-                or len(self._parts) + len(part) > MAX_ENCODED_BYTES
+                len(part) > self.MAX_PART_BYTES
+                or len(self._parts) + len(part) > self.MAX_ENCODED_BYTES
             ):
                 raise ValueError("Inline image transfer exceeds limit")
             self._parts.extend(part)
@@ -157,7 +160,7 @@ class Images:
 
         if not self.terminal.graphics_enabled:
             return
-        if len(header) > MAX_HEADER_BYTES or len(encoded) > MAX_ENCODED_BYTES:
+        if len(header) > self.MAX_HEADER_BYTES or len(encoded) > self.MAX_ENCODED_BYTES:
             raise ValueError("Inline image transfer exceeds limit")
         options = {}
         for item in header.split(b";"):
@@ -168,18 +171,18 @@ class Images:
         if options.get(b"inline", b"0") != b"1":
             raise ValueError("File download controls are not inline images")
         data = base64.b64decode(encoded, validate=True)
-        if len(data) > MAX_SOURCE_BYTES:
+        if len(data) > self.MAX_SOURCE_BYTES:
             raise ValueError("Inline image file exceeds limit")
         context = self.terminal.image_context()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
                 with Image.open(io.BytesIO(data)) as source:
-                    if source.format not in RASTER_FORMATS:
+                    if source.format not in self.RASTER_FORMATS:
                         raise ValueError(
                             "Inline image format is not a supported raster"
                         )
-                    if source.width * source.height * 4 > MAX_PIXEL_BYTES:
+                    if source.width * source.height * 4 > self.MAX_PIXEL_BYTES:
                         raise ValueError("Decoded inline image exceeds the pixel limit")
                     if getattr(source, "n_frames", 1) != 1:
                         raise ValueError("Animated iTerm images are not supported")
@@ -202,7 +205,7 @@ class Images:
                 max(1, int(image.width * scale)),
                 max(1, int(image.height * scale)),
             )
-        if width * height * 4 > MAX_PIXEL_BYTES:
+        if width * height * 4 > self.MAX_PIXEL_BYTES:
             raise ValueError("Displayed inline image exceeds the pixel limit")
         if image.size != (width, height):
             image = image.resize((width, height), Image.Resampling.LANCZOS)
@@ -211,17 +214,19 @@ class Images:
 
     def _upload(self, image, identity, columns, rows):
         payload = image.tobytes()
-        prefix = f"a=T,f=32,s={image.width},v={image.height},i={identity},q=2,C=1"
-        prefix += f",U=1,c={columns},r={rows}"
-        for offset in range(0, len(payload), KITTY_CHUNK_BYTES):
-            chunk = payload[offset : offset + KITTY_CHUNK_BYTES]
+        prefix = (
+            f"a=T,f=32,s={image.width},v={image.height},i={identity},q=2,C=1"
+            f",U=1,c={columns},r={rows}"
+        )
+        for offset in range(0, len(payload), self.KITTY_CHUNK_BYTES):
+            chunk = payload[offset : offset + self.KITTY_CHUNK_BYTES]
             more = int(offset + len(chunk) < len(payload))
             keys = prefix + f",m={more}" if offset == 0 else f"m={more},q=2"
             self.terminal.feed_raw(
                 b"\x1b_G" + keys.encode() + b";" + base64.b64encode(chunk) + b"\x1b\\"
             )
 
-    def _place(self, image, *, advance):
+    def _place(self, image, *, advance, position=None):
         from PIL import Image
 
         context = self.terminal.image_context()
@@ -235,36 +240,45 @@ class Images:
             )
         if advance == "stay" and context.pending_wrap:
             raise ValueError("Stationary inline image at a pending wrap is unsupported")
+        x, y = (context.x, context.y) if position is None else position
+        if not (0 <= x < context.cols and 0 <= y < context.rows):
+            raise ValueError("Inline image position is outside the viewport")
         columns = math.ceil(image.width / context.cell_width)
         rows = math.ceil(image.height / context.cell_height)
-        if rows > len(DIACRITICS):
-            raise ValueError("Inline image exceeds the placeholder row limit")
+        visible_columns = min(columns, context.cols - x)
+        visible_rows = min(rows, context.rows - y) if advance == "stay" else rows
+        if max(visible_columns, visible_rows) > len(self.DIACRITICS):
+            raise ValueError("Inline image exceeds the placeholder coordinate limit")
         size = columns * context.cell_width, rows * context.cell_height
-        if size[0] * size[1] * 4 > MAX_PIXEL_BYTES:
+        if size[0] * size[1] * 4 > self.MAX_PIXEL_BYTES:
             raise ValueError("Padded inline image exceeds the pixel limit")
         padded = Image.new("RGBA", size)
         padded.paste(image)
         image = padded
         identity = self.terminal.unused_image_id()
         self._upload(image, identity, columns, rows)
-        if self.terminal.image(identity) is None:
+        if not self.terminal.image_exists(identity):
             raise ValueError("Native image storage rejected the image")
         write = self.terminal.feed_raw
-        start = f"\x1b[{context.x + 1}G".encode()
+        start = f"\x1b[{x + 1}G".encode()
         red, green, blue = (identity >> 16) & 255, (identity >> 8) & 255, identity & 255
         background = _color(48, context.style[4:8])
         paint = f"\x1b[0;38;2;{red};{green};{blue};58;2;0;0;0;{background}m".encode()
-        write(b"\x1b[?7l\x1b[4l" + paint + start)
-        visible_columns = min(columns, context.cols - context.x)
-        visible_rows = (
-            min(rows, context.rows - context.y) if advance == "stay" else rows
-        )
+        anchor = start if position is None else f"\x1b[{y + 1};{x + 1}H".encode()
+        write(b"\x1b[?7l\x1b[4l" + paint + anchor)
         for row in range(visible_rows):
-            line = PLACEHOLDER + DIACRITICS[row] + DIACRITICS[0]
-            line += PLACEHOLDER * (visible_columns - 1)
+            # Every surviving run must retain its own source coordinates after
+            # a middle cell is overwritten, erased or reflowed by the engine.
+            line = "".join(
+                self.PLACEHOLDER + self.DIACRITICS[row] + self.DIACRITICS[column]
+                for column in range(visible_columns)
+            )
             write(line.encode())
-            if row < visible_rows - 1 or advance == "below":
-                write(start + b"\x1bD")
+            if row < visible_rows - 1:
+                if advance == "stay":
+                    write(f"\x1b[{y + row + 2};{x + 1}H".encode())
+                else:
+                    write(start + b"\x1bD")
         if advance == "stay":
             write(f"\x1b[{context.y + 1};{context.x + 1}H".encode())
         write(_restore(context.style))
@@ -272,3 +286,141 @@ class Images:
             write(b"\x1b[?7h")
         if context.insert:
             write(b"\x1b[4h")
+        return columns, visible_rows
+
+
+class SixelImages(Images):
+    """Normalize SIXEL into the same native placeholder cells as inline images.
+
+    libghostty owns cell replacement, erasure and history. Covered text and
+    older image cells are replaced even where the new raster is transparent.
+    """
+
+    MODES = frozenset((80, 1070, 8452))
+    MODE_NAMES = {str(mode).encode(): mode for mode in MODES}
+    MODE_CHANGE = re.compile(rb"\?([0-9;]+)([hl])\Z")
+    MODE_QUERY = re.compile(rb"\?([0-9]+)\$p\Z")
+    GRAPHICS_QUERY = re.compile(rb"\?([12]);([1-4])(?:;([0-9;]+))?S\Z")
+
+    def __init__(self, terminal):
+        """Share bounded native upload while owning only SIXEL protocol modes."""
+        super().__init__(terminal)
+        self.reset()
+
+    def reset(self):
+        """Reset only supplemental protocol modes at RIS, not ordinary CAN."""
+        self.display = False
+        self.cursor_right = False
+
+    def handle(self, body):
+        """Commit one validated image, retaining the next input after a failure."""
+        from .sixel import Decoder
+
+        if not self.terminal.graphics_enabled:
+            return
+        try:
+            self._place_sixel(Decoder().decode(body))
+        except (ValueError, OSError) as error:
+            self.error_count += 1
+            self.errors.append(str(error))
+            del self.errors[: -self.MAX_ERRORS]
+
+    def csi(self, body, reply):
+        """Own only reviewed non-native SIXEL modes and graphics queries."""
+        query = self.MODE_QUERY.fullmatch(body)
+        if query:
+            mode = self.MODE_NAMES.get(query[1].lstrip(b"0"))
+            if mode is None:
+                return False
+            state = (
+                3
+                if mode == 1070
+                else 1
+                if (self.display if mode == 80 else self.cursor_right)
+                else 2
+            )
+            reply(f"\x1b[?{mode};{state}$y".encode())
+            return True
+        change = self.MODE_CHANGE.fullmatch(body)
+        if change:
+            # Empty/default and arbitrarily large native parameters belong to
+            # the native parser. Recognize only our short, canonical mode IDs;
+            # never convert unrelated input to Python integers or rewrite it.
+            modes = [
+                (value, self.MODE_NAMES.get(value.lstrip(b"0")))
+                for value in change[1].split(b";")
+            ]
+            if not any(mode is not None for _, mode in modes):
+                return False
+            enabled = change[2] == b"h"
+            for value, mode in modes:
+                if mode == 80:
+                    self.display = enabled
+                elif mode == 8452:
+                    self.cursor_right = enabled
+                elif mode != 1070:
+                    self.terminal.feed_raw(b"\x1b[?" + value + change[2])
+            return True
+        query = self.GRAPHICS_QUERY.fullmatch(body)
+        if query:
+            from .sixel import Decoder
+
+            item, action = int(query[1]), int(query[2])
+            if not self.terminal.graphics_enabled or action not in (1, 4):
+                reply(f"\x1b[?{item};1;0S".encode())
+            else:
+                values = (
+                    "256"
+                    if item == 1
+                    else f"{Decoder.MAX_DIMENSION};{Decoder.MAX_DIMENSION}"
+                )
+                reply(f"\x1b[?{item};0;{values}S".encode())
+            return True
+        return False
+
+    def _place_sixel(self, raster):
+        context = self.terminal.image_context()
+        if not context.ground or not context.cell_width or not context.cell_height:
+            raise ValueError("SIXEL needs a complete boundary and measured cell pixels")
+        if context.origin or context.margins:
+            raise ValueError("SIXEL with origin or horizontal margins is unsupported")
+        if self.display and context.pending_wrap:
+            raise ValueError("Stationary SIXEL at a pending wrap is unsupported")
+        image = raster.image
+        write = self.terminal.feed_raw
+        if self.display:
+            image = image.crop(
+                (
+                    0,
+                    0,
+                    min(image.width, context.cols * context.cell_width),
+                    min(image.height, context.rows * context.cell_height),
+                )
+            )
+        else:
+            image = image.crop(
+                (
+                    0,
+                    0,
+                    min(image.width, (context.cols - context.x) * context.cell_width),
+                    image.height,
+                )
+            )
+        if self.display:
+            self._place(image, advance="stay", position=(0, 0))
+            return
+        columns, rows = self._place(image, advance="right")
+        cursor_rows = raster.cursor_y // context.cell_height
+        # Placement already indexed between raster rows. SIXEL's final cursor
+        # can be above or below that last row; the native engine owns scrolling.
+        remaining = cursor_rows - (rows - 1)
+        if remaining > 0:
+            write(b"\x1bD" * remaining)
+        elif remaining < 0:
+            write(f"\x1b[{-remaining}A".encode())
+        col = (
+            min(context.cols - 1, context.x + columns)
+            if self.cursor_right
+            else context.x
+        )
+        write(f"\x1b[{col + 1}G".encode())

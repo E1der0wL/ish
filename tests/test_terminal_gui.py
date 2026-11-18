@@ -39,7 +39,7 @@ class TerminalGuiTests(unittest.TestCase):
         (EVIDENCE / getattr(self, "evidence_name", "result.json")).write_text(
             json.dumps({"status": "running"})
         )
-        self.temporary = tempfile.TemporaryDirectory(prefix="ish-vt-gui-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="ish-gui-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.dump = self.directory / "state.json"

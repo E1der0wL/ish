@@ -167,6 +167,35 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.exits, [0])
         self.assertEqual(self.errors, [])
 
+    async def test_start_paused_retains_final_output_without_readable_spin(self):
+        """A pre-start geometry wait must not repeatedly dispatch a readable PTY."""
+        self.session = Session(
+            [sys.executable, "-c", "import os; os.write(1, b'PAUSED_FINAL')"],
+            os.getcwd(),
+            self.received,
+            self.exited,
+            self.errors.append,
+        )
+        reads = []
+        original = self.session._read
+
+        def read():
+            reads.append(None)
+            original()
+
+        self.session._read = read
+        self.session.set_output_enabled(False)
+        self.session.start(80, 24)
+        await self.require_child_exit()
+        self.assertLessEqual(len(reads), 1)  # The child-exit final pass may probe once.
+        self.assertEqual(self.output, b"")
+        self.assertFalse(self.completed.is_set())
+        self.session.set_output_enabled(True)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertEqual(self.output, b"PAUSED_FINAL")
+        self.assertEqual(self.exits, [0])
+        self.assertEqual(self.errors, [])
+
     async def test_host_writer_backpressure_preserves_final_output(self):
         """A real blocked host pipe resumes without losing the child's last bytes."""
         loop = asyncio.get_running_loop()

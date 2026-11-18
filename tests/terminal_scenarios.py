@@ -197,7 +197,7 @@ def prepare(root: Path, shell: str, plugins: bool) -> list[str]:
         arguments = [
             "--plugin-dir",
             str(directory.parent),
-            "--library-dir",
+            "--plugin-lib-dir",
             str(root / "libraries"),
             "--plugin",
             "terminal_check",
@@ -218,6 +218,7 @@ class HooklessTerminal(Terminal):
         cols=100,
         environment=None,
         extra_args=(),
+        executable=None,
     ):
         """Select an ordinary interactive shell and explicit external test plugin."""
         arguments = prepare(root, shell, plugins)
@@ -229,6 +230,7 @@ class HooklessTerminal(Terminal):
             extra_args=[*arguments, *extra_args],
             environment=environment,
             configure=False,
+            executable=executable,
         )
 
 

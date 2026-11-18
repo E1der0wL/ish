@@ -118,7 +118,7 @@ class BaselineContracts(unittest.TestCase):
             terminal.feed(b"\x1b[>q\x1bP+q544e\x1b\\")
             self.assertEqual(
                 b"".join(replies),
-                b"\x1bP>|ish-vt 2.0.0\x1b\\"
+                b"\x1bP>|ish 2.0.0\x1b\\"
                 b"\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\",
             )
             self.assertFalse(terminal.processing_error)

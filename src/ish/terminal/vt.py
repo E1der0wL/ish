@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from wcwidth import iter_graphemes
+
 from ish.lang import Message, i18n
+from ish.runtime.distribution import bundled_vt_library
 
 from .engine import EngineError, check_library
 from .identity import IDENTITY, TERM, key_bytes
@@ -32,40 +35,12 @@ MAX_CELLS = 262_144
 MAX_BUFFER = 32 * 1024 * 1024
 DEFAULT_SCROLLBACK_LINES = 10_000
 DEFAULT_SCROLLBACK_BYTES = 32 * 1024 * 1024
-DEFAULT_IMAGE_BYTES = 16 * 1024 * 1024
-MOUSE_ACTIONS = {"press": 0, "release": 1, "move": 2}
-MOUSE_BUTTONS = {
-    None: 0,
-    "left": 1,
-    "middle": 2,
-    "right": 3,
-    "wheelup": 4,
-    "wheeldown": 5,
-    "wheelright": 7,
-    "wheelleft": 6,
-}
 LIBRARY_ENV = "ISH_GHOSTTY_LIB"
-DEFAULT_LIBRARY = (
+DEFAULT_LIBRARY = bundled_vt_library() or (
     Path(__file__).resolve().parents[3] / ".cache/ghostty-vt/install/lib/libish_vt.so"
 )
-HEADER = struct.Struct("<7I2Q5IQ4I")
-# The native snapshot carries color presence separately from RGB values.
-CELL = struct.Struct("<HB6B4I3BI")
-PLACEMENT = struct.Struct("<IIQii6Iii")
-IMAGE_HEADER = struct.Struct("<IIQ")
-IMAGE_CONTEXT = struct.Struct("<12I16s")
-EFFECT_HEADER = struct.Struct("<II")
-EFFECT_KINDS = {1: "bell", 2: "title", 3: "pwd"}
-CURSOR_SHAPES = ("bar", "block", "underline", "block_hollow")
-KEY_ACTIONS = {"release": 0, "press": 1, "repeat": 2}
-SELECTION_ACTIONS = {"press": 0, "release": 1, "drag": 2, "autoscroll": 3, "reset": 4}
-SELECTION_BEHAVIORS = ("cell", "word", "line", "output")
-SELECTION_AUTOSCROLL = (0, -1, 1)
-REPEAT_INTERVAL_NS = 500_000_000
-REPEAT_DISTANCE = 1.0
 COLOR_FG = 1
 COLOR_BG = 2
-COUNT = struct.Struct("<I")
 STYLE_FLAGS = (
     (1, "bold"),
     (2, "italic"),
@@ -391,6 +366,7 @@ def _load() -> ctypes.CDLL:
         "ish_vt_frame": ([pointer, *output], ctypes.c_int),
         "ish_vt_effects": ([pointer, *output], ctypes.c_int),
         "ish_vt_graphics": ([pointer, ctypes.c_uint64], ctypes.c_int),
+        "ish_vt_sixel_supported": ([pointer, ctypes.c_bool], ctypes.c_int),
         "ish_vt_appearance": (
             [pointer, ctypes.c_char_p, size, ctypes.c_int],
             ctypes.c_int,
@@ -402,6 +378,10 @@ def _load() -> ctypes.CDLL:
         ),
         "ish_vt_release_hold": ([pointer], ctypes.c_int),
         "ish_vt_image": ([pointer, ctypes.c_uint32, *output], ctypes.c_int),
+        "ish_vt_image_exists": (
+            [pointer, ctypes.c_uint32, ctypes.POINTER(ctypes.c_bool)],
+            ctypes.c_int,
+        ),
         "ish_vt_tick": (
             [pointer, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)],
             ctypes.c_int,
@@ -429,6 +409,14 @@ def _load() -> ctypes.CDLL:
             ctypes.c_int,
         ),
         "ish_vt_scroll": ([pointer, unsigned, ctypes.c_int64], ctypes.c_int),
+        "ish_vt_select_output": (
+            [pointer, unsigned, unsigned, ctypes.POINTER(ctypes.c_bool)],
+            ctypes.c_int,
+        ),
+        "ish_vt_select_last_output": (
+            [pointer, ctypes.POINTER(ctypes.c_bool)],
+            ctypes.c_int,
+        ),
         "ish_vt_mouse": (
             [
                 pointer,
@@ -478,6 +466,42 @@ def _load() -> ctypes.CDLL:
 class Terminal:
     """Own one libghostty-vt terminal; close explicitly when its PTY closes."""
 
+    DEFAULT_IMAGE_BYTES = 16 * 1024 * 1024
+    IMAGE_PLACEHOLDER = "\U0010eeee"
+    MOUSE_ACTIONS = {"press": 0, "release": 1, "move": 2}
+    MOUSE_BUTTONS = {
+        None: 0,
+        "left": 1,
+        "middle": 2,
+        "right": 3,
+        "wheelup": 4,
+        "wheeldown": 5,
+        "wheelright": 7,
+        "wheelleft": 6,
+    }
+    HEADER = struct.Struct("<7I2Q5IQ4I")
+    # The native snapshot carries color presence separately from RGB values.
+    CELL = struct.Struct("<HB6B4I3BI")
+    PLACEMENT = struct.Struct("<IIQii6Iii")
+    IMAGE_HEADER = struct.Struct("<IIQ")
+    IMAGE_CONTEXT = struct.Struct("<12I16s")
+    EFFECT_HEADER = struct.Struct("<II")
+    EFFECT_KINDS = {1: "bell", 2: "title", 3: "pwd", 4: "notification"}
+    CURSOR_SHAPES = ("bar", "block", "underline", "block_hollow")
+    KEY_ACTIONS = {"release": 0, "press": 1, "repeat": 2}
+    SELECTION_ACTIONS = {
+        "press": 0,
+        "release": 1,
+        "drag": 2,
+        "autoscroll": 3,
+        "reset": 4,
+    }
+    SELECTION_BEHAVIORS = ("cell", "word", "line", "output")
+    SELECTION_AUTOSCROLL = (0, -1, 1)
+    REPEAT_INTERVAL_NS = 500_000_000
+    REPEAT_DISTANCE = 1.0
+    COUNT = struct.Struct("<I")
+
     def __init__(
         self,
         cols: int,
@@ -523,11 +547,11 @@ class Terminal:
 
     def set_default_cursor(self, shape: str, *, blink: bool) -> None:
         """Set the native DECSCUSR reset defaults without changing the live cursor."""
-        if shape not in CURSOR_SHAPES or type(blink) is not bool:
+        if shape not in self.CURSOR_SHAPES or type(blink) is not bool:
             raise ValueError(i18n.get(Message.VT_CURSOR_DEFAULT))
         _check(
             self._library.ish_vt_default_cursor(
-                self._open(), CURSOR_SHAPES.index(shape), blink
+                self._open(), self.CURSOR_SHAPES.index(shape), blink
             )
         )
 
@@ -642,6 +666,10 @@ class Terminal:
     def clipboard(self, broker):
         self._inputs.clipboard = broker
 
+    def set_notifications(self, broker, *, before):
+        """Attach an optional policy sink before any child input is accepted."""
+        self._inputs.set_notifications(broker, before=before)
+
     def resize(
         self,
         cols: int,
@@ -691,14 +719,14 @@ class Terminal:
             cursor_red,
             cursor_green,
             cursor_blue,
-        ) = HEADER.unpack_from(data)
+        ) = self.HEADER.unpack_from(data)
         _dimensions(cols, rows)
-        offset = HEADER.size
+        offset = self.HEADER.size
         lines = []
         cell_rows = []
         for _ in range(rows):
-            (count,) = COUNT.unpack_from(data, offset)
-            offset += COUNT.size
+            (count,) = self.COUNT.unpack_from(data, offset)
+            offset += self.COUNT.size
             if count > cols:
                 raise TerminalError(i18n.get(Message.VT_NATIVE_ROW))
             runs: list[tuple[str, str]] = []
@@ -723,8 +751,8 @@ class Terminal:
                     ul_green,
                     ul_blue,
                     link_length,
-                ) = CELL.unpack_from(data, offset)
-                offset += CELL.size
+                ) = self.CELL.unpack_from(data, offset)
+                offset += self.CELL.size
                 end = offset + length
                 if (
                     end + link_length > len(data)
@@ -766,11 +794,11 @@ class Terminal:
             lines.append(runs)
             cell_rows.append(tuple(native_cells))
         images = []
-        if image_count > (len(data) - offset) // PLACEMENT.size:
+        if image_count > (len(data) - offset) // self.PLACEMENT.size:
             raise TerminalError(i18n.get(Message.VT_NATIVE_IMAGES))
         for _ in range(image_count):
-            images.append(Placement(*PLACEMENT.unpack_from(data, offset)))
-            offset += PLACEMENT.size
+            images.append(Placement(*self.PLACEMENT.unpack_from(data, offset)))
+            offset += self.PLACEMENT.size
         if offset != len(data):
             raise TerminalError(i18n.get(Message.VT_NATIVE_FRAME))
         return Frame(
@@ -785,7 +813,7 @@ class Terminal:
             history,
             offset_top,
             tuple(cell_rows),
-            CURSOR_SHAPES[shape] if shape < len(CURSOR_SHAPES) else "block",
+            self.CURSOR_SHAPES[shape] if shape < len(self.CURSOR_SHAPES) else "block",
             bool(blinking),
             cell_width,
             cell_height,
@@ -851,12 +879,19 @@ class Terminal:
                 raise TerminalError(i18n.get(Message.VT_IMAGE_DECODER)) from error
         _check(self._library.ish_vt_graphics(self._open(), max_bytes if enabled else 0))
         self.graphics_enabled = bool(enabled)
+        self._inputs.graphics_changed(self.graphics_enabled)
         if not enabled:
             self._inputs.cancel_images()
 
+    def set_sixel_supported(self, enabled: bool) -> None:
+        """Expose the selected input adapter through native device attributes."""
+        _check(self._library.ish_vt_sixel_supported(self._open(), bool(enabled)))
+
     def image_context(self) -> ImageContext:
         """Query live native state even while presentation is held or scrolled."""
-        return ImageContext(*IMAGE_CONTEXT.unpack(self._bytes("ish_vt_image_context")))
+        return ImageContext(
+            *self.IMAGE_CONTEXT.unpack(self._bytes("ish_vt_image_context"))
+        )
 
     def unused_image_id(self) -> int:
         """Select an unused image identity without replacing a child image."""
@@ -865,16 +900,30 @@ class Terminal:
         return value.value
 
     def image(self, image_id: int) -> Image | None:
-        """Copy decoded pixels on demand, never on every cell redraw."""
+        """Copy presentation pixels; synchronized output retains its held view."""
         if not 0 <= image_id < 2**32:
             raise ValueError(i18n.get(Message.VT_IMAGE_ID))
         data = self._bytes("ish_vt_image", image_id)
         if not data:
             return None
-        width, height, generation = IMAGE_HEADER.unpack_from(data)
-        if len(data) != IMAGE_HEADER.size + width * height * 4:
+        width, height, generation = self.IMAGE_HEADER.unpack_from(data)
+        if len(data) != self.IMAGE_HEADER.size + width * height * 4:
             raise TerminalError(i18n.get(Message.VT_NATIVE_IMAGE))
-        return Image(image_id, generation, width, height, data[IMAGE_HEADER.size :])
+        return Image(
+            image_id, generation, width, height, data[self.IMAGE_HEADER.size :]
+        )
+
+    def image_exists(self, image_id: int) -> bool:
+        """Validate live image storage independently of synchronized presentation."""
+        if not 0 <= image_id < 2**32:
+            raise ValueError(i18n.get(Message.VT_IMAGE_ID))
+        exists = ctypes.c_bool()
+        _check(
+            self._library.ish_vt_image_exists(
+                self._open(), image_id, ctypes.byref(exists)
+            )
+        )
+        return exists.value
 
     def tick(self, now_ms: int) -> int | None:
         """Advance native image playback once and return its next deadline."""
@@ -894,11 +943,13 @@ class Terminal:
         events = []
         offset = 0
         while offset < len(data):
-            kind, length = EFFECT_HEADER.unpack_from(data, offset)
-            offset += EFFECT_HEADER.size
-            if offset + length > len(data) or kind not in EFFECT_KINDS:
+            kind, length = self.EFFECT_HEADER.unpack_from(data, offset)
+            offset += self.EFFECT_HEADER.size
+            if offset + length > len(data) or kind not in self.EFFECT_KINDS:
                 raise TerminalError(i18n.get(Message.VT_NATIVE_EFFECT))
-            events.append(Effect(EFFECT_KINDS[kind], data[offset : offset + length]))
+            events.append(
+                Effect(self.EFFECT_KINDS[kind], data[offset : offset + length])
+            )
             offset += length
         return tuple(events)
 
@@ -959,6 +1010,12 @@ class Terminal:
         """Show the oldest retained native history."""
         _check(self._library.ish_vt_scroll(self._open(), 0, 0))
 
+    def scroll_prompts(self, count: int) -> None:
+        """Navigate native semantic markers; absent markers are a no-op."""
+        if not -(2**63) <= count < 2**63:
+            raise ValueError(i18n.get(Message.VT_SCROLL_DELTA))
+        _check(self._library.ish_vt_scroll(self._open(), 3, count))
+
     def scroll_bottom(self) -> None:
         """Follow the active terminal area without modifying terminal content."""
         _check(self._library.ish_vt_scroll(self._open(), 1, 0))
@@ -978,7 +1035,7 @@ class Terminal:
         Mode 1016 emits bytes only when the caller supplies actual host pixel
         coordinates and confirmed cell geometry. A cell centre is not evidence.
         """
-        if action not in MOUSE_ACTIONS or button not in MOUSE_BUTTONS:
+        if action not in self.MOUSE_ACTIONS or button not in self.MOUSE_BUTTONS:
             raise ValueError(i18n.get(Message.VT_MOUSE_EVENT))
         if modifiers & ~(SHIFT | CTRL | ALT):
             raise ValueError(i18n.get(Message.VT_MOUSE_MODIFIERS))
@@ -992,8 +1049,8 @@ class Terminal:
                 raise ValueError(i18n.get(Message.VT_MOUSE_PIXELS))
         return self._bytes(
             "ish_vt_mouse",
-            MOUSE_ACTIONS[action],
-            MOUSE_BUTTONS[button],
+            self.MOUSE_ACTIONS[action],
+            self.MOUSE_BUTTONS[button],
             x,
             y,
             modifiers,
@@ -1025,7 +1082,7 @@ class Terminal:
         autoscroll. A tick scrolls one row and updates selection atomically.
         Reset cancels the gesture while preserving the installed selection.
         """
-        if action not in SELECTION_ACTIONS:
+        if action not in self.SELECTION_ACTIONS:
             raise ValueError(i18n.get(Message.VT_SELECTION_ACTION))
         if not all(
             isinstance(value, int) and -(2**31) <= value < 2**31 for value in (x, y)
@@ -1046,7 +1103,7 @@ class Terminal:
         _check(
             self._library.ish_vt_selection(
                 self._open(),
-                SELECTION_ACTIONS[action],
+                self.SELECTION_ACTIONS[action],
                 x,
                 y,
                 *position,
@@ -1061,8 +1118,8 @@ class Terminal:
         return SelectionState(
             result[0],
             bool(result[1]),
-            SELECTION_AUTOSCROLL[result[2]],
-            SELECTION_BEHAVIORS[result[3]],
+            self.SELECTION_AUTOSCROLL[result[2]],
+            self.SELECTION_BEHAVIORS[result[3]],
         )
 
     def begin_selection(self, x: int, y: int) -> None:
@@ -1079,9 +1136,34 @@ class Terminal:
         """Clear the active native selection and release its tracked anchor."""
         _check(self._library.ish_vt_clear_selection(self._open()))
 
+    def select_output(self, x: int, y: int) -> bool:
+        """Select native command output containing one viewport cell."""
+        self._selection_point(x, y)
+        found = ctypes.c_bool()
+        _check(
+            self._library.ish_vt_select_output(self._open(), x, y, ctypes.byref(found))
+        )
+        return found.value
+
+    def select_last_output(self) -> bool:
+        """Select output at the last native OSC 133 C anchor, if retained."""
+        found = ctypes.c_bool()
+        _check(
+            self._library.ish_vt_select_last_output(self._open(), ctypes.byref(found))
+        )
+        return found.value
+
     def selection_text(self) -> str:
-        """Copy current selected text using native unwrap/format semantics."""
-        return self._bytes("ish_vt_selection_text").decode("utf-8")
+        """Keep native selection formatting while hiding image cell metadata."""
+        text = self._bytes("ish_vt_selection_text").decode("utf-8")
+        if self.IMAGE_PLACEHOLDER not in text:
+            return text
+        # Match the snapshot's blank image cells without altering native ranges,
+        # line wrapping or unrelated combining characters in selected text.
+        return "".join(
+            " " if grapheme.startswith(self.IMAGE_PLACEHOLDER) else grapheme
+            for grapheme in iter_graphemes(text)
+        )
 
     @property
     def keyboard_flags(self) -> int:
@@ -1100,9 +1182,9 @@ class Terminal:
         C0 bytes already decoded by PTK retain their original meaning.
         """
         self._open()
-        if action not in KEY_ACTIONS:
+        if action not in self.KEY_ACTIONS:
             raise ValueError(i18n.get(Message.VT_KEY_ACTION))
-        native_action = KEY_ACTIONS[action]
+        native_action = self.KEY_ACTIONS[action]
         if modifiers & ~(SHIFT | CTRL | ALT):
             raise ValueError(i18n.get(Message.VT_KEY_MODIFIERS))
         text = key.encode("utf-8")

@@ -1,7 +1,1 @@
-"""Provide the plugin manager instance shared by the CLI."""
-
-from .manager import PluginManager
-
-plugin_manager = PluginManager()
-
-__all__ = ["plugin_manager"]
+"""Load explicitly selected Python plugins through the shared PluginManager."""

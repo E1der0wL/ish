@@ -1,14 +1,16 @@
 """Package a relocatable Linux x86_64 CPython installation and the locked ish wheel.
 
 Run with tools/build.sh. The pinned runtime determines platform and libc
-requirements; dependencies come from locked wheels without compiling shell helpers.
+requirements; dependencies come from locked wheels and the pinned libghostty build.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -21,22 +23,25 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
-DOCUMENTATION_PATHS = ("README.md", "docs", "examples")
+DOCUMENTATION_PATHS = ("README.md", "AGENTS.md", "docs", "examples")
 LAUNCHERS = ("ish",)
 SOURCE_PATHS = (
     "src",
     "pyproject.toml",
     "uv.lock",
     ".python-version",
+    "tools/build.sh",
     "tools/python-runtime.toml",
     "tools/ish-launcher.sh",
     "tools/build_distribution.py",
+    "tools/build_ghostty_vt.py",
     *DOCUMENTATION_PATHS,
 )
 SOURCE_CACHE_DIRS = frozenset(("__pycache__", ".pytest_cache", ".ruff_cache"))
 SOURCE_BINARY_SUFFIXES = frozenset(
     (".pyc", ".pyo", ".so", ".pyd", ".dll", ".dylib", ".o", ".a")
 )
+NATIVE_LICENSE_NAMES = frozenset(("LICENSE", "COPYING", "COPYRIGHT", "NOTICE"))
 
 
 def source_digest(root: Path) -> str:
@@ -176,6 +181,97 @@ def require_case_sensitive_output(destination: Path) -> None:
             )
 
 
+def copy_native(source: Path, bundle: Path, licenses: tuple[Path, ...]) -> dict:
+    """Install the verified bridge, its relative engine links and source licenses."""
+    from tools.build_ghostty_vt import NATIVE_STAMP, verify_install
+
+    from ish.runtime.distribution import VT_LIBRARY_PATH
+    from ish.terminal.engine import ENGINE_VERSION, check_library
+
+    source = source.resolve()
+    verify_install(source.parent)
+    check_library(ctypes.CDLL(str(source / VT_LIBRARY_PATH.name)))
+    destination = bundle / VT_LIBRARY_PATH.parent
+    destination.mkdir(parents=True)
+    names = (
+        VT_LIBRARY_PATH.name,
+        "libghostty-vt.so",
+        "libghostty-vt.so.1",
+        f"libghostty-vt.so.{ENGINE_VERSION}",
+    )
+    hashes = {}
+    for name in names:
+        path = source / name
+        if not path.is_file() or not path.resolve().is_relative_to(source):
+            raise RuntimeError(f"Missing or escaping native library: {path}")
+        if path.is_symlink() and Path(os.readlink(path)).is_absolute():
+            raise RuntimeError(f"Native library link is not relocatable: {path}")
+        shutil.copy2(path, destination / name, follow_symlinks=False)
+        hashes[name] = sha256(path)
+    license_count = 0
+    for directory in licenses:
+        for path in directory.rglob("*"):
+            if (
+                path.is_file()
+                and re.split(r"[._-]", path.name.upper(), maxsplit=1)[0]
+                in NATIVE_LICENSE_NAMES
+            ):
+                target = (
+                    bundle / "licenses" / directory.name / path.relative_to(directory)
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+                license_count += 1
+    if not license_count:
+        raise RuntimeError("The pinned native source did not provide license files")
+    provenance_dir = bundle / "licenses/ish-native-build"
+    provenance_dir.mkdir(parents=True)
+    shutil.copy2(source.parent / NATIVE_STAMP, provenance_dir / NATIVE_STAMP)
+    return {
+        "engine": ENGINE_VERSION,
+        "source": "upstream",
+        "provenance_sha256": sha256(source.parent / NATIVE_STAMP),
+        "sha256": hashes,
+        "license_files": license_count,
+    }
+
+
+def prepare_native(root: Path, cache: Path) -> None:
+    """Reuse a verified engine and rebuild only the narrow bridge for current source."""
+    from ish.runtime.distribution import VT_LIBRARY_PATH
+
+    native = root / ".cache/ghostty-vt/install/lib" / VT_LIBRARY_PATH.name
+    header = native.parent.parent / "include/ghostty/vt.h"
+    reusable = False
+    if native.is_file() and header.is_file():
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import ctypes, sys; from pathlib import Path; "
+                "sys.path.insert(0, sys.argv[2]); "
+                "from ish.terminal.engine import check_library; "
+                "from tools.build_ghostty_vt import verify_install; "
+                "verify_install(Path(sys.argv[1]).parents[1]); "
+                "check_library(ctypes.CDLL(sys.argv[1]))",
+                str(native),
+                str(Path(__file__).resolve().parents[1]),
+            ],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        reusable = probe.returncode == 0
+    command = [sys.executable, str(root / "tools/build_ghostty_vt.py")]
+    subprocess.run(
+        [*command, "--cache-dir", str(cache), *(["--prepare"] if reusable else [])],
+        cwd=root,
+        check=True,
+    )
+    if reusable:
+        subprocess.run([*command, "--bridge-only"], cwd=root, check=True)
+
+
 def main() -> None:
     """Build in a private staging directory and publish only a verified installation."""
     from ish.runtime.distribution import RUNTIME_MARKER
@@ -197,6 +293,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
     spec = tomllib.loads((root / "tools/python-runtime.toml").read_text())
     version = tuple(map(int, spec["version"].split(".")))
     if (
@@ -235,6 +332,8 @@ def main() -> None:
         args.licenses_archive,
         cache,
     )
+    native_cache = cache.parent / "ghostty-vt"
+    prepare_native(root, native_cache)
     with tempfile.TemporaryDirectory(prefix="build-", dir=cache) as staging:
         work = Path(staging)
         bundle = work / "bin"
@@ -330,6 +429,16 @@ def main() -> None:
         (bundle / "python" / RUNTIME_MARKER).write_text(
             json.dumps(spec, indent=2) + "\n"
         )
+        from ish.terminal.engine import ENGINE_VERSION
+
+        native = copy_native(
+            root / ".cache/ghostty-vt/install/lib",
+            bundle,
+            (
+                native_cache / "upstream" / f"libghostty-vt-{ENGINE_VERSION}",
+                native_cache / f"libghostty-vt-{ENGINE_VERSION}-deps",
+            ),
+        )
         copy_documentation(root, bundle)
         for pattern in ("LICENSE", "LICENSE.*", "COPYING", "COPYING.*"):
             for license_path in root.glob(pattern):
@@ -359,6 +468,7 @@ def main() -> None:
             "libc": platform.libc_ver(),
             "source_sha256": digest,
             "wheel_sha256": sha256(wheel),
+            "native": native,
             "created_utc": timestamp,
         }
         destination.mkdir(parents=True)

@@ -1,16 +1,19 @@
 # 기본 명세와 유지할 자동 회귀 사례
 
-2026-11-17. [기본 지원 명세](VT_BASELINE_AUDIT.md), 보완 모듈과 기능 정책 계약의 **50개 ID에 연결된 105개 테스트**를 삭제·이름 변경으로부터 보호한다. 이것은 명세 전체의 합격표가 아니다. 각 행은 아래의 특정 자동 사례만 뜻하며, 물리 입력·픽셀·실제 호스트 증거는 [기능 정책 검증](VT_FEATURE_POLICY.md), [보완 모듈 검증](VT_SUPPLEMENTS_RESULT.md), [이전 검증 결과](VT_BASELINE_RESULT.md)에서 별도로 판정한다.
+2026-11-18. [기본 지원 명세](VT_BASELINE_AUDIT.md), 보완 모듈·기능 정책·선택 확장 계약의 ID에 연결된 필수 회귀를 삭제·이름 변경으로부터 보호한다. 정확한 목록은 아래 검사 코드가 소유한다. 이것은 명세 전체의 합격표가 아니다. 각 행은 아래의 특정 자동 사례만 뜻하며, 물리 입력·픽셀·실제 호스트 증거는 [기능 정책 검증](VT_FEATURE_POLICY.md), [보완 모듈 검증](VT_SUPPLEMENTS_RESULT.md), [이전 검증 결과](VT_BASELINE_RESULT.md)에서 별도로 판정한다.
 
 정확한 `module.Class.test_method` 목록은 [tools/terminal_contracts.py](../tools/terminal_contracts.py)의 `REQUIRED_CASES`가 소유한다. 같은 테스트가 여러 명세의 일부를 검증할 수 있지만 실행은 한 번만 한다. 아래 설명은 해당 사례의 범위이며, 같은 ID의 나머지 조합을 검증 완료로 만들지 않는다.
 
 | ID | 보호하는 자동 사례 | 테스트 경계 |
 |---|---|---|
+| MG01 | 카테고리 도움말·실제 설정 저장·외부 편집기·플러그인 비실행·기능 선택 | `test_management_ui` |
+| MG02 | 원본 보존·외부 수정 충돌·symlink·설정 객체 identity·비실행 메타데이터 | `test_management_store` |
+| MG03 | 관리 창의 시작 상태 복원·관측 중 입력 순서·편집기 handoff·지연 응답 거부 | `test_management_restore` |
 | FP01 | 질의가 있는 기능만 auto, 정책·관찰·사용 분리, identity 없는 선택, resize 후 off 보존, geometry·초기 색 복원 필수 조건, 실제 PTK의 형식 on/off 및 커서 정리 | `test_terminal_features.FeaturePolicyTests`, `test_terminal_composition.FormattingPolicyTests` |
 | IO01 | 3셸 × 기본형/플러그인의 native 셸·프로그램 입력 | `test_terminal_hookless.HooklessTests`의 6개 조합 |
 | IO02 | 호스트 backpressure 중 마지막 출력 보존, 3셸의 1,280행·팝업 4회·resize 8회 뒤 전체 history 비교 | `test_terminal_session.TerminalSessionTests`, `test_terminal_supplements.SustainedOutputTests` |
 | IO03 | 종료 후 열린 slave가 있어도 보류된 출력 drain | `test_terminal_session.TerminalSessionTests` |
-| IO04 | 최초 bar 제외 크기, resize 후 native grid/size 응답 | `test_terminal_cursor.CursorPTYTests`, `test_terminal_vt.TerminalVTTests` |
+| IO04 | 최초 bar 제외 크기, resize 후 native grid/size 응답, 직렬 크기 조회·실패 복귀·이미지 보존·애니메이션 재개 | `test_terminal_cursor.CursorPTYTests`, `test_terminal_vt.TerminalVTTests`, `test_terminal_geometry` |
 | IO05 | 실제 셸의 Ctrl+C/D/Z, jobs/bg/fg와 최종 파일 | 위 `HooklessTests` 6개 조합 |
 | IO06 | 최초 상태 관찰, 정상/HUP/TERM/중지·재개, 최종 renderer 실패 cleanup | `test_terminal_cursor.RestorationPTYTests`, `test_terminal_composition.TerminalCompositionTests` |
 | IO07 | native 처리 실패를 정상 feed로 보고하지 않음 | `test_terminal_contracts.BaselineContracts` |
@@ -54,6 +57,11 @@
 | UI06 | 조회 부작용 차단, 언어 우선순위, 플러그인 저장, 파일 로그 수준·본문 비수집 | `test_terminal_startup.StartupTests` |
 | UI07 | CLI/진단의 정책 설명, history 0바이트 정책 | `test_terminal_startup.StartupTests`, `test_terminal_vt.TerminalVTTests` |
 | UI08 | 종료 시 primary 커서·scroll region 복원 | `test_terminal_cursor.RestorationPTYTests`. 내부 history의 호스트 이관을 요구하지 않음 |
+| IM04의 synchronized 입력 사례 | hold 중 업로드는 live 저장소로 확인하고, 화면은 해제 전 상태를 유지한 후 새 픽셀 표시 | `test_terminal_image_protocol.ImageProtocolTests`. iTerm 전체 조합의 완료를 뜻하지 않음 |
+| IM05의 SIXEL 자동 사례 | 독립 palette/alpha·반복·aspect·HLS 픽셀, fragmented 입력, 취소/reset/disable, query 단일 응답, native history/alternate/erase·커서·겹침 수명, hold 중 live 업로드와 해제 시 표시, 미지원 pending-wrap의 후속 문자 보존 | `test_terminal_sixel.SixelDecoderTests`, `SixelInputTests`, `SixelOverwriteTests`. 공통 placeholder의 글자·ECH 교체, 다색 이미지 조각 좌표, 투명 padding, 스크롤 영역의 고정 배치, 일반 Kitty 보존과 실제 PTY 입력 결과를 검증 |
+| IM06의 SIXEL 자동 사례 | sparse/투명·색상 255·wire 한도, page origin·가림/복원, 이미지 제거 후 text repaint, 불완전 alpha의 알려진 배경 처리/모르는 배경 거부 | `test_terminal_sixel.SixelEncoderTests`, `SixelPresenterTests`. 실제 호스트 픽셀 관찰의 대체가 아님 |
+| OPT01 | 알림 기본 off, OSC 9/777/99 순서, chunk/identity/query, bounded payload, host 제어문자·OSC 9 하위명령 방어, 실제 PTK writer·프레임 한도 | `test_terminal_optional.NotificationTests`, `SemanticTests`, `OptionalCompositionTests`. [선택 확장](VT_OPTIONAL.md)의 제한된 title/body/query 범위이며 OS 알림 풍선 표시의 증명이 아님 |
+| OPT02 | native prompt 이동·출력 선택, Unicode·빈 출력·reflow·alternate·history/RIS anchor, 실제 PTK F8/F9·ClipboardBroker·PTY의 최종 파일, 기본형 키/UI 보존 | `test_terminal_optional.SemanticTests`, `OptionalCompositionTests`. OSC 133 마커가 없는 셸의 자동 명령 인식을 뜻하지 않음 |
 | IM08의 B 부분 | 이미지 입력 거부 건수와 로그 본문 비수집 | `test_terminal_startup.StartupTests`. 이미지 지원의 추가/완료 판정이 아님 |
 | EXT01 | 동일 폴더의 출력/키/클립보드 동시 로딩, 키 등록 충돌·응답 격리·정상 키 보존·실제 PTY 소비자, terminfo 목록 변경 감지 | `test_terminal_supplements`, `test_terminal_keys`, `test_terminal_terminfo` |
 
@@ -62,8 +70,9 @@
 1. 기존 `REQUIRED_TERMINAL`은 모듈 파일의 존재를 확인한다. 빈 모듈·import 실패·skip도 기존 strict runner가 실패로 처리한다.
 2. `REQUIRED_CASES`는 **실제 실행할 unittest suite** 안에 각 사례가 정확히 한 번 있는지 확인한다. 함수가 파일에 남아 있어도 `load_tests`가 수집에서 빼면 실패한다. 다른 테스트가 남아 있는 파일에서 하나만 삭제하거나 이름을 바꿔도 실패한다.
 3. `test_terminal_checks.py`의 독립 literal 목록은 선언에서 ID·필수 사례를 지워 보호 범위가 조용히 줄어드는 것을 막는다. 이름을 의도적으로 바꿀 때는 선언과 독립 기대값을 함께 검토해야 한다.
-4. 별도 `REQUIRED_CHECKS`는 이 방어를 검증하는 5개 검사 자체도 보호한다. 제품 명세의 50개 ID/105개 사례 수에는 이 검사기 테스트를 합치지 않는다.
-5. 검사 실패는 사례의 실행 전에 명세 ID와 누락/중복된 전체 테스트 이름을 보고한다. import 실패가 원인이면 원래 수집 traceback도 보존한다. 수집하거나 실행하는 별도 두 번째 테스트 runner는 만들지 않는다. stream의 기본 runner 호출은 바뀌지 않는다.
+4. 별도 `REQUIRED_CHECKS`는 이 방어를 검증하는 검사 자체도 보호한다. 제품 명세에 연결한 사례와 검사기 테스트를 구분한다.
+5. 검사 실패는 사례의 실행 전에 명세 ID와 누락/중복된 전체 테스트 이름을 보고한다. import 실패가 원인이면 원래 수집 traceback도 보존한다. 수집하거나 실행하는 별도 두 번째 테스트 runner는 만들지 않는다. 단일 `tools/check_terminal.py` 검사기가 수집·실행을 소유한다.
+6. `REQUIRED_HELPERS`는 Zellij 비교·이미지·실제 presentation·키보드/IME runner가 사용하는 helper 6개를 lint 입력으로 고정한다. 독립 literal 경로 목록과 각 파일 삭제 검사가 glob 자동 발견에 기대지 않고 누락을 잡는다. 별도의 Zellij 다운로드·비교 실행·실제 Windows Terminal 조작을 매번 unit 회귀 안에서 실행한다는 뜻은 아니다.
 
 테스트 본문의 assertion을 제거하거나 같은 이름을 무의미한 검사로 바꾸는 것은 이 검사기의 보장 범위가 아니다. 결과의 독립성과 테스트 의미는 코드 검토가 계속 확인한다. 개별 `subTest` 조합 삭제도 별도 테스트 ID 삭제와 같게 감지하지 않는다.
 
@@ -71,5 +80,5 @@
 
 - IN05의 실제 IME, UI09의 접근성, 물리 마우스·검색 키·클립보드·픽셀 결과는 자동 선언에 새로 통과 표시하지 않는다.
 - HX05 BEL의 실제 호스트 효과 및 HX06 제목의 실제 호스트 결과는 자동 사례와 따로 확인한다.
-- terminfo 287개는 [후속 대조](VT_TERMINFO_RESULT.md)에서 빠짐없이 분류했다. 전 상태 조합·전 호스트 표현의 지원을 뜻하지 않으며, 11개 명시적 차이와 선택 확장·SIXEL 제외는 유지한다.
+- terminfo 287개의 [이전 후속 대조](VT_TERMINFO_RESULT.md)는 당시 범위의 기록이다. 이번 IM05/IM06·OPT01/OPT02 자동 사례 추가가 전 상태 조합·전 호스트 표현이나 전체 선택 확장의 지원을 뜻하지 않는다. 기존 명시적 차이와 이번 native placement·알림 범위 제한은 별도로 남는다.
 - 실제 Windows Terminal 검사와 GitHub workflow 실행 여부는 로컬 회귀와 따로 기록한다.

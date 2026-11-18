@@ -154,7 +154,7 @@ class DependencyTests(PluginFixture):
             body=f"import {NAME}\nPath({str(self.root / 'result')!r}).write_bytes((Path({NAME}.__file__).parent / 'data.txt').read_bytes())\n",
         )
         with self.stage(incoming) as installer:
-            self.manager.load()
+            self.manager.load(["fixture_reader"])
         self.assertEqual(installer.call_count, 1)
         self.assertEqual((self.root / "result").read_bytes(), b"usable")
         self.assertIsNotNone(self.manager.get("fixture_reader"))

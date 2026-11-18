@@ -9,10 +9,11 @@ from pathlib import Path
 
 from ish.config import config
 from ish.lang import Message, i18n
+from ish.runtime.cli import OPTIONS as COMMON_OPTIONS
+from ish.runtime.cli import Startup, command, report_logs
+from ish.runtime.cli import parse as parse_common
 from ish.runtime.diagnostics import display_diagnostics, environment_fields
-from ish.stream.startup import OPTIONS as COMMON_OPTIONS
-from ish.stream.startup import Startup, command, report_logs
-from ish.stream.startup import parse as parse_common
+from ish.runtime.settings import PATH_OPTIONS as COMMON_PATHS
 
 from .engine import BRIDGE_ABI, ENGINE_VERSION
 from .features import merge, parse_assignment
@@ -21,10 +22,6 @@ from .settings import CLIPBOARD_POLICIES, COLOR_DEPTHS, MOUSE_POLICIES, Settings
 from .vt import DEFAULT_LIBRARY, LIBRARY_ENV
 
 __all__ = ["command", "parse", "report_logs"]
-
-EXCLUDED_OPTIONS = frozenset(
-    ("--plugin", "--plugin-dir", "--plugin-lib-dir", "--integration-dir")
-)
 
 
 def feature_assignment(value):
@@ -35,14 +32,12 @@ def feature_assignment(value):
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
-OPTIONS = tuple(
-    item for item in COMMON_OPTIONS if item[0][0] not in EXCLUDED_OPTIONS
-) + (
+OPTIONS = COMMON_OPTIONS + (
     (("--plugin",), Message.VT_PLUGIN_HELP, {"action": "append", "metavar": "NAME"}),
     (("--plugin-dir",), Message.VT_PLUGIN_DIR_HELP, {"type": Path, "metavar": "DIR"}),
     (
-        ("--plugin-lib-dir", "--library-dir"),
-        Message.STREAM_PLUGIN_LIB_HELP,
+        ("--plugin-lib-dir",),
+        Message.STARTUP_PLUGIN_LIB_HELP,
         {"type": Path, "metavar": "DIR"},
     ),
     (("--mouse",), Message.VT_MOUSE_HELP, {"choices": MOUSE_POLICIES}),
@@ -64,7 +59,7 @@ OPTIONS = tuple(
     # It is not a normal file log and is intentionally absent from public help.
     (("--dump-state",), None, {"type": Path}),
 )
-PATH_OPTIONS = ("cwd", "plugin_dir", "plugin_lib_dir", "log_file", "dump_state")
+PATH_OPTIONS = (*COMMON_PATHS, "dump_state")
 
 
 def diagnose(args):
@@ -73,22 +68,22 @@ def diagnose(args):
     values = environment_fields(args.shell)
     values.update(
         {
-            Message.STREAM_DIAGNOSE_CWD: args.cwd,
+            Message.STARTUP_DIAGNOSE_CWD: args.cwd,
             Message.CLI_DIAGNOSE_RC: config.RC_FILE,
-            Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(Message.STREAM_RC_NOT_EXECUTED),
-            Message.VT_DIAGNOSE_NAMESPACE: "config.vt",
+            Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(Message.STARTUP_RC_NOT_EXECUTED),
+            Message.VT_DIAGNOSE_NAMESPACE: "config",
             Message.VT_DIAGNOSE_CONTROLS: i18n.get(Message.VT_CONTROL_POLICY),
             Message.VT_DIAGNOSE_HOST: i18n.get(Message.VT_HOST_POLICY),
-            Message.STREAM_DIAGNOSE_ARGS: shlex.join(args.shell_args),
-            Message.STREAM_DIAGNOSE_ESCAPE_DELAY: args.escape_delay,
+            Message.STARTUP_DIAGNOSE_ARGS: shlex.join(args.shell_args),
+            Message.STARTUP_DIAGNOSE_ESCAPE_DELAY: args.escape_delay,
             Message.CLI_DIAGNOSE_PLUGINS: args.plugin_dir or config.PLUGIN_SCRIPT_DIR,
-            Message.STREAM_DIAGNOSE_PLUGIN_LIB: args.plugin_lib_dir
+            Message.STARTUP_DIAGNOSE_PLUGIN_LIB: args.plugin_lib_dir
             or config.PLUGIN_LIB_DIR,
-            Message.STREAM_DIAGNOSE_SELECTED_PLUGINS: ", ".join(args.plugin)
+            Message.STARTUP_DIAGNOSE_SELECTED_PLUGINS: ", ".join(args.plugin)
             or i18n.get(Message.CLI_DIAGNOSE_DISABLED),
-            Message.STREAM_DIAGNOSE_LOG_FILE: args.log_file
+            Message.STARTUP_DIAGNOSE_LOG_FILE: args.log_file
             or i18n.get(Message.CLI_DIAGNOSE_DISABLED),
-            Message.STREAM_DIAGNOSE_LOG_LEVEL: args.log_level,
+            Message.STARTUP_DIAGNOSE_LOG_LEVEL: args.log_level,
             Message.VT_DIAGNOSE_MOUSE: args.mouse,
             Message.VT_DIAGNOSE_COLOR_DEPTH: args.color_depth,
             Message.VT_DIAGNOSE_FEATURES: "; ".join(
@@ -119,7 +114,7 @@ def diagnose(args):
 
 
 def parse(argv=None):
-    """Share language precedence and read-only queries without stream integration."""
+    """Apply terminal policy to shared language precedence and read-only queries."""
     return parse_common(
         argv,
         startup=Startup(

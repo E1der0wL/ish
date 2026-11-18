@@ -17,17 +17,8 @@ from ish.lang.i18n import I18N, Message
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT_SOURCES = (
-    "src/ish/stream",
-    "src/ish/log.py",
-    "src/ish/lang/i18n.py",
-    "src/ish/plugin/manager.py",
-    "src/ish/plugin/dependencies.py",
-    "src/ish/runtime/diagnostics.py",
-    "src/ish/runtime/startup.py",
-    "src/ish/runtime/fdio.py",
-    "src/ish/terminal",
-    "examples/stream_plugins/stream_bar/stream_bar.py",
-    "examples/stream_plugins/stream_popup/stream_popup.py",
+    "src/ish",
+    "examples/terminal_plugins",
 )
 
 
@@ -62,7 +53,7 @@ class LanguageTests(unittest.TestCase):
                 patch.object(locale, "getlocale", side_effect=AssertionError),
                 patch.object(locale, "setlocale", side_effect=AssertionError),
             ):
-                self.language.load(create=False)
+                self.language.load()
                 self.assertEqual(self.language.current_lang, "ko")
                 self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
         self.assertEqual(list(self.root.iterdir()), [])
@@ -86,7 +77,7 @@ class LanguageTests(unittest.TestCase):
                 self.subTest(environment=environment),
                 patch.dict(os.environ, environment, clear=True),
             ):
-                self.language.load(create=False)
+                self.language.load()
                 self.assertEqual(self.language.current_lang, expected)
                 self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), text)
 
@@ -113,7 +104,7 @@ class LanguageTests(unittest.TestCase):
                 self.subTest(value=value),
                 patch.dict(os.environ, environment, clear=True),
             ):
-                self.language.load(create=False)
+                self.language.load()
                 self.assertEqual(self.language.current_lang, "en")
                 self.assertEqual(
                     self.language.get(Message.CLI_OPTIONS_TITLE), "options"
@@ -122,28 +113,28 @@ class LanguageTests(unittest.TestCase):
 
     def test_each_automatic_load_detects_lang_again(self):
         """An earlier explicit or automatic choice cannot stick in the singleton."""
-        self.language.load("ko", create=False)
+        self.language.load("ko")
         for value, expected in (
             ("en_US.UTF-8", "options"),
             ("ko_KR", "옵션"),
             ("", "options"),
         ):
             with patch.dict(os.environ, {"LANG": value}, clear=True):
-                self.language.load(create=False)
+                self.language.load()
                 self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), expected)
         with patch.dict(os.environ, {"LANG": "ko_KR.UTF-8"}, clear=True):
-            self.language.load("en", create=False)
+            self.language.load("en")
             self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
 
     def test_partial_user_language_keeps_english_for_missing_messages(self):
         """A local language pack need not duplicate the entire English catalog."""
         self.write("zz", {"cli_options_title": "LOCAL OPTIONS"})
         with patch.dict(os.environ, {"LANG": "zz_ZZ.UTF-8"}, clear=True):
-            self.language.load(create=False)
+            self.language.load()
         self.assertEqual(self.language.current_lang, "zz")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "LOCAL OPTIONS")
         self.assertEqual(
-            self.language.get(Message.STREAM_SHELL_ERROR, shell="missing"),
+            self.language.get(Message.STARTUP_SHELL_ERROR, shell="missing"),
             "Shell executable not found: missing",
         )
 
@@ -153,7 +144,7 @@ class LanguageTests(unittest.TestCase):
 
         from ish.terminal.vt import Terminal, TerminalError
 
-        self.language.load("ko", create=False)
+        self.language.load("ko")
         library = SimpleNamespace(_ish_engine=None, ish_vt_new=lambda *_: 0)
         with (
             patch("ish.terminal.vt.i18n", self.language),
@@ -172,7 +163,7 @@ class LanguageTests(unittest.TestCase):
 
         from ish.terminal.diagnostics import report_session
 
-        self.language.load("ko", create=False)
+        self.language.load("ko")
         application = SimpleNamespace(
             vt=SimpleNamespace(
                 framing_drops=0, protocol_failures=(), image_failure_count=2
@@ -231,7 +222,7 @@ class LanguageTests(unittest.TestCase):
                         and node.value.id == "Message"
                     ):
                         required.add(node.attr)
-        self.assertIn("STREAM_SHELL_ERROR", required)
+        self.assertIn("STARTUP_SHELL_ERROR", required)
         self.assertIn("I18N_LOAD_ERROR", required)
         self.assertGreater(len(required), 80)
         formatter = Formatter()
@@ -255,34 +246,39 @@ class LanguageTests(unittest.TestCase):
 
     def test_korean_is_available_without_creating_settings(self):
         """Selecting Korean works before any user language file exists."""
-        self.language.load("ko", create=False)
+        self.language.load("ko")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
-        self.assertIn("셸", self.language.get(Message.STREAM_DESCRIPTION))
+        self.assertIn("셸", self.language.get(Message.VT_DESCRIPTION))
         self.assertEqual(
-            self.language.get(Message.STREAM_SHELL_ERROR, shell="missing-shell"),
+            self.language.get(Message.STARTUP_SHELL_ERROR, shell="missing-shell"),
             "셸 실행 파일을 찾을 수 없습니다: missing-shell",
         )
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_korean_regions_use_shipped_language(self):
         """A regional code retains its own user filename and Korean base messages."""
-        self.write("ko_KR", {"stream_description": "사용자 한국어 설명"})
-        self.language.load("ko_KR", create=False)
+        self.write("ko_KR", {"vt_description": "사용자 한국어 설명"})
+        self.language.load("ko_KR")
         self.assertEqual(self.language.current_lang, "ko_KR")
         self.assertEqual(
-            self.language.get(Message.STREAM_DESCRIPTION), "사용자 한국어 설명"
+            self.language.get(Message.VT_DESCRIPTION), "사용자 한국어 설명"
         )
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
-        self.language.load("ko-KR", create=False)
+        self.language.load("ko-KR")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
 
-    def test_generated_defaults_do_not_hide_korean_on_next_start(self):
-        """An automatically created English file remains a fallback on later starts."""
-        self.language.load("ko", create=True)
-        self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
-        self.assertTrue((self.language.base_path / "en.json").is_file())
-        self.language.load("ko", create=False)
-        self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
+    def test_repeated_language_loads_never_create_files(self):
+        """English fallback and shipped Korean remain available without generated files."""
+        for language, expected in (
+            ("en", "options"),
+            ("ko", "옵션"),
+            ("zz", "options"),
+            ("ko", "옵션"),
+        ):
+            with self.subTest(language=language):
+                self.language.load(language)
+                self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), expected)
+                self.assertEqual(list(self.root.iterdir()), [])
         self.assertEqual(
             self.language.get(
                 Message.PM_LOAD_ERROR, plugin_file="sample.py", error="broken"
@@ -294,30 +290,30 @@ class LanguageTests(unittest.TestCase):
         """Selected user text wins while untranslated extension keys retain English fallback."""
         self.write(
             "en",
-            {"custom_message": "English {value}", "cli_description": "User fallback"},
+            {"custom_message": "English {value}", "custom_title": "User fallback"},
         )
-        self.write("ko", {"stream_description": "내 설명"})
-        self.language.load("ko", create=False)
-        self.assertEqual(self.language.get(Message.STREAM_DESCRIPTION), "내 설명")
+        self.write("ko", {"vt_description": "내 설명"})
+        self.language.load("ko")
+        self.assertEqual(self.language.get(Message.VT_DESCRIPTION), "내 설명")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
-        self.assertEqual(self.language.get(Message.CLI_DESCRIPTION), "User fallback")
+        self.assertEqual(self.language.get("custom_title"), "User fallback")
         self.assertEqual(
             self.language.get("custom_message", value="data"), "English data"
         )
 
     def test_language_switch_drops_previous_translation(self):
         """A new language starts from its own fallback instead of stale UI strings."""
-        self.language.load("ko", create=False)
-        self.language.load("en", create=False)
+        self.language.load("ko")
+        self.language.load("en")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
         self.assertEqual(
-            self.language.get(Message.STREAM_VERSION, version="2.0.0"),
+            self.language.get(Message.VT_VERSION, version="2.0.0"),
             "ish 2.0.0",
         )
 
     def test_unknown_language_uses_english_without_creating_files(self):
         """An absent language file is an ordinary English fallback."""
-        self.language.load("zz", create=False)
+        self.language.load("zz")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
         self.assertEqual(list(self.root.iterdir()), [])
 
@@ -326,7 +322,7 @@ class LanguageTests(unittest.TestCase):
         self.language.base_path.mkdir()
         (self.root / "outside.json").write_text('{"cli_options_title": "OUTSIDE"}')
         with self.assertRaises(ValueError):
-            self.language.load("../outside", create=False)
+            self.language.load("../outside")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
 
     def test_invalid_language_names_are_rejected_without_files(self):
@@ -342,22 +338,21 @@ class LanguageTests(unittest.TestCase):
             "ko.json",
         ):
             with self.subTest(name=name), self.assertRaises(ValueError):
-                self.language.load(name, create=False)
+                self.language.load(name)
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_default_file_does_not_save_previous_language_messages(self):
-        """Creating English defaults never persists stale runtime overrides."""
+    def test_english_load_resets_overrides_without_writing_defaults(self):
+        """A fresh English load uses code defaults without persisting runtime overrides."""
         self.language.update({"cli_options_title": "STALE"})
-        self.language.load("en", create=True)
-        saved = json.loads((self.language.base_path / "en.json").read_text())
-        self.assertEqual(saved["cli_options_title"], "options")
+        self.language.load("en")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "options")
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_existing_user_file_is_preserved(self):
-        """Loading in creation mode does not overwrite a user's valid file."""
+        """Reading a valid user file preserves its contents and applies its overrides."""
         path = self.write("en", {"cli_options_title": "My options"})
         original = path.read_bytes()
-        self.language.load("en", create=True)
+        self.language.load("en")
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "My options")
 
@@ -370,30 +365,30 @@ class LanguageTests(unittest.TestCase):
             "버전 {version.secret}",
         ):
             with self.subTest(template=template):
-                self.write("ko", {"cli_version": template})
+                self.write("ko", {"vt_version": template})
                 with self.assertLogs("global", level="WARNING"):
-                    self.language.load("ko", create=False)
+                    self.language.load("ko")
                 self.assertEqual(
-                    self.language.get(Message.CLI_VERSION, version="1.2.1"), "ish 1.2.1"
+                    self.language.get(Message.VT_VERSION, version="1.2.1"), "ish 1.2.1"
                 )
 
     def test_bad_format_conversion_uses_english_instead_of_raw_placeholder(self):
         """Formatting failures retain a usable known message and its supplied value."""
-        self.write("ko", {"cli_version": "버전 {version:d}"})
-        self.language.load("ko", create=False)
+        self.write("ko", {"vt_version": "버전 {version:d}"})
+        self.language.load("ko")
         self.assertEqual(
-            self.language.get(Message.CLI_VERSION, version="1.2.1"), "ish 1.2.1"
+            self.language.get(Message.VT_VERSION, version="1.2.1"), "ish 1.2.1"
         )
 
     def test_invalid_json_or_value_does_not_replace_shipped_messages(self):
         """A broken user file is ignored without disabling the shipped locale."""
         path = self.write("ko", {"cli_options_title": 7})
         with self.assertLogs("global", level="WARNING"):
-            self.language.load("ko", create=False)
+            self.language.load("ko")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
         path.write_text("{", encoding="utf-8")
         with self.assertLogs("global", level="WARNING"):
-            self.language.load("ko", create=False)
+            self.language.load("ko")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
 
     def test_load_failures_use_the_selected_language_not_the_previous_one(self):
@@ -413,14 +408,14 @@ class LanguageTests(unittest.TestCase):
                 self.subTest(selected=selected),
                 self.assertLogs("global", level="WARNING") as captured,
             ):
-                self.language.load(selected, create=False)
+                self.language.load(selected)
             self.assertEqual(
                 [record.getMessage() for record in captured.records], [expected]
             )
 
     def test_user_language_can_override_the_entire_failure_message(self):
         """Loader diagnostics are public translation keys, including their owned reason."""
-        failed = self.write("en", {"cli_version": "missing field"})
+        failed = self.write("en", {"vt_version": "missing field"})
         self.write(
             "ko",
             {
@@ -429,46 +424,47 @@ class LanguageTests(unittest.TestCase):
             },
         )
         with self.assertLogs("global", level="WARNING") as captured:
-            self.language.load("ko", create=False)
+            self.language.load("ko")
         self.assertEqual(
-            captured.records[0].getMessage(), f"LOCAL {failed} :: FIELD cli_version"
+            captured.records[0].getMessage(), f"LOCAL {failed} :: FIELD vt_version"
         )
 
-    def test_create_failure_uses_selected_language_and_supplied_logger(self):
-        """A failed optional file creation preserves shipped text and the caller's log sink."""
-        self.language.base_path.write_text("not a directory", encoding="utf-8")
+    def test_read_failure_uses_selected_language_and_supplied_logger(self):
+        """An unreadable user file preserves shipped text and the caller's log sink."""
+        self.language.base_path.mkdir()
+        path = self.language.base_path / "en.json"
+        path.mkdir()
         logger = logging.getLogger("language-test")
         with (
             self.assertLogs(logger, level="WARNING") as captured,
             self.assertNoLogs("global"),
         ):
-            self.language.load("ko", create=True, logger=logger)
+            self.language.load("ko", logger=logger)
         self.assertEqual(len(captured.records), 1)
         self.assertTrue(
             captured.records[0]
             .getMessage()
-            .startswith(
-                f"언어 파일 {self.language.base_path / 'en.json'}을 만들 수 없습니다:"
-            )
+            .startswith(f"언어 파일 {path}을 불러올 수 없습니다:")
         )
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
-        self.assertEqual(self.language.base_path.read_text(), "not a directory")
+        self.assertTrue(path.is_dir())
+        self.assertEqual(list(self.language.base_path.iterdir()), [path])
 
     def test_translation_validation_errors_use_the_active_language(self):
         """Public updates reject bad text atomically with translated user errors."""
-        self.language.load("ko", create=False)
+        self.language.load("ko")
         with self.assertRaisesRegex(
-            ValueError, "번역의 치환 항목이 cli_version과 일치하지 않습니다"
+            ValueError, "번역의 치환 항목이 vt_version과 일치하지 않습니다"
         ):
-            self.language.update({"cli_version": "missing"})
+            self.language.update({"vt_version": "missing"})
         with self.assertRaisesRegex(
             ValueError, "언어 메시지는 문자열 키와 문자열 값으로 구성되어야 합니다"
         ):
             self.language.message = {"cli_options_title": 7}
         with self.assertRaisesRegex(
-            ValueError, "번역의 치환 항목이 cli_version과 일치하지 않습니다"
+            ValueError, "번역의 치환 항목이 vt_version과 일치하지 않습니다"
         ):
-            self.language.message["cli_version"] = "missing"
+            self.language.message["vt_version"] = "missing"
         with self.assertRaisesRegex(
             ValueError, "언어 메시지는 문자열 키와 문자열 값으로 구성되어야 합니다"
         ):
@@ -476,7 +472,7 @@ class LanguageTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "언어는 en 또는 ko와 같은 단일 언어 코드여야 합니다"
         ):
-            self.language.load("../outside", create=False)
+            self.language.load("../outside")
         self.assertEqual(self.language.get(Message.CLI_OPTIONS_TITLE), "옵션")
 
     def test_dynamic_updates_keep_unknown_keys_and_validate_known_contracts(self):
@@ -484,14 +480,14 @@ class LanguageTests(unittest.TestCase):
         self.language.update({"custom": "Value: {item}"})
         self.assertEqual(self.language.get("custom", item="x"), "Value: x")
         with self.assertRaises(ValueError):
-            self.language.update({"cli_version": "Version without its value"})
+            self.language.update({"vt_version": "Version without its value"})
         self.assertEqual(
-            self.language.get(Message.CLI_VERSION, version="2.0"), "ish 2.0"
+            self.language.get(Message.VT_VERSION, version="2.0"), "ish 2.0"
         )
 
     def test_missing_arguments_and_unknown_keys_retain_existing_behavior(self):
         """Callers missing format arguments still receive the template or key."""
-        self.assertEqual(self.language.get(Message.CLI_VERSION), "ish {version}")
+        self.assertEqual(self.language.get(Message.VT_VERSION), "ish {version}")
         self.assertEqual(self.language.get("not_registered"), "not_registered")
 
 

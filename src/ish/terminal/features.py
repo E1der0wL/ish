@@ -12,15 +12,15 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from ish.lang import Message
-from ish.stream.settings import SettingsError
-
-SWITCHES = ("on", "off")
-QUERIED_SWITCHES = (*SWITCHES, "auto")
+from ish.runtime.settings import SettingsError
 
 
 @dataclass(frozen=True, slots=True)
 class FeatureSpec:
     """Declare a feature's default and its implemented support query, if any."""
+
+    SWITCHES = ("on", "off")
+    QUERIED_SWITCHES = (*SWITCHES, "auto")
 
     default: str
     query: str | None = None
@@ -28,7 +28,7 @@ class FeatureSpec:
     @property
     def choices(self):
         """Offer automatic selection only for an implemented support query."""
-        return QUERIED_SWITCHES if self.query is not None else SWITCHES
+        return self.QUERIED_SWITCHES if self.query is not None else self.SWITCHES
 
 
 FEATURES = MappingProxyType(
@@ -39,6 +39,8 @@ FEATURES = MappingProxyType(
         "cursor_color": FeatureSpec("on"),
         "iterm_graphics": FeatureSpec("off"),
         "kitty_graphics": FeatureSpec("auto", "kitty-query"),
+        "sixel_graphics": FeatureSpec("auto", "DA1-4"),
+        "desktop_notifications": FeatureSpec("off"),
         "synchronized_output": FeatureSpec("auto", "DECRQM-2026"),
         "enhanced_keyboard": FeatureSpec("auto", "CSI-?u"),
         "pixel_mouse": FeatureSpec("auto", "DECRQM-1016"),

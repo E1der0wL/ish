@@ -23,14 +23,6 @@ from .graphics import (
 LINK_END = "\x1b]8;;\x1b\\"
 UNDERLINE_RESET = "\x1b[59m"
 OVERLINE_RESET = "\x1b[55m"
-FORMAT_RESETS = (
-    ("hyperlinks", LINK_END),
-    ("extended_styles", UNDERLINE_RESET),
-    ("overline", OVERLINE_RESET),
-)
-SYNC_START = "\x1b[?2026h"
-SYNC_END = "\x1b[?2026l"
-MAX_GRAPHICS_FAILURES = 3
 
 
 class RestoringOutput:
@@ -279,13 +271,76 @@ class Composition(Container):
         self.owner.app.renderer.compose(screen)
 
 
-class TerminalRenderer(Renderer):
+class RestoringRenderer(Renderer):
+    """Share PTK screen ownership and observed-state restoration across UIs."""
+
+    def __init__(self, owner, previous, *, output=None):
+        """Keep one broker as the source of initial host state."""
+        self.owner = owner
+        self._screen_owned = False
+        super().__init__(
+            previous.style,
+            previous.output if output is None else output,
+            full_screen=True,
+            mouse_support=previous.mouse_support,
+            cpr_not_supported_callback=previous.cpr_not_supported_callback,
+        )
+
+    def acquire_screen(self):
+        """Save the primary cursor before normalizing inherited host modes."""
+        if self._screen_owned:
+            return
+        self._screen_owned = True
+        self.owner.host.change_attributes()
+        if not self._in_alternate_screen:
+            self.output.enter_alternate_screen()
+            self._in_alternate_screen = True
+        self._cursor_key_mode_reset = False
+        self.output.write_raw(self.owner.host.enter_modes())
+
+    def restore_cursor_shape(self):
+        """Apply the observed cursor after PTK resets its own cursor changes."""
+        if self._screen_owned:
+            self.output.write_raw(self.owner.host.restore_cursor_shape())
+
+    def render(self, app, layout, is_done=False):
+        """Avoid all painting until the initial observations are closed."""
+        if not self.owner.presentation_ready:
+            return
+        self.acquire_screen()
+        super().render(app, layout, is_done=is_done)
+
+    def reset(self, *args, **kwargs):
+        """Restore owned state on exit and PTK's external-command suspension."""
+        if not self._screen_owned:
+            return super().reset(*args, **kwargs)
+        self.output.write_raw(self.owner.host.restore_modes(before_screen=True))
+        super().reset(*args, **kwargs)
+        self.restore_cursor_shape()
+        self.output.write_raw(self.owner.host.restore_modes())
+        self.output.write_raw(self.owner.host.restore_attributes())
+        self._screen_owned = False
+        self.output.flush()
+
+
+class TerminalRenderer(RestoringRenderer):
     """Extend the pinned PTK renderer with native metadata and graphics."""
+
+    FORMAT_RESETS = (
+        ("hyperlinks", LINK_END),
+        ("extended_styles", UNDERLINE_RESET),
+        ("overline", OVERLINE_RESET),
+    )
+    SYNC_START = "\x1b[?2026h"
+    SYNC_END = "\x1b[?2026l"
+    MAX_ERROR_CHARS = 256
+    MAX_GRAPHICS_FAILURES = 3
 
     def __init__(self, owner, previous):
         """Preserve PTK's style, mode and CPR configuration."""
         self.owner = owner
         self.graphics = create_presenter(None)
+        self._graphics_background = None
         self.transaction = TransactionOutput(previous.output)
         self.after_text = ""
         self.finishing = False
@@ -297,23 +352,21 @@ class TerminalRenderer(Renderer):
         self._focus_enabled = False
         self._cursor_color = None
         self._cursor_changed = False
-        self._screen_owned = False
         self._format_used = set()
-        super().__init__(
-            previous.style,
-            self.transaction,
-            full_screen=True,
-            mouse_support=previous.mouse_support,
-            cpr_not_supported_callback=previous.cpr_not_supported_callback,
-        )
+        super().__init__(owner, previous, output=self.transaction)
 
     def compose(self, screen):
         """Attach metadata to visible cells and plan graphics under the floats."""
         profile = self.owner.profile
         protocol = profile.image_protocol
-        if protocol != self.graphics.protocol:
+        background = profile.appearance.background
+        if (
+            protocol != self.graphics.protocol
+            or background != self._graphics_background
+        ):
             self.clear_graphics()
-            self.graphics = create_presenter(protocol)
+            self.graphics = create_presenter(protocol, background=background)
+            self._graphics_background = background
             self._host_failures = 0
             self._rejected_content = self._limited_scene = None
             self.graphics_error = None
@@ -383,7 +436,7 @@ class TerminalRenderer(Renderer):
             ),
         )
         if (
-            self._host_failures >= MAX_GRAPHICS_FAILURES
+            self._host_failures >= self.MAX_GRAPHICS_FAILURES
             or content == self._rejected_content
             or scene == self._limited_scene
         ):
@@ -437,7 +490,7 @@ class TerminalRenderer(Renderer):
             return False
         self._host_failures += 1
         self.graphics_failure_count += 1
-        self.graphics_error = message[:256]
+        self.graphics_error = message[: self.MAX_ERROR_CHARS]
         frame = self.owner.control.frame
         if frame is not None:
             self._rejected_content = self._image_content(frame)
@@ -500,34 +553,22 @@ class TerminalRenderer(Renderer):
         self.owner.restore_cwd(self.output)
         self.output.write_raw(self.owner.host.leave_metadata_modes())
 
-    def restore_cursor_shape(self):
-        """Apply the observed shape after PTK has reset its own cursor changes."""
-        if self._screen_owned:
-            self.output.write_raw(self.owner.host.restore_cursor_shape())
-
     def format_reset(self):
         """Reset only enabled or previously written optional cell formats."""
         self._format_used.update(
-            name for name, _ in FORMAT_RESETS if getattr(self.owner.profile, name)
+            name for name, _ in self.FORMAT_RESETS if getattr(self.owner.profile, name)
         )
         return "".join(
-            sequence for name, sequence in FORMAT_RESETS if name in self._format_used
+            sequence
+            for name, sequence in self.FORMAT_RESETS
+            if name in self._format_used
         )
 
     def render(self, app, layout, is_done=False):
         """Publish text, images and effects in one ordered presentation."""
         if not self.owner.presentation_ready:
             return
-        if not self._screen_owned:
-            self._screen_owned = True
-            self.owner.host.change_attributes()
-            # Preserve the primary cursor before normalizing inherited modes.
-            # The screen-local keyboard stack must also be entered here.
-            if not self._in_alternate_screen:
-                self.output.enter_alternate_screen()
-                self._in_alternate_screen = True
-            self._cursor_key_mode_reset = False
-            self.output.write_raw(self.owner.host.enter_modes())
+        self.acquire_screen()
         self.enter_input_modes()
         self.finishing = is_done
         synchronized = self.owner.profile.synchronized_output and not is_done
@@ -537,7 +578,7 @@ class TerminalRenderer(Renderer):
                 self.owner.release_mouse_capture(clear=True)
             if synchronized:
                 self.owner.host.change_modes(2026)
-                self.output.write_raw(SYNC_START)
+                self.output.write_raw(self.SYNC_START)
             self.output.write_raw(self.format_reset())
             super().render(app, layout, is_done=is_done)
             if not is_done:
@@ -552,7 +593,7 @@ class TerminalRenderer(Renderer):
                 self.restore_metadata()
         finally:
             if synchronized:
-                self.output.write_raw(SYNC_END)
+                self.output.write_raw(self.SYNC_END)
             self.transaction.pending = None
             self.transaction.active = False
             self.transaction.output.flush()
@@ -568,11 +609,6 @@ class TerminalRenderer(Renderer):
         if not self.finishing:
             self.restore_metadata()
         self.transaction.output.write_raw(self.graphics.close() + self.format_reset())
-        self.output.write_raw(self.owner.host.restore_modes(before_screen=True))
         super().reset(*args, **kwargs)
-        self.restore_cursor_shape()
-        self.output.write_raw(self.owner.host.restore_modes())
-        self.output.write_raw(self.owner.host.restore_attributes())
-        self._screen_owned = False
         self._format_used.clear()
         self.transaction.output.flush()

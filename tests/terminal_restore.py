@@ -16,7 +16,7 @@ from pathlib import Path
 from terminal_host import HostTerminal, record
 from test_terminal_cli import STARTUP_DEADLINE
 
-MODES = (1, 6, 7, 12, 25, 1000, 1002, 1003, 1004, 1006, 2004)
+MODES = (1, 6, 7, 12, 25, 80, 1000, 1002, 1003, 1004, 1006, 2004)
 REPORT = re.compile(rb"\x1b\[\?([0-9]+);([0-4])\$y")
 CURSOR = re.compile(rb"\x1bP1\$r([1-6]) q\x1b\\")
 POSITION = re.compile(rb"\x1b\[([0-9]+);([0-9]+)R")

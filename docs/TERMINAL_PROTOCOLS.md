@@ -1,5 +1,7 @@
 # 이미지·클립보드·호스트 상태 계약
 
+> 통합 전 프로토콜 구현 기록이다. 아래의 `ish-vt` 명령·`module:setup` 선택법은 제거됐다. 현재 실행·설정은 [사용 안내](VT_USAGE.md), 보완 모듈 API는 [플러그인 계약](VT_PROTOCOL_PLUGINS.md)을 참고한다.
+
 2026-11-15의 Linux/WSL `ish-vt` 구현이다. 기본형은 셸의 전체 화면을 표시하며 하단 바·우측 프롬프트·팝업·UI 전용 단축키를 추가하지 않는다. 선택적인 UI만 `--plugin module:setup` 경로를 사용한다.
 
 ## 입력과 출력의 경계
@@ -23,6 +25,8 @@
 libghostty가 이미지 **입력**을 지원하게 되어도 외부 터미널용 **출력**과 PTK popup 합성이 저절로 생기지는 않는다. 입력 shim과 출력 presenter를 독립적으로 제거할 수 있게 분리했다. Pillow도 native PNG decode callback과 raster 출력에서 사용하므로 iTerm shim 삭제만으로 의존성이 없어지지는 않는다.
 
 `engine.py`의 `ENGINE_VERSION`과 `BRIDGE_ABI`가 빌드 도구와 런타임 검사의 단일 원본이다. 현재는 libghostty-vt 1.0.1만 검증했다. 버전이 더 높거나 심볼이 있다는 이유만으로 활성화하지 않는다. metadata가 없는 이전 bridge, 다른 ABI, header/runtime 불일치, 필수 빌드 기능 누락은 state 생성 전에 재빌드 안내와 함께 거절한다. 빌드 도구는 임시 산출물 검사에 성공한 뒤에만 기존 bridge를 교체한다.
+
+현재 SIXEL 입력은 iTerm과 같은 native Unicode placeholder 배치를 재사용한다. libghostty 원본 소스 패치·전용 등록 API·patch revision은 제거했다. 이미지 셀의 교체·지우기·이동은 엔진이 처리하고, 투명 부분 아래의 원래 문자와 이미지 셀은 보존하지 않는다. 공식 source archive와 추출 파일을 대조하며 빌드 출처로 순정 엔진과 이전 수정본을 구분한다. 최신 지원 범위는 [SIXEL 계약](VT_SIXEL.md)을 따른다.
 
 업그레이드 순서는 ① 새 엔진의 공개 API와 의미 확인 ② native 입력 기능 profile 및 필요한 bridge 연결 변경 ③ 보완 경로와 동일한 독립 wire/pixel/파일 기대값으로 검증 ④ 실제 호스트에서 이미지·popup·resize·종료 회귀 ⑤ 통과한 보완 경로와 전용 의존성만 삭제다. 지원 선언을 먼저 늘리지 않는다.
 

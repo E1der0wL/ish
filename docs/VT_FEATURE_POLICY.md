@@ -1,27 +1,25 @@
-# ish-vt의 기능별 호스트 정책
+# ish의 기능별 호스트 정책
 
-이 정책은 `ish-vt`의 외부 터미널 출력·입력 연결에 적용한다. `ish` 2.0.0의 stream 실행 경로, 셸 명령줄 편집, 플러그인 선택과는 별개다. 기본형에는 여전히 추가 UI와 셸 hook이 없다.
+이 정책은 `ish`의 외부 터미널 출력·입력 연결에 적용한다. 셸 명령줄 편집과 플러그인 선택은 별도의 책임이다. 기본형에는 추가 UI와 셸 hook이 없다.
 
 ## 설정
 
 `~/ish/.ishrc.py`에서 다음 세션의 선택을 저장한다.
 
 ```python
-config.vt = {
-    "features": {
-        "hyperlinks": "on",
-        "enhanced_keyboard": "auto",
-        "pixel_mouse": "off",
-    },
-    "color_depth": "inherit",
-    "clipboard": "write",
+config.features = {
+    "hyperlinks": "on",
+    "enhanced_keyboard": "auto",
+    "pixel_mouse": "off",
 }
+config.color_depth = "inherit"
+config.clipboard = "write"
 ```
 
 CLI는 지정한 기능만 덮어쓴다. 다른 rc 선택은 유지하며 같은 이름이 반복되면 마지막 값이 적용된다.
 
 ```sh
-ish-vt --feature hyperlinks=off --feature enhanced_keyboard=auto
+ish --feature hyperlinks=off --feature enhanced_keyboard=auto
 ```
 
 - `on`: 해당 프로토콜 사용을 요청한다. 실제 지원 응답이 있었다고 기록하지 않는다.
@@ -38,13 +36,15 @@ ish-vt --feature hyperlinks=off --feature enhanced_keyboard=auto
 | `cursor_color` | on/off, **on** | 커서 색 출력. 초기 색·동적 상태를 복원할 수 있어야 함. 현재 색 조회를 지원 질의로 간주하지 않음 |
 | `iterm_graphics` | on/off, **off** | iTerm 이미지 출력. 정확한 셀 크기 필요, 지원 질의 없음 |
 | `kitty_graphics` | on/off/auto, **auto** | 식별자가 일치하는 Kitty graphics `a=q`의 OK 응답. 정확한 셀 크기 필요 |
+| `sixel_graphics` | on/off/auto, **auto** | DA1 속성 4. 정확한 셀 크기와 복원 가능한 DECRQM 80 시작값 필요 |
+| `desktop_notifications` | on/off, **off** | 정규화한 알림을 OSC 9로 출력. 지원 질의 없음. 실제 OS 표시를 보장하지 않음 |
 | `synchronized_output` | on/off/auto, **auto** | DECRQM 2026의 변경 가능한 모드 응답 |
 | `enhanced_keyboard` | on/off/auto, **auto** | `CSI ? u` 응답으로 확장 키 프로토콜 존재 확인 |
 | `pixel_mouse` | on/off/auto, **auto** | DECRQM 1016의 변경 가능한 모드 응답과 정확한 셀 크기 |
 | `clipboard_protocol` | on/off/auto, **auto** | DECRQM 5522. **호스트 OSC 5522 전송** 선택만 뜻함 |
 | `scheme_notifications` | on/off/auto, **auto** | DECRQM 2031. 복원할 초기 모드와 초기 997 테마 응답도 필요 |
 
-`on`은 지원 응답과 무관하게 기능 사용을 요청하는 방법이다. 이미지의 크기 정보나 커서·테마의 복원 정보까지 만들어 내지는 않는다. iTerm과 Kitty를 함께 요청하면 iTerm을 선택한다. 실제 이미지 출력 방식은 `image_protocol` 하나가 결정한다. 명시적인 iTerm 선택이 없으면 Kitty의 정책과 관찰에 따른다. 셀 크기가 유실되면 이미지·픽셀 마우스를 중지하고, 유효한 크기가 다시 생겨도 `off`는 유지한다. 종전 WezTerm 이름에 따른 iTerm 자동 선택은 제거했으므로 필요한 세션에서는 `iterm_graphics=on`을 명시한다.
+`on`은 지원 응답과 무관하게 기능 사용을 요청하는 방법이다. 이미지의 크기 정보나 커서·테마의 복원 정보까지 만들어 내지는 않는다. 여러 이미지 출력을 함께 요청하면 iTerm, Kitty, SIXEL 순으로 하나만 선택한다. 실제 출력 방식은 `image_protocol` 하나가 결정한다. SIXEL은 모드 80의 시작값을 확인하지 못하면 강제 켜기에서도 사용하지 않는다. 셀 크기가 유실되면 이미지·픽셀 마우스를 중지하고, 유효한 크기가 다시 생겨도 `off`는 유지한다. 종전 WezTerm 이름에 따른 iTerm 자동 선택은 제거했으므로 필요한 세션에서는 `iterm_graphics=on`을 명시한다.
 
 이미지 질의 OK는 현재 사용 중인 기본 전송 경로의 근거이며 이미지 프로토콜의 모든 확장을 지원한다는 뜻이 아니다. 키보드 질의는 프로토콜 존재와 현재 플래그 응답을 확인한다. 기존 disambiguation/event-types 요청과 push/pop을 유지하며, 모든 확장 플래그를 따르지 않는 부분 구현까지 검증했다고 주장하지 않는다.
 
@@ -69,7 +69,11 @@ ish-vt --feature hyperlinks=off --feature enhanced_keyboard=auto
 3. `active`: 필요한 조건을 만족해 현재 사용하도록 선택했는지.
 4. `reason`: 비활성화 또는 선택 이유. 화면 크기 유실·원래 상태 미확인 등을 구별한다.
 
-`active`는 해당 내용이 지금 화면에 있다는 뜻이 아니다. 예를 들어 픽셀 마우스 기능을 사용할 수 있어도 실제 캡처가 꺼져 있을 수 있다. 실제 입력 모드 활성·변경 기록은 기존 소유자가 별도로 관리한다. 요청 종료 뒤의 지연 응답과 중복 응답은 profile을 다시 켜지 못한다.
+`active`는 해당 내용이 지금 화면에 있다는 뜻이 아니다. 예를 들어 픽셀 마우스 기능을 사용할 수 있어도 실제 캡처가 꺼져 있을 수 있다. 실제 입력 모드 활성·변경 기록은 기존 소유자가 별도로 관리한다. 최초 기능 조회가 끝난 뒤 지연·중복 지원 응답으로 기능을 다시 켜지 않는다.
+
+창 크기 변경 때 커널이 픽셀 크기를 제공하지 않으면 별도의 크기 조회만 반복한다. 최초 CSI 16t·14t 양쪽 응답이 확인된 세션에서 한 쌍만 진행하며, 연속 resize는 최신 크기로 합친다. 이전 쌍의 응답을 모두 소비하기 전 다음 쌍을 보내지 않고, 셀 크기 × 행·열과 전체 픽셀 크기가 정확히 일치해야 적용한다. 그동안 PTY 출력 읽기에 역압을 걸고 native 이미지 원본을 보존한다. 입력은 기존 PTY로 전달된다. 검증 실패나 제한 시간 초과 시 이미지를 끄고 텍스트 출력을 재개하며, 해당 세션에서 다시 질의하지 않는다.
+
+이 크기 프로토콜에는 wire 요청 ID가 없다. 로컬 세대 번호는 타이머와 resize 순서만 구별하며, 호스트가 질의 순서대로 한 번씩 응답한다는 전제가 있다. 뒤늦게 복제된 옛 응답이 새 쌍의 값과 우연히 일치하는 경우까지 구별한다고 보장하지 않는다. 제한 시간은 측정 실패 판정에만 사용하며 셸 readiness를 추정하지 않는다.
 
 `--diagnose`는 터미널을 조회하지 않고 rc도 실행하지 않는다. 기본값·CLI 요청만 보여 주며 실제 관찰은 수행하지 않았다고 표시한다. 실제 세션 결과는 `--log-level INFO`의 기능별 진단에서 확인한다. 입력·출력·클립보드 내용은 일반 파일 로그에 기록하지 않는다.
 
@@ -84,7 +88,7 @@ ish-vt --feature hyperlinks=off --feature enhanced_keyboard=auto
 
 ## Windows Terminal/WSL 결과
 
-전체 자동 회귀는 `tools/check_terminal.py` **540개**, `tools/check_stream.py` **387개**가 모두 통과했다. skip은 0이며 두 검사기의 Ruff·format 검사도 통과했다. 최종 원문은 `.cache/vt-feature-policy/terminal-verified.log`, `stream-final.log`에 보존했다. 필수 모듈 등록과 독립적인 누락 검사, FP01 계약의 실제 PTK/정책 회귀도 추가했다. 독립 재검토에서 남은 확정 결함을 찾지 못했으며, 이 결론은 아래의 검증 범위에 한정한다.
+다음 숫자는 단일 `ish`로 통합하기 전의 기능 정책 검증 기록이며 삭제된 stream 검사기를 현재 실행하라는 안내가 아니다. 당시 전체 자동 회귀는 `tools/check_terminal.py` **540개**, `tools/check_stream.py` **387개**가 모두 통과했다. skip은 0이며 두 검사기의 Ruff·format 검사도 통과했다. 최종 원문은 `.cache/vt-feature-policy/terminal-verified.log`, `stream-final.log`에 보존했다. 필수 모듈 등록과 독립적인 누락 검사, FP01 계약의 실제 PTK/정책 회귀도 추가했다. 독립 재검토에서 남은 확정 결함을 찾지 못했으며, 이 결론은 아래의 검증 범위에 한정한다.
 
 Windows Terminal 1.24.12741.0, libghostty-vt 1.0.1 / bridge ABI 4, Bash 5.3.9·zsh 5.9·tcsh 6.24.13·Vim 9.1에서 확인했다. 실제 호스트가 질의에 응답하며 테스트가 가짜 지원 응답을 주입하지 않는다.
 

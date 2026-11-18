@@ -1,4 +1,4 @@
-"""Run the separate hookless VT entry point with shared startup services."""
+"""Run ish's native terminal with shared startup services."""
 
 import asyncio
 import signal

@@ -15,7 +15,7 @@ from ish.lang import Message, i18n
 ENGINE_VERSION = "1.0.1"
 # Increment whenever the private C/Python signatures or snapshots change.
 # The build script passes this value to C; there is no independent C default.
-BRIDGE_ABI = 4
+BRIDGE_ABI = 7
 NATIVE_INPUTS = ("kitty",)
 # Reviewed public extension identities include their exact wire namespaces.
 # Image routing above remains independent; a name alone never promotes an OSC.

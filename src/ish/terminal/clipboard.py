@@ -22,27 +22,9 @@ from ish.lang import Message, i18n
 
 OSC = "\x1b]"
 ST = "\x1b\\"
-MAX_BYTES = 64 * 1024 * 1024
 MAX_TEXT = 1024 * 1024
 MAX_METADATA = 4096
-MAX_MIMES = 256
-CHUNK_BYTES = 4096
-WRITE_CHUNK_BYTES = 4095  # Non-final MIME chunks never contain base64 padding.
-REQUEST_TIMEOUT = 30.0
-MAX_QUEUED_REQUESTS = 64
-MAX_QUEUED_BYTES = 4 * MAX_TEXT
-IDENTITY = re.compile(r"[^a-zA-Z0-9_+.-]")
-BASE64 = re.compile(rb"[A-Za-z0-9+/]*={0,2}\Z")
 MIME = re.compile(r"[!-~]{1,255}\Z")
-WRITE_ERRORS = frozenset(("EIO", "EINVAL", "ENOSYS", "EPERM", "EBUSY", "EFBIG"))
-READ_ERRORS = frozenset(("ENOSYS", "EPERM", "EBUSY"))
-TEXT_MIME = "text/plain"
-PROVIDER_ERRORS = {
-    errno.ENOSYS: "ENOSYS",
-    errno.EPERM: "EPERM",
-    errno.EACCES: "EPERM",
-    errno.EFBIG: "EFBIG",
-}
 
 
 def _encode(data: bytes) -> str:
@@ -122,6 +104,26 @@ class Transfer:
 
 class ClipboardBroker:
     """Apply explicit policy and route one clipboard transaction at a time."""
+
+    MAX_ID_CHARS = 512
+    MAX_BYTES = 64 * 1024 * 1024
+    MAX_MIMES = 256
+    CHUNK_BYTES = 4096
+    WRITE_CHUNK_BYTES = 4095  # Non-final MIME chunks never contain base64 padding.
+    REQUEST_TIMEOUT = 30.0
+    MAX_QUEUED_REQUESTS = 64
+    MAX_QUEUED_BYTES = 4 * MAX_TEXT
+    IDENTITY = re.compile(r"[^a-zA-Z0-9_+.-]")
+    BASE64 = re.compile(rb"[A-Za-z0-9+/]*={0,2}\Z")
+    WRITE_ERRORS = frozenset(("EIO", "EINVAL", "ENOSYS", "EPERM", "EBUSY", "EFBIG"))
+    READ_ERRORS = frozenset(("ENOSYS", "EPERM", "EBUSY"))
+    TEXT_MIME = "text/plain"
+    PROVIDER_ERRORS = {
+        errno.ENOSYS: "ENOSYS",
+        errno.EPERM: "EPERM",
+        errno.EACCES: "EPERM",
+        errno.EFBIG: "EFBIG",
+    }
 
     def __init__(
         self, *, reply, emit, profile, allow_read=False, allow_write=True, failed=None
@@ -206,8 +208,8 @@ class ClipboardBroker:
 
     def _defer(self, operation, data, selection="c", explicit=False):
         if (
-            len(self._deferred) >= MAX_QUEUED_REQUESTS
-            or self._deferred_bytes + len(data) > MAX_QUEUED_BYTES
+            len(self._deferred) >= self.MAX_QUEUED_REQUESTS
+            or self._deferred_bytes + len(data) > self.MAX_QUEUED_BYTES
         ):
             self.failures += 1
             return False
@@ -238,7 +240,7 @@ class ClipboardBroker:
             self.failures += 1
             if not self._closed and self.pending is transfer:
                 code = getattr(error, "errno", None)
-                status = PROVIDER_ERRORS.get(code, "EIO")
+                status = self.PROVIDER_ERRORS.get(code, "EIO")
                 self._fail(status)
             return
         if self._closed or self.pending is not transfer:
@@ -255,13 +257,15 @@ class ClipboardBroker:
             return
         if transfer.operation == "read":
             self._status("read", "OK", child_id=transfer.child_id)
-            mime = TEXT_MIME
+            mime = self.TEXT_MIME
             fields = {"type": "read", "status": "DATA", "mime": _encode(mime.encode())}
             if transfer.child_id:
                 fields["id"] = transfer.child_id
-            for offset in range(0, max(1, len(data)), CHUNK_BYTES):
+            for offset in range(0, max(1, len(data)), self.CHUNK_BYTES):
                 self.reply(
-                    _packet(fields, data[offset : offset + CHUNK_BYTES]).encode("ascii")
+                    _packet(fields, data[offset : offset + self.CHUNK_BYTES]).encode(
+                        "ascii"
+                    )
                 )
         self._status(transfer.operation, "DONE", child_id=transfer.child_id)
 
@@ -272,7 +276,7 @@ class ClipboardBroker:
         self.idle.clear()
         try:
             transfer.timer = asyncio.get_running_loop().call_later(
-                REQUEST_TIMEOUT, self.expire, transfer.host_id
+                self.REQUEST_TIMEOUT, self.expire, transfer.host_id
             )
         except RuntimeError:
             pass
@@ -318,7 +322,7 @@ class ClipboardBroker:
         if transfer.protocol == "52":
             self.reply(f"{OSC}52;{transfer.selection};{ST}".encode("ascii"))
         else:
-            if transfer.operation == "read" and status not in READ_ERRORS:
+            if transfer.operation == "read" and status not in self.READ_ERRORS:
                 status = "EBUSY"
             self._status(
                 transfer.operation,
@@ -421,10 +425,10 @@ class ClipboardBroker:
             "read",
             protocol="user",
             location="primary",
-            requested=(TEXT_MIME,),
+            requested=(self.TEXT_MIME,),
             consume=consume,
         )
-        self.emit(_packet(self._host_metadata(transfer), TEXT_MIME.encode()))
+        self.emit(_packet(self._host_metadata(transfer), self.TEXT_MIME.encode()))
         return transfer.host_id
 
     def cancel_paste(self) -> bool:
@@ -566,12 +570,12 @@ class ClipboardBroker:
             protocol="52",
             selection=selection,
             location=location,
-            requested=(TEXT_MIME,),
+            requested=(self.TEXT_MIME,),
         )
         if self._provider is not None:
             self._start_provider(transfer)
         else:
-            self.emit(_packet(self._host_metadata(transfer), TEXT_MIME.encode()))
+            self.emit(_packet(self._host_metadata(transfer), self.TEXT_MIME.encode()))
 
     def _host_metadata(self, transfer):
         metadata = {"type": transfer.operation, "id": transfer.host_id}
@@ -580,7 +584,7 @@ class ClipboardBroker:
         return metadata
 
     def _begin(self, operation, metadata, payload):
-        child_id = IDENTITY.sub("", metadata.get("id", ""))[:512]
+        child_id = self.IDENTITY.sub("", metadata.get("id", ""))[: self.MAX_ID_CHARS]
         location = metadata.get("loc", "clipboard")
         if location not in ("clipboard", "primary"):
             self._status(operation, "ENOSYS", child_id=child_id)
@@ -591,7 +595,7 @@ class ClipboardBroker:
             requested = tuple(
                 _decode(payload, limit=MAX_METADATA).decode("utf-8").split()
             )
-            if not requested or len(requested) > MAX_MIMES:
+            if not requested or len(requested) > self.MAX_MIMES:
                 raise ValueError("Invalid MIME request")
             for mime in requested:
                 _mime(mime)
@@ -615,7 +619,7 @@ class ClipboardBroker:
                     self._provider is not None
                     and (
                         location != "clipboard"
-                        or (operation == "read" and requested != (TEXT_MIME,))
+                        or (operation == "read" and requested != (self.TEXT_MIME,))
                         or extra
                     )
                 )
@@ -656,14 +660,14 @@ class ClipboardBroker:
         ):
             return
         if "id" in metadata:
-            identity = IDENTITY.sub("", metadata["id"])[:512]
+            identity = self.IDENTITY.sub("", metadata["id"])[: self.MAX_ID_CHARS]
             if identity != transfer.child_id:
                 return
         if operation == "wdata" and "mime" not in metadata:
             if payload or transfer.carry:
                 raise ValueError("Incomplete clipboard data")
             if transfer.local:
-                if transfer.mime != TEXT_MIME:
+                if transfer.mime != self.TEXT_MIME:
                     self._fail("ENOSYS")
                     return
                 text = transfer.text.decode("utf-8")
@@ -675,12 +679,12 @@ class ClipboardBroker:
             self.emit(_packet({"type": "wdata", "id": transfer.host_id}))
             return
         mime = _mime(_text(metadata.get("mime", "")))
-        if transfer.local and (operation != "wdata" or mime != TEXT_MIME):
+        if transfer.local and (operation != "wdata" or mime != self.TEXT_MIME):
             self._fail("ENOSYS")
             return
         if operation == "walias":
             aliases = _decode(payload, limit=MAX_METADATA).decode("utf-8").split()
-            if not aliases or len(aliases) > MAX_MIMES:
+            if not aliases or len(aliases) > self.MAX_MIMES:
                 raise ValueError("Invalid MIME aliases")
             for alias in aliases:
                 _mime(alias)
@@ -699,22 +703,22 @@ class ClipboardBroker:
             if (
                 transfer.carry
                 or mime in transfer.seen
-                or len(transfer.seen) >= MAX_MIMES
+                or len(transfer.seen) >= self.MAX_MIMES
             ):
                 raise ValueError("Invalid MIME stream order")
             self._flush_tail(transfer)
             transfer.seen.add(mime)
             transfer.mime = mime
         combined = transfer.carry + payload
-        if not BASE64.fullmatch(combined):
+        if not self.BASE64.fullmatch(combined):
             raise ValueError("Invalid clipboard base64 alphabet")
         count = len(combined) // 4 * 4
         head, transfer.carry = combined[:count], combined[count:]
         if b"=" in head and transfer.carry:
             raise ValueError("Data follows terminal padding")
-        decoded = _decode(head, limit=MAX_TEXT if transfer.local else MAX_BYTES)
+        decoded = _decode(head, limit=MAX_TEXT if transfer.local else self.MAX_BYTES)
         transfer.total += len(decoded)
-        if transfer.total > (MAX_TEXT if transfer.local else MAX_BYTES):
+        if transfer.total > (MAX_TEXT if transfer.local else self.MAX_BYTES):
             self._fail("EFBIG")
             return
         if transfer.local:
@@ -728,11 +732,11 @@ class ClipboardBroker:
         normalized = transfer.outgoing_tail + decoded
         count = len(normalized) // 3 * 3
         transfer.outgoing_tail = normalized[count:]
-        for offset in range(0, count, WRITE_CHUNK_BYTES):
+        for offset in range(0, count, self.WRITE_CHUNK_BYTES):
             self.emit(
                 _packet(
                     outgoing,
-                    normalized[offset : min(count, offset + WRITE_CHUNK_BYTES)],
+                    normalized[offset : min(count, offset + self.WRITE_CHUNK_BYTES)],
                 )
             )
         if not normalized and not transfer.carry:
@@ -778,7 +782,7 @@ class ClipboardBroker:
             correlated = True
             status = metadata.get("status")
             if transfer.operation == "write":
-                if status in WRITE_ERRORS:
+                if status in self.WRITE_ERRORS:
                     self._fail(status)
                 elif status == "DONE" and transfer.committed and not payload:
                     self._finish()
@@ -789,7 +793,7 @@ class ClipboardBroker:
                         location=transfer.location,
                     )
                 return True
-            if status in READ_ERRORS and not transfer.started:
+            if status in self.READ_ERRORS and not transfer.started:
                 self._fail(status)
                 return True
             if status == "OK" and not transfer.started and not payload:
@@ -806,10 +810,10 @@ class ClipboardBroker:
                 mime = _mime(_text(metadata.get("mime", "")))
                 if mime not in transfer.requested:
                     raise ValueError("Unrequested MIME response")
-                data = _decode(payload, limit=CHUNK_BYTES)
+                data = _decode(payload, limit=self.CHUNK_BYTES)
                 transfer.total += len(data)
                 if transfer.total > (
-                    MAX_TEXT if transfer.protocol in ("52", "user") else MAX_BYTES
+                    MAX_TEXT if transfer.protocol in ("52", "user") else self.MAX_BYTES
                 ):
                     raise ValueError("Clipboard response exceeds limit")
                 if transfer.protocol in ("52", "user"):

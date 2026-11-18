@@ -1,4 +1,4 @@
-"""Verify read-only shared diagnostics and the existing main report contract."""
+"""Verify read-only shared diagnostics."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +18,6 @@ from ish.lang import Message, i18n
 from ish.runtime.diagnostics import (
     display_diagnostics,
     environment_fields,
-    print_diagnostics,
 )
 
 
@@ -54,10 +52,8 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(values[Message.CLI_DIAGNOSE_LANGUAGE], i18n.current_lang)
         self.assertFalse(config.ISH_HOME.exists())
         for field in (
-            Message.CLI_DIAGNOSE_ADAPTER,
             Message.CLI_DIAGNOSE_RC,
             Message.CLI_DIAGNOSE_PLUGINS,
-            Message.CLI_DIAGNOSE_HELPER,
         ):
             self.assertNotIn(field, values)
 
@@ -89,7 +85,7 @@ class DiagnosticsTests(unittest.TestCase):
         )
         self.assertFalse(config.ISH_HOME.exists())
 
-    def test_common_import_does_not_load_legacy_shell_modules(self):
+    def test_common_import_stays_read_only(self):
         """A fresh diagnostic process neither loads shell integrations nor spawns code."""
         code = """
 import sys
@@ -99,7 +95,6 @@ with patch('subprocess.Popen', side_effect=AssertionError('process started')):
     config.ISH_HOME = sys.argv[1]
     from ish.runtime.diagnostics import environment_fields
     environment_fields('ish-test-missing-shell')
-assert not any(name == 'ish.shell' or name.startswith('ish.shell.') for name in sys.modules)
 assert not config.ISH_HOME.exists()
 print('read-only common diagnostics')
 """
@@ -119,8 +114,8 @@ print('read-only common diagnostics')
     def test_display_uses_requested_translations_and_field_order(self):
         """The common renderer accepts caller-specific scope without changing facts."""
         translations = {
-            Message.CLI_DIAGNOSE_TITLE: "환경 진단",
-            Message.CLI_DIAGNOSE_SCOPE: "읽기 전용",
+            Message.VT_DIAGNOSE_TITLE: "환경 진단",
+            Message.VT_DIAGNOSE_SCOPE: "읽기 전용",
             Message.CLI_DIAGNOSE_SHELL: "요청 셸",
             Message.CLI_DIAGNOSE_VERSION: "버전",
         }
@@ -130,8 +125,8 @@ print('read-only common diagnostics')
             contextlib.redirect_stdout(output),
         ):
             display_diagnostics(
-                Message.CLI_DIAGNOSE_TITLE,
-                Message.CLI_DIAGNOSE_SCOPE,
+                Message.VT_DIAGNOSE_TITLE,
+                Message.VT_DIAGNOSE_SCOPE,
                 {
                     Message.CLI_DIAGNOSE_SHELL: "tcsh",
                     Message.CLI_DIAGNOSE_VERSION: "test-version",
@@ -141,69 +136,6 @@ print('read-only common diagnostics')
             output.getvalue(),
             "환경 진단\n읽기 전용\n요청 셸: tcsh\n버전: test-version\n",
         )
-
-    def test_main_report_preserves_main_specific_values_and_order(self):
-        """The original entry point still reports adapter, startup, and helper policy."""
-        labels = (
-            Message.CLI_DIAGNOSE_VERSION,
-            Message.CLI_DIAGNOSE_RUNTIME,
-            Message.CLI_DIAGNOSE_PYTHON,
-            Message.CLI_DIAGNOSE_EXECUTABLE,
-            Message.CLI_DIAGNOSE_PLATFORM,
-            Message.CLI_DIAGNOSE_LIBC,
-            Message.CLI_DIAGNOSE_SHELL,
-            Message.CLI_DIAGNOSE_SHELL_PATH,
-            Message.CLI_DIAGNOSE_SHELL_REALPATH,
-            Message.CLI_DIAGNOSE_ADAPTER,
-            Message.CLI_DIAGNOSE_HOME,
-            Message.CLI_DIAGNOSE_RC,
-            Message.CLI_DIAGNOSE_RC_POLICY,
-            Message.CLI_DIAGNOSE_PLUGINS,
-            Message.CLI_DIAGNOSE_PLUGIN_POLICY,
-            Message.CLI_DIAGNOSE_LANGUAGE,
-            Message.CLI_DIAGNOSE_LANGUAGE_DIR,
-            Message.CLI_DIAGNOSE_CACHE,
-            Message.CLI_DIAGNOSE_CACHE_ACCESS,
-            Message.CLI_DIAGNOSE_CACHE_NOEXEC,
-            Message.CLI_DIAGNOSE_HELPER,
-            Message.CLI_DIAGNOSE_TERMINAL,
-            Message.CLI_DIAGNOSE_STDIN_TTY,
-            Message.CLI_DIAGNOSE_STDOUT_TTY,
-            Message.CLI_DIAGNOSE_TERMINAL_SIZE,
-        )
-        output = io.StringIO()
-        with (
-            contextlib.redirect_stdout(output),
-            patch("subprocess.Popen", side_effect=AssertionError("spawned a process")),
-        ):
-            print_diagnostics(
-                Namespace(
-                    shell="ish-test-shell-that-does-not-exist",
-                    no_rc=True,
-                    no_plugins=True,
-                )
-            )
-        lines = output.getvalue().splitlines()
-        self.assertEqual(lines[0], i18n.get(Message.CLI_DIAGNOSE_TITLE))
-        self.assertEqual(lines[1], i18n.get(Message.CLI_DIAGNOSE_SCOPE))
-        self.assertEqual(
-            [line.split(": ", 1)[0] for line in lines[2:]],
-            [i18n.get(label) for label in labels],
-        )
-        self.assertIn(f"{i18n.get(Message.CLI_DIAGNOSE_RC)}: {config.RC_FILE}", lines)
-        self.assertIn(
-            f"{i18n.get(Message.CLI_DIAGNOSE_RC_POLICY)}: {i18n.get(Message.CLI_DIAGNOSE_DISABLED)}",
-            lines,
-        )
-        self.assertIn(
-            f"{i18n.get(Message.CLI_DIAGNOSE_PLUGIN_POLICY)}: {i18n.get(Message.CLI_DIAGNOSE_DISABLED)}",
-            lines,
-        )
-        self.assertIn(
-            f"{i18n.get(Message.CLI_DIAGNOSE_ADAPTER)}: {i18n.get(Message.CLI_DIAGNOSE_UNSUPPORTED)}",
-            lines,
-        )
-        self.assertFalse(config.ISH_HOME.exists())
 
 
 if __name__ == "__main__":

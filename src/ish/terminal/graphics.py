@@ -23,9 +23,6 @@ MAX_IMAGES = 1024
 MAX_FRAGMENTS = 4096
 MAX_OCCLUDERS = 128
 PAYLOAD_SIZE = 4096
-# Host capability probes reserve the upper half of the Kitty ID space.
-MAX_WIRE_ID = (1 << 31) - 1
-LAYER_Z_BASES = (-(1 << 31), -(1 << 30), 0)
 
 
 class GraphicsError(ValueError):
@@ -259,6 +256,10 @@ def _pixels(image: Image, placement: Placement, raster: Rect) -> bytes:
 class GraphicsPresenter:
     """Cache outer image resources and compose clipped native placements."""
 
+    # Host capability probes reserve the upper half of the Kitty ID space.
+    MAX_WIRE_ID = (1 << 31) - 1
+    LAYER_Z_BASES = (-(1 << 31), -(1 << 30), 0)
+
     protocol = "kitty"
 
     def __init__(
@@ -276,7 +277,7 @@ class GraphicsPresenter:
         self._next_id = (
             first_id if first_id is not None else secrets.randbelow(1 << 29) + (1 << 29)
         )
-        if not 0 < self._next_id <= MAX_WIRE_ID:
+        if not 0 < self._next_id <= self.MAX_WIRE_ID:
             raise GraphicsError("Invalid outer image namespace")
         self._assets: dict[tuple[int, ...], _Asset] = {}
         self._fragments: dict[tuple, _Fragment] = {}
@@ -401,7 +402,7 @@ class GraphicsPresenter:
                     )
             if uncovered:
                 visible[key] = raster
-                z = LAYER_Z_BASES[placement.layer] + rank
+                z = self.LAYER_Z_BASES[placement.layer] + rank
                 pieces.extend(
                     (key, placement, raster_bounds, rect, z) for rect in uncovered
                 )
@@ -444,7 +445,7 @@ class GraphicsPresenter:
                         "Native image changed during the frame snapshot"
                     )
                 rgba = _pixels(image, placement, raster.local)
-                if next_id > MAX_WIRE_ID:
+                if next_id > self.MAX_WIRE_ID:
                     raise GraphicsLimitError("Outer image namespace exhausted")
                 asset = _Asset(next_id, len(rgba), generation)
                 next_id += 1
@@ -527,28 +528,38 @@ class RasterPresenter:
         *,
         max_bytes=MAX_CACHE_BYTES,
         max_image_bytes=MAX_IMAGE_BYTES,
+        background=None,
     ):
         """Select a verified wire protocol and keep all derived storage bounded."""
-        if protocol != "iterm":
+        if protocol not in ("iterm", "sixel"):
             raise GraphicsError("Unknown raster image protocol")
         if max_bytes <= 0 or max_image_bytes <= 0:
             raise GraphicsError("Graphics limits must be positive")
         self.protocol = protocol
         self.max_bytes = max_bytes
         self.max_image_bytes = min(max_bytes, max_image_bytes)
+        self.background = background
         self._scene = None
         self._coverage = None
         self._wire = ""
 
     def scene_key(self, frame, *, origin=(0, 0), clip=None, occluders=()) -> tuple:
         """Below-text acceptance also depends on the cells under native images."""
-        cells = frame.cells if any(p.layer == 1 for p in frame.images) else ()
-        return (*_image_scene(frame, origin, clip, occluders), cells)
+        cells = (
+            frame.cells
+            if self.protocol == "sixel" or any(p.layer == 1 for p in frame.images)
+            else ()
+        )
+        return (*_image_scene(frame, origin, clip, occluders), cells, self.background)
 
-    @staticmethod
-    def _erase(coverage):
+    def _erase(self, coverage):
         if coverage is None:
             return ""
+        if self.protocol == "sixel":
+            # ECH need not erase SIXEL pixels (Zellij demonstrates this). The
+            # Application owns this alternate screen; ED2 plus repaint retires
+            # image pixels and reconstructs all native text/popup contents.
+            return "\x1b7\x1b[0m\x1b[2J\x1b8"
         return (
             "\x1b7\x1b[0m"
             + "".join(
@@ -570,6 +581,15 @@ class RasterPresenter:
         return False
 
     @staticmethod
+    def _blank_cell(cell):
+        return (
+            cell.text in ("", " ")
+            and not cell.underline
+            and not cell.overline
+            and "strike" not in cell.style.split()
+        )
+
+    @staticmethod
     def _blank(frame, pieces, origin):
         cells = getattr(frame, "cells", ())
         if len(cells) != frame.rows:
@@ -586,17 +606,60 @@ class RasterPresenter:
                     width = min(right, cell.x + cell.width) - max(left, cell.x)
                     if width <= 0:
                         continue
-                    if (
-                        cell.text not in ("", " ")
-                        or cell.underline
-                        or cell.overline
-                        or "strike" in cell.style.split()
-                    ):
+                    if not RasterPresenter._blank_cell(cell):
                         return False
                     covered += width
                 if covered != right - left:
                     return False
         return True
+
+    def _flatten_alpha(self, canvas, frame, origin):
+        """Resolve partial alpha only over independently known blank cell colors.
+
+        Text glyph pixels belong to the host font renderer. We cannot infer
+        them from a codepoint, or replace unknown defaults with invented black.
+        Transparent holes remain holes so popup/text restoration is preserved.
+        """
+        from PIL import Image as Pixels
+
+        alpha = canvas.getchannel("A")
+        partial = alpha.point(lambda value: 255 if 0 < value < 255 else 0)
+        if partial.getbbox() is None:
+            return
+        cw, ch = frame.cell_width, frame.cell_height
+        for row, cells in enumerate(frame.cells):
+            for cell in cells:
+                bounds = Rect(
+                    origin[0] + cell.x * cw,
+                    origin[1] + row * ch,
+                    cell.width * cw,
+                    ch,
+                ).intersect(Rect(0, 0, canvas.width, canvas.height))
+                if bounds is None:
+                    continue
+                box = (bounds.x, bounds.y, bounds.right, bounds.bottom)
+                mask = partial.crop(box)
+                if mask.getbbox() is None:
+                    continue
+                background = getattr(cell, "bg", None) or self.background
+                if (
+                    background is None
+                    or not self._blank_cell(cell)
+                    or "reverse" in cell.style.split()
+                ):
+                    raise GraphicsCapabilityError(
+                        "SIXEL partial alpha needs a known blank cell background"
+                    )
+                backdrop = Pixels.new(
+                    "RGBA", (bounds.width, bounds.height), (*background, 255)
+                )
+                backdrop.alpha_composite(canvas.crop(box))
+                canvas.paste(backdrop, (bounds.x, bounds.y), mask)
+                partial.paste(0, box)
+        if partial.getbbox() is not None:
+            raise GraphicsCapabilityError(
+                "SIXEL partial alpha extends outside known native cells"
+            )
 
     def plan(self, frame, image_lookup, *, origin=(0, 0), clip=None, occluders=()):
         """Build an alpha-composited viewport without changing any native asset."""
@@ -660,6 +723,11 @@ class RasterPresenter:
             return GraphicsPlan(cleared, repaint=bool(cleared))
         left = min(item[2].x for item in visible) // cw * cw
         top = min(item[2].y for item in visible) // ch * ch
+        if self.protocol == "sixel":
+            # DECSDM is acquired by HostBroker. In display mode the raster is
+            # anchored at the outer page origin, with no text scrolling. Empty
+            # leading pixels stay transparent, including text and popup areas.
+            left = top = 0
         right = max(item[2].right for item in visible)
         bottom = max(item[2].bottom for item in visible)
         width, height = right - left, bottom - top
@@ -695,8 +763,14 @@ class RasterPresenter:
                     ),
                     fill=(0, 0, 0, 0),
                 )
-        cursor = f"\x1b[{top // ch + 1};{left // cw + 1}H"
-        encoded = cursor + raster.iterm(canvas, self.max_bytes)
+        if self.protocol == "sixel":
+            from . import sixel
+
+            self._flatten_alpha(canvas, frame, origin)
+            encoded = sixel.encode(canvas, self.max_bytes)
+        else:
+            cursor = f"\x1b[{top // ch + 1};{left // cw + 1}H"
+            encoded = cursor + raster.iterm(canvas, self.max_bytes)
         wire = "\x1b7" + encoded + "\x1b8"
         if len(wire) > self.max_bytes:
             raise GraphicsLimitError("Composited raster exceeds the wire byte limit")
@@ -709,7 +783,7 @@ class RasterPresenter:
         return GraphicsPlan(old, wire, repaint=bool(old))
 
 
-def create_presenter(protocol: str | None) -> Presenter:
+def create_presenter(protocol: str | None, *, background=None) -> Presenter:
     """Instantiate the broker's selected output independently of native input providers.
 
     This is the only selection point. A replacement can retire a backend and
@@ -719,6 +793,6 @@ def create_presenter(protocol: str | None) -> Presenter:
         return DisabledPresenter()
     if protocol == "kitty":
         return GraphicsPresenter()
-    if protocol == "iterm":
-        return RasterPresenter(protocol)
+    if protocol in ("iterm", "sixel"):
+        return RasterPresenter(protocol, background=background)
     raise GraphicsError("Unknown image output protocol")

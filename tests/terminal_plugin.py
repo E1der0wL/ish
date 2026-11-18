@@ -19,7 +19,7 @@ def plugin_options(directory):
     return [
         "--plugin-dir",
         str(scripts),
-        "--library-dir",
+        "--plugin-lib-dir",
         str(directory / "libraries"),
         "--plugin",
         "terminal_test",

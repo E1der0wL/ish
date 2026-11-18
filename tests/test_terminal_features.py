@@ -23,6 +23,7 @@ class FeaturePolicyTests(unittest.TestCase):
         """No terminal-name default may quietly become automatic detection."""
         queried = (
             "kitty_graphics",
+            "sixel_graphics",
             "synchronized_output",
             "enhanced_keyboard",
             "pixel_mouse",
@@ -35,6 +36,7 @@ class FeaturePolicyTests(unittest.TestCase):
             "overline",
             "cursor_color",
             "iterm_graphics",
+            "desktop_notifications",
         )
         self.assertEqual(set(validate()), set(queried + unqueried))
         for name in queried:
@@ -65,6 +67,80 @@ class FeaturePolicyTests(unittest.TestCase):
         for invalid in ("hyperlinks", "=on", "hyperlinks=", "hyperlinks=auto"):
             with self.assertRaises(ValueError):
                 parse_assignment(invalid)
+
+    def test_sixel_requires_attributes_geometry_and_restorable_mode(self):
+        """DA1 attribute four is evidence; a host brand or terminal class is not."""
+        for response, supported in (("\x1b[?61;4;6c", True), ("\x1b[?4c", False)):
+            with self.subTest(response=response):
+                broker = self.broker()
+                broker.control(response)
+                broker.control("\x1b[6;20;10t")
+                broker.control("\x1b[?80;2$y")
+                profile = broker.finish_probe()
+                self.assertEqual(profile.sixel_graphics, supported)
+                self.assertEqual(profile.image_protocol, "sixel" if supported else None)
+        forced = self.broker(sixel_graphics="on")
+        forced.control("\x1b[6;20;10t")
+        self.assertFalse(forced.finish_probe().sixel_graphics)
+        self.assertEqual(
+            forced.feature_status["sixel_graphics"].reason, "initial-mode-unavailable"
+        )
+        self.assertEqual(forced.graphics_reason, "initial-mode-unavailable")
+
+    def test_sixel_owns_one_output_backend_and_restores_original_mode(self):
+        """A fallback must not draw twice or leave the host in page mode."""
+        for initial in (1, 2):
+            broker = self.broker()
+            broker.control("\x1b[?61;4c")
+            broker.control("\x1b[6;20;10t")
+            broker.control(f"\x1b[?80;{initial}$y")
+            broker.finish_probe()
+            self.assertEqual(broker.enter_metadata_modes(), "\x1b[?80h")
+            self.assertEqual(
+                broker.restore_modes(), "\x1b[?80" + ("h" if initial == 1 else "l")
+            )
+            self.assertEqual(broker.restore_modes(), "")
+        preferred = self.broker()
+        for reply in (
+            "\x1b[?61;4c",
+            "\x1b[6;20;10t",
+            "\x1b[?80;2$y",
+            "\x1b_Gi=2147515049;OK\x1b\\",
+        ):
+            preferred.control(reply)
+        self.assertEqual(preferred.finish_probe().image_protocol, "kitty")
+        state = preferred.feature_status["sixel_graphics"]
+        self.assertEqual(
+            (state.support, state.active, state.reason),
+            ("supported", False, "other-image-protocol-selected"),
+        )
+
+    def test_sixel_late_duplicate_and_cancelled_replies_do_not_upgrade(self):
+        """Identity-free DA1 is accepted only once in the initial probe."""
+        broker = self.broker()
+        broker.control("\x1b[?61;6c")
+        broker.control("\x1b[?61;4c")
+        broker.control("\x1b[6;20;10t")
+        broker.control("\x1b[?80;2$y")
+        self.assertFalse(broker.finish_probe().sixel_graphics)
+        broker.control("\x1b[?61;4c")
+        self.assertEqual(broker.feature_status["sixel_graphics"].support, "unsupported")
+        cancelled = self.broker(sixel_graphics="on")
+        cancelled.cancel_probe()
+        for reply in ("\x1b[?61;4c", "\x1b[?80;2$y", "\x1b[6;20;10t"):
+            cancelled.control(reply)
+        self.assertFalse(cancelled.profile.sixel_graphics)
+        self.assertEqual(cancelled.feature_status["sixel_graphics"].support, "unknown")
+
+    def test_sixel_geometry_loss_revokes_output_without_losing_evidence(self):
+        """A resize cannot reuse stale cell measurements for raster positioning."""
+        broker = self.broker()
+        for reply in ("\x1b[?61;4c", "\x1b[?80;2$y", "\x1b[6;20;10t"):
+            broker.control(reply)
+        self.assertTrue(broker.finish_probe().sixel_graphics)
+        self.assertFalse(broker.refresh_geometry(90, 25, 0, 0).sixel_graphics)
+        self.assertEqual(broker.feature_status["sixel_graphics"].support, "supported")
+        self.assertTrue(broker.refresh_geometry(90, 25, 900, 500).sixel_graphics)
 
     def test_on_and_off_do_not_rewrite_observed_support(self):
         """Explicit use and positive protocol evidence are different facts."""

@@ -1,6 +1,6 @@
 """Opt-in Windows/forwarded-X11 text clipboard, using Hub's native transports.
 
-Choose this package through config.vt.plugins in the existing script_dir.
+Choose this package through config.plugins in the configured plugin_dir.
 TARGET can be edited before the next session: auto, windows, or x11. Selecting
 one target never falls back to another desktop or to terminal escape output.
 """
@@ -15,27 +15,28 @@ from .x11_clipboard import X11Clipboard, read_bounded
 PLUGIN_META = {"version": "1.0.0", "description": "Windows and X11 text clipboard"}
 TERMINAL_API = 1
 TARGET = "auto"
-REMOTE_ENV = ("SSH_CONNECTION", "SSH_TTY")
-WINDOWS_ENV = ("WSL_DISTRO_NAME", "WSL_INTEROP")
-WINDOWS_READ = (
-    "powershell.exe",
-    "-NoProfile",
-    "-NonInteractive",
-    "-Command",
-    "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
-    "[Console]::Write((Get-Clipboard -Raw))",
-)
-WINDOWS_WRITE = ("clip.exe",)
 
 
 class SystemClipboard:
     """Fix one destination at session start; read fresh data without a text cache."""
 
+    REMOTE_ENV = ("SSH_CONNECTION", "SSH_TTY")
+    WINDOWS_ENV = ("WSL_DISTRO_NAME", "WSL_INTEROP")
+    WINDOWS_READ = (
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
+        "[Console]::Write((Get-Clipboard -Raw))",
+    )
+    WINDOWS_WRITE = ("clip.exe",)
+
     def __init__(self, *, target=TARGET, env=None):
         """Select one explicit or environment-scoped target without performing I/O."""
         self.env = dict(os.environ if env is None else env)
-        remote = any(self.env.get(key) for key in REMOTE_ENV)
-        windows = not remote and any(self.env.get(key) for key in WINDOWS_ENV)
+        remote = any(self.env.get(key) for key in self.REMOTE_ENV)
+        windows = not remote and any(self.env.get(key) for key in self.WINDOWS_ENV)
         if target == "auto":
             target = (
                 "windows" if windows else "x11" if self.env.get("DISPLAY") else None
@@ -56,7 +57,7 @@ class SystemClipboard:
         try:
             async with asyncio.timeout(TIMEOUT_SECONDS):
                 process = await asyncio.create_subprocess_exec(
-                    *(WINDOWS_READ if text is None else WINDOWS_WRITE),
+                    *(self.WINDOWS_READ if text is None else self.WINDOWS_WRITE),
                     stdin=asyncio.subprocess.DEVNULL
                     if text is None
                     else asyncio.subprocess.PIPE,

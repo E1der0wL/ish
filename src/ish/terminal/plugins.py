@@ -30,11 +30,6 @@ from prompt_toolkit.layout.screen import WritePosition
 
 from ish.lang import Message, i18n
 
-API_VERSION = 1
-MAX_POPUPS = 16
-MAX_BAR_ROWS = 8
-MAX_ERRORS = 16
-
 
 class Surface(Container):
     """A plugin's opaque rectangle, recorded by the same layout that paints it."""
@@ -94,6 +89,11 @@ class _TaskScope:
 class Plugins:
     """Manage plugin UI lifetimes without interpreting shell input or output."""
 
+    API_VERSION = 1
+    MAX_POPUPS = 16
+    MAX_BAR_ROWS = 8
+    MAX_ERRORS = 16
+
     def __init__(self, owner, terminal):
         """Start with a full terminal and no additional UI or reserved keys."""
         self.owner = owner
@@ -147,7 +147,7 @@ class Plugins:
             if module is None:
                 raise ValueError(i18n.get(Message.VT_PLUGIN_MISSING, name=name))
             version = getattr(module, "TERMINAL_API", None)
-            if type(version) is not int or version != API_VERSION:
+            if type(version) is not int or version != self.API_VERSION:
                 raise ValueError(i18n.get(Message.VT_PLUGIN_API, name=name))
             setup = getattr(module, "setup", None)
             if not callable(setup):
@@ -155,7 +155,7 @@ class Plugins:
             cleanup = setup(self)
             if cleanup is not None:
                 if not callable(cleanup):
-                    raise TypeError(i18n.get(Message.STREAM_PLUGIN_CLEANUP))
+                    raise TypeError(i18n.get(Message.STARTUP_PLUGIN_CLEANUP))
                 self._cleanups.append(cleanup)
 
     def get(self, name):
@@ -186,6 +186,36 @@ class Plugins:
         if self._closed:
             raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
         return self.owner.clipboard.register_provider(name, factory=factory)
+
+    def scroll_prompts(self, delta):
+        """Navigate native semantic markers without interpreting shell commands."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        self.owner.vt.scroll_prompts(delta)
+        self.owner.app.invalidate()
+
+    def select_output(self, x, y):
+        """Select marked native output at a viewport cell, if available."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        selected = self.owner.vt.select_output(x, y)
+        self.owner.app.invalidate()
+        return selected
+
+    def select_last_output(self):
+        """Select the last valid native output anchor, without a shadow history."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        selected = self.owner.vt.select_last_output()
+        self.owner.app.invalidate()
+        return selected
+
+    def copy_last_output(self):
+        """Request a copy after native selection; True is not OS copy completion."""
+        if not self.select_last_output():
+            return False
+        self.owner.copy_selection()
+        return True
 
     @property
     def mouse_required(self):
@@ -276,7 +306,7 @@ class Plugins:
 
     def _record_error(self, error, scope=None):
         self.errors.append(f"{type(error).__name__}: {error}")
-        del self.errors[:-MAX_ERRORS]
+        del self.errors[: -self.MAX_ERRORS]
         # An old task can finish after its popup closes. Its diagnostic remains
         # useful, but it no longer owns another popup's focus or result.
         if scope is not None and scope.popup in self.popups:
@@ -287,7 +317,7 @@ class Plugins:
         """Reserve a bounded bottom region; removing it restores the full grid."""
         if self._closed:
             raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
-        if not 1 <= rows <= MAX_BAR_ROWS:
+        if not 1 <= rows <= self.MAX_BAR_ROWS:
             raise ValueError(i18n.get(Message.VT_BAR_HEIGHT))
         if type(mouse) is not bool:
             raise TypeError(i18n.get(Message.VT_PLUGIN_MOUSE))
@@ -309,7 +339,7 @@ class Plugins:
         self, content, *, width=40, height=8, left=None, top=None, mouse=False
     ):
         """Open an opaque PTK surface and give its widgets exclusive focus."""
-        if self._closed or len(self.popups) >= MAX_POPUPS:
+        if self._closed or len(self.popups) >= self.MAX_POPUPS:
             raise RuntimeError(i18n.get(Message.VT_POPUP_UNAVAILABLE))
         if width < 1 or height < 1 or any(v is not None and v < 0 for v in (left, top)):
             raise ValueError(i18n.get(Message.VT_POPUP_GEOMETRY))

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 RUNTIME_MARKER = "ish-runtime.json"
-LAUNCHER_NAME = "ish"
+VT_LIBRARY_PATH = Path("libexec/ghostty-vt/libish_vt.so")
 
 
 def bundled_root() -> Path | None:
@@ -19,10 +19,7 @@ def bundled_root() -> Path | None:
     return prefix.parent if (prefix / RUNTIME_MARKER).is_file() else None
 
 
-def bundled_forward_binary() -> Path | None:
-    """Return the expected helper path, including when that file is missing."""
-    # Import lazily: shell.__init__ also loads the integration module.
-    from ish.shell.constants import BUNDLED_FORWARD_DIRECTORY, FORWARD_BINARY
-
+def bundled_vt_library() -> Path | None:
+    """Return the installed VT bridge path without hiding a packaging error."""
     root = bundled_root()
-    return root / BUNDLED_FORWARD_DIRECTORY / FORWARD_BINARY if root else None
+    return root / VT_LIBRARY_PATH if root else None

@@ -21,6 +21,8 @@
 #define ISH_COLOR_BG 2u
 #define ISH_KITTY_PLACEHOLDER 0x10EEEEu
 #define ISH_APPEARANCE_BYTES (259u * 4u)
+#define ISH_NOTIFICATION_BYTES (16u * 1024u)
+#define ISH_NOTIFICATIONS_PER_DRAIN 64u
 /* Logical gesture units, not a fabricated host pixel measurement. Subcells
  * preserve native within-cell thresholds without its one-unit edge buffer
  * turning the entire first/last text row into an autoscroll zone. */
@@ -87,6 +89,9 @@ typedef struct {
     GhosttySelectionGesture gesture;
     GhosttyTrackedGridRef anchor;
     GhosttyTerminalScreen anchor_screen;
+    GhosttyTrackedGridRef last_output;
+    GhosttyTerminalScreen output_screen;
+    unsigned notifications;
     Buffer output, replies, grapheme, link, effects, identity;
     Buffer held_frame, held_images;
     bool held;
@@ -97,6 +102,7 @@ typedef struct {
     uint32_t adapter_image_id;
     int scheme;
     bool colors_dirty;
+    bool sixel_supported;
     GhosttyColorRgb color_overrides[3];
     int color_results[3];
 } Terminal;
@@ -178,6 +184,43 @@ static void pwd_changed(GhosttyTerminal terminal, void *userdata) {
     if (!ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_PWD, &pwd))
         effect(userdata, 3, pwd.ptr, pwd.len);
 }
+static void desktop_notification(GhosttyTerminal terminal, void *userdata,
+                                 const GhosttyTerminalDesktopNotification *notification) {
+    (void)terminal;
+    Terminal *state = userdata;
+    if (notification->title.len > ISH_NOTIFICATION_BYTES ||
+        notification->body.len > ISH_NOTIFICATION_BYTES - notification->title.len ||
+        state->notifications >= ISH_NOTIFICATIONS_PER_DRAIN) return;
+    Buffer *buffer = &state->effects;
+    size_t length = 4 + notification->title.len + notification->body.len;
+    if (buffer->error) return;
+    buffer->error = reserve(buffer, length + 8);
+    if (buffer->error) return;
+    number(buffer, 4); number(buffer, (uint32_t)length);
+    number(buffer, (uint32_t)notification->title.len);
+    append(buffer, notification->title.ptr, notification->title.len);
+    append(buffer, notification->body.ptr, notification->body.len);
+    state->notifications++;
+}
+static void reset(GhosttyTerminal terminal, void *userdata) {
+    (void)terminal;
+    Terminal *state = userdata;
+    ghostty_tracked_grid_ref_free(state->last_output);
+    state->last_output = NULL;
+}
+static void semantic_prompt(GhosttyTerminal terminal, void *userdata,
+                            const GhosttyTerminalSemanticPrompt *prompt) {
+    if (prompt->kind != GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START) return;
+    Terminal *state = userdata;
+    reset(terminal, state);
+    uint16_t x = 0, y = 0;
+    int status = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_X, &x);
+    if (!status) status = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &y);
+    if (!status) status = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &state->output_screen);
+    GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_ACTIVE, .value = {.coordinate = {.x = x, .y = y}}};
+    if (!status) status = ghostty_terminal_grid_ref_track(terminal, point, &state->last_output);
+    if (status && !state->effects.error) state->effects.error = status;
+}
 int ish_vt_png_decoder(GhosttySysDecodePngFn callback) {
     return ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)callback);
 }
@@ -203,10 +246,12 @@ void *ish_vt_image_alloc(const GhosttyAllocator *allocator, size_t size) {
 }
 static bool device_attributes(GhosttyTerminal terminal, void *userdata, GhosttyDeviceAttributes *attrs) {
     (void)terminal;
-    (void)userdata;
+    Terminal *state = userdata;
     attrs->primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220;
     attrs->primary.features[0] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
     attrs->primary.num_features = 1;
+    if (state->sixel_supported)
+        attrs->primary.features[attrs->primary.num_features++] = GHOSTTY_DA_FEATURE_SIXEL;
     attrs->secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220;
     return true;
 }
@@ -217,6 +262,7 @@ static int dimensions(unsigned cols, unsigned rows) {
 void ish_vt_free(Terminal *state) {
     if (!state) return;
     ghostty_tracked_grid_ref_free(state->anchor);
+    ghostty_tracked_grid_ref_free(state->last_output);
     ghostty_selection_gesture_free(state->gesture, state->terminal);
     ghostty_formatter_free(state->formatter);
     ghostty_search_free(state->search);
@@ -259,6 +305,9 @@ Terminal *ish_vt_new(unsigned cols, unsigned rows) {
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_BELL, (const void *)bell) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, (const void *)title_changed) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_PWD_CHANGED, (const void *)pwd_changed) ||
+        ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (const void *)desktop_notification) ||
+        ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, (const void *)semantic_prompt) ||
+        ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_RESET, (const void *)reset) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, (const void *)render_hold) ||
         ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, (const void *)device_attributes)) {
         ish_vt_free(state); return NULL;
@@ -398,12 +447,18 @@ int ish_vt_effects(Terminal *state, const uint8_t **out, size_t *len) {
     if (!state || !out || !len) return ISH_LIMIT;
     *out = state->effects.data; *len = state->effects.len;
     state->effects.len = 0;
+    state->notifications = 0;
     int error = state->effects.error; state->effects.error = 0;
     return error;
 }
 int ish_vt_graphics(Terminal *state, uint64_t limit) {
     if (!state || limit > ISH_MAX_BUFFER) return ISH_LIMIT;
     return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &limit);
+}
+int ish_vt_sixel_supported(Terminal *state, bool enabled) {
+    if (!state) return ISH_LIMIT;
+    state->sixel_supported = enabled;
+    return 0;
 }
 int ish_vt_image_context(Terminal *state, const uint8_t **out, size_t *len) {
     if (!state || !out || !len) return ISH_LIMIT;
@@ -495,10 +550,11 @@ int ish_vt_scrollback_limit(Terminal *state, uint64_t lines, uint64_t bytes) {
     return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &line_limit);
 }
 int ish_vt_scroll(Terminal *state, unsigned kind, int64_t rows) {
-    if (!state || kind > 2 || rows > INTPTR_MAX || rows < INTPTR_MIN) return ISH_LIMIT;
+    if (!state || kind > 3 || rows > INTPTR_MAX || rows < INTPTR_MIN) return ISH_LIMIT;
     GhosttyTerminalScrollViewport behavior = {0};
     behavior.tag = kind == 0 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_TOP :
-        kind == 1 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM : GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA;
+        kind == 1 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM :
+        kind == 2 ? GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA : GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA_PROMPT;
     behavior.value.delta = (intptr_t)rows;
     return ghostty_terminal_scroll_viewport(state->terminal, behavior);
 }
@@ -768,6 +824,23 @@ int ish_vt_image(Terminal *state, uint32_t id, const uint8_t **out, size_t *len)
     *out = buffer->data; *len = buffer->len;
     return 0;
 }
+int ish_vt_image_exists(Terminal *state, uint32_t id, bool *exists) {
+    if (!state || !exists) return ISH_LIMIT;
+    *exists = false;
+    /* Input validation observes current storage, not the held presentation.
+     * Query borrowed pixels without copying them or advancing render state. */
+    GhosttyKittyGraphics graphics;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics));
+    if (!graphics) return 0;
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, id);
+    if (!image) return 0;
+    GhosttyString pixels;
+    int result = ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS, &pixels);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    CHECK(result);
+    *exists = true;
+    return 0;
+}
 int ish_vt_tick(Terminal *state, uint64_t now_ms, uint64_t *next_ms) {
     if (!state || !next_ms) return ISH_LIMIT;
     *next_ms = UINT64_MAX;
@@ -973,6 +1046,39 @@ int ish_vt_clear_selection(Terminal *state) {
     ghostty_selection_gesture_reset(state->gesture, state->terminal);
     ghostty_tracked_grid_ref_free(state->anchor); state->anchor = NULL;
     return ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+}
+static int select_output(Terminal *state, const GhosttyGridRef *ref, bool *found) {
+    GhosttySelection selection = {0};
+    int result = ghostty_terminal_select_output(state->terminal, ref, &selection);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    CHECK(result);
+    /* This API copies the snapshot before any further terminal mutation. */
+    CHECK(ghostty_terminal_set(state->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection));
+    *found = true;
+    return 0;
+}
+int ish_vt_select_output(Terminal *state, unsigned x, unsigned y, bool *found) {
+    if (!state || !found || x >= state->cols || y >= state->height) return ISH_LIMIT;
+    *found = false;
+    CHECK(ish_vt_clear_selection(state));
+    GhosttyGridRef ref = {0};
+    GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value = {.coordinate = {.x = x, .y = y}}};
+    CHECK(ghostty_terminal_grid_ref(state->terminal, point, &ref));
+    return select_output(state, &ref, found);
+}
+int ish_vt_select_last_output(Terminal *state, bool *found) {
+    if (!state || !found) return ISH_LIMIT;
+    *found = false;
+    CHECK(ish_vt_clear_selection(state));
+    if (!state->last_output) return 0;
+    GhosttyTerminalScreen screen;
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen));
+    if (screen != state->output_screen) return 0;
+    GhosttyGridRef ref = {0};
+    int result = ghostty_tracked_grid_ref_snapshot(state->last_output, &ref);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    CHECK(result);
+    return select_output(state, &ref, found);
 }
 int ish_vt_selection(Terminal *state, unsigned action, int32_t x, int32_t y,
                      double position_x, double position_y, uint64_t time_ns, bool timed,

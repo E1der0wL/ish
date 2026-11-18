@@ -5,13 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 
-AUTOSCROLL_SECONDS = 0.05
-REPEAT_INTERVAL_NS = 500_000_000
-REPEAT_DISTANCE = 1.0
-
 
 class SelectionController:
     """Own one local drag's timer; libghostty owns its range and click behavior."""
+
+    AUTOSCROLL_SECONDS = 0.05
 
     def __init__(self, terminal, *, changed, copied):
         """Connect native gestures to renderer invalidation and explicit user copy."""
@@ -38,8 +36,6 @@ class SelectionController:
             position=position,
             rectangle=self._rectangle,
             time_ns=time.monotonic_ns(),
-            repeat_interval_ns=REPEAT_INTERVAL_NS,
-            repeat_distance=REPEAT_DISTANCE,
         )
         self.changed()
         return state
@@ -48,7 +44,7 @@ class SelectionController:
         if not self.active or not state.autoscroll:
             return
         self._timer = asyncio.get_running_loop().call_later(
-            AUTOSCROLL_SECONDS, self._tick, self._generation
+            self.AUTOSCROLL_SECONDS, self._tick, self._generation
         )
 
     def _tick(self, generation):

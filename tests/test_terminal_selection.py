@@ -1,12 +1,14 @@
 """Verify native gesture results and frontend timer lifetime without text parsing."""
 
 import asyncio
+import base64
 import os
 import unittest
 from unittest.mock import patch
 
 from ish.terminal.selection import SelectionController
 from ish.terminal.vt import Terminal
+from test_terminal_image_protocol import iterm, png
 
 
 @unittest.skipUnless(os.name == "posix", "Native VT requires POSIX")
@@ -56,6 +58,44 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.controller.release(4, 1)
         self.assertEqual(self.copied, ["한B\n234"])
 
+    async def test_iterm_image_copy_keeps_blank_cells_unicode_and_newlines(self):
+        """Actual inline image cells copy as spaces, preserving adjacent graphemes."""
+        self.terminal.resize(12, 4, 2, 3)
+        self.terminal.set_graphics(True)
+        self.terminal.feed("한e\u0301".encode() + iterm(png(4, 3)))
+        self.terminal.feed("가o\u0308👩\u200d💻\r\n둘째 줄".encode())
+        self.assertTrue(self.terminal.frame().images)
+        self.controller.press(0, 0)
+        self.controller.drag(6, 1)
+        self.controller.release(6, 1)
+        self.assertEqual(self.copied, ["한e\u0301  가o\u0308👩\u200d💻\n둘째 줄"])
+        self.assertEqual(self.terminal.selection_text(), self.copied[0])
+
+    async def test_kitty_placeholder_copy_drops_only_image_grapheme_metadata(self):
+        """Native Kitty cells omit row, column and high-ID marks from copied text."""
+        self.terminal.resize(12, 4, 2, 3)
+        self.terminal.set_graphics(True)
+        self.terminal.feed(
+            b"\x1b_Ga=T,U=1,i=17,f=32,s=4,v=3,c=2,r=1,C=1,q=2;"
+            + base64.b64encode(b"\xff\0\0\xff" * 12)
+            + b"\x1b\\A\x1b[38;2;0;0;17;58;2;0;0;0m"
+            + "\U0010eeee\u0305\u0305\u0305\u0301\U0010eeee\u0305\u030d".encode()
+            + "\x1b[0me\u0301한\r\n끝".encode()
+        )
+        self.assertTrue(self.terminal.frame().images)
+        self.controller.press(0, 0)
+        self.controller.drag(1, 1)
+        self.controller.release(1, 1)
+        self.assertEqual(self.copied, ["A  e\u0301한\n끝"])
+
+    async def test_text_only_copy_preserves_combining_and_emoji_graphemes(self):
+        """Ordinary Unicode is returned unchanged when there are no image cells."""
+        self.terminal.feed("e\u0301한👩\u200d💻\r\nA\u0305B\u030d".encode())
+        self.controller.press(0, 0)
+        self.controller.drag(2, 1)
+        self.controller.release(2, 1)
+        self.assertEqual(self.copied, ["e\u0301한👩\u200d💻\nA\u0305B\u030d"])
+
     async def test_reset_preserves_highlight_but_cancels_repeat_click_sequence(self):
         """Focus cancellation must not turn a later click into an old double-click."""
         self.terminal.feed(b"hello world")
@@ -75,7 +115,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.terminal.scroll(-5)
         before = self.terminal.frame().viewport_offset
         self.controller.press(0, 2)
-        with patch("ish.terminal.selection.AUTOSCROLL_SECONDS", 0.005):
+        with patch.object(SelectionController, "AUTOSCROLL_SECONDS", 0.005):
             state = self.controller.drag(4, -1)
             self.assertEqual(state.autoscroll, -1)
             async with asyncio.timeout(2):

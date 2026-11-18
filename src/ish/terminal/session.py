@@ -15,15 +15,15 @@ from ish.runtime.fdio import FDWriter
 
 from .identity import PROGRAM, TERM
 
-READ_BYTES = 65536
-READ_BUDGET = 256 * 1024
-SHUTDOWN_SECONDS = 2
-SHUTDOWN_INTERVAL = 0.05
-MAX_PENDING_INPUT = 4 * 1024 * 1024
-
 
 class Session:
     """Forward native input and terminal output through a single ordered PTY."""
+
+    READ_BYTES = 65536
+    READ_BUDGET = 256 * 1024
+    SHUTDOWN_SECONDS = 2
+    SHUTDOWN_INTERVAL = 0.05
+    MAX_PENDING_INPUT = 4 * 1024 * 1024
 
     def __init__(
         self,
@@ -86,20 +86,21 @@ class Session:
         if self.pending_input:
             self.writer.write(self.pending_input)
             self.pending_input.clear()
-        self.loop.add_reader(self.fd, self._read)
+        if self.output_enabled:
+            self.loop.add_reader(self.fd, self._read)
         self.waiter = self.loop.create_task(self._wait())
 
     def _read(self) -> None:
         """Deliver bounded output batches, retaining final work across pauses."""
         if self.closed or not self.output_enabled or self._output_done.done():
             return
-        budget = READ_BUDGET
+        budget = self.READ_BUDGET
         if self._final_remaining is not None:
             budget = min(budget, self._final_remaining)
         try:
             while budget > 0:
                 try:
-                    data = os.read(self.fd, min(READ_BYTES, budget))
+                    data = os.read(self.fd, min(self.READ_BYTES, budget))
                 except BlockingIOError:
                     if self._final_remaining is not None:
                         self._finish_output()
@@ -151,7 +152,7 @@ class Session:
             # final budget, carrying its remainder across host backpressure.
             # EAGAIN ends that pass without waiting for a retained slave's EOF.
             if not self._output_done.done():
-                self._final_remaining = READ_BUDGET
+                self._final_remaining = self.READ_BUDGET
                 self._read()
             delivered = await self._output_done
             if delivered and not self.closed:
@@ -162,7 +163,7 @@ class Session:
         if not self.closed and not self.eof and self.returncode is None:
             try:
                 if self.writer is None:
-                    if len(self.pending_input) + len(data) > MAX_PENDING_INPUT:
+                    if len(self.pending_input) + len(data) > self.MAX_PENDING_INPUT:
                         raise BufferError(i18n.get(Message.INPUT_LIMIT))
                     self.pending_input.extend(data)
                 else:
@@ -216,7 +217,7 @@ class Session:
             except ProcessLookupError:
                 pass
         os.close(self.fd)
-        deadline = self.loop.time() + SHUTDOWN_SECONDS
+        deadline = self.loop.time() + self.SHUTDOWN_SECONDS
         while groups and self.loop.time() < deadline:
             for group in tuple(groups):
                 try:
@@ -224,7 +225,7 @@ class Session:
                 except ProcessLookupError:
                     groups.remove(group)
             if groups:
-                await asyncio.sleep(SHUTDOWN_INTERVAL)
+                await asyncio.sleep(self.SHUTDOWN_INTERVAL)
         for group in groups:
             try:
                 os.killpg(group, signal.SIGKILL)

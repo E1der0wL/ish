@@ -6,12 +6,11 @@ import os
 import platform
 import shutil
 import sys
-from argparse import Namespace
 
 from ish import __version__
 from ish.config import config
 from ish.lang import Message, i18n
-from ish.runtime.distribution import bundled_forward_binary, bundled_root
+from ish.runtime.distribution import bundled_root
 
 _TERM_ENV = "TERM"
 
@@ -40,27 +39,8 @@ def _cache_status() -> tuple[str, str]:
         return (i18n.get(Message.CLI_DIAGNOSE_UNAVAILABLE),) * 2
 
 
-def _helper_status() -> str:
-    """Locate the bundled helper or compiler without importing the build machinery."""
-    from ish.shell.constants import NATIVE_COMPILER
-
-    path = bundled_forward_binary()
-    if path is not None:
-        return i18n.get(
-            Message.CLI_DIAGNOSE_HELPER_BUNDLED
-            if path.is_file()
-            else Message.CLI_DIAGNOSE_HELPER_MISSING,
-            path=path,
-        )
-    return i18n.get(
-        Message.CLI_DIAGNOSE_HELPER_SOURCE,
-        compiler=shutil.which(NATIVE_COMPILER)
-        or i18n.get(Message.CLI_DIAGNOSE_MISSING),
-    )
-
-
 def environment_fields(shell: str) -> dict[Message, object]:
-    """Collect shared runtime facts without invoking shell adapters or user code.
+    """Collect shared runtime facts without invoking a shell or user code.
 
     A successful report does not certify shell health or the ability to execute files.
     Missing dependencies are reported as data; no shell or helper is spawned here.
@@ -120,43 +100,3 @@ def display_diagnostics(
     print(i18n.get(scope))
     for label, value in values.items():
         print(f"{i18n.get(label)}: {value}")
-
-
-def print_diagnostics(option: Namespace) -> None:
-    """Preserve the original ish report and its main-specific adapter facts."""
-    from ish.shell.adapter import get_adapter
-
-    shell_path = shutil.which(option.shell)
-    if shell_path:
-        shell_path = os.path.abspath(shell_path)
-    try:
-        adapter = get_adapter(option.shell, shell_path).name
-    except ValueError:
-        adapter = i18n.get(Message.CLI_DIAGNOSE_UNSUPPORTED)
-    extra = {
-        Message.CLI_DIAGNOSE_SHELL_REALPATH: {
-            Message.CLI_DIAGNOSE_ADAPTER: adapter,
-        },
-        Message.CLI_DIAGNOSE_HOME: {
-            Message.CLI_DIAGNOSE_RC: config.RC_FILE,
-            Message.CLI_DIAGNOSE_RC_POLICY: i18n.get(
-                Message.CLI_DIAGNOSE_DISABLED
-                if option.no_rc
-                else Message.CLI_DIAGNOSE_ENABLED
-            ),
-            Message.CLI_DIAGNOSE_PLUGINS: config.PLUGIN_SCRIPT_DIR,
-            Message.CLI_DIAGNOSE_PLUGIN_POLICY: i18n.get(
-                Message.CLI_DIAGNOSE_DISABLED
-                if option.no_plugins
-                else Message.CLI_DIAGNOSE_ENABLED
-            ),
-        },
-        Message.CLI_DIAGNOSE_CACHE_NOEXEC: {
-            Message.CLI_DIAGNOSE_HELPER: _helper_status(),
-        },
-    }
-    values = {}
-    for label, value in environment_fields(option.shell).items():
-        values[label] = value
-        values.update(extra.get(label, {}))
-    display_diagnostics(Message.CLI_DIAGNOSE_TITLE, Message.CLI_DIAGNOSE_SCOPE, values)

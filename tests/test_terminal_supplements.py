@@ -72,8 +72,8 @@ class SharedDirectoryTests(unittest.TestCase):
                 package.mkdir(parents=True)
                 (package / f"{name}.py").write_text(PLUGIN_HEADER + source)
             (home / ".ishrc.py").write_text(
-                "config.vt = {'plugins': ['shared_output', 'shared_key', "
-                "'shared_clipboard'], 'clipboard': 'read-write'}\n"
+                "config.plugins = ['shared_output', 'shared_key', "
+                "'shared_clipboard']\nconfig.clipboard = 'read-write'\n"
             )
             program = root / "reader.py"
             program.write_text(READER)

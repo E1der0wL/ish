@@ -35,11 +35,6 @@ _CONSOLE_FORMAT = "[%(levelname)s] %(message)s"
 _FILE_FORMAT = "[%(asctime)s] %(levelname)-8s  | %(message)s"
 _REGISTRATION_LOCK = RLock()
 _BUFFER_MEMORY_BYTES = 64 * 1024
-_FLUSH_CHARACTERS = 64 * 1024
-_FILE_PERMISSIONS = 0o666
-_SESSION_FILE_FLAGS = (
-    os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
-)
 
 
 def register_logger(
@@ -105,6 +100,9 @@ class _DeferredHandler(_SessionErrors, logging.StreamHandler):
 class _SessionFileHandler(_SessionErrors, logging.FileHandler):
     """Append to the selected file while deferring runtime write errors."""
 
+    PERMISSIONS = 0o666
+    OPEN_FLAGS = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
+
     def __init__(self, path, on_error):
         """Use the existing UTF-8 file format and a deferred failure sink."""
         self.on_error = on_error
@@ -118,7 +116,7 @@ class _SessionFileHandler(_SessionErrors, logging.FileHandler):
         """
         from ish.lang import Message, i18n
 
-        descriptor = os.open(self.baseFilename, _SESSION_FILE_FLAGS, _FILE_PERMISSIONS)
+        descriptor = os.open(self.baseFilename, self.OPEN_FLAGS, self.PERMISSIONS)
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise OSError(
@@ -143,6 +141,8 @@ class SessionLog:
     an unbounded in-memory queue. No terminal or shell input is captured here.
     """
 
+    FLUSH_CHARACTERS = 64 * 1024
+
     def __init__(self, logger: logging.Logger, buffer: TextIO):
         """Bind the shared logger to the private deferred console stream."""
         self.logger = logger
@@ -163,7 +163,7 @@ class SessionLog:
             try:
                 self._console.flush()
                 self._buffer.seek(0)
-                while chunk := self._buffer.read(_FLUSH_CHARACTERS):
+                while chunk := self._buffer.read(self.FLUSH_CHARACTERS):
                     destination.write(chunk)
                 self._buffer.seek(0)
                 self._buffer.truncate()

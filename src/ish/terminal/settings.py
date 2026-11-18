@@ -1,16 +1,16 @@
-"""Resolve VT choices from the shared rc without loading stream UI plugins."""
+"""Declare the terminal settings used by ish and its configuration window."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from prompt_toolkit.output import ColorDepth
 
 from ish.lang import Message
-from ish.stream.settings import RcError, SettingsError
-from ish.stream.settings import Settings as StreamSettings
-from ish.stream.settings import load as load_common
+from ish.runtime.settings import Settings as BaseSettings
+from ish.runtime.settings import SettingsError
+from ish.runtime.settings import load as load_common
 
 from .features import validate as validate_features
 from .mouse import DEFAULT_MOUSE, MOUSE_POLICIES
@@ -27,8 +27,6 @@ COLOR_DEPTHS = {
     "8": ColorDepth.DEPTH_8_BIT,
     "24": ColorDepth.DEPTH_24_BIT,
 }
-# These belong to the other execution path; explicit VT plugins are independent.
-STREAM_ONLY = frozenset(("plugins", "integration_dir", "vt"))
 
 
 def validate_color_depth(value):
@@ -43,7 +41,7 @@ def validate_color_depth(value):
 
 
 @dataclass(slots=True)
-class Settings(StreamSettings):
+class Settings(BaseSettings):
     """Share startup choices, keeping terminal policy in the explicit VT namespace."""
 
     mouse: str = DEFAULT_MOUSE
@@ -55,7 +53,7 @@ class Settings(StreamSettings):
 
     def validate(self, base: Path):
         """Reject invalid policies before acquiring a terminal or native library."""
-        StreamSettings.validate(self, base)
+        BaseSettings.validate(self, base)
         self.color_depth = validate_color_depth(self.color_depth)
         if not isinstance(self.features, dict):
             raise SettingsError(Message.VT_FEATURES_MAPPING)
@@ -77,21 +75,5 @@ class Settings(StreamSettings):
 
 
 def load(path: Path) -> Settings:
-    """Reuse the rc evaluator once; only config.vt selects terminal plugins."""
-    common = load_common(path)
-    settings = Settings()
-    for item in fields(StreamSettings):
-        if item.name not in STREAM_ONLY:
-            setattr(settings, item.name, getattr(common, item.name))
-    try:
-        if not isinstance(common.vt, dict):
-            raise SettingsError(Message.VT_SETTING_NAMESPACE)
-        allowed = {item.name for item in fields(Settings)} - {"integration_dir", "vt"}
-        for name, value in common.vt.items():
-            if name not in allowed:
-                raise SettingsError(Message.VT_SETTING_UNKNOWN, name=name)
-            setattr(settings, name, value)
-        settings.validate(path.parent)
-    except (Exception, SystemExit) as error:
-        raise RcError(path, settings, error) from error
-    return settings
+    """Evaluate the one Python configuration exactly once using terminal fields."""
+    return load_common(path, settings_type=Settings)

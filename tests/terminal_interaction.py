@@ -259,7 +259,7 @@ def run_case(directory, case, powershell, timeout):
     record(directory, "result.json", result)
     terminal = None
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="ish-vt-physical-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ish-physical-") as temporary:
         native_home = Path(temporary)
         try:
             terminal = InteractionTerminal(

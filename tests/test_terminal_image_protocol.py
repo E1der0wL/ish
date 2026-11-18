@@ -171,20 +171,50 @@ class ImageProtocolTests(unittest.TestCase):
         self.assertEqual(self.terminal.frame().images, ())
         self.assertIn("File download", self.terminal.image_errors[-1])
 
-    def test_sixel_is_ignored_without_images_text_leaks_or_capability(self):
-        """Both SIXEL backgrounds remain unsupported by the native engine."""
+    def test_sixel_adapter_replaces_covered_text_and_uses_native_storage(self):
+        """Both SIXEL backgrounds use native image cells without protocol leakage."""
         self.terminal.feed(b"AB\r")
         for parameter in (b"0", b"1", b"01"):
             wire = SIXEL.replace(b"0;0q", b"0;" + parameter + b"q")
             for byte in wire:
                 self.terminal.feed(bytes((byte,)))
         frame = self.terminal.frame()
-        self.assertEqual("".join(c.text for c in frame.cells[0])[:2], "AB")
+        self.assertEqual("".join(c.text for c in frame.cells[0])[:2], " B")
         self.assertEqual((frame.cursor_x, frame.cursor_y), (0, 0))
-        self.assertEqual(frame.images, ())
+        self.assertEqual(len({image.image_id for image in frame.images}), 1)
         self.assertEqual(self.terminal.image_errors, ())
         self.terminal.feed(b"\x1b[c")
-        self.assertEqual(self.replies.pop(), b"\x1b[?62;22c")
+        self.assertEqual(self.replies.pop(), b"\x1b[?62;22;4c")
+
+    def test_iterm_upload_inside_synchronized_output_waits_for_frame_release(self):
+        """Live storage validation is independent of the frozen display snapshot."""
+        self.terminal.frame()
+        self.terminal.feed(b"\x1b[?2026h" + iterm(png(2, 3)))
+        self.assertEqual(self.terminal.frame().images, ())
+        self.assertEqual(self.terminal.image_errors, ())
+        self.terminal.feed(b"\x1b[?2026l")
+        self.assertEqual(self.image().rgba, RED * 6)
+
+    def test_stationary_iterm_image_never_scrolls_a_smaller_margin_region(self):
+        """doNotMoveCursor also preserves rows outside its image cell rectangle."""
+        self.terminal.feed(
+            b"\x1b[1;5HTOP\x1b[2;5HMID\x1b[3;5HLOW\x1b[4;5HEND\x1b[1;2r\x1b[H"
+        )
+        self.terminal.feed(iterm(png(2, 9), b"inline=1;doNotMoveCursor=1"))
+        frame = self.terminal.frame()
+        self.assertEqual((frame.cursor_x, frame.cursor_y), (0, 0))
+        self.assertEqual(
+            ["".join(cell.text for cell in row)[4:7] for row in frame.cells],
+            ["TOP", "MID", "LOW", "END"],
+        )
+        coverage = {
+            (x, y)
+            for item in frame.images
+            for y in range(item.y, item.y + item.height)
+            for x in range(item.x, item.x + item.width)
+        }
+        self.assertEqual(coverage, {(x, y) for x in range(2) for y in range(9)})
+        self.assertEqual(self.image().rgba, RED * 18)
 
 
 if __name__ == "__main__":

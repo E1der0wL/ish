@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from terminal_scenarios import Scenario
+from test_terminal_cli import STARTUP_DEADLINE
 
 CHUNKS = 8
 CHUNK_ROWS = 160
@@ -71,7 +72,7 @@ def prepare(directory: Path):
 def exercise(terminal, shell, *, resize=None):
     """Compare every retained numbered row, including output produced under popups."""
     scenario = Scenario(terminal, shell, True)
-    terminal.require(terminal.at_prompt)
+    terminal.require(terminal.at_prompt, STARTUP_DEADLINE)
     terminal.submit(f"{shlex.quote(sys.executable)} stress-writer.py")
     for chunk in range(CHUNKS):
         if chunk % 2 == 0:

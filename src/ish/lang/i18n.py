@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
 import re
-import shutil
-import tempfile
-import textwrap
 import threading
 from enum import StrEnum, auto
 from pathlib import Path
@@ -23,22 +19,12 @@ from ish.log import DEFAULT_LOGGER_NAME
 __all__ = ["I18N", "Message"]
 
 
-_DEFAULT_LANG = "en"
-_DEFAULT_ENCODING = "utf-8"
-_JSON_SUFFIX = ".json"
-_JSON_INDENT = 4
-_LANG_STAGE_PREFIX = ".ish-lang-"
-_UNSUPPORTED_HARD_LINK = frozenset({errno.ENOTSUP, errno.EPERM, errno.ENOSYS})
-_FALLBACK_COPY_BYTES = 64 * 1024
-_LOCALE_SEPARATOR = "_"
 _LANGUAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
-_LOCALE_NAME = re.compile(
-    r"(?P<language>[A-Za-z]{2,3})(?:[_-][A-Za-z0-9]+)*"
-    r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)?(?:@[A-Za-z0-9][A-Za-z0-9_-]*)?\Z"
-)
-_LANG_ENV = "LANG"
-_BUNDLED_DIRECTORY = Path(__file__).with_name("locales")
-_FORMATTER = Formatter()
+
+
+def valid_language(value):
+    """Validate the language name shared by configuration and translation lookup."""
+    return isinstance(value, str) and _LANGUAGE_NAME.fullmatch(value) is not None
 
 
 class Message(StrEnum):
@@ -56,96 +42,167 @@ class Message(StrEnum):
         """Return the shipped English template for this key."""
         return self._english
 
-    ERROR = auto(), "An error has been occurred: {error}"
-    FILE_NOT_FOUND = auto(), '"{path}" not found.'
-    CLI_DESCRIPTION = (
+    MANAGE_CONFIG_OPTION = auto(), "Open the settings window without starting a shell."
+    MANAGE_OPTION_CONFLICT = (
         auto(),
-        textwrap.dedent("""\
-        ish - An interactive command editor for Linux shells.
-
-        Run your shell with multiline editing, syntax highlighting,
-        completion, and Python extensions.
-
-        Usage:
-          ish [options] [shell]
-
-        Supported shells:
-          Bash, zsh, dash/sh, BSD csh, and tcsh.
-          The login shell is selected by default.
-
-        Examples:
-          ish
-          ish bash
-          ish /bin/tcsh
-
-        On Windows, run ish inside WSL.
-
-        """),
+        "--config can be combined only with --home, --lang and --no-rc.",
     )
-    CLI_SHELL_SUPPORT = (
+    MANAGE_HELP_TITLE = auto(), "ish — Help"
+    MANAGE_CONFIG_TITLE = auto(), "ish — Settings"
+    MANAGE_OVERVIEW = auto(), "Getting started"
+    MANAGE_KEYS = auto(), "Keys and navigation"
+    MANAGE_SETTINGS = auto(), "Configuration"
+    MANAGE_PLUGINS = auto(), "Plugins and supplements"
+    MANAGE_FEATURES = auto(), "Host features"
+    MANAGE_INPUT = auto(), "Input and display"
+    MANAGE_DIAGNOSTICS = auto(), "Diagnostics and logs"
+    MANAGE_LIMITS = auto(), "Support and limits"
+    MANAGE_OPTIONS = auto(), "Command-line options"
+    MANAGE_GENERAL = auto(), "Language and startup"
+    MANAGE_HELP_KEYS = auto(), "↑↓ Category   Tab Focus   PgUp/PgDn Scroll   Esc Close"
+    MANAGE_CONFIG_KEYS = (
         auto(),
-        textwrap.dedent("""\
-        Supported shell versions:
-          Bash 5.3.9 or newer
-          zsh 5.5.1 or newer
-          tcsh 6.21.00 or newer
-            Requires a dynamically linked Linux tcsh with preload support.
-          BSD csh and dash/sh: see README for support limits.
-
-        Shell versions are not checked automatically. Select a supported version;
-        older versions may fail to initialize or process commands incorrectly.
-
-        Continuation prompts are fixed to Bash '> ', zsh '%_> ', and tcsh '%R? '.
-        Custom PS2 / prompt2 text and command substitutions are replaced at each
-        primary prompt, including after ish_recover. Primary prompts are customizable.
-        """),
+        "Tab Focus   Space Select   Ctrl+S Save   Ctrl+E Edit file   Esc Cancel",
     )
-    CLI_ZSH_MODULE_HELP = (
+    MANAGE_SAVE = auto(), "Save and close"
+    MANAGE_CANCEL = auto(), "Cancel"
+    MANAGE_EDIT = auto(), "Edit .ishrc.py"
+    MANAGE_RELOAD = auto(), "Reload / discard draft"
+    MANAGE_CONFIG_OBJECT = (
         auto(),
-        textwrap.dedent("""\
-        zsh continuation prompt setup:
-          ish enables PROMPT_SUBST at startup and on ish_recover.
-          Hiding queued continuation prompts also needs zsh/zselect.
-          zselect is a zsh module, not a separate program or Python package.
-
-          Load/check inside the zsh selected for ish:
-            builtin zmodload -F zsh/zselect b:zselect
-
-          Install the distribution's zsh and its matching modules:
-            RHEL 8 / AlmaLinux 8: sudo dnf install zsh
-            Debian / Ubuntu: sudo apt-get install zsh zsh-common
-          To repair missing packaged files, use dnf reinstall zsh or
-          apt-get install --reinstall zsh zsh-common with sudo.
-
-          Offline: transfer packages and dependencies from a matching OS
-          release and architecture, or build zsh from an official source
-          archive with its modules. See README, "Installing zsh/zselect",
-          for offline RPM commands and installation under your home.
-          Custom zsh builds need their own matching modules.
-          ish does not install packages or enforce module availability.
-        """),
+        "Assign settings on config; do not replace or delete the config object.",
     )
+    MANAGE_REFRESH = auto(), "Refresh list"
+    MANAGE_FILE = auto(), "Settings file: {path}"
+    MANAGE_ERROR = auto(), "Cannot complete this action: {error}"
+    MANAGE_READ_ERROR = (
+        auto(),
+        "The settings file could not be loaded. Edit the file to fix it; saving is disabled.\n{error}",
+    )
+    MANAGE_NEXT_SESSION = (
+        auto(),
+        "This window changes saved choices for the next session. No plugins or native engine are started here.",
+    )
+    MANAGE_UNSAVED = (
+        auto(),
+        "There are unsaved changes. Save or cancel before opening or reloading the file.",
+    )
+    MANAGE_RELOADED = auto(), "Settings reloaded from disk."
+    MANAGE_EDITOR_MISSING = (
+        auto(),
+        "No editor found. Set VISUAL or EDITOR, or install vi.",
+    )
+    MANAGE_EDITOR_STATUS = auto(), "The editor exited with status {status}."
+    MANAGE_LANG = auto(), "Language"
+    MANAGE_LANG_AUTO = auto(), "Automatic — LANG, then English"
+    MANAGE_LANG_EN = auto(), "English"
+    MANAGE_LANG_KO = auto(), "Korean"
+    MANAGE_SHELL = auto(), "Shell executable"
+    MANAGE_CWD = auto(), "Starting directory"
+    MANAGE_LOG_FILE = auto(), "Log file (empty: disabled)"
+    MANAGE_LOG_LEVEL = auto(), "Log level"
+    MANAGE_ESCAPE = auto(), "ESC / Alt sequence wait (seconds)"
+    MANAGE_PLUGIN_DIR = auto(), "Plugin directory"
+    MANAGE_LIBRARY_DIR = auto(), "Plugin dependency directory"
+    MANAGE_PLUGIN_NOTE = (
+        auto(),
+        "UI plugins and protocol supplements use the same directory and selection list. Only selected modules load at the next startup. Browsing this list does not run plugin code or install dependencies.",
+    )
+    MANAGE_NO_PLUGINS = (
+        auto(),
+        "No plugins found. Choose a directory containing plugin packages and refresh the list.",
+    )
+    MANAGE_PLUGIN_UNAVAILABLE = auto(), "{name} — unavailable: {error}"
+    MANAGE_PLUGIN_MISSING = auto(), "Selected plugin is missing from this directory."
+    MANAGE_FEATURE_NOTE = (
+        auto(),
+        "These are user choices, not detected support. Actual host support has not been queried in this window. Automatic is offered only where ish implements a support query; geometry and restoration requirements still apply to On.",
+    )
+    MANAGE_ON = auto(), "On"
+    MANAGE_OFF = auto(), "Off"
+    MANAGE_AUTO = auto(), "Automatic"
+    MANAGE_QUERY = auto(), "Support query: {query}"
+    MANAGE_UNQUERIED = auto(), "No support query; choose On or Off."
+    MANAGE_MOUSE = auto(), "Mouse policy"
+    MANAGE_CLIPBOARD = auto(), "Program clipboard access"
+    MANAGE_CLIPBOARD_WRITE = auto(), "Write only"
+    MANAGE_CLIPBOARD_BOTH = auto(), "Read and write"
+    MANAGE_COLOR_DEPTH = auto(), "Color depth"
+    MANAGE_INHERIT = auto(), "Inherit PTK / environment"
+    MANAGE_SCROLL_LINES = auto(), "Scrollback line budget"
+    MANAGE_SCROLL_BYTES = auto(), "Scrollback byte budget (0: disabled)"
+    MANAGE_FEATURE_HYPERLINKS = auto(), "Clickable hyperlinks (OSC 8)"
+    MANAGE_FEATURE_EXTENDED_STYLES = auto(), "Extended underline styles and colors"
+    MANAGE_FEATURE_OVERLINE = auto(), "Overline"
+    MANAGE_FEATURE_CURSOR_COLOR = auto(), "Cursor color"
+    MANAGE_FEATURE_ITERM_GRAPHICS = auto(), "iTerm image output"
+    MANAGE_FEATURE_KITTY_GRAPHICS = auto(), "Kitty image output"
+    MANAGE_FEATURE_SIXEL_GRAPHICS = auto(), "SIXEL image output"
+    MANAGE_FEATURE_DESKTOP_NOTIFICATIONS = auto(), "Desktop notifications"
+    MANAGE_FEATURE_SYNCHRONIZED_OUTPUT = auto(), "Synchronized screen updates"
+    MANAGE_FEATURE_ENHANCED_KEYBOARD = auto(), "Extended keyboard protocol"
+    MANAGE_FEATURE_PIXEL_MOUSE = auto(), "Pixel mouse coordinates"
+    MANAGE_FEATURE_CLIPBOARD_PROTOCOL = auto(), "Extended clipboard protocol"
+    MANAGE_FEATURE_SCHEME_NOTIFICATIONS = auto(), "Light / dark theme notifications"
+    MANAGE_STORE_CHANGED = (
+        auto(),
+        "The settings file changed outside this window. Reload it before saving.",
+    )
+    MANAGE_STORE_BLOCK = (
+        auto(),
+        "The managed settings block is malformed or is followed by executable code. Edit .ishrc.py before saving.",
+    )
+    MANAGE_STORE_INVALID = auto(), "Fix the settings file before saving: {error}"
+    MANAGE_STORE_FIELD = auto(), "This setting cannot be edited here: {name}"
+    MANAGE_STORE_VALUE = (
+        auto(),
+        "This value cannot be saved as a Python literal: {name}",
+    )
+    MANAGE_STORE_LINK = (
+        auto(),
+        "The settings path or its link target changed. Reload before saving.",
+    )
+    MANAGE_HELP_OVERVIEW = (
+        auto(),
+        "Run ish to start your native shell in the libghostty + PTK terminal. The default adds no bar, popup, shortcut or shell hook.\n\nExamples:\n  ish\n  ish --shell bash\n  ish --shell zsh --cwd ~/work\n  ish --shell tcsh --no-plugins\n  ish --config\n\nThe shell edits command lines, continuation and heredocs. Programs keep their normal PTY stdin. Bash, zsh and tcsh are the tested shells on Linux/WSL.",
+    )
+    MANAGE_HELP_KEYS_BODY = (
+        auto(),
+        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. ESC / Alt parsing uses escape_delay (default 0.05 seconds).\n\nShift+PageUp / Shift+PageDown scroll internal history. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn these management windows: Tab changes focus, arrows select categories or choices, Space toggles choices, PageUp/PageDown scroll, Esc closes. In settings, Ctrl+S saves and Ctrl+E opens .ishrc.py.",
+    )
+    MANAGE_HELP_SETTINGS_BODY = (
+        auto(),
+        "Use ish --config to edit language, selected plugins, host features and other session choices. Save and close writes only edited values; Cancel does not write. Changes apply at the next startup.\n\nThe one settings file is ~/ish/.ishrc.py, or DIR/.ishrc.py with --home DIR. It is Python code evaluated once when starting a session or loading the settings window. Help, version and diagnose never evaluate it.\n\nExample:\n  config.lang = 'ko'\n  config.plugins = []\n  config.mouse = 'auto'\n  config.features = {'hyperlinks': 'on'}\n\nExplicit CLI choices override this file. Language order is explicit setting (CLI first), LANG, then English. --no-rc skips the file. The settings window preserves your Python code and appends one managed block, backs up the prior file and rejects conflicting edits.\n\nEdit .ishrc.py uses VISUAL, EDITOR, or vi without invoking a shell. Save or cancel draft changes before editing the file.",
+    )
+    MANAGE_HELP_PLUGINS_BODY = (
+        auto(),
+        "UI plugins and protocol supplements share PluginManager, plugin_dir and config.plugins. No second loader or directory is needed.\n\nDefault sources: ~/ish/plugin/script\nDefault dependencies: ~/ish/plugin/lib\n\nEach plugin is a directory with NAME.py or __init__.py and literal PLUGIN_META metadata. Put a trusted package there, refresh the settings list, and select it. Turning it off removes it from the saved selection; source files stay on disk.\n\nA plugin may add bars, popups, search, keys, output protocols or a clipboard provider through the existing API. Configuring a protocol does not enable a UI plugin. Python changes apply at the next session without rebuilding the native engine.\n\n--plugin NAME selects this session's list; --no-plugins disables all. Plugin code is trusted Python and can install its declared dependencies when actually loaded, never while merely browsing settings.",
+    )
+    MANAGE_HELP_FEATURES_BODY = (
+        auto(),
+        "Every feature offers On and Off. Automatic exists only for features with an implemented support query. User policy, query response and actual use are separate facts.\n\nExample:\n  ish --feature hyperlinks=on --feature enhanced_keyboard=auto\n  config.features = {'kitty_graphics': 'off'}\n\nOn does not prove host support and cannot bypass image geometry or cursor restoration prerequisites. Unknown support does not turn an automatic feature on. Host names are not a general allow list.\n\nThe settings page lists every feature and its query, where available. It does not send queries or claim a connected host supports them.",
+    )
+    MANAGE_HELP_INPUT_BODY = (
+        auto(),
+        "Mouse: off preserves host drag selection; auto captures program/UI requests; on also enables local selection. The host can select only currently displayed cells, not hidden native history or content behind a popup.\n\nClipboard defaults to write-only access for programs. Use read-write only when reads are wanted. This is separate from the host terminal's usual copy/paste. The optional clipboard_system supplement can connect Windows/WSL or an available X11 selection. A remote session needs an actual clipboard transport.\n\nColor depth defaults to inherit from PTK/environment. Use --color-depth 24 for explicit RGB. Scrollback line/byte budgets are approximate native page budgets; a byte budget of 0 disables history.",
+    )
+    MANAGE_HELP_DIAGNOSTICS_BODY = (
+        auto(),
+        "ish --version\nish --diagnose\nish --log-file ./ish.log --log-level INFO\n\nHelp, version and diagnostics do not evaluate .ishrc.py, load plugins, start a shell or load the native engine. Diagnostics report defaults and CLI choices, not evaluated saved settings or measured host support.\n\nFile logs are optional. DEBUG, INFO, WARNING, ERROR and CRITICAL are available. Logs contain diagnostics, not native input/output or clipboard content. Console diagnostics are emitted outside the active terminal screen.",
+    )
+    MANAGE_HELP_LIMITS_BODY = (
+        auto(),
+        "Current validation targets Linux/WSL with Bash, zsh and tcsh. This is not a claim that every host, operating system or escape sequence is supported.\n\nSIXEL, Kitty and iTerm images use native storage and the selected host output protocol. SIXEL text writes clear the overlapped image cells; origin/horizontal-margin input remains unsupported. Partial alpha over text requires a host output protocol that supports it. Transparent defaults use the host's background. Some ambiguous legacy keys cannot be distinguished from terminal replies and are not guessed as input.\n\nDesktop notifications are off by default. Optional command navigation uses existing OSC 133 markers and does nothing without them; ish installs no shell hooks.\n\nNormal exit restores the host state ish observed and changed. The final application title is intentionally retained. SIGKILL or loss of the host cannot guarantee restoration.\n\nThe shell owns command editing; ish composes the screen. Host features cannot all be passed through unchanged while also providing screen composition.",
+    )
+
     CLI_ARGUMENTS_TITLE = auto(), "positional arguments"
     CLI_OPTIONS_TITLE = auto(), "options"
     CLI_HELP_OPTION_HELP = auto(), "Show this help message and exit."
-    CLI_SHELL_OPTION_HELP = (
-        auto(),
-        "Specify the shell to use. The login shell is selected by default.",
-    )
     CLI_LANG_OPTION_HELP = (
         auto(),
         "Set the interface language. Otherwise use LANG, with English fallback.",
     )
     CLI_VERSION_OPTION_HELP = auto(), "Show the ish version and exit."
-    CLI_VERSION = auto(), "ish {version}"
-    CLI_NO_RC_OPTION_HELP = (
-        auto(),
-        "Skip loading ish's .ishrc.py startup file. Shell startup files are still read.",
-    )
-    CLI_NO_PLUGINS_OPTION_HELP = (
-        auto(),
-        "Skip automatic plugin loading and dependency installation.",
-    )
     CLI_HOME_OPTION_HELP = (
         auto(),
         "Use DIR for ish settings, plugins, logs, and cache (default: ~/ish). Does not change HOME.",
@@ -154,11 +211,6 @@ class Message(StrEnum):
     CLI_DIAGNOSE_OPTION_HELP = (
         auto(),
         "Print environment diagnostics and exit without loading user code or starting a shell.",
-    )
-    CLI_DIAGNOSE_TITLE = auto(), "ish environment diagnostics"
-    CLI_DIAGNOSE_SCOPE = (
-        auto(),
-        "Read-only snapshot before user rc. No shell, helper, compiler, or plugin was executed; this is not an interactive health check.",
     )
     CLI_DIAGNOSE_VERSION = auto(), "ish version"
     CLI_DIAGNOSE_RUNTIME = auto(), "Runtime"
@@ -171,16 +223,12 @@ class Message(StrEnum):
     CLI_DIAGNOSE_SHELL = auto(), "Requested shell"
     CLI_DIAGNOSE_SHELL_PATH = auto(), "Shell path"
     CLI_DIAGNOSE_SHELL_REALPATH = auto(), "Resolved shell path"
-    CLI_DIAGNOSE_ADAPTER = auto(), "Shell adapter"
-    CLI_DIAGNOSE_UNSUPPORTED = auto(), "Unsupported shell"
     CLI_DIAGNOSE_MISSING = auto(), "Not found"
     CLI_DIAGNOSE_UNAVAILABLE = auto(), "Unavailable"
     CLI_DIAGNOSE_HOME = auto(), "ish home"
     CLI_DIAGNOSE_RC = auto(), "Startup file"
     CLI_DIAGNOSE_RC_POLICY = auto(), "Startup file loading"
     CLI_DIAGNOSE_PLUGINS = auto(), "Plugin directory"
-    CLI_DIAGNOSE_PLUGIN_POLICY = auto(), "Automatic plugin loading"
-    CLI_DIAGNOSE_ENABLED = auto(), "Enabled for interactive startup"
     CLI_DIAGNOSE_DISABLED = auto(), "Disabled"
     CLI_DIAGNOSE_LANGUAGE = auto(), "Selected language"
     CLI_DIAGNOSE_LANGUAGE_DIR = auto(), "Language directory"
@@ -194,42 +242,16 @@ class Message(StrEnum):
     CLI_DIAGNOSE_CACHE_NOEXEC = auto(), "Cache filesystem noexec"
     CLI_DIAGNOSE_YES = auto(), "Yes"
     CLI_DIAGNOSE_NO = auto(), "No"
-    CLI_DIAGNOSE_HELPER = auto(), "State helper"
-    CLI_DIAGNOSE_HELPER_SOURCE = (
-        auto(),
-        "Built at session startup using GCC: {compiler}",
-    )
-    CLI_DIAGNOSE_HELPER_BUNDLED = (
-        auto(),
-        "Bundled file present: {path}; execution was not tested",
-    )
-    CLI_DIAGNOSE_HELPER_MISSING = auto(), "Bundled file missing: {path}"
     CLI_DIAGNOSE_TERMINAL = auto(), "TERM"
     CLI_DIAGNOSE_STDIN_TTY = auto(), "Standard input is a TTY"
     CLI_DIAGNOSE_STDOUT_TTY = auto(), "Standard output is a TTY"
     CLI_DIAGNOSE_TERMINAL_SIZE = auto(), "Terminal size"
     CLI_DIAGNOSE_TERMINAL_DIMENSIONS = auto(), "{columns} columns x {rows} rows"
-    PROMPT_OS_ERROR = (
-        auto(),
-        "This program is designed to run only on 'Linux' operating systmes.",
-    )
-    PROMPT_SHELL_INIT_ERROR = (
-        auto(),
-        "An error occurred during shell initialization:\r\n{error}",
-    )
-    PROMPT_SHELL_PATH_NOT_FOUND = auto(), "Shell path not found: {path}"
-    PROMPT_RC_NOT_FOUND = auto(), "{path} not found. Running default shell."
-    PROMPT_BINARY_BUILD_DONE = (
-        auto(),
-        "Binary build completed successfully. (Path: {path})",
-    )
     PM_LOAD_ERROR = (
         auto(),
         "An Error has been occurred while resolving plugin {plugin_file}:\r\n{error}",
     )
     PM_LOAD_FAIL = auto(), "Failed to load plugin '{plugin_file}'"
-    PM_PYTHON_NOT_FOUND = auto(), "Failed to find python. Cannot load"
-    PM_PYTHON_VERSION_MISMATCH = auto(), "{value} != {req}"
     PM_EXPECT_STRING = auto(), "expected a string"
     PM_EXPECT_STRINGS = auto(), "expected a list or tuple of strings"
     PM_META_MAPPING = auto(), "{field} must be a mapping"
@@ -306,14 +328,12 @@ class Message(StrEnum):
     I18N_MESSAGES_ERROR = auto(), "Language messages must map strings to strings"
     I18N_FIELDS_ERROR = auto(), "Translation placeholders do not match {name}"
     I18N_FORMAT_ERROR = auto(), "Invalid translation template for {name}: {error}"
-    I18N_CREATE_ERROR = auto(), "Cannot create language file {path}: {error}"
     I18N_LOAD_ERROR = auto(), "Cannot load language file {path}: {error}"
 
     # Shared logging and native transport diagnostics.
     LOG_DESTINATION = auto(), "Log destination must be a regular file"
     LOG_OUTPUT_ERROR = auto(), "Log output failed: {error}"
     LOG_LEVEL_ERROR = auto(), "Unknown log level: {value}"
-    INPUT_PREFIX_ERROR = auto(), "Native prefix is outside the input payload"
     WRITER_CLOSED = auto(), "Writer is closed"
     WRITE_LIMIT = auto(), "Pending terminal writes exceed the byte limit"
     WRITE_EMPTY = auto(), "write returned zero bytes"
@@ -321,160 +341,84 @@ class Message(StrEnum):
     INPUT_LIMIT = auto(), "Pending startup input exceeds the byte limit"
 
     # Native-stream startup and UI messages.
-    STREAM_SETTING_LANG = auto(), "lang must be a nonempty language code or None"
-    STREAM_SETTING_SHELL = auto(), "shell must be a nonempty executable name or path"
-    STREAM_SETTING_LIST = auto(), "{name} must be a list of strings"
-    STREAM_SETTING_PLUGINS = auto(), "plugins must contain nonempty names"
-    STREAM_SETTING_PATH = auto(), "{name} must be a path"
-    STREAM_SETTING_LEVEL = auto(), "log_level must be one of {levels}"
-    STREAM_SETTING_ESCAPE = (
+    STARTUP_SETTING_LANG = auto(), "lang must be a nonempty language code or None"
+    STARTUP_SETTING_SHELL = auto(), "shell must be a nonempty executable name or path"
+    STARTUP_SETTING_LIST = auto(), "{name} must be a list of strings"
+    STARTUP_SETTING_PLUGINS = auto(), "plugins must contain nonempty names"
+    STARTUP_SETTING_PATH = auto(), "{name} must be a path"
+    STARTUP_SETTING_LEVEL = auto(), "log_level must be one of {levels}"
+    STARTUP_SETTING_ESCAPE = (
         auto(),
         "escape_delay must be between {minimum} and {maximum} seconds",
     )
-    STREAM_RC_FILE_ERROR = auto(), "configuration must be a regular Python file"
-    STREAM_RC_ERROR = auto(), "Cannot load configuration {path}: {error}"
-    STREAM_ARG_ERROR = auto(), "argument {argument}: {error}"
-    STREAM_ARG_UNKNOWN = auto(), "unrecognized arguments: {arguments}"
-    STREAM_ARG_EXPECTED = auto(), "expected one argument"
-    STREAM_ARG_CONFLICT = auto(), "not allowed with argument {argument}"
-    STREAM_ARG_CHOICE = auto(), "invalid choice: {value} (choose from {choices})"
-    STREAM_ARG_VALUE = auto(), "invalid {kind} value: {value}"
-    STREAM_ARG_EXPLICIT = auto(), "ignored explicit argument {value}"
-    STREAM_META_DIR = auto(), "DIR"
-    STREAM_META_SECONDS = auto(), "SECONDS"
-    STREAM_META_SHELL = auto(), "SHELL"
-    STREAM_META_NAME = auto(), "NAME"
-    STREAM_META_PATH = auto(), "PATH"
-    STREAM_META_ARG = auto(), "ARG"
-    STREAM_META_LANG = auto(), "LANG"
-    STREAM_DESCRIPTION = (
-        auto(),
-        "ish - Run a native shell with direct terminal output and optional prompt-time Python plugins.",
-    )
-    STREAM_VERSION = auto(), "ish {version}"
-    STREAM_NO_RC_HELP = auto(), "Skip ish's .ishrc.py for this session."
-    STREAM_NO_PLUGINS_HELP = auto(), "Disable all selected plugins for this session."
-    STREAM_ESCAPE_DELAY_HELP = (
+    STARTUP_RC_FILE_ERROR = auto(), "configuration must be a regular Python file"
+    STARTUP_RC_ERROR = auto(), "Cannot load configuration {path}: {error}"
+    STARTUP_ARG_ERROR = auto(), "argument {argument}: {error}"
+    STARTUP_ARG_UNKNOWN = auto(), "unrecognized arguments: {arguments}"
+    STARTUP_ARG_EXPECTED = auto(), "expected one argument"
+    STARTUP_ARG_CONFLICT = auto(), "not allowed with argument {argument}"
+    STARTUP_ARG_CHOICE = auto(), "invalid choice: {value} (choose from {choices})"
+    STARTUP_ARG_VALUE = auto(), "invalid {kind} value: {value}"
+    STARTUP_ARG_EXPLICIT = auto(), "ignored explicit argument {value}"
+    STARTUP_META_DIR = auto(), "DIR"
+    STARTUP_META_SECONDS = auto(), "SECONDS"
+    STARTUP_META_SHELL = auto(), "SHELL"
+    STARTUP_META_NAME = auto(), "NAME"
+    STARTUP_META_PATH = auto(), "PATH"
+    STARTUP_META_ARG = auto(), "ARG"
+    STARTUP_META_LANG = auto(), "LANG"
+    STARTUP_NO_RC_HELP = auto(), "Skip ish's .ishrc.py for this session."
+    STARTUP_NO_PLUGINS_HELP = auto(), "Disable all selected plugins for this session."
+    STARTUP_ESCAPE_DELAY_HELP = (
         auto(),
         "Wait SECONDS to distinguish ESC from Alt sequences (default: 0.05).",
     )
-    STREAM_RC_NOT_EXECUTED = auto(), "Not executed (read-only query)"
-    STREAM_DIAGNOSE_ESCAPE_DELAY = auto(), "Escape sequence delay (seconds)"
-    STREAM_USAGE = auto(), "usage: "
-    STREAM_PARSE_ERROR = auto(), "error: {error}"
-    STREAM_SHELL_HELP = (
+    STARTUP_RC_NOT_EXECUTED = auto(), "Not executed (read-only query)"
+    STARTUP_DIAGNOSE_ESCAPE_DELAY = auto(), "Escape sequence delay (seconds)"
+    STARTUP_USAGE = auto(), "usage: "
+    STARTUP_PARSE_ERROR = auto(), "error: {error}"
+    STARTUP_SHELL_HELP = (
         auto(),
         "Run SHELL; the account's login shell is selected by default.",
     )
-    STREAM_CWD_HELP = auto(), "Start the shell in DIR (default: current directory)."
-    STREAM_PLUGIN_HELP = (
+    STARTUP_CWD_HELP = auto(), "Start the shell in DIR (default: current directory)."
+    STARTUP_PLUGIN_HELP = (
         auto(),
         "Select Python plugins instead of the rc list; repeat to select more.",
     )
-    STREAM_PLUGIN_DIR_HELP = (
+    STARTUP_PLUGIN_DIR_HELP = (
         auto(),
         "Read selected Python plugins from DIR instead of the bundled directory.",
     )
-    STREAM_PLUGIN_LIB_HELP = auto(), "Use DIR for plugin Python dependencies."
-    STREAM_INTEGRATION_HELP = (
-        auto(),
-        "Read the selected shell integration's text resources from DIR.",
-    )
-    STREAM_LOGIN_HELP = (
-        auto(),
-        "Start a login shell; unsupported plugin startup modes fall back to native operation.",
-    )
-    STREAM_SHELL_ARG_HELP = (
+    STARTUP_PLUGIN_LIB_HELP = auto(), "Use DIR for plugin Python dependencies."
+    STARTUP_SHELL_ARG_HELP = (
         auto(),
         "Replace the default -i shell arguments; repeat as --shell-arg=ARG.",
     )
-    STREAM_LOG_FILE_HELP = (
+    STARTUP_LOG_FILE_HELP = (
         auto(),
         "Append logs to PATH; without PATH use ish's configured log file.",
     )
-    STREAM_LOG_LEVEL_HELP = auto(), "Set the log threshold (default: WARNING)."
-    STREAM_PLATFORM_ERROR = (
+    STARTUP_LOG_LEVEL_HELP = auto(), "Set the log threshold (default: WARNING)."
+    STARTUP_PLATFORM_ERROR = (
         auto(),
         "ish requires Linux/WSL with a controlling PTY.",
     )
-    STREAM_TTY_ERROR = auto(), "Standard input and output must be terminals."
-    STREAM_SHELL_ERROR = auto(), "Shell executable not found: {shell}"
-    STREAM_CWD_ERROR = auto(), "Working directory not found: {path}"
-    STREAM_FALLBACK = auto(), "{error}; starting without UI"
-    STREAM_UI_ERROR = auto(), "Plugin UI disabled: {error}"
-    STREAM_CLEANUP_ERROR = auto(), "Plugin cleanup failed: {error}"
-    STREAM_SESSION_ERROR = auto(), "Session error: {error}"
-    STREAM_DIAGNOSE_TITLE = auto(), "ish environment diagnostics"
-    STREAM_DIAGNOSE_SCOPE = (
-        auto(),
-        "Read-only CLI/default settings; .ishrc.py was not executed. No shell or plugin was executed; selected plugins do not certify runtime support or readiness.",
-    )
-    STREAM_DIAGNOSE_CWD = auto(), "Shell working directory"
-    STREAM_DIAGNOSE_ARGS = auto(), "Shell arguments"
-    STREAM_DIAGNOSE_SELECTED_PLUGINS = auto(), "Selected plugins"
-    STREAM_DIAGNOSE_PLUGIN_LIB = auto(), "Plugin library directory"
-    STREAM_DIAGNOSE_INTEGRATIONS = auto(), "Shell integration directory"
-    STREAM_DIAGNOSE_LOG_FILE = auto(), "Log file"
-    STREAM_DIAGNOSE_LOG_LEVEL = auto(), "Log threshold"
+    STARTUP_TTY_ERROR = auto(), "Standard input and output must be terminals."
+    STARTUP_SHELL_ERROR = auto(), "Shell executable not found: {shell}"
+    STARTUP_CWD_ERROR = auto(), "Working directory not found: {path}"
+    STARTUP_DIAGNOSE_CWD = auto(), "Shell working directory"
+    STARTUP_DIAGNOSE_ARGS = auto(), "Shell arguments"
+    STARTUP_DIAGNOSE_SELECTED_PLUGINS = auto(), "Selected plugins"
+    STARTUP_DIAGNOSE_PLUGIN_LIB = auto(), "Plugin library directory"
+    STARTUP_DIAGNOSE_LOG_FILE = auto(), "Log file"
+    STARTUP_DIAGNOSE_LOG_LEVEL = auto(), "Log threshold"
 
     # Optional plugin registration, rendering and shell integration.
-    STREAM_PLUGIN_ONCE = auto(), "Stream plugins can only be loaded once"
-    STREAM_PLUGIN_MISSING = auto(), "Cannot load stream plugin: {name}"
-    STREAM_PLUGIN_API = auto(), "Unsupported stream plugin API: {name}"
-    STREAM_PLUGIN_SETUP = auto(), "Stream plugin has no setup function: {name}"
-    STREAM_PLUGIN_CLEANUP = auto(), "Plugin setup must return a cleanup or None"
-    STREAM_REGISTER_SETUP = auto(), "Stream registration is only available during setup"
-    STREAM_BAR_EXISTS = auto(), "A stream bar is already registered"
-    STREAM_BAR_REQUIRED = auto(), "A bar provider must not be None"
-    STREAM_POPUP_EXISTS = auto(), "A stream popup is already registered"
-    STREAM_POPUP_CALLABLE = auto(), "A popup factory must be callable"
-    STREAM_SHELL_CALLBACKS = (
-        auto(),
-        "A shell registration needs matching and build functions",
-    )
-    STREAM_SHELL_MISSING = (
-        auto(),
-        "No prompt integration is installed for this shell in the selected plugins",
-    )
-    STREAM_SHELL_MULTIPLE = auto(), "Multiple selected plugins support this shell"
-    STREAM_SCRIPT_READ = auto(), "Cannot read shell integration: {path}"
-    STREAM_SCRIPT_CONTRACT = auto(), "Unsupported shell integration contract: {path}"
-    STREAM_SCRIPT_TOKEN = auto(), "Unknown integration placeholder {token}: {path}"
-    STREAM_NONCE_INVALID = auto(), "Invalid shell notification nonce"
-    STREAM_HOME_ABSOLUTE = auto(), "Shell integration requires an absolute HOME"
-    STREAM_PANEL_ROW = auto(), "Panel top must be a positive terminal row"
-    STREAM_PANEL_ONCE = auto(), "Panel can only be started once"
-    STREAM_PANEL_SIZE = auto(), "Panel dimensions must be positive"
-    STREAM_PANEL_NOT_RUNNING = auto(), "Panel is not running"
-    STREAM_POPUP_VIEW = auto(), "A popup factory must return PopupView"
-    STREAM_BASH_STARTUP = (
-        auto(),
-        "Bash prompt decorations require a non-login interactive shell",
-    )
-    STREAM_ZSH_STARTUP = (
-        auto(),
-        "zsh prompt decorations require non-login interactive startup",
-    )
-    STREAM_TCSH_STARTUP = (
-        auto(),
-        "tcsh prompt decorations require non-login interactive startup",
-    )
-    STREAM_SHELL_PATH = (
-        auto(),
-        "Shell integration paths must not contain line breaks or NUL",
-    )
-    STREAM_BASH_VERSION = auto(), "ish prompt decorations require Bash 5.1 or later"
+    STARTUP_PLUGIN_CLEANUP = auto(), "Plugin setup must return a cleanup or None"
 
     # Native-stream diagnostics and optional sample UI.
-    STREAM_CHILD_EXIT = auto(), "Child exit status={status}; draining output"
-    STREAM_SHELL_EVENT = auto(), "Shell event kind={kind} serial={serial}"
-    STREAM_POPUP_REQUEST = auto(), "Popup request stage={stage} serial={serial}"
-    STREAM_POPUP_FOCUS = auto(), "Popup focus={focus}"
-    STREAM_RESIZE = auto(), "Terminal resize columns={columns} rows={rows}"
-    STREAM_SESSION_START = auto(), "Session start shell={shell} plugins={plugins}"
-    STREAM_SESSION_EXIT = auto(), "Session exit status={status}"
-    STREAM_SAMPLE_BAR = auto(), "ish stream | native shell | F2 popup"
-    STREAM_SAMPLE_POPUP = auto(), "Plugin popup | Enter accepts | Esc cancels"
+    STARTUP_SAMPLE_POPUP = auto(), "Plugin popup | Enter accepts | Esc cancels"
 
     # Hookless VT plugin selection and optional sample UI.
     VT_PLUGIN_HELP = (
@@ -499,7 +443,7 @@ class Message(StrEnum):
         auto(),
         "Run a native shell in a hookless libghostty-vt + PTK terminal; no UI plugins by default.",
     )
-    VT_VERSION = auto(), "ish-vt {version} (separate VT experiment)"
+    VT_VERSION = auto(), "ish {version}"
     VT_LOGIN_HELP = (
         auto(),
         "Start the native shell with -l; shell startup files remain unchanged.",
@@ -522,28 +466,27 @@ class Message(StrEnum):
     )
     VT_SETTING_CHOICE = auto(), "{name} must be one of: {choices}"
     VT_SETTING_LIMIT = auto(), "{name} must be an integer from 0 to {maximum}"
-    VT_SETTING_NAMESPACE = auto(), "config.vt must be a dictionary of VT settings"
-    VT_SETTING_UNKNOWN = auto(), "Unknown config.vt setting: {name}"
+    VT_SETTING_UNKNOWN = auto(), "Unknown setting: {name}"
     VT_FEATURES_MAPPING = (
         auto(),
-        "config.vt.features must be a dictionary of feature names and on/off/auto policies",
+        "config.features must be a dictionary of feature names and on/off/auto policies",
     )
     VT_FEATURE_ASSIGNMENT = auto(), "Feature selection must use NAME=on|off|auto"
     VT_FEATURE_HELP = (
         auto(),
-        "Set one host feature to on, off, or auto; repeat for multiple features. CLI overrides the matching config.vt.features entry. Auto uses implemented support queries only. clipboard_protocol selects OSC5522 host transport, not clipboard access permission.",
+        "Set one host feature to on, off, or auto; repeat for multiple features. CLI overrides the matching config.features entry. Auto uses implemented support queries only. clipboard_protocol selects OSC5522 host transport, not clipboard access permission.",
     )
     VT_DIAGNOSE_FEATURES = auto(), "Requested feature policies (host not probed)"
     VT_FEATURE_STATUS = (
         auto(),
         "{name}: policy={policy}, support={support}, active={active}, reason={reason}",
     )
-    VT_DIAGNOSE_TITLE = auto(), "ish-vt environment diagnostics"
+    VT_DIAGNOSE_TITLE = auto(), "ish environment diagnostics"
     VT_DIAGNOSE_SCOPE = (
         auto(),
-        "Read-only configuration report: rc, plugins, shell and native library are not executed; host features are not probed. This is separate from ish's stream path.",
+        "Read-only configuration report: rc, plugins, shell and native library are not executed; host features are not probed.",
     )
-    VT_DIAGNOSE_NAMESPACE = auto(), "VT settings namespace"
+    VT_DIAGNOSE_NAMESPACE = auto(), "Settings object"
     VT_DIAGNOSE_MOUSE = auto(), "Mouse capture"
     VT_CURSOR_DEFAULT = auto(), "Invalid default cursor shape or blink setting"
     VT_LIBRARY_LOAD = (
@@ -623,7 +566,7 @@ class Message(StrEnum):
     VT_DIAGNOSE_LIBRARY_PRESENT = auto(), "Native library file exists (not loaded)"
     VT_SESSION_START = auto(), "VT session start shell={shell} plugins={plugins}"
     VT_SESSION_EXIT = auto(), "VT session exit status={status}"
-    VT_SESSION_ERROR = auto(), "ish-vt session failed: {error}"
+    VT_SESSION_ERROR = auto(), "ish session failed: {error}"
     VT_NATIVE_LOGS = (
         auto(),
         "Native diagnostics (payloads omitted): error={error}, warning={warning}, info={info}, debug={debug}",
@@ -761,33 +704,6 @@ class Message(StrEnum):
 
 
 _DEFAULT_MESSAGES = MappingProxyType({item.value: item.english for item in Message})
-_MESSAGE_FIELDS = {
-    key: {field for _, field, _, _ in _FORMATTER.parse(value) if field is not None}
-    for key, value in _DEFAULT_MESSAGES.items()
-}
-
-
-def _publish_missing(staged: Path, destination: Path) -> None:
-    """Publish completed JSON without replacing a concurrently created language file."""
-    try:
-        destination.hardlink_to(staged)
-        return
-    except FileExistsError:
-        return
-    except OSError as exc:
-        if exc.errno not in _UNSUPPORTED_HARD_LINK:
-            raise
-
-    # FAT-like mounts may allow ordinary files but forbid links. Exclusive
-    # creation still preserves another writer's file; a reader can observe
-    # this fallback copy in progress.
-    with staged.open("rb") as source:
-        try:
-            target = destination.open("xb")
-        except FileExistsError:
-            return
-        with target:
-            shutil.copyfileobj(source, target, _FALLBACK_COPY_BYTES)
 
 
 class _TranslationError(ValueError):
@@ -802,6 +718,18 @@ class _TranslationError(ValueError):
 class _Messages(dict):
     """Validate message mutations once, retaining ordinary dictionary reads."""
 
+    FORMATTER = Formatter()
+    FIELDS = MappingProxyType(
+        {
+            key: frozenset(
+                field
+                for _, field, _, _ in Formatter().parse(value)
+                if field is not None
+            )
+            for key, value in _DEFAULT_MESSAGES.items()
+        }
+    )
+
     __slots__ = ("translate",)
 
     def __init__(self, *args, translate=None, **kwargs):
@@ -810,23 +738,23 @@ class _Messages(dict):
         self.translate = translate
         self.update(*args, **kwargs)
 
-    @staticmethod
-    def _validate_entry(key, value):
+    @classmethod
+    def _validate_entry(cls, key, value):
         """Keep the same string-to-string contract for every mutation path."""
         if not isinstance(key, str) or not isinstance(value, str):
             raise _TranslationError(Message.I18N_MESSAGES_ERROR)
-        if key in _MESSAGE_FIELDS:
+        if key in cls.FIELDS:
             try:
                 fields = {
                     field
-                    for _, field, _, _ in _FORMATTER.parse(value)
+                    for _, field, _, _ in cls.FORMATTER.parse(value)
                     if field is not None
                 }
             except ValueError as error:
                 raise _TranslationError(
                     Message.I18N_FORMAT_ERROR, name=key, error=error
                 ) from error
-            if fields != _MESSAGE_FIELDS[key]:
+            if fields != cls.FIELDS[key]:
                 raise _TranslationError(Message.I18N_FIELDS_ERROR, name=key)
 
     def _validate(self, key, value):
@@ -867,10 +795,21 @@ class _Messages(dict):
 class I18N:
     """Thread-safe message manager combining built-in defaults and language files."""
 
+    DEFAULT_LANG = "en"
+    DEFAULT_ENCODING = "utf-8"
+    JSON_SUFFIX = ".json"
+    LOCALE_SEPARATOR = "_"
+    LOCALE_NAME = re.compile(
+        r"(?P<language>[A-Za-z]{2,3})(?:[_-][A-Za-z0-9]+)*"
+        r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)?(?:@[A-Za-z0-9][A-Za-z0-9_-]*)?\Z"
+    )
+    LANG_ENV = "LANG"
+    BUNDLED_DIRECTORY = Path(__file__).with_name("locales")
+
     def __init__(self, encoder: Optional[str] = None):
         """Initialize the encoding, selected language, default messages, and update lock."""
-        self.encoder = encoder or _DEFAULT_ENCODING
-        self.default_lang: str = _DEFAULT_LANG
+        self.encoder = encoder or self.DEFAULT_ENCODING
+        self.default_lang: str = self.DEFAULT_LANG
         self.current_lang: str = self._detect()
         self.base_path: Path = config.LANG_DIR
 
@@ -890,51 +829,20 @@ class I18N:
 
     def _language_path(self, lang: str) -> Path:
         """Map a language name to its JSON file under the current base directory."""
-        if not isinstance(lang, str) or not _LANGUAGE_NAME.fullmatch(lang):
+        if not valid_language(lang):
             raise ValueError(self.get(Message.I18N_LANGUAGE_ERROR))
-        return self.base_path / (lang + _JSON_SUFFIX)
-
-    def _get_lang_file(self, lang: Optional[str], *, create: bool = True) -> Path:
-        """Find the selected or default language file, optionally saving missing defaults."""
-        default_file = self._language_path(self.default_lang)
-
-        lang = lang or self.current_lang
-        lang_file = self._language_path(lang)
-        if lang_file.exists():
-            return lang_file
-
-        if default_file.exists():
-            return default_file
-
-        if not create:
-            return default_file
-
-        self.base_path.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            dir=default_file.parent, prefix=_LANG_STAGE_PREFIX
-        ) as temporary:
-            staged = Path(temporary) / default_file.name
-            with staged.open("w", encoding=self.encoder) as stream:
-                json.dump(
-                    dict(_DEFAULT_MESSAGES),
-                    stream,
-                    ensure_ascii=False,
-                    indent=_JSON_INDENT,
-                )
-            _publish_missing(staged, default_file)
-
-        return default_file
+        return self.base_path / (lang + self.JSON_SUFFIX)
 
     def _detect(self) -> str:
         """Read LANG only, independently of installed locales and LC_* overrides."""
-        match = _LOCALE_NAME.fullmatch(os.environ.get(_LANG_ENV, ""))
+        match = self.LOCALE_NAME.fullmatch(os.environ.get(self.LANG_ENV, ""))
         return match.group("language").lower() if match else self.default_lang
 
-    def load(self, lang: Optional[str] = None, *, create: bool = True, logger=None):
+    def load(self, lang: Optional[str] = None, *, logger=None):
         """Merge English defaults, user fallback, shipped locale and user locale.
 
         Log invalid JSON and read errors, and discard stale translations from the
-        previous language. Set create=False for CLI queries that must not write files.
+        previous language. Reading translations never creates or changes files.
         """
         logger = logger or logging.getLogger(DEFAULT_LOGGER_NAME)
         selected = self._detect() if lang is None else lang
@@ -943,18 +851,14 @@ class I18N:
         selected_path = self._language_path(selected)
         default_path = self._language_path(self.default_lang)
         diagnostics = []
-        try:
-            self._get_lang_file(selected, create=create)
-        except OSError as error:
-            diagnostics.append((Message.I18N_CREATE_ERROR, default_path, error))
         # User English remains the fallback for untranslated keys. A shipped
         # locale then supplies its translations, and the selected user file wins.
         language = (
-            selected.replace("-", _LOCALE_SEPARATOR)
-            .partition(_LOCALE_SEPARATOR)[0]
+            selected.replace("-", self.LOCALE_SEPARATOR)
+            .partition(self.LOCALE_SEPARATOR)[0]
             .lower()
         )
-        paths = [default_path, _BUNDLED_DIRECTORY / (language + _JSON_SUFFIX)]
+        paths = [default_path, self.BUNDLED_DIRECTORY / (language + self.JSON_SUFFIX)]
         if selected_path != default_path:
             paths.append(selected_path)
         for path in paths:

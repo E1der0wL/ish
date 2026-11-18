@@ -430,12 +430,14 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with (
                     patch.object(
-                        sample,
+                        sample.SystemClipboard,
                         "WINDOWS_WRITE",
                         (sys.executable, "-c", write, str(path)),
                     ),
                     patch.object(
-                        sample, "WINDOWS_READ", (sys.executable, "-c", read, str(path))
+                        sample.SystemClipboard,
+                        "WINDOWS_READ",
+                        (sys.executable, "-c", read, str(path)),
                     ),
                 ):
                     for text in ("한글 😀\n$(literal)", ""):
@@ -461,7 +463,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         try:
             with patch.object(
-                sample,
+                sample.SystemClipboard,
                 "WINDOWS_READ",
                 (
                     sys.executable,
@@ -473,7 +475,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
                     await provider.read()
                 self.assertEqual(error.exception.errno, errno.EFBIG)
             with patch.object(
-                sample,
+                sample.SystemClipboard,
                 "WINDOWS_READ",
                 (sys.executable, "-c", "import time; time.sleep(60)"),
             ):

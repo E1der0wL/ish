@@ -6,48 +6,9 @@ import errno
 import os
 import stat
 from collections import deque
-from operator import index
 from typing import Callable
 
 from ish.lang import Message, i18n
-
-_DEFAULT_QUEUE_BYTES = 4 * 1024 * 1024
-_FLUSH_BYTES = 64 * 1024
-_FLUSH_ATTEMPTS = 16
-_PAUSE_DIVISOR = 2
-_RESUME_DIVISOR = 4
-
-
-class InputBytes(bytes):
-    """Carry a native-text prefix through a shell send without changing its byte API.
-
-    The prefix has already passed through a previous PTY. If a send is rejected
-    before writing all of it, that unsent part must retain its text provenance.
-    Bytes after the prefix are fresh key input.
-    """
-
-    def __new__(cls, data: bytes, native_prefix: int = 0):
-        """Validate the prefix against the immutable payload."""
-        value = super().__new__(cls, data)
-        value.native_prefix = cls._prefix_size(value, native_prefix)
-        return value
-
-    @staticmethod
-    def _prefix_size(data: bytes, length: int) -> int:
-        size = index(length)
-        if not 0 <= size <= len(data):
-            raise ValueError(i18n.get(Message.INPUT_PREFIX_ERROR))
-        return size
-
-    @staticmethod
-    def native_size(data: bytes) -> int:
-        """Return the leading byte count already offered to a PTY; plain input is fresh."""
-        # The byte payload is immutable, but callers can update the public tag.
-        return (
-            InputBytes._prefix_size(data, data.native_prefix)
-            if isinstance(data, InputBytes)
-            else 0
-        )
 
 
 class FDWriter:
@@ -56,6 +17,12 @@ class FDWriter:
     The owner must set O_NONBLOCK and close this writer before closing its fd.
     A bounded amount of work per callback also makes repeated EINTR yield.
     """
+
+    _DEFAULT_QUEUE_BYTES = 4 * 1024 * 1024
+    _FLUSH_BYTES = 64 * 1024
+    _FLUSH_ATTEMPTS = 16
+    _PAUSE_DIVISOR = 2
+    _RESUME_DIVISOR = 4
 
     def __init__(
         self,
@@ -96,9 +63,7 @@ class FDWriter:
         if data:
             if self.pending_bytes + len(data) > self.max_pending_bytes:
                 raise BufferError(i18n.get(Message.WRITE_LIMIT))
-            # A tagged handoff is immutable too. Converting it to plain bytes
-            # would copy the entire payload solely to queue a read-only view.
-            payload = data if type(data) is InputBytes else bytes(data)
+            payload = bytes(data)
             self.pending.append(memoryview(payload))
             self.pending_bytes += len(data)
             self._flush()
@@ -131,9 +96,9 @@ class FDWriter:
         """Drain the queue within a callback work budget and wait for readiness as needed."""
         if self.closed or self.error:
             return
-        budget = _FLUSH_BYTES
+        budget = self._FLUSH_BYTES
         try:
-            for _ in range(_FLUSH_ATTEMPTS):
+            for _ in range(self._FLUSH_ATTEMPTS):
                 if not self.pending or budget <= 0:
                     break
                 data = self.pending[0]
@@ -167,13 +132,15 @@ class FDWriter:
             if self.on_flow:
                 if (
                     not self._paused
-                    and self.pending_bytes >= self.max_pending_bytes // _PAUSE_DIVISOR
+                    and self.pending_bytes
+                    >= self.max_pending_bytes // self._PAUSE_DIVISOR
                 ):
                     self._paused = True
                     self.on_flow(True)
                 elif (
                     self._paused
-                    and self.pending_bytes <= self.max_pending_bytes // _RESUME_DIVISOR
+                    and self.pending_bytes
+                    <= self.max_pending_bytes // self._RESUME_DIVISOR
                 ):
                     self._paused = False
                     self.on_flow(False)
@@ -210,15 +177,9 @@ class FDWriter:
         self._wake()
 
     def discard(self) -> None:
-        """Cancel queued bytes without closing the writer, for an interrupted submission."""
+        """Cancel queued bytes without closing the writer, when its owner cancels queued output."""
         self._drop_pending()
         if self._paused:
             self._paused = False
             if self.on_flow and not self.closed:
                 self.on_flow(False)
-
-    def take(self) -> bytes:
-        """Detach unsent bytes in order before transferring input to another consumer."""
-        data = b"".join(self.pending)
-        self.discard()
-        return data

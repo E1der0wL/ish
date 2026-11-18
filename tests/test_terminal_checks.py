@@ -25,9 +25,13 @@ CONTRACT_MODULES = (
     "test_terminal_composition",
     "test_terminal_contracts",
     "test_terminal_cursor",
+    "test_terminal_distribution",
     "test_terminal_engine",
     "test_terminal_extensions",
     "test_terminal_features",
+    "test_terminal_geometry",
+    "test_terminal_sixel",
+    "test_terminal_optional",
     "test_terminal_graphics",
     "test_terminal_graphics_vt",
     "test_terminal_hookless",
@@ -47,6 +51,20 @@ CONTRACT_MODULES = (
     "test_terminal_vt",
     "test_plugin_loading",
     "test_plugin_dependencies",
+    "test_i18n",
+    "test_diagnostics",
+    "test_logging",
+    "test_management_store",
+    "test_management_ui",
+    "test_management_restore",
+)
+HELPER_FILES = (
+    "tests/comparison_terminal.py",
+    "tests/comparison_child.py",
+    "tests/comparison_apps.py",
+    "tests/comparison_images.py",
+    "tests/terminal_presentation.py",
+    "tests/terminal_keyboard.py",
 )
 GUI_MODULES = (
     "test_terminal_appearance_gui",
@@ -60,6 +78,51 @@ GUI_MODULES = (
 # Do not import or derive these expectations from tools.terminal_contracts.
 # IDs protect the stated examples; they are not claims of complete B/P coverage.
 CASE_CONTRACTS = (
+    (
+        "MG03",
+        "test_management_restore.ManagementRestoreTests",
+        (
+            "test_close_keys_restore_observed_modes_cursor_and_attributes",
+            "test_probe_precedes_paint_and_keeps_interleaved_keys_in_order",
+            "test_external_editor_handoff_restores_then_reenters_the_screen",
+            "test_unanswered_probe_does_not_restore_late_unobserved_values",
+            "test_restore_only_probe_cannot_enable_features_even_if_explicitly_on",
+        ),
+    ),
+    (
+        "MG01",
+        "test_management_ui.PublicManagementTests",
+        (
+            "test_help_is_categorized_readonly_and_does_not_execute_rc_or_plugins",
+            "test_settings_save_from_keyboard_changes_the_actual_file",
+            "test_external_editor_uses_literal_argv_and_reload_recovers_invalid_rc",
+            "test_editor_interrupt_leaves_no_child_and_restores_the_terminal",
+        ),
+    ),
+    (
+        "MG01",
+        "test_management_ui.PipeInputTests",
+        (
+            "test_feature_choices_do_not_offer_auto_without_a_query",
+            "test_plugin_selection_uses_one_catalog_and_never_imports_the_plugin",
+        ),
+    ),
+    (
+        "MG02",
+        "test_management_store.SettingsStoreTests",
+        (
+            "test_opening_and_cancelling_missing_settings_creates_nothing",
+            "test_existing_encoding_newlines_and_bytes_are_preserved",
+            "test_external_edit_during_staging_is_not_overwritten",
+            "test_rebinding_config_cannot_make_saved_choices_disappear",
+            "test_symlink_stays_link_and_retargeting_is_rejected",
+        ),
+    ),
+    (
+        "MG02",
+        "test_management_store.DiscoveryTests",
+        ("test_metadata_listing_is_inert_and_does_not_claim_dependency_readiness",),
+    ),
     (
         "FP01",
         "test_terminal_composition.FormattingPolicyTests",
@@ -162,7 +225,10 @@ CASE_CONTRACTS = (
     (
         "IO02",
         "test_terminal_session.TerminalSessionTests",
-        ("test_host_writer_backpressure_preserves_final_output",),
+        (
+            "test_host_writer_backpressure_preserves_final_output",
+            "test_start_paused_retains_final_output_without_readable_spin",
+        ),
     ),
     (
         "IO03",
@@ -178,6 +244,35 @@ CASE_CONTRACTS = (
         "IO04",
         "test_terminal_vt.TerminalVTTests",
         ("test_resize_updates_the_grid_and_native_size_report",),
+    ),
+    (
+        "IO04",
+        "test_terminal_geometry.GeometryTests",
+        (
+            "test_complete_pair_restores_images_without_reopening_capability_probe",
+            "test_resize_retires_pair_and_drains_both_before_new_query",
+            "test_timeout_rejects_late_pairs_and_prohibits_another_query",
+            "test_old_timer_cannot_cancel_the_next_valid_pair",
+            "test_disabled_unknown_or_unrestorable_features_do_not_query_geometry",
+        ),
+    ),
+    (
+        "IO04",
+        "test_terminal_geometry.AppGeometryTests",
+        (
+            "test_resize_keeps_images_and_stdin_while_pty_output_waits_for_geometry",
+            "test_geometry_timeout_disables_images_and_resumes_native_text",
+            "test_resize_restarts_animation_without_further_child_output",
+            "test_popup_escape_adjacent_to_geometry_response_never_reaches_stdin",
+        ),
+    ),
+    (
+        "IO04",
+        "test_terminal_host.HostProbeTests",
+        (
+            "test_escape_before_reply_keeps_its_introducer_across_every_split",
+            "test_legacy_alt_arrow_and_repeated_escape_keep_key_identity",
+        ),
     ),
     (
         "IO06",
@@ -346,7 +441,12 @@ CASE_CONTRACTS = (
     (
         "IN09",
         "test_terminal_selection.SelectionTests",
-        ("test_single_double_and_triple_click_use_native_word_and_line_ranges",),
+        (
+            "test_single_double_and_triple_click_use_native_word_and_line_ranges",
+            "test_iterm_image_copy_keeps_blank_cells_unicode_and_newlines",
+            "test_kitty_placeholder_copy_drops_only_image_grapheme_metadata",
+            "test_text_only_copy_preserves_combining_and_emoji_graphemes",
+        ),
     ),
     (
         "IN10",
@@ -427,14 +527,14 @@ CASE_CONTRACTS = (
         (
             "test_queries_do_not_execute_rc_plugins_shell_or_native_library",
             "test_language_is_cli_then_lang_then_builtin_english",
-            "test_saved_vt_plugins_persist_without_loading_stream_plugins",
+            "test_saved_plugins_persist_once_per_session",
             "test_selected_file_logs_exclude_native_payload_and_obey_level",
         ),
     ),
     (
         "UI07",
         "test_terminal_startup.StartupTests",
-        ("test_help_and_diagnostics_distinguish_vt_from_stream",),
+        ("test_help_and_diagnostics_describe_the_single_terminal_runtime",),
     ),
     (
         "UI07",
@@ -445,6 +545,175 @@ CASE_CONTRACTS = (
         "UI08",
         "test_terminal_cursor.RestorationPTYTests",
         ("test_origin_restoration_keeps_the_primary_cursor_and_scroll_region",),
+    ),
+    (
+        "IM01 IM04 IM05",
+        "test_terminal_inputs.RouteTests",
+        (
+            "test_cancelled_fragment_never_reaches_any_image_native_route",
+            "test_image_cancel_preserves_unfinished_non_image_records",
+        ),
+    ),
+    (
+        "IM01",
+        "test_terminal_protocol.NativeFramingTests",
+        (
+            "test_kitty_terminators_keep_completion_and_cancel_distinct_at_every_split",
+            "test_c1_st_preserves_opaque_clipboard_string_records_at_every_split",
+        ),
+    ),
+    (
+        "IM01 IM04 IM05",
+        "test_terminal_inputs.LiveInputTests",
+        ("test_disabled_fragment_cannot_reappear_when_each_image_input_resumes",),
+    ),
+    (
+        "IM04",
+        "test_terminal_image_protocol.ImageProtocolTests",
+        (
+            "test_iterm_upload_inside_synchronized_output_waits_for_frame_release",
+            "test_stationary_iterm_image_never_scrolls_a_smaller_margin_region",
+        ),
+    ),
+    (
+        "IM05",
+        "test_terminal_engine.BridgeBuildTests",
+        (
+            "test_missing_or_unverified_library_preserves_existing_artifact",
+            "test_official_archive_checksum_rejects_modified_download",
+            "test_upstream_source_verification_never_changes_original_bytes",
+            "test_modified_missing_or_added_upstream_sources_are_rejected_without_repair",
+            "test_native_provenance_binds_upstream_archives_recipe_and_artifact",
+            "test_failed_provenance_write_preserves_previous_stamp_and_cleans_temporary",
+        ),
+    ),
+    (
+        "IM05",
+        "test_terminal_sixel.SixelDecoderTests",
+        (
+            "test_transparent_palette_255_and_blank_background_are_independent",
+            "test_repeat_carriage_return_bands_hls_and_final_cursor",
+            "test_aspect_and_palette_redefinition_are_applied_to_indexed_pixels",
+            "test_foreign_dcs_and_malformed_or_oversized_inputs_are_not_images",
+            "test_excessive_parameter_fields_do_not_expand_into_a_large_object_list",
+        ),
+    ),
+    (
+        "IM05",
+        "test_terminal_sixel.SixelInputTests",
+        (
+            "test_every_byte_fragment_replaces_covered_cells_and_keeps_exact_alpha",
+            "test_partial_cells_keep_alpha_padding_and_replace_only_the_image_rectangle",
+            "test_cancel_reset_disable_and_foreign_dcs_do_not_leak_or_duplicate",
+            "test_display_modes_queries_and_native_modes_do_not_get_duplicate_responses",
+            "test_stationary_image_keeps_viewport_rows_inside_scroll_margins",
+            "test_native_history_alternate_and_erase_keep_the_image_owner",
+            "test_character_erasure_removes_image_cells_without_changing_source_pixels",
+            "test_bottom_scroll_saved_cursor_style_and_right_mode_are_independent",
+            "test_malformed_image_is_counted_and_following_valid_image_still_works",
+            "test_later_transparent_image_replaces_previous_image_cells",
+            "test_stationary_pending_wrap_rejects_image_without_corrupting_next_text",
+            "test_synchronized_output_validates_live_storage_and_publishes_on_release",
+            "test_native_mode_empty_and_large_parameters_never_close_input",
+            "test_sixel_mode_groups_preserve_native_defaults_and_oversized_fields",
+        ),
+    ),
+    (
+        "IM05",
+        "test_terminal_sixel.SixelOverwriteTests",
+        (
+            "test_repeated_character_write_keeps_its_cell_clear_and_source_unchanged",
+            "test_cursor_style_and_writes_outside_the_raster_preserve_every_pixel",
+            "test_byte_fragmented_wide_character_cuts_both_columns_on_the_right_row",
+            "test_remaining_colored_cells_keep_original_source_coordinates",
+            "test_combining_mark_changes_existing_glyph_and_cuts_its_cell",
+            "test_grapheme_width_changes_cut_both_new_and_previous_wide_cells",
+            "test_printed_space_repeat_and_character_erasure_remove_image_cells",
+            "test_overlapping_image_replacement_does_not_restore_previous_cells",
+            "test_ordinary_kitty_placements_keep_their_own_write_semantics",
+            "test_kitty_replacing_a_sixel_id_keeps_native_asset_write_semantics",
+            "test_cut_pixels_follow_native_history_and_alternate_screen_lifetime",
+            "test_synchronized_frame_keeps_the_previous_pixels_until_commit",
+            "test_pending_wrap_uses_the_actual_destination_row",
+            "test_origin_mode_uses_native_absolute_cell_coordinates",
+        ),
+    ),
+    (
+        "IM05",
+        "test_terminal_sixel.SixelPtyTests",
+        ("test_child_output_cuts_pixels_and_input_reaches_its_result_file",),
+    ),
+    (
+        "IM06",
+        "test_terminal_sixel.SixelEncoderTests",
+        (
+            "test_sparse_pixels_bands_and_repeat_preserve_transparency",
+            "test_all_transparent_and_color_255_do_not_share_an_alpha_sentinel",
+            "test_partial_alpha_is_rejected_without_silent_background_flattening",
+            "test_wire_pixel_and_zero_budgets_are_bounded",
+        ),
+    ),
+    (
+        "IM06",
+        "test_terminal_sixel.SixelPresenterTests",
+        (
+            "test_page_origin_padding_popup_occlusion_and_restoration",
+            "test_unchanged_scene_reuses_wire_and_erasure_requests_text_repaint",
+            "test_rejection_preserves_previous_cleanup_and_below_text_contract",
+            "test_partial_alpha_flattens_known_blank_background_and_preserves_holes",
+            "test_partial_alpha_prefers_explicit_cell_color_and_rejects_unknown_defaults",
+        ),
+    ),
+    (
+        "OPT01",
+        "test_terminal_optional.NotificationTests",
+        (
+            "test_fragmented_title_body_and_correlated_query",
+            "test_off_consumes_known_protocol_without_reply_or_notification",
+            "test_encoded_chunks_preserve_utf8_and_strip_host_controls",
+            "test_notification_text_cannot_become_an_osc9_subcommand",
+            "test_native_payloads_have_one_bounded_text_contract",
+            "test_unknown_extensions_and_invalid_identity_cannot_inject_replies",
+            "test_chunk_overflow_does_not_publish_truncated_tail",
+            "test_pending_capacity_fails_closed_and_cancel_recovers",
+            "test_body_only_no_padding_and_close_release_incomplete_payload",
+        ),
+    ),
+    (
+        "OPT01",
+        "test_terminal_optional.SemanticTests",
+        (
+            "test_native_notification_events_remain_ordered_and_bounded",
+            "test_mixed_native_adapter_notifications_keep_wire_order",
+        ),
+    ),
+    (
+        "OPT01",
+        "test_terminal_optional.OptionalCompositionTests",
+        ("test_notification_limit_and_correlated_query_use_existing_writers",),
+    ),
+    (
+        "OPT01 OPT02",
+        "test_terminal_optional.OptionalCompositionTests",
+        ("test_default_has_no_reserved_command_keys_or_notification_output",),
+    ),
+    (
+        "OPT02",
+        "test_terminal_optional.SemanticTests",
+        (
+            "test_last_output_uses_native_metadata_and_excludes_prompt_input",
+            "test_no_markers_and_empty_command_do_not_select_unrelated_text",
+            "test_viewport_selection_selects_output_but_not_prompt",
+            "test_reflow_keeps_native_output_anchor",
+            "test_alternate_screen_cannot_reuse_primary_output_anchor",
+            "test_history_erasure_and_pruning_never_select_new_unmarked_text",
+            "test_prompt_navigation_and_missing_markers_are_native_noops",
+        ),
+    ),
+    (
+        "OPT02",
+        "test_terminal_optional.OptionalCompositionTests",
+        ("test_opt_in_command_keys_use_native_output_and_existing_clipboard",),
     ),
     (
         "IM08",
@@ -478,6 +747,8 @@ CHECK_CASES = {
     "test_terminal_checks.CheckCommandTests.test_removed_or_renamed_case_fails_with_its_baseline_id",
     "test_terminal_checks.CheckCommandTests.test_load_tests_cannot_hide_an_existing_required_method",
     "test_terminal_checks.CheckCommandTests.test_missing_evidence_mapping_fails_before_test_execution",
+    "test_terminal_checks.CheckCommandTests.test_required_helpers_match_independent_paths",
+    "test_terminal_checks.CheckCommandTests.test_each_required_helper_is_checked_without_glob_discovery",
 }
 ALL_CASES = CHECK_CASES.union(*EXPECTED_CASES.values())
 PASSING_TEST = """import unittest
@@ -521,7 +792,7 @@ class CheckCommandTests(unittest.TestCase):
         (self.root / "tools").mkdir()
         (self.root / "tests").mkdir()
         (self.root / "src").symlink_to(ROOT / "src", target_is_directory=True)
-        for name in ("check_terminal.py", "check_stream.py", "terminal_contracts.py"):
+        for name in ("check_terminal.py", "terminal_contracts.py"):
             shutil.copy2(ROOT / "tools" / name, self.root / "tools" / name)
         (self.root / "pyproject.toml").write_text(
             '[project]\nrequires-python = ">=3.12.14,<3.13"\ndependencies = []\n'
@@ -567,6 +838,42 @@ class CheckCommandTests(unittest.TestCase):
         for requirement, cases in REQUIRED_CASES.items():
             with self.subTest(requirement=requirement):
                 self.assertEqual(len(cases), len(set(cases)))
+
+    def test_required_helpers_match_independent_paths(self):
+        """An integration helper cannot silently disappear from the lint contract."""
+        from tools.check_terminal import REQUIRED_HELPERS
+
+        self.assertEqual(REQUIRED_HELPERS, HELPER_FILES)
+
+    def test_each_required_helper_is_checked_without_glob_discovery(self):
+        """Required helper deletion fails even when automatic globbing is absent."""
+        from tools.check_terminal import lint_paths
+
+        for relative in HELPER_FILES:
+            (self.root / relative).write_text("# independent helper fixture\n")
+        with (
+            patch("tools.check_terminal.ROOT", self.root),
+            patch("tools.check_terminal.LINT_PATHS", ()),
+            patch("tools.check_terminal.HELPER_PATTERNS", ()),
+        ):
+            self.assertEqual(
+                set(lint_paths(())), {str(self.root / name) for name in HELPER_FILES}
+            )
+            for relative in HELPER_FILES:
+                path = self.root / relative
+                path.unlink()
+                try:
+                    with (
+                        self.subTest(helper=relative),
+                        self.assertRaises(RuntimeError) as error,
+                    ):
+                        lint_paths(())
+                    self.assertEqual(
+                        str(error.exception),
+                        f"Required lint input is missing: {relative}",
+                    )
+                finally:
+                    path.write_text("# independent helper fixture\n")
 
     def test_each_mapped_case_is_required_exactly_once_in_the_collected_suite(self):
         """Keep module membership separate from individual test identity coverage."""

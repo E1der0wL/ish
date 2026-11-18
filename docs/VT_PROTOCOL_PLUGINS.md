@@ -1,10 +1,10 @@
-# ish-vt 프로토콜 보완 플러그인
+# ish 프로토콜 보완 플러그인
 
-이 API는 별도 `ish-vt` 실험 경로에만 적용한다. `ish` 2.0.0의 stream 경로를 바꾸지 않으며, 기본형에는 플러그인·UI·예약 키를 추가하지 않는다.
+이 API는 `ish`의 libghostty-vt·PTK 경로에 적용한다. 기본형에는 플러그인·UI·예약 키를 추가하지 않는다.
 
 ## 단일 관리 경로
 
-출력·키·클립보드 보완 모듈은 모두 기존 `PluginManager`의 한 스크립트 경로를 사용한다. 기본은 `~/ish/plugin/script`이며 `config.vt["plugin_dir"]` 또는 `--plugin-dir`로 경로 하나를 바꿀 수 있다. 종류별 디렉터리 설정이나 별도 로더는 없다. `plugin_lib_dir`는 Python 의존성 설치 경로이며 또 다른 모듈 검색 경로가 아니다. 선택 목록도 `config.vt["plugins"]` 하나다.
+출력·키·클립보드 보완 모듈은 모두 기존 `PluginManager`의 한 스크립트 경로를 사용한다. 기본은 `~/ish/plugin/script`이며 `config.plugin_dir` 또는 `--plugin-dir`로 경로 하나를 바꿀 수 있다. 종류별 디렉터리 설정이나 별도 로더는 없다. `plugin_lib_dir`는 Python 의존성 설치 경로이며 또 다른 모듈 검색 경로가 아니다. 선택 목록도 `config.plugins` 하나다.
 
 아래 계약 안에서 외부 Python 파일을 추가·수정·제거할 때 native 재컴파일은 필요하지 않다. 변경은 다음 세션부터 적용한다. 새 입력 구조·협상·공통 이벤트가 필요하면 본체 API 보강이 필요할 수 있으며, C bridge 또는 libghostty를 바꿀 때는 해당 native 라이브러리를 다시 빌드한다. 지원 버전은 `TERMINAL_API = 1`이다.
 
@@ -14,7 +14,7 @@
 
 libghostty의 독립 OSC parser로 소유 여부를 확인한다. 제목·색상·링크·클립보드 등 이미 알려진 명령은 내용이 불완전하거나 기능이 꺼져 있어도 보완 모듈로 넘기지 않는다. 같은 이름이나 겹치는 selector도 거부한다. `UNKNOWN_SEQUENCE` callback을 범용 fallback으로 사용하지 않는다.
 
-이 범위는 보편적인 터미널 확장 API가 아니다. 새 DCS/APC 해석기를 공개하려면 해당 프로토콜의 native 소유 여부와 입력 경계를 먼저 입증해야 한다. SIXEL 지원을 추가하지 않았다.
+이 범위는 보편적인 터미널 확장 API가 아니다. 새 DCS/APC 해석기를 공개하려면 해당 프로토콜의 native 소유 여부와 입력 경계를 먼저 입증해야 한다. SIXEL은 공개 등록 범위를 넓히지 않고 좁은 내장 DCS/관련 CSI 경로로 연결한다. native 이미지 저장소·화면 수명은 기존 엔진을 재사용한다. [SIXEL의 실제 범위와 차이](VT_SIXEL.md)를 참고한다.
 
 ## 최소 예시
 
@@ -88,7 +88,7 @@ def setup(api):
 
 `api.register_clipboard(name, factory)`로 일반 CLIPBOARD 텍스트를 읽고 쓰는 provider 하나를 선택한다. factory는 `async read() -> str`, `async write(text) -> None`, `close()`, `async aclose()`를 제공하는 객체를 반환한다. 세션 시작 전에 한 번 생성하며 읽기·쓰기는 실제 요청에서만 수행한다.
 
-기본 접근 정책은 `write`다. `.ishrc.py`의 `config.vt["clipboard"] = "read-write"` 또는 `--clipboard read-write`로 프로그램 읽기를 켠다. provider는 정책·PTY writer를 갖지 않으며 Broker가 요청 순서·취소·지연 완료·크기 제한을 관리한다. 잘못된 provider, 중복 선택, 세션 시작 후 등록은 거부한다. 운영 로그에는 내용 대신 실패 횟수만 남긴다.
+기본 접근 정책은 `write`다. `.ishrc.py`의 `config.clipboard = "read-write"` 또는 `--clipboard read-write`로 프로그램 읽기를 켠다. provider는 정책·PTY writer를 갖지 않으며 Broker가 요청 순서·취소·지연 완료·크기 제한을 관리한다. 잘못된 provider, 중복 선택, 세션 시작 후 등록은 거부한다. 운영 로그에는 내용 대신 실패 횟수만 남긴다.
 
 `clipboard_system` 샘플은 hub의 별도 X11 worker를 재사용한다. `TARGET`의 기본 `auto`는 로컬 WSL에서 Windows, 전달된 `DISPLAY`가 있는 환경에서 X11을 선택한다. SSH 환경에서는 원격 Windows/Wayland 데스크톱으로 우회하지 않는다. `windows` 또는 `x11`로 명시할 수도 있으며, 선택한 대상 실패 후 다른 대상으로 바꾸지 않는다. X11에는 연결 가능한 `DISPLAY`·인증과 시스템 libX11이 필요하다. Windows는 WSL의 Windows 실행 파일 상호운용성과 `powershell.exe`·`clip.exe`가 필요하다.
 

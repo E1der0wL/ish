@@ -15,12 +15,7 @@ from ish.lang import Message, i18n
 
 from .protocol import MAX_STRING_BYTES, Control, ProtocolStream
 
-KINDS = frozenset(("osc", "apc", "dcs", "pm", "sos"))
 MAX_PREFIX_BYTES = 256
-MAX_PREFIXES = 16
-MAX_PROTOCOLS = 64
-MAX_REPLY_BYTES = 1024 * 1024
-MAX_ERRORS = 16
 
 
 def _discard_awaitable(value):
@@ -62,6 +57,12 @@ class _Route:
 
 class ProtocolRegistry:
     """Assign a complete control to one owner, without fallthrough on errors."""
+
+    KINDS = frozenset(("osc", "apc", "dcs", "pm", "sos"))
+    MAX_PREFIXES = 16
+    MAX_PROTOCOLS = 64
+    MAX_REPLY_BYTES = 1024 * 1024
+    MAX_ERRORS = 16
 
     def __init__(self, *, native=(), write, reply=None):
         """Keep reviewed native facts and the sole output sinks for this session."""
@@ -105,9 +106,9 @@ class ProtocolRegistry:
             or any(not (char.isalnum() or char in "-_.") for char in name)
         ):
             raise ValueError(i18n.get(Message.VT_PROTOCOL_NAME))
-        if kind not in KINDS or not isinstance(prefixes, tuple):
+        if kind not in self.KINDS or not isinstance(prefixes, tuple):
             raise ValueError(i18n.get(Message.VT_PROTOCOL_SELECTORS))
-        if not 1 <= len(prefixes) <= MAX_PREFIXES or any(
+        if not 1 <= len(prefixes) <= self.MAX_PREFIXES or any(
             not isinstance(prefix, bytes) or not 1 <= len(prefix) <= MAX_PREFIX_BYTES
             for prefix in prefixes
         ):
@@ -118,7 +119,7 @@ class ProtocolRegistry:
                 for other in prefixes[:index]
             ):
                 raise ValueError(i18n.get(Message.VT_PROTOCOL_OVERLAP))
-        if len(self._routes) >= MAX_PROTOCOLS:
+        if len(self._routes) >= self.MAX_PROTOCOLS:
             raise ValueError(i18n.get(Message.VT_PROTOCOL_LIMIT))
         for route in self._routes:
             if route.name == name or (
@@ -166,7 +167,7 @@ class ProtocolRegistry:
     def _record(self, route, error):
         route.errors += 1
         self._errors.append(f"{route.name}: {type(error).__name__}: {error}")
-        del self._errors[:-MAX_ERRORS]
+        del self._errors[: -self.MAX_ERRORS]
 
     def _invoke(self, route, method):
         try:
@@ -218,7 +219,7 @@ class ProtocolRegistry:
                     not isinstance(result.native, bytes)
                     or not isinstance(result.reply, bytes)
                     or len(result.native) > MAX_STRING_BYTES
-                    or len(result.reply) > MAX_REPLY_BYTES
+                    or len(result.reply) > self.MAX_REPLY_BYTES
                     or not self._complete(result.native)
                 ):
                     raise ValueError(i18n.get(Message.VT_PROTOCOL_RESULT))

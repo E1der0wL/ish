@@ -22,51 +22,12 @@ var/
 wheels/
 share/python-wheels/
 /tests/*
-!/tests/test_stream_protocol.py
-!/tests/test_stream_scroll.py
-!/tests/test_stream_requests.py
-!/tests/test_stream_cli.py
-!/tests/test_stream_panel.py
-!/tests/test_stream_shells.py
-!/tests/test_stream_bash.py
-!/tests/test_stream_zsh.py
-!/tests/test_stream_posix.py
-!/tests/test_stream_scripts.py
-!/tests/stream_fixture.py
-!/tests/stream_state.py
-!/tests/test_stream_state.py
-!/tests/tcsh_completion.py
-!/tests/test_tcsh_completion.py
-!/tests/test_stream_extensions.py
-!/tests/test_stream_extensions_shells.py
 !/tests/plugin_fixture.py
 !/tests/test_plugin_loading.py
 !/tests/test_plugin_dependencies.py
-!/tests/stream_host.py
-!/tests/stream_plugins.py
 !/tests/test_logging.py
 !/tests/test_diagnostics.py
 !/tests/test_i18n.py
-!/tests/test_stream_startup.py
-!/tests/test_stream_logging.py
-!/tests/test_stream_options.py
-!/tests/test_stream_helper.py
-!/tests/test_stream_checks.py
-!/tests/test_stream_host.py
-!/tests/test_stream_distribution.py
-!/tests/stream_matrix.py
-!/tests/test_shell_editing.py
-!/tests/test_edit_requests.py
-!/tests/test_native_cursor_keys.py
-!/tests/test_p2_shells.py
-!/tests/test_handoff_protocol.py
-!/tests/test_bash_edit_protocol.py
-!/tests/test_zsh_semantic.py
-!/tests/test_semantic_edit_cli.py
-!/tests/test_zsh_edit_cli.py
-!/tests/test_shell_handoff_boundaries.py
-!/tests/test_semantic_races.py
-!/tests/test_shell_submission_cli.py
 !/tests/test_terminal_cli.py
 !/tests/test_terminal_vt.py
 !/tests/test_terminal_session.py
@@ -102,6 +63,8 @@ share/python-wheels/
 !/tests/test_terminal_cursor.py
 !/tests/test_terminal_extensions.py
 !/tests/test_terminal_features.py
+!/tests/test_terminal_sixel.py
+!/tests/test_terminal_optional.py
 !/tests/terminal_features.py
 !/tests/test_terminal_mouse_policy.py
 !/tests/test_terminal_startup.py
@@ -112,25 +75,18 @@ share/python-wheels/
 !/tests/terminal_supplements.py
 !/tests/terminal_scenarios.py
 !/tests/terminal_host.py
+!/tests/terminal_presentation.py
+!/tests/terminal_keyboard.py
+!/tests/comparison_terminal.py
+!/tests/comparison_child.py
+!/tests/comparison_apps.py
+!/tests/comparison_images.py
 !/tests/terminal_color.py
 !/tests/terminal_interaction.py
 !/tests/terminal_matrix.py
 !/tests/terminal_restore.py
-!/tests/tcsh_channel.py
-!/tests/test_tcsh_channel.py
-!/tests/channel_gate.c
-!/tests/test_tcsh_channel_gate.py
 /dev/
 /docs/*
-!/docs/PROMPT_STREAM.md
-!/docs/STREAM_VALIDATION.md
-!/docs/INTERRUPT_INVESTIGATION.md
-!/docs/bash-readline-diagnostic.patch
-!/docs/TCSH_COMPLETION.md
-!/docs/STREAM_PLUGINS.md
-!/docs/HANDOFF_LIMITS.md
-!/docs/EDITING.md
-!/docs/CHANNEL_EXPERIMENT.md
 !/docs/TERMINAL_EXPERIMENT.md
 !/docs/TERMINAL_CAPABILITIES.md
 !/docs/TERMINAL_PROTOCOLS.md
@@ -146,6 +102,9 @@ share/python-wheels/
 !/docs/VT_RESTORATION.md
 !/docs/VT_TEST_CONTRACTS.md
 !/docs/VT_FEATURE_POLICY.md
+!/docs/VT_SIXEL.md
+!/docs/VT_OPTIONAL.md
+!/docs/VT_PARITY.md
 !/docs/DEVELOPMENT.md
 /.codex-remote-attachments/
 *.egg-info/
@@ -331,6 +290,12 @@ cython_debug/
 tempCodeRunnerFile.py
 
 # Ruff stuff:
+!/tests/startup_fixture.py
+!/tests/test_terminal_distribution.py
+!/tests/test_management_store.py
+!/tests/test_management_ui.py
+!/tests/test_management_restore.py
+!/tests/management_host.py
 .ruff_cache/
 
 # PyPI configuration file
@@ -343,3 +308,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+!tests/test_terminal_geometry.py

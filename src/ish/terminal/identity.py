@@ -3,7 +3,7 @@
 from ish import __version__
 
 TERM = "xterm-256color"
-PROGRAM = "ish-vt"
+PROGRAM = "ish"
 IDENTITY = f"{PROGRAM} {__version__}"
 
 # libghostty deliberately avoids F3/CPR ambiguity using CSI 13;modifier~.

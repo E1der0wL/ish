@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import json
 import os
 import platform
 import subprocess
 import sys
+import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -17,10 +19,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ish.terminal.engine import BRIDGE_ABI, ENGINE_VERSION, check_library  # noqa: E402
+from ish.terminal.engine import (  # noqa: E402
+    BRIDGE_ABI,
+    ENGINE_VERSION,
+    check_library,
+)
 
 CACHE = ROOT / ".cache" / "ghostty-vt"
+NATIVE_STAMP = "ish-native.json"
 ZIG_VERSION = "0.17.1"
+BUILD_FLAGS = ("-Doptimize=ReleaseFast", "-Dcpu=baseline", "-Dsimd=false")
+SOURCE_BUILD_DIRS = frozenset((".zig-cache", "zig-out"))
 RELEASE = f"https://release.files.ghostty.org/libghostty-vt/{ENGINE_VERSION}"
 DOWNLOADS = (
     (
@@ -74,11 +83,14 @@ def download(item: tuple[str, str], *, cache: Path) -> Path:
     return path
 
 
-def unpack(path: Path) -> None:
+def unpack(path: Path, destination: Path | None = None) -> None:
     """Extract the checksum-pinned official archives inside the local cache."""
-    marker = path.with_name(path.name + ".unpacked")
-    if marker.exists():
+    destination = destination or path.parent
+    marker = destination / (path.name + ".unpacked")
+    expected = digest(path)
+    if marker.is_file() and marker.read_text() == expected:
         return
+    destination.mkdir(parents=True, exist_ok=True)
     print(f"Extracting {path.name}", flush=True)
     subprocess.run(
         [
@@ -88,15 +100,61 @@ def unpack(path: Path) -> None:
             "--no-same-owner",
             "--no-same-permissions",
             "-C",
-            str(path.parent),
+            str(destination),
         ],
         check=True,
     )
-    marker.write_text(digest(path), encoding="ascii")
+    marker.write_text(expected, encoding="ascii")
+
+
+def verify_source(archive: Path, source: Path) -> None:
+    """Reject cached source edits instead of patching or repairing upstream files."""
+    expected = set()
+    with tarfile.open(archive) as stream:
+        for member in stream:
+            name = Path(member.name)
+            if not name.parts or name.parts[0] != source.name or ".." in name.parts:
+                raise RuntimeError(f"Unexpected upstream archive path: {member.name}")
+            relative = Path(*name.parts[1:])
+            path = source / relative
+            expected.add(relative)
+            expected.update(relative.parents)
+            if member.isfile():
+                if not path.is_file() or path.is_symlink():
+                    raise RuntimeError(
+                        f"Upstream source is missing or modified: {relative}"
+                    )
+                with stream.extractfile(member) as content:
+                    matches = (
+                        digest(path)
+                        == hashlib.file_digest(content, "sha256").hexdigest()
+                    )
+                if not matches:
+                    raise RuntimeError(f"Upstream source is modified: {relative}")
+            elif member.issym():
+                if not path.is_symlink() or os.readlink(path) != member.linkname:
+                    raise RuntimeError(f"Upstream source link is modified: {relative}")
+            elif member.isdir():
+                if not path.is_dir() or path.is_symlink():
+                    raise RuntimeError(
+                        f"Upstream source directory is modified: {relative}"
+                    )
+            else:
+                raise RuntimeError(f"Unexpected upstream archive entry: {member.name}")
+    for directory, directories, files in source.walk():
+        if directory == source:
+            directories[:] = [
+                name for name in directories if name not in SOURCE_BUILD_DIRS
+            ]
+        for name in (*directories, *files):
+            relative = (directory / name).relative_to(source)
+            if relative not in expected:
+                raise RuntimeError(f"Unexpected file in upstream source: {relative}")
 
 
 def build_bridge(prefix: Path) -> None:
     """Compile the selected ABI and atomically replace only a successful build."""
+    verify_install(prefix)
     output = prefix / "lib" / "libish_vt.so"
     with tempfile.NamedTemporaryFile(
         prefix="libish_vt-", suffix=".so", dir=output.parent, delete=False
@@ -133,6 +191,56 @@ def build_bridge(prefix: Path) -> None:
     print(f"Built {output}", flush=True)
 
 
+def install_identity(prefix: Path) -> dict:
+    """Bind the artifact to the official archives and unmodified build recipe."""
+    library = prefix / "lib" / f"libghostty-vt.so.{ENGINE_VERSION}"
+    if not library.is_file() or library.is_symlink():
+        raise ValueError("Native versioned library is missing or replaced")
+    for suffix in ("", f".{ENGINE_VERSION.split('.')[0]}"):
+        alias = library.parent / f"libghostty-vt.so{suffix}"
+        if not alias.is_symlink() or alias.resolve() != library.resolve():
+            raise ValueError(
+                f"Native library alias does not match verified artifact: {alias.name}"
+            )
+    return {
+        "engine": ENGINE_VERSION,
+        "source": "upstream",
+        "archives": {url.rsplit("/", 1)[1]: checksum for url, checksum in DOWNLOADS},
+        "zig_version": ZIG_VERSION,
+        "build_flags": list(BUILD_FLAGS),
+        "library_sha256": digest(library),
+    }
+
+
+def record_install(prefix: Path) -> None:
+    """Publish provenance only after the pinned engine build succeeds."""
+    stamp = prefix / NATIVE_STAMP
+    identity = install_identity(prefix)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=prefix, prefix=NATIVE_STAMP, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(identity, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+        temporary.replace(stamp)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def verify_install(prefix: Path) -> None:
+    """Reject old patched builds and modified or differently built libraries."""
+    try:
+        recorded = json.loads((prefix / NATIVE_STAMP).read_text())
+        matches = recorded == install_identity(prefix)
+    except (OSError, ValueError):
+        matches = False
+    if not matches:
+        raise RuntimeError("Native artifact provenance mismatch; rebuild libghostty-vt")
+
+
 def main() -> None:
     """Install the library and build the narrow C bridge without global installs."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -157,11 +265,16 @@ def main() -> None:
     cache.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=3) as pool:
         archives = list(pool.map(partial(download, cache=cache), DOWNLOADS))
-    for archive in archives:
+    # Former experimental source trees are left untouched. Builds use a
+    # separate official-source directory and reject edits on every reuse.
+    source_cache = cache / "upstream"
+    unpack(archives[0], source_cache)
+    source = source_cache / f"libghostty-vt-{ENGINE_VERSION}"
+    verify_source(archives[0], source)
+    for archive in archives[1:]:
         unpack(archive)
     if args.prepare:
         return
-    source = cache / f"libghostty-vt-{ENGINE_VERSION}"
     dependencies = cache / f"libghostty-vt-{ENGINE_VERSION}-deps"
     zig = cache / f"zig-x86_64-linux-{ZIG_VERSION}" / "zig"
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(cache / "zig-cache"))
@@ -172,9 +285,7 @@ def main() -> None:
         [
             str(zig),
             "build",
-            "-Doptimize=ReleaseFast",
-            "-Dcpu=baseline",
-            "-Dsimd=false",
+            *BUILD_FLAGS,
             "--system",
             str(dependencies),
             "--prefix",
@@ -185,6 +296,7 @@ def main() -> None:
         env=env,
         check=True,
     )
+    record_install(prefix)
     if args.library_only:
         return
     build_bridge(prefix)

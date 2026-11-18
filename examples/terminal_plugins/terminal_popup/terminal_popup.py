@@ -46,7 +46,9 @@ def setup(api):
         content = HSplit(
             [
                 Window(
-                    FormattedTextControl(lambda: i18n.get(Message.STREAM_SAMPLE_POPUP)),
+                    FormattedTextControl(
+                        lambda: i18n.get(Message.STARTUP_SAMPLE_POPUP)
+                    ),
                     height=1,
                 ),
                 editor,

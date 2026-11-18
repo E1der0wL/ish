@@ -41,9 +41,7 @@ class AbnormalExitTests(unittest.TestCase):
 
     def run_case(self, shell):
         """Check status and termios after the public PTK exceptional-exit API."""
-        directory = self.enterContext(
-            tempfile.TemporaryDirectory(prefix="ish-vt-exit-")
-        )
+        directory = self.enterContext(tempfile.TemporaryDirectory(prefix="ish-exit-"))
         root = Path(directory)
         arguments = prepare(root, shell, False)
         plugin = root / "plugins" / "exit_failure"

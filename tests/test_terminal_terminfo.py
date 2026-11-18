@@ -375,7 +375,7 @@ class RemainingTerminfoContracts(unittest.TestCase):
             self.assertIsNone(re.fullmatch(self.capability("rv"), secondary))
             terminal.feed(self.capability("XR"))
             version = replies.pop()
-            self.assertEqual(version, b"\x1bP>|ish-vt 2.0.0\x1b\\")
+            self.assertEqual(version, b"\x1bP>|ish 2.0.0\x1b\\")
             self.assertIsNone(re.fullmatch(self.capability("xr"), version))
 
     def test_bell_and_visual_bell_have_distinct_native_effects(self):

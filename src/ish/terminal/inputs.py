@@ -20,12 +20,6 @@ if TYPE_CHECKING:
     from .vt import Terminal
 
 Provider = Literal["native", "adapter", "unsupported"]
-ITERM_IMAGES = (
-    b"1337;File=",
-    b"1337;MultipartFile=",
-    b"1337;FilePart=",
-    b"1337;FileEnd",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +46,11 @@ def select_routes(engine: EngineInfo) -> InputRoutes:
         else "adapter"
         if "kitty" in native
         else "unsupported",
-        sixel="native" if "sixel" in native else "unsupported",
+        sixel="native"
+        if "sixel" in native
+        else "adapter"
+        if "kitty" in native
+        else "unsupported",
     )
 
 
@@ -62,6 +60,12 @@ def _iterm_adapter(terminal):
     from .image_protocol import Images
 
     return Images(terminal)
+
+
+def _sixel_adapter(terminal):
+    from .image_protocol import SixelImages
+
+    return SixelImages(terminal)
 
 
 class _ImageAdapter:
@@ -89,12 +93,25 @@ class InputPipeline:
     a synchronous clipboard callback in a future release.
     """
 
+    ITERM_IMAGES = (
+        b"1337;File=",
+        b"1337;MultipartFile=",
+        b"1337;FilePart=",
+        b"1337;FileEnd",
+    )
+    KITTY_IMAGE = b"G"
+
     def __init__(self, terminal: Terminal, engine: EngineInfo, *, reply=None):
         """Select image ownership once, independently of host negotiations."""
         self._write = terminal.feed_raw
+        self._terminal = terminal
+        self._reply = reply
         self._routes = select_routes(engine)
         self._images = (
             _iterm_adapter(terminal) if self._routes.iterm == "adapter" else None
+        )
+        self._sixel = (
+            _sixel_adapter(terminal) if self._routes.sixel == "adapter" else None
         )
         self._unknown_osc = getattr(terminal, "is_unknown_osc", None)
         self._native_images = frozenset(engine.native_inputs)
@@ -107,13 +124,16 @@ class InputPipeline:
         self._protocols.register(
             "iterm",
             kind="osc",
-            prefixes=ITERM_IMAGES,
+            prefixes=self.ITERM_IMAGES,
             provider=self._routes.iterm,
             factory=lambda: _ImageAdapter(self._images),
         )
         self._clipboard = None
+        self._notifications = None
+        self._before_notification = None
         self._started = False
         self._closed = False
+        self._cancelled_image_record = None
         self._stream = ProtocolStream(
             self._text,
             self._control,
@@ -130,12 +150,27 @@ class InputPipeline:
     @property
     def image_errors(self) -> tuple[str, ...]:
         """Return diagnostics without exposing an adapter instance to the UI."""
-        return tuple(self._images.errors) if self._images is not None else ()
+        return tuple(
+            error
+            for adapter in (self._images, self._sixel)
+            if adapter is not None
+            for error in adapter.errors
+        )
 
     @property
     def image_failure_count(self) -> int:
         """Count rejected shim images without retaining input or decoder messages."""
-        return self._images.error_count if self._images is not None else 0
+        return sum(
+            adapter.error_count
+            for adapter in (self._images, self._sixel)
+            if adapter is not None
+        )
+
+    def graphics_changed(self, enabled):
+        """Advertise the adapter only while native storage/output are enabled."""
+        self._terminal.set_sixel_supported(
+            bool(enabled and self._routes.sixel != "unsupported")
+        )
 
     @property
     def protocol_errors(self):
@@ -214,6 +249,13 @@ class InputPipeline:
             self.close()
             raise
 
+    def set_notifications(self, broker, *, before):
+        """Attach optional effects without changing the shared native writer."""
+        if self._started or self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PROTOCOL_LATE))
+        self._notifications = broker
+        self._before_notification = before
+
     def _text(self, data):
         if self._clipboard is None or not self._clipboard.capture(data):
             self._write(data)
@@ -228,6 +270,11 @@ class InputPipeline:
         return clipboard.capture(control.raw)
 
     def _control(self, control):
+        cancelled_image = (
+            self._cancelled_image_record is not None
+            and self._cancelled_image_record == self._stream.record_id
+        )
+        self._cancelled_image_record = None
         clipboard = self._clipboard
         if clipboard is not None:
             if control.kind == "osc" and clipboard.child_osc(control.body):
@@ -236,20 +283,66 @@ class InputPipeline:
                 return True
             if control.kind == "csi" and clipboard.child_csi(control.body):
                 return True
+        if cancelled_image and self._is_image(control):
+            return True
+        if (
+            self._notifications is not None
+            and control.kind == "osc"
+            and control.body.startswith(b"99;")
+        ):
+            # Preserve native 9/777 -> supplemental 99 order within one read.
+            self._before_notification()
+            return self._notifications.handle(control)
         if control.kind == "esc" and control.body == b"c":
             self._protocols.cancel()
+            if self._sixel is not None:
+                self._sixel.reset()
+            if self._notifications is not None:
+                self._notifications.cancel()
             if clipboard is not None:
                 clipboard.reset()
+        if self._sixel is not None:
+            if control.kind == "dcs":
+                from .sixel import Decoder
+
+                if Decoder.matches(control.body):
+                    self._sixel.handle(control.body)
+                    return True
+            elif control.kind == "csi" and self._reply is not None:
+                if self._sixel.csi(control.body, self._reply):
+                    return True
         return self._protocols.handle(control)
 
+    def _is_image(self, control):
+        """Recognize image namespaces without consuming unrelated records."""
+        if control.kind == "osc":
+            return control.body.startswith(self.ITERM_IMAGES)
+        if control.kind == "apc":
+            return control.body.startswith(self.KITTY_IMAGE)
+        if control.kind == "dcs":
+            from .sixel import Decoder
+
+            return Decoder.matches(control.body)
+        return False
+
     def cancel_images(self) -> None:
-        """Discard incomplete shim transfers when presentation is disabled."""
+        """Cancel the current image record and incomplete adapter transfers.
+
+        Framing remains active so a partial title, clipboard record or query
+        can still finish. Only this identity is suppressed if it proves to be
+        an image; a later graphics enable cannot resurrect that old record.
+        """
+        self._cancelled_image_record = self._stream.record_id
         if self._images is not None:
             self._images.cancel()
+        if self._sixel is not None:
+            self._sixel.cancel()
 
     def cancel(self) -> None:
         """Keep existing capture cancellation semantics at framing boundaries."""
         self._protocols.cancel()
+        if self._notifications is not None:
+            self._notifications.cancel()
         if self._clipboard is not None:
             self._clipboard.cancel()
 
@@ -261,3 +354,5 @@ class InputPipeline:
                 self._stream.close()
             finally:
                 self._protocols.close()
+                if self._notifications is not None:
+                    self._notifications.close()

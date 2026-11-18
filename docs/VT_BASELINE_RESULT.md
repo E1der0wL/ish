@@ -1,5 +1,7 @@
 # ish-vt 기본 계약 보강과 검증
 
+> 통합 전 검증 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 검사기·`ish-vt` 명령은 제거됐다. 현재 실행·검증 방법은 [사용 안내](VT_USAGE.md)와 [개발 안내](DEVELOPMENT.md)를 참고한다.
+
 후속 입력·클립보드·보완 모듈 및 terminfo 전수 분류는 [최신 보강 결과](VT_SUPPLEMENTS_RESULT.md)를 참고한다. 아래 수치와 미검증 판정은 이 문서 작성 당시의 기록이다.
 
 2026-11-17, `codex/hookless-vt`. [기본 지원 명세](VT_BASELINE_AUDIT.md)의 B/P 항목을 대상으로 한다. 선택 확장(E), SIXEL, native Windows/ConPTY는 이번 구현 범위가 아니다. 기존 `ish` 2.0.0 stream 경로와 다른 실행 경로이며 기본형에는 UI·UI 단축키·셸 hook을 추가하지 않았다.

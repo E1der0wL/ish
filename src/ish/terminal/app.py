@@ -29,12 +29,13 @@ from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.output import ColorDepth
 
 from ish.lang import Message, i18n
-from ish.stream.settings import ESCAPE_DELAY, INTERACTIVE_ARGS, validate_escape_delay
+from ish.runtime.settings import ESCAPE_DELAY, INTERACTIVE_ARGS, validate_escape_delay
 
 from . import diagnostics
 from .clipboard import ClipboardBroker
 from .host import HostBroker, HostInput, directory_uri
 from .mouse import DEFAULT_MOUSE, decode_mouse, validate_mouse_policy
+from .notifications import Notifications
 from .plugins import Plugins
 from .rendering import Composition, NativeWindow, RestoringOutput, TerminalRenderer
 from .selection import SelectionController
@@ -56,31 +57,6 @@ from .vt import (
     SPECIAL_KEYS,
     Terminal,
 )
-
-DEFAULT_SIZE = (80, 24)
-FRAME_INTERVAL = 1 / 60
-WHEEL_ROWS = 3
-MAX_EFFECT_BYTES = 96 * 1024 * 1024
-PROBE_SECONDS = 0.75
-RENDER_HOLD_SECONDS = 1.0
-CURSOR_SHAPES = {
-    "block": "BLOCK",
-    "block_hollow": "BLOCK",
-    "bar": "BEAM",
-    "underline": "UNDERLINE",
-}
-WHEEL_BUTTONS = frozenset(("wheelup", "wheeldown", "wheelleft", "wheelright"))
-SKIP_KEYS = frozenset(
-    (
-        Keys.Any,
-        Keys.CPRResponse,
-        Keys.Vt100MouseEvent,
-        Keys.WindowsMouseEvent,
-        Keys.Ignore,
-        Keys.BracketedPaste,
-    )
-)
-MODIFIERS = {"c": CTRL, "s": SHIFT, "a": ALT}
 
 
 class InputProcessor(KeyProcessor):
@@ -133,6 +109,18 @@ class InputProcessor(KeyProcessor):
 class TerminalControl(UIControl):
     """Render VT cells without a shadow command-line buffer or shell parsing."""
 
+    SKIP_KEYS = frozenset(
+        (
+            Keys.Any,
+            Keys.CPRResponse,
+            Keys.Vt100MouseEvent,
+            Keys.WindowsMouseEvent,
+            Keys.Ignore,
+            Keys.BracketedPaste,
+        )
+    )
+    MODIFIERS = {"c": CTRL, "s": SHIFT, "a": ALT}
+
     def __init__(self, owner: TerminalApp):
         """Bind terminal input without reserving application shortcut keys."""
         self.owner = owner
@@ -140,7 +128,7 @@ class TerminalControl(UIControl):
         self.bindings = KeyBindings()
         self.bindings.add(Keys.Any, eager=True)(self._key)
         for key in Keys:
-            if key not in SKIP_KEYS:
+            if key not in self.SKIP_KEYS:
                 self.bindings.add(key, eager=True)(self._key)
         self.bindings.add(Keys.BracketedPaste, eager=True)(self._paste)
         self.bindings.add(Keys.Vt100MouseEvent, eager=True)(self._mouse)
@@ -240,7 +228,7 @@ class TerminalControl(UIControl):
         if base in SPECIAL_KEYS:
             modifiers = 0
             for part in parts[:-1]:
-                modifiers |= MODIFIERS.get(part, 0)
+                modifiers |= self.MODIFIERS.get(part, 0)
             return self.owner.vt.encode_key(base, modifiers)
         if len(event.data) == 1:
             # C0 bytes retain Ctrl+C/D and CR/LF semantics. Printable keys use
@@ -269,6 +257,21 @@ class TerminalControl(UIControl):
 class TerminalApp:
     """Display the native terminal while the shell owns command editing."""
 
+    DEFAULT_SIZE = (80, 24)
+    FRAME_INTERVAL = 1 / 60
+    WHEEL_ROWS = 3
+    MAX_EFFECT_BYTES = 96 * 1024 * 1024
+    MAX_NOTIFICATIONS_PER_FRAME = 64
+    PROBE_SECONDS = 0.75
+    RENDER_HOLD_SECONDS = 1.0
+    CURSOR_SHAPES = {
+        "block": "BLOCK",
+        "block_hollow": "BLOCK",
+        "bar": "BEAM",
+        "underline": "UNDERLINE",
+    }
+    WHEEL_BUTTONS = frozenset(("wheelup", "wheeldown", "wheelleft", "wheelright"))
+
     def __init__(
         self,
         shell: str,
@@ -291,7 +294,7 @@ class TerminalApp:
         self.dump_state = dump_state
         self.launch_cwd = Path.cwd()
         self.cwd_changed = False
-        self.size = DEFAULT_SIZE
+        self.size = self.DEFAULT_SIZE
         self.pressed_buttons = []
         self.native_buttons = {}
         self.mouse_policy = validate_mouse_policy(mouse)
@@ -310,9 +313,12 @@ class TerminalApp:
             )
         self.control_output = []
         self.control_bytes = 0
+        self.notification_count = 0
+        self.notification_drops = 0
         self.effects = {}
         self.animation = None
         self.hold_timer = None
+        self.geometry_timer = None
         self.hold_serial = 0
         self.pressed_keys = {}
         self.host_focused = True
@@ -330,6 +336,7 @@ class TerminalApp:
             on_key=self._host_key,
             on_clipboard_reply=lambda sequence: self.clipboard.host_reply(sequence),
             on_appearance=self._appearance,
+            on_geometry=self._geometry_changed,
         )
         self.input = HostInput(create_input(), self.host)
         self.session = Session(
@@ -350,6 +357,12 @@ class TerminalApp:
             failed=self._failed,
         )
         self.vt.clipboard = self.clipboard
+        self.notifications = Notifications(
+            self._notification,
+            self.session.send,
+            enabled=self.host.features["desktop_notifications"] == "on",
+        )
+        self.vt.set_notifications(self.notifications, before=self._drain_effects)
         self.control = TerminalControl(self)
         self.window = NativeWindow(self.control)
         self.plugins = Plugins(self, self.window)
@@ -366,7 +379,7 @@ class TerminalApp:
             color_depth=preferred_color_depth,
             full_screen=True,
             mouse_support=Condition(lambda: self.mouse_enabled),
-            min_redraw_interval=FRAME_INTERVAL,
+            min_redraw_interval=self.FRAME_INTERVAL,
             after_render=self._after_render,
         )
         self.app.key_processor = InputProcessor(self, self.app.key_processor)
@@ -427,7 +440,7 @@ class TerminalApp:
         frame = self.control.frame
         if frame is None or self.plugins.popups:
             return CursorShape.BEAM
-        shape = CURSOR_SHAPES.get(frame.cursor_shape, "BLOCK")
+        shape = self.CURSOR_SHAPES.get(frame.cursor_shape, "BLOCK")
         if frame.cursor_blink:
             shape = "BLINKING_" + shape
         return CursorShape[shape]
@@ -521,7 +534,7 @@ class TerminalApp:
             self.app.output.write_raw(self.host.begin_probe(size.columns, size.rows))
             self.app.output.flush()
             try:
-                await asyncio.wait_for(self.host.ready.wait(), PROBE_SECONDS)
+                await asyncio.wait_for(self.host.ready.wait(), self.PROBE_SECONDS)
             except TimeoutError:
                 pass  # Conservative host capability fallback, never shell readiness.
             self.host.finish_probe()
@@ -601,7 +614,7 @@ class TerminalApp:
         )
         if data:
             self.session.send(data)
-            if action == "press" and button not in WHEEL_BUTTONS:
+            if action == "press" and button not in self.WHEEL_BUTTONS:
                 self.native_buttons[button] = (x, y, modifiers, pixel_position)
             elif action == "move":
                 for held in self.native_buttons:
@@ -642,7 +655,7 @@ class TerminalApp:
         button = event.button
         if event.action == "press":
             self.clipboard.cancel_paste()
-        if event.action == "press" and button not in WHEEL_BUTTONS:
+        if event.action == "press" and button not in self.WHEEL_BUTTONS:
             if button not in self.pressed_buttons:
                 self.pressed_buttons.append(button)
         if event.action == "release" and button is None:
@@ -660,7 +673,7 @@ class TerminalApp:
             return
 
         # A local drag remains local if output changes the application's modes.
-        if self.selection.active and button not in WHEEL_BUTTONS:
+        if self.selection.active and button not in self.WHEEL_BUTTONS:
             if button in ("left", None) and event.action in ("move", "release"):
                 if event.action == "release":
                     self.selection.release(local_x, local_y, position=pointer)
@@ -685,7 +698,7 @@ class TerminalApp:
                 event.action, button, x, y, event.modifiers, pixel_position
             )
             return
-        if button in WHEEL_BUTTONS:
+        if button in self.WHEEL_BUTTONS:
             if event.action != "press" or button in ("wheelleft", "wheelright"):
                 return
             direction = -1 if button == "wheelup" else 1
@@ -696,9 +709,9 @@ class TerminalApp:
             ):
                 self.live()
                 key = "up" if direction < 0 else "down"
-                self.session.send(self.vt.encode_key(key) * WHEEL_ROWS)
+                self.session.send(self.vt.encode_key(key) * self.WHEEL_ROWS)
             else:
-                self.scroll(direction * WHEEL_ROWS)
+                self.scroll(direction * self.WHEEL_ROWS)
             return
         if event.action == "press" and button == "left":
             self._release_mouse()
@@ -732,12 +745,15 @@ class TerminalApp:
 
     def resize(self, cols, rows):
         """Keep the emulated grid and controlling PTY on the same pane dimensions."""
-        previous = self.profile
         self.host.refresh_geometry(*self._geometry())
-        changed_geometry = (previous.cell_width, previous.cell_height) != (
-            self.profile.cell_width,
-            self.profile.cell_height,
+        self.host.request_geometry()
+        pending = self.host.geometry_pending
+        cell = (
+            (self.vt.cell_width, self.vt.cell_height)
+            if pending and not self.profile.has_cell_size
+            else (self.profile.cell_width, self.profile.cell_height)
         )
+        changed_geometry = (self.vt.cell_width, self.vt.cell_height) != cell
         if self.session.pid is not None:
             self.app.renderer.enter_input_modes()
         if self.size != (cols, rows) or changed_geometry:
@@ -746,28 +762,47 @@ class TerminalApp:
             self.pressed_buttons.clear()
             self.selection.reset()
             self.clipboard.cancel_paste()
-            self.vt.resize(
-                cols, rows, self.profile.cell_width, self.profile.cell_height
-            )
+            self.vt.resize(cols, rows, *cell)
             self.session.resize(cols, rows)
             self.size = (cols, rows)
-            if self.session.pid is not None:
-                self.vt.set_graphics(self.profile.image_protocol is not None)
+        if self.session.pid is not None and not pending:
+            enabled = self.profile.image_protocol is not None
+            if self.vt.graphics_enabled != enabled:
+                self.vt.set_graphics(enabled)
+        self._sync_output_flow()
+
+    def _sync_output_flow(self):
+        """Reuse PTY backpressure while presentation geometry or suspension waits."""
+        enabled = (
+            self.suspend_task is None
+            and not self.host.geometry_pending
+            and (self.vt.cell_width, self.vt.cell_height)
+            == (self.profile.cell_width, self.profile.cell_height)
+        )
+        if self.session.output_enabled != enabled:
+            self.session.set_output_enabled(enabled)
+            if enabled and self.animation is None and self.profile.image_protocol:
+                self._animate()
+
+    def _geometry_changed(self):
+        """Apply a completed measurement on the next render before resuming output."""
+        if self.geometry_timer is not None:
+            self.geometry_timer.cancel()
+            self.geometry_timer = None
+        self.app.invalidate()
 
     def _output(self, data):
         """Only the VT receives child output; PTK remains the sole outer renderer."""
         alternate = self.vt.alternate
         self.vt.feed(data)
-        # Title/cwd represent current state; ring at most once per presentation.
-        for effect in self.vt.drain_events():
-            self.effects[effect.kind] = effect
+        self._drain_effects()
         serial = self.vt.render_hold_serial
         if self.vt.synchronized_output:
             if serial != self.hold_serial:
                 if self.hold_timer is not None:
                     self.hold_timer.cancel()
                 self.hold_timer = asyncio.get_running_loop().call_later(
-                    RENDER_HOLD_SECONDS, self.release_hold
+                    self.RENDER_HOLD_SECONDS, self.release_hold
                 )
                 self.hold_serial = serial
         elif self.hold_timer is not None:
@@ -844,7 +879,7 @@ class TerminalApp:
         try:
             self.release_capture()
             self.clipboard.cancel_paste()
-            self.session.set_output_enabled(False)
+            self._sync_output_flow()
             with set_app(self.app):
                 async with in_terminal():
                     # SIGSTOP cannot be ignored by an orphaned process group.
@@ -856,8 +891,8 @@ class TerminalApp:
         except Exception as error:
             self._failed(error)
         finally:
-            self.session.set_output_enabled(True)
             self.suspend_task = None
+            self._sync_output_flow()
 
     def restore_cwd(self, output):
         """Restore the known launch directory, separately from the child --cwd."""
@@ -868,10 +903,21 @@ class TerminalApp:
 
     def publish_effects(self, output):
         """Serialize queued effects through the same presentation output."""
+        if not self.stopping and not self.app.is_done:
+            geometry = self.host.take_geometry_query()
+            if geometry is not None:
+                serial, query = geometry
+                output.write_raw(query)
+                if self.geometry_timer is not None:
+                    self.geometry_timer.cancel()
+                self.geometry_timer = asyncio.get_running_loop().call_later(
+                    self.PROBE_SECONDS, self.host.expire_geometry, serial
+                )
         for control in self.control_output:
             output.write_raw(control)
         self.control_output.clear()
         self.control_bytes = 0
+        self.notification_count = 0
         for effect in self.effects.values():
             value = effect.data.decode("utf-8", errors="replace")
             if effect.kind == "bell":
@@ -889,9 +935,30 @@ class TerminalApp:
                         self.cwd_changed = True
         self.effects.clear()
 
+    def _drain_effects(self):
+        """Retain notification order while coalescing current title/cwd state."""
+        for effect in self.vt.drain_events():
+            if effect.kind == "notification":
+                self.notifications.native(effect.data)
+            else:
+                self.effects[effect.kind] = effect
+
+    def _notification(self, value):
+        """Use the existing bounded queue and the sole host output owner."""
+        sequence = self.host.notification(value)
+        if sequence:
+            if (
+                self.notification_count >= self.MAX_NOTIFICATIONS_PER_FRAME
+                or self.control_bytes + len(sequence) > self.MAX_EFFECT_BYTES
+            ):
+                self.notification_drops += 1
+            else:
+                self.notification_count += 1
+                self._queue_control(sequence)
+
     def _queue_control(self, sequence):
         """Queue normalized adapter output for the sole terminal renderer."""
-        if self.control_bytes + len(sequence) > MAX_EFFECT_BYTES:
+        if self.control_bytes + len(sequence) > self.MAX_EFFECT_BYTES:
             raise BufferError(i18n.get(Message.VT_EFFECT_LIMIT))
         self.control_output.append(sequence)
         self.control_bytes += len(sequence)
@@ -927,11 +994,14 @@ class TerminalApp:
             "input_routes": asdict(self.vt.input_routes),
             "native_processing_error": self.vt.processing_error,
             "native_log_counts": diagnostics.snapshot(),
+            "notification_drops": self.notification_drops,
+            "notification_rejections": self.notifications.rejected,
             "protocol_errors": self.vt.protocol_errors,
             "protocol_failures": self.vt.protocol_failures,
             "framing_drops": self.vt.framing_drops,
             "host_adapter": self.host.adapter.name,
             "graphics_enabled": self.vt.graphics_enabled,
+            "geometry_pending": self.host.geometry_pending,
             "image_errors": self.vt.image_errors,
             "clipboard_policy": {
                 "read": self.clipboard.allow_read,
@@ -969,6 +1039,10 @@ class TerminalApp:
                 set_exception_handler=False,
             )
         finally:
+            if self.geometry_timer is not None:
+                self.geometry_timer.cancel()
+                self.geometry_timer = None
+            self.host.cancel_geometry()
             self.clipboard.close()
             self.selection.close()
             if self.animation is not None:

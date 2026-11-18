@@ -21,7 +21,6 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.vt100 import Vt100_Output
 
 from ish.terminal.host import (
-    MAX_CONTROL,
     HostAppearance,
     HostBroker,
     HostInput,
@@ -67,6 +66,7 @@ class HostProbeTests(unittest.TestCase):
                     7,
                     12,
                     25,
+                    80,
                     1000,
                     1002,
                     1003,
@@ -78,7 +78,7 @@ class HostProbeTests(unittest.TestCase):
                     2004,
                 )
             )
-            + "\x1bP$qm\x1b\\",
+            + "\x1bP$qm\x1b\\\x1b[c",
         )
         self.assertEqual(self.broker.profile, HostProfile())
         with self.assertRaises(FrozenInstanceError):
@@ -207,6 +207,47 @@ class HostProbeTests(unittest.TestCase):
         self.assertEqual(self.keys[1].data, "x")
         self.assertFalse(self.broker.finish_probe().kitty_graphics)
 
+    def test_escape_before_reply_keeps_its_introducer_across_every_split(self):
+        """Popup cancellation adjacent to a response never turns its tail into keys."""
+        for reply in (
+            "\x1b[6;20;10t",
+            "\x1b[4;480;800t",
+            "\x1b_Gi=2147515049;OK\x1b\\",
+            "\x9b6;20;10t",
+            "\x9fGi=2147515049;OK\x9c",
+        ):
+            wire = "\x1b" + reply
+            for split in range(len(wire) + 1):
+                with self.subTest(reply=repr(reply), split=split):
+                    keys = []
+                    parser = HostParser(Vt100Parser(keys.append), HostBroker())
+                    parser.feed("a" + wire[:split])
+                    # A solitary, legacy response ESC still has the known
+                    # timing ambiguity. Once framed, the reply survives flush.
+                    if split != 2 or reply.startswith("\x9b"):
+                        parser.flush()
+                    parser.feed(wire[split:] + "b")
+                    parser.flush()
+                    self.assertEqual(
+                        [(key.key, key.data) for key in keys],
+                        [("a", "a"), (Keys.Escape, "\x1b"), ("b", "b")],
+                    )
+
+    def test_legacy_alt_arrow_and_repeated_escape_keep_key_identity(self):
+        """Preserving the second introducer also preserves conventional Meta keys."""
+        wire = "\x1b\x1b[A\x1bx\x1b\x1b"
+        for split in range(len(wire) + 1):
+            with self.subTest(split=split):
+                keys = []
+                parser = HostParser(Vt100Parser(keys.append), HostBroker())
+                parser.feed(wire[:split])
+                parser.feed(wire[split:])
+                parser.flush()
+                self.assertEqual(
+                    [key.key for key in keys],
+                    [Keys.Escape, Keys.Up, Keys.Escape, "x", Keys.Escape, Keys.Escape],
+                )
+
     def test_mouse_arrow_cpr_alt_and_lone_escape_keep_ptk_semantics(self):
         """Existing keyboard, mouse and PTK cursor-response paths are preserved."""
         self.feed("\x1b[A\x1b[<0;3;5M\x1b[2;9R\x1bx")
@@ -292,7 +333,7 @@ class HostProbeTests(unittest.TestCase):
 
     def test_oversized_control_is_discarded_through_split_terminator(self):
         """A bounded parser discards the entire oversized control payload."""
-        self.feed("\x1b]52;c;" + "x" * MAX_CONTROL)
+        self.feed("\x1b]52;c;" + "x" * HostParser.MAX_CONTROL)
         self.feed("more\x1b")
         self.feed("\\after")
         self.assertEqual("".join(key.data for key in self.keys), "after")
@@ -1205,6 +1246,7 @@ class HostAppearanceTests(unittest.TestCase):
         """Readiness here is complete optional observations, never shell readiness."""
         self.dispatch(
             "\x1b[6;20;10t\x1b[?2026;0$y\x1b[?5522;0$y\x1b[?2031;0$y"
+            "\x1b[?80;0$y\x1b[?62;6c"
             "\x1bP>|XTerm(407)\x1b\\\x1b[?0u"
             + f"\x1b_Gi={self.broker._query_id};EINVAL:unsupported\x1b\\"
             + "\x1b]10;rgb:ff/ff/ff;rgb:00/00/00;rgb:ff/ff/ff\x07"
@@ -1487,6 +1529,8 @@ class HostFeatureTests(unittest.TestCase):
             "cursor_color",
             "iterm_graphics",
             "kitty_graphics",
+            "sixel_graphics",
+            "desktop_notifications",
             "synchronized_output",
             "enhanced_keyboard",
             "pixel_mouse",

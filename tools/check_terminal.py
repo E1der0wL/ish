@@ -24,9 +24,13 @@ REQUIRED_TERMINAL = (
     "test_terminal_composition",
     "test_terminal_contracts",
     "test_terminal_cursor",
+    "test_terminal_distribution",
     "test_terminal_engine",
     "test_terminal_extensions",
     "test_terminal_features",
+    "test_terminal_geometry",
+    "test_terminal_sixel",
+    "test_terminal_optional",
     "test_terminal_graphics",
     "test_terminal_graphics_vt",
     "test_terminal_hookless",
@@ -45,7 +49,16 @@ REQUIRED_TERMINAL = (
     "test_terminal_terminfo",
     "test_terminal_vt",
 )
-SHARED_TESTS = ("test_plugin_loading", "test_plugin_dependencies")
+SHARED_TESTS = (
+    "test_plugin_loading",
+    "test_plugin_dependencies",
+    "test_i18n",
+    "test_diagnostics",
+    "test_logging",
+    "test_management_store",
+    "test_management_ui",
+    "test_management_restore",
+)
 OPT_IN_GUI = (
     "test_terminal_appearance_gui",
     "test_terminal_basics_gui",
@@ -58,17 +71,61 @@ NATIVE_PROGRAMS = ("bash", "zsh", "tcsh", "vim")
 TEST_PROGRAMS = ("infocmp", "tput", "Xvfb", "xclip")
 NATIVE_PROBE = b"VT_READY"
 LINT_PATHS = (
-    "src/ish/terminal",
-    "src/ish/lang",
-    "src/ish/plugin/dependencies.py",
-    "src/ish/plugin/manager.py",
+    "src/ish",
     "examples/terminal_plugins",
+    "tools/build_distribution.py",
     "tools/build_ghostty_vt.py",
-    "tools/check_stream.py",
+    "tools/check_runtime.py",
     "tools/check_terminal.py",
+    "tools/smoke_distribution.py",
     "tools/terminal_contracts.py",
+    "tools/compare_terminal.py",
 )
-HELPER_PATTERNS = ("terminal_*.py", "plugin_fixture.py")
+REQUIRED_HELPERS = (
+    "tests/comparison_terminal.py",
+    "tests/comparison_child.py",
+    "tests/comparison_apps.py",
+    "tests/comparison_images.py",
+    "tests/terminal_presentation.py",
+    "tests/terminal_keyboard.py",
+)
+HELPER_PATTERNS = (
+    "terminal_*.py",
+    "plugin_fixture.py",
+    "startup_fixture.py",
+    "management_*.py",
+)
+
+
+class StrictResult(unittest.TextTestResult):
+    """A missing capability or unexpected skip cannot turn native coverage green."""
+
+    def wasSuccessful(self):
+        """Require every collected test to execute, in addition to ordinary success."""
+        return super().wasSuccessful() and not self.skipped
+
+
+def regression(selected, *, validate=None):
+    """Run independent existing tests, rejecting empty modules and skipped cases."""
+    suite = unittest.TestSuite()
+    loader = unittest.TestLoader()
+    for name in selected:
+        tests = loader.loadTestsFromName(name)
+        if not tests.countTestCases():
+            raise RuntimeError(f"Test module collected no tests: {name}")
+        suite.addTests(tests)
+    if validate is not None:
+        try:
+            validate(suite)
+        except RuntimeError:
+            # Preserve collection tracebacks when an evidence check rejects a
+            # failed import before the runner can execute its _FailedTest.
+            for error in loader.errors:
+                print(error, file=sys.stderr)
+            raise
+    print(f"Running {suite.countTestCases()} tests; skips fail this check.", flush=True)
+    result = unittest.TextTestRunner(verbosity=2, resultclass=StrictResult).run(suite)
+    return 0 if result.wasSuccessful() else 1
 
 
 def modules():
@@ -181,8 +238,9 @@ def environment(*, lint):
 
 
 def lint_paths(selected):
-    """Keep this experiment's source and helper checks on an explicit scope."""
+    """Keep product, distribution and regression helper checks on an explicit scope."""
     paths = [ROOT / path for path in LINT_PATHS]
+    paths.extend(ROOT / path for path in REQUIRED_HELPERS)
     paths.extend(ROOT / "tests" / f"{name}.py" for name in selected)
     for pattern in HELPER_PATTERNS:
         paths.extend(sorted((ROOT / "tests").glob(pattern)))
@@ -222,8 +280,6 @@ def main(argv=None):
     os.environ["PYTHONPATH"] = os.pathsep.join(paths)
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
-        from tools.check_stream import regression
-
         selected = modules()
         # Resolve any relative native library override from the project, matching
         # the test processes that run with the project as their working directory.

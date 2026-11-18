@@ -38,14 +38,9 @@ from .dependencies import (
 )
 from .metadata import DependencySpec, split_requirement
 
-__all__ = ["PluginManager", "PluginInfo"]
+__all__ = ["PluginManager", "PluginInfo", "PluginCandidate"]
 
 PLUGIN_META = "PLUGIN_META"
-_NORMALIZER = "normalize"
-_PLUGIN_REQUIREMENT = re.compile(r"^([a-zA-Z0-9_./-]+?)([><=!~]+.+)?$")
-_HIDDEN_PREFIX = "."
-_DEBUG_FILE_LIMIT = 10
-_EXTRA_MARKER = "extra"
 
 
 def _metadata_string(value: object) -> str:
@@ -68,16 +63,18 @@ def _metadata_list(value: object) -> list[str]:
 class PluginInfo:
     """Loaded plugin module and its declared version and dependency metadata."""
 
+    NORMALIZER = "normalize"
+
     name: str
-    version: str = field(default="0.0.0", metadata={_NORMALIZER: _metadata_string})
-    description: str = field(default="", metadata={_NORMALIZER: _metadata_string})
-    author: str = field(default="", metadata={_NORMALIZER: _metadata_string})
+    version: str = field(default="0.0.0", metadata={NORMALIZER: _metadata_string})
+    description: str = field(default="", metadata={NORMALIZER: _metadata_string})
+    author: str = field(default="", metadata={NORMALIZER: _metadata_string})
     module: Optional[Any] = None
     requirements: List[str] = field(
-        default_factory=list, metadata={_NORMALIZER: _metadata_list}
+        default_factory=list, metadata={NORMALIZER: _metadata_list}
     )
     dependencies: List[str] = field(
-        default_factory=list, metadata={_NORMALIZER: _metadata_list}
+        default_factory=list, metadata={NORMALIZER: _metadata_list}
     )
 
     @classmethod
@@ -95,8 +92,10 @@ class PluginInfo:
         if not meta:
             return None
         values = {}
-        for field_name, normalize in _METADATA_FIELDS:
-            if field_name in meta:
+        for declaration in fields(cls):
+            normalize = declaration.metadata.get(cls.NORMALIZER)
+            field_name = declaration.name
+            if normalize is not None and field_name in meta:
                 try:
                     values[field_name] = normalize(meta[field_name])
                 except TypeError as exc:
@@ -104,11 +103,14 @@ class PluginInfo:
         return cls(name=name, **values)
 
 
-_METADATA_FIELDS = tuple(
-    (declaration.name, declaration.metadata[_NORMALIZER])
-    for declaration in fields(PluginInfo)
-    if _NORMALIZER in declaration.metadata
-)
+@dataclass(frozen=True, slots=True)
+class PluginCandidate:
+    """Describe source metadata without claiming that a plugin can be loaded."""
+
+    name: str
+    path: Path
+    info: PluginInfo | None
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,13 +188,17 @@ class PluginManager:
     dependency cycles with a loading stack and unregister failed modules.
     """
 
+    REQUIREMENT = re.compile(r"^([a-zA-Z0-9_./-]+?)([><=!~]+.+)?$")
+    HIDDEN_PREFIX = "."
+    DEBUG_FILE_LIMIT = 10
+    EXTRA_MARKER = "extra"
+
     def __init__(self, *, script_dir: Path | None = None, lib_dir: Path | None = None):
         """Prepare the registry, installation history, cycle-detection set, and logger."""
         self._script_dir = Path(script_dir) if script_dir is not None else None
         self._lib_dir = Path(lib_dir) if lib_dir is not None else None
         self.registry = PluginRegistry()
         self.python_exe: Optional[str] = None
-        self.plugins: List[Any] = []
 
         self._installed_libs: set = set()
         self._loading_stack: set = set()
@@ -203,7 +209,7 @@ class PluginManager:
 
     @property
     def script_dir(self) -> Path:
-        """Use an explicit source root or the current legacy configuration."""
+        """Use an explicit source root or the current common configuration."""
         return (
             self._script_dir
             if self._script_dir is not None
@@ -212,7 +218,7 @@ class PluginManager:
 
     @property
     def lib_dir(self) -> Path:
-        """Use an explicit library root or the current legacy configuration."""
+        """Use an explicit library root or the current common configuration."""
         return self._lib_dir if self._lib_dir is not None else config.PLUGIN_LIB_DIR
 
     def _parse_plugin_requirement(
@@ -221,7 +227,7 @@ class PluginManager:
         """Parse ish plugin names separately from Python distribution requirements."""
         req, lib_name = split_requirement(req)
 
-        match = _PLUGIN_REQUIREMENT.match(req.strip())
+        match = self.REQUIREMENT.match(req.strip())
         if match:
             name = match.group(1).strip()
             version_spec = match.group(2).strip() if match.group(2) else None
@@ -247,7 +253,7 @@ class PluginManager:
         if (
             not isinstance(name, str)
             or not name
-            or name.startswith(_HIDDEN_PREFIX)
+            or name.startswith(self.HIDDEN_PREFIX)
             or "/" in name
             or "\\" in name
         ):
@@ -276,6 +282,41 @@ class PluginManager:
                         i18n.get(Message.PM_META_LITERAL, field=PLUGIN_META)
                     ) from exc
         return None
+
+    def discover(self) -> tuple[PluginCandidate, ...]:
+        """List source metadata without imports, dependency installs or registration.
+
+        A candidate is not a readiness or compatibility claim. Loading still
+        validates dependencies and the selected execution API at session start.
+        """
+        if not self.script_dir.exists():
+            return ()
+        candidates = []
+        for directory in sorted(self.script_dir.iterdir(), key=lambda item: item.name):
+            if not directory.is_dir() or directory.name.startswith(self.HIDDEN_PREFIX):
+                continue
+            entry = directory
+            info = None
+            error = None
+            try:
+                entry = self._get_plugin_entry_point(
+                    self._get_plugin_path(directory.name)
+                )
+                if entry is None:
+                    raise ValueError(
+                        i18n.get(Message.PM_LOAD_FAIL, plugin_file=directory)
+                    )
+                info = PluginInfo.from_mapping(
+                    directory.name, self._get_plugin_meta(entry)
+                )
+                if info is None:
+                    raise ValueError(i18n.get(Message.PM_LOAD_FAIL, plugin_file=entry))
+            except Exception as failure:
+                error = str(failure)
+            candidates.append(
+                PluginCandidate(directory.name, entry or directory, info, error)
+            )
+        return tuple(candidates)
 
     def _is_version_allowed(
         self, installed: str, spec: str | SpecifierSet | None
@@ -327,7 +368,7 @@ class PluginManager:
         for value in distribution.requires or ():
             child = Requirement(value)
             if child.marker is not None and not any(
-                child.marker.evaluate({_EXTRA_MARKER: extra}) for extra in extras
+                child.marker.evaluate({self.EXTRA_MARKER: extra}) for extra in extras
             ):
                 continue
             if not self._has_dependencies(child, seen, checked):
@@ -576,13 +617,13 @@ class PluginManager:
         finally:
             self._loading_stack.discard(plugin_name)
 
-    def load(self, names: Sequence[str] | None = None) -> List[Any]:
-        """Load selected plugins in order, or discover all legacy plugins with None.
+    def load(self, names: Sequence[str]) -> List[Any]:
+        """Load an explicit plugin selection in order.
 
         Use the current interpreter to install dependencies. Log individual plugin
         errors and continue loading other plugins. An empty selection runs none.
         """
-        if isinstance(names, (str, bytes)):
+        if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
             raise TypeError(i18n.get(Message.PM_SELECTION_INVALID))
         if str(self.lib_dir) not in sys.path:
             sys.path.insert(0, str(self.lib_dir))
@@ -594,20 +635,11 @@ class PluginManager:
         self.python_exe = sys.executable
         return self._load_plugins(names)
 
-    def _load_plugins(self, names: Sequence[str] | None = None) -> List[Any]:
+    def _load_plugins(self, names: Sequence[str]) -> List[Any]:
         """Load plugin directories after configuring dependency installation and imports."""
         loaded_infos = []
-        selected = (
-            names
-            if names is not None
-            else [
-                d.name
-                for d in self.script_dir.iterdir()
-                if d.is_dir() and not d.name.startswith(_HIDDEN_PREFIX)
-            ]
-        )
         visited = set()
-        for name in selected:
+        for name in names:
             plugin_dir = self.script_dir / str(name)
             try:
                 plugin_dir = self._get_plugin_path(name)
@@ -633,7 +665,9 @@ class PluginManager:
                 lib_dir_contents = ""
                 if lib_dir_exists:
                     try:
-                        dir_contents = islice(self.lib_dir.iterdir(), _DEBUG_FILE_LIMIT)
+                        dir_contents = islice(
+                            self.lib_dir.iterdir(), self.DEBUG_FILE_LIMIT
+                        )
                         lib_dir_contents = "\n" + "\n".join(
                             f"  - {f.name}" for f in dir_contents
                         )
@@ -644,7 +678,7 @@ class PluginManager:
                     Message.PM_DEBUG_LIBRARY,
                     exists=lib_dir_exists,
                     path=target_path,
-                    limit=_DEBUG_FILE_LIMIT,
+                    limit=self.DEBUG_FILE_LIMIT,
                     contents=lib_dir_contents,
                 )
                 log_python_info = i18n.get(

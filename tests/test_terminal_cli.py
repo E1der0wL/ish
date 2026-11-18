@@ -248,6 +248,7 @@ class Terminal:
         extra_args=(),
         environment=None,
         configure=True,
+        executable=None,
     ):
         """Launch the new CLI in a private HOME with a known native tcsh prompt."""
         self.root = root
@@ -278,6 +279,13 @@ class Terminal:
             if name.startswith("ISH_GHOSTTY_"):
                 child_environment[name] = value
         child_environment.update(environment or {})
+        invocation = [sys.executable, "-B", "-m", "ish"]
+        if executable is not None:
+            invocation = [str(executable)]
+            child_environment.pop("PYTHONPATH", None)
+            for name in tuple(child_environment):
+                if name.startswith("ISH_GHOSTTY_"):
+                    child_environment.pop(name)
         self.fd, slave = pty_open(rows, cols)
         self.attrs = termios.tcgetattr(slave)
         self.pid = os.fork()
@@ -291,12 +299,9 @@ class Terminal:
                 os.close(slave)
             os.chdir(root)
             os.execve(
-                sys.executable,
+                invocation[0],
                 [
-                    sys.executable,
-                    "-B",
-                    "-m",
-                    "ish.terminal",
+                    *invocation,
                     "--shell",
                     shell,
                     "--cwd",
@@ -639,7 +644,7 @@ class TerminalCLIFixture(unittest.TestCase):
 
     def setUp(self):
         """Start an isolated shell occupying the entire outer terminal."""
-        directory = self.enterContext(tempfile.TemporaryDirectory(prefix="ish-vt-cli-"))
+        directory = self.enterContext(tempfile.TemporaryDirectory(prefix="ish-cli-"))
         self.root = Path(directory)
         self.terminal = Terminal(self.root, extra_args=self.terminal_args)
         self.addCleanup(self.terminal.close)
@@ -656,8 +661,8 @@ class TerminalCLIFixture(unittest.TestCase):
         self.assertEqual((state["rows"], state["cols"]), (terminal.rows, terminal.cols))
         self.assertNotIn("popup", state)
         self.assertNotIn("popup_text", state)
-        self.assertFalse(terminal.frame_has("ish-vt |"))
-        self.assertFalse(terminal.frame_has("ish-vt popup"))
+        self.assertFalse(terminal.frame_has("ish |"))
+        self.assertFalse(terminal.frame_has("ish popup"))
 
 
 class TerminalCLITests(TerminalCLIFixture):
@@ -670,7 +675,7 @@ class TerminalCLITests(TerminalCLIFixture):
         self.assertEqual(state["engine"]["native_inputs"], ["kitty"])
         self.assertEqual(
             state["input_routes"],
-            {"kitty": "native", "iterm": "adapter", "sixel": "unsupported"},
+            {"kitty": "native", "iterm": "adapter", "sixel": "adapter"},
         )
         self.assertEqual(state["host_adapter"], "unknown")
         self.assertFalse(state["graphics_enabled"])

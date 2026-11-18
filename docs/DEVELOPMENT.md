@@ -1,4 +1,4 @@
-# ish-vt 개발 저장소
+# ish 개발 저장소
 
 정식 작업 위치는 Windows의 `D:\Developments\ish`, WSL의 `/mnt/d/Developments/ish`다. 현재 개발 브랜치는 `codex/hookless-vt`이며, 저장소 내부에 독립된 `.git`과 전체 조상 커밋 이력을 보관한다. 기존 GitHub 저장소를 `origin`으로 사용한다.
 
@@ -16,13 +16,12 @@ uv sync --frozen --group dev
 uv run --no-sync python tools/build_ghostty_vt.py
 
 # 추가 UI 없는 기본형
-uv run --no-sync ish-vt --shell tcsh
-uv run --no-sync ish-vt --shell bash
-uv run --no-sync ish-vt --shell zsh
+uv run --no-sync ish --shell tcsh
+uv run --no-sync ish --shell bash
+uv run --no-sync ish --shell zsh
 
 # 유지할 자동 검사
 uv run --no-sync python tools/check_terminal.py
-uv run --no-sync python tools/check_stream.py
 ```
 
 이전 환경에서 검증한 Linux native 라이브러리는 `.cache/ghostty-vt/install/lib`에 상대 symlink와 함께 보존했다. 새로 빌드할 때는 기존 checksum 고정 빌드 도구를 사용한다. 가상환경과 native 바이너리는 Git에 커밋하지 않는다.
@@ -30,11 +29,11 @@ uv run --no-sync python tools/check_stream.py
 Windows Terminal에서도 저장소의 새 가상환경으로 시작할 수 있다.
 
 ```powershell
-wsl.exe -d Ubuntu --cd /mnt/d/Developments/ish --exec .venv/bin/ish-vt --shell tcsh
+wsl.exe -d Ubuntu --cd /mnt/d/Developments/ish --exec .venv/bin/ish --shell tcsh
 ```
 
 실제 호스트 검증은 [기능 정책 및 결과](VT_FEATURE_POLICY.md), 실행 옵션은 [사용 안내](VT_USAGE.md)를 참고한다. 옮긴 `.cache`에는 이전 실패·성공 증거를 그대로 보존했다. 이 안의 과거 임시 실행 스크립트에는 C 드라이브 절대 경로가 남아 있을 수 있으므로 새 실행에는 저장소의 `tests/terminal_matrix.py`, `tests/terminal_features.py` 등 유지되는 도구를 사용한다.
 
 ## 관리 범위
 
-`ish-vt`는 libghostty-vt와 PTK 경로이며 `ish`는 기존 stream 경로다. 저장 위치 변경은 이 진입점을 바꾸거나 새 릴리스를 발행하는 작업과 구분한다. GitHub push·기본 브랜치 변경·릴리스 태그 발행은 별도의 배포 작업이다. 현재 검증 대상은 Windows Terminal/WSL의 Bash·zsh·tcsh이며, 이 위치를 정식 개발 저장소로 사용하는 것이 모든 OS·터미널 기능의 검증 완료를 뜻하지는 않는다.
+`ish`는 libghostty-vt와 PTK를 사용하는 단일 제품 경로다. 이전 stream 실행기와 별도 `ish-vt` 명령은 제거했으며 호환 실행기를 제공하지 않는다. `ish --help`와 `ish --config`에서 사용법과 설정을 확인한다. GitHub push·기본 브랜치 변경·릴리스 태그 발행은 별도의 배포 작업이다. 현재 검증 대상은 Windows Terminal/WSL의 Bash·zsh·tcsh이며, 이 위치를 정식 개발 저장소로 사용하는 것이 모든 OS·터미널 기능의 검증 완료를 뜻하지는 않는다.

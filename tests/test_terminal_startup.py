@@ -2,28 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 
-import test_stream_startup as shared
+from startup_fixture import StartupFixture
 from test_terminal_cli import Terminal
 
 
-class StartupTests(unittest.TestCase):
+class StartupTests(StartupFixture, unittest.TestCase):
     """Reuse isolated rc/PTY fixtures; expectations are public output and file bytes."""
-
-    setUp = shared.StartupTests.setUp
-    tearDown = shared.StartupTests.tearDown
-    files = shared.StartupTests.files
-    field = shared.StartupTests.field
-    write_rc = shared.StartupTests.write_rc
-    trap_shell = shared.StartupTests.trap_shell
-    trap_plugin = shared.StartupTests.trap_plugin
-    write_language = shared.StartupTests.write_language
-
-    def cli(self, *args):
-        """Run the actual public module without a terminal."""
-        return shared.StartupTests.cli(self, *args, module="ish.terminal")
 
     def run_terminal(self, *args, shell="/bin/sh"):
         """Start actual PTK/PTY and require process cleanup before reading outputs."""
@@ -38,13 +26,6 @@ class StartupTests(unittest.TestCase):
         terminal.require(terminal.exited, timeout=30)
         terminal.receive()
         return terminal.status, bytes(terminal.output).decode(errors="replace")
-
-    def recording_plugin(self, name):
-        """Reuse PluginManager's observable fixture with the VT registration API."""
-        shared.StartupTests.recording_plugin(self, name)
-        path = self.home / "plugins" / name / f"{name}.py"
-        text = path.read_text().replace("STREAM_API = 1", "TERMINAL_API = 1")
-        path.write_text(text)
 
     def test_queries_do_not_execute_rc_plugins_shell_or_native_library(self):
         """Queries work with active rc, import traps and an unusable native library."""
@@ -87,8 +68,8 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.files(), before)
 
-    def test_help_and_diagnostics_distinguish_vt_from_stream(self):
-        """No stream integration policy or internal screen dump is advertised."""
+    def test_help_and_diagnostics_describe_the_single_terminal_runtime(self):
+        """The public runtime advertises terminal policy and no retired options."""
         help_result = self.cli("--help", "--lang", "en")
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         for text in (
@@ -99,17 +80,20 @@ class StartupTests(unittest.TestCase):
             "--escape-delay",
             "--feature",
             "--login",
+            "--config",
         ):
             self.assertIn(text, help_result.stdout)
         for text in (
             "--integration-dir",
+            "--library-dir",
             "--demo",
             "--dump-state",
             "fall back to native operation",
+            "ish-vt",
         ):
             self.assertNotIn(text, help_result.stdout)
         result = self.cli("--diagnose", "--lang", "en")
-        self.assertIn("VT settings namespace: config.vt", result.stdout)
+        self.assertEqual(self.field(result.stdout, "Settings object"), "config")
         self.assertEqual(self.field(result.stdout, "Mouse capture"), "auto")
         self.assertEqual(self.field(result.stdout, "History line limit"), "10000")
         self.assertEqual(self.field(result.stdout, "History byte limit"), "33554432")
@@ -125,7 +109,7 @@ class StartupTests(unittest.TestCase):
         self.assertIn("hookless libghostty-vt", result.stdout)
         self.env["LANG"] = "C.UTF-8"
         result = self.cli("--version")
-        self.assertEqual(result.stdout.strip(), "ish-vt 2.0.0 (separate VT experiment)")
+        self.assertEqual(result.stdout.strip(), "ish 2.0.0")
 
     def test_feature_diagnostics_keep_forced_policy_separate_from_unprobed_support(
         self,
@@ -156,16 +140,16 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("clipboard_protocol", result.stdout)
                 self.assertEqual(self.files(), before)
 
-    def test_stream_rejects_vt_feature_cli_without_loading_rc(self):
-        """A generic field merger does not expose terminal-only options in stream."""
+    def test_removed_options_are_rejected_without_loading_rc(self):
+        """Removed execution paths and aliases cannot silently select a fallback."""
         marker = self.root / "rc-executed"
         self.write_rc(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
-        result = shared.StartupTests.cli(
-            self, "--diagnose", "--feature", "hyperlinks=off"
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("--feature", result.stderr)
-        self.assertFalse(marker.exists())
+        for option in ("--integration-dir=unused", "--library-dir=unused", "--demo"):
+            with self.subTest(option=option):
+                result = self.cli("--diagnose", option)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(option.split("=", 1)[0], result.stderr)
+                self.assertFalse(marker.exists())
 
     def test_invalid_cli_is_translated_and_never_runs_rc(self):
         """Policy and parsing failures stay before arbitrary initialization."""
@@ -209,12 +193,17 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual((work / "argv-result").read_bytes(), b"-l\n")
 
-    def test_saved_vt_plugins_persist_without_loading_stream_plugins(self):
-        """One shared rc keeps the entry points' selections independent."""
+    def test_saved_plugins_persist_once_per_session(self):
+        """One selection list loads each plugin once and applies flat policies."""
         self.recording_plugin("saved")
         self.write_rc(
-            "config.plugins = ['stream-only-must-not-load']\nconfig.plugin_dir = 'plugins'\nconfig.lang = 'ko'\nconfig.vt = {'plugins': ['saved', 'saved'], 'mouse': 'off', 'clipboard': 'off', 'escape_delay': 0.08, 'scrollback_lines': 42, 'scrollback_bytes': 65536}\n"
+            "config.plugins = ['saved', 'saved']\n"
+            "config.plugin_dir = 'plugins'\nconfig.lang = 'ko'\n"
+            "config.mouse = 'off'\nconfig.clipboard = 'off'\n"
+            "config.escape_delay = 0.08\nconfig.scrollback_lines = 42\n"
+            "config.scrollback_bytes = 65536\n"
         )
+        original = (self.home / ".ishrc.py").read_bytes()
         for count in (1, 2):
             status, output = self.run_terminal("--shell-arg=-c", "--shell-arg=exit 0")
             self.assertEqual(status, 0, output)
@@ -222,14 +211,17 @@ class StartupTests(unittest.TestCase):
                 (self.root / "saved-runs").read_text(),
                 "import\nsetup\ncleanup\n" * count,
             )
+            state = json.loads((self.root / "terminal-state.json").read_text())
+            self.assertEqual(state["mouse_policy"], "off")
+            self.assertEqual(state["clipboard_policy"], {"read": False, "write": False})
+            self.assertEqual(state["popups"], [])
+        self.assertEqual((self.home / ".ishrc.py").read_bytes(), original)
 
     def test_cli_plugin_selection_replaces_saved_and_no_plugins_disables(self):
         """Overrides affect the new session without rewriting persisted choices."""
         self.recording_plugin("saved")
         self.recording_plugin("once")
-        self.write_rc(
-            "config.plugin_dir = 'plugins'\nconfig.vt = {'plugins': ['saved']}\n"
-        )
+        self.write_rc("config.plugin_dir = 'plugins'\nconfig.plugins = ['saved']\n")
         original = (self.home / ".ishrc.py").read_bytes()
         status, output = self.run_terminal(
             "--plugin", "once", "--shell-arg=-c", "--shell-arg=exit 0"
@@ -253,7 +245,7 @@ class StartupTests(unittest.TestCase):
             "from pathlib import Path\nprint('FEATURE_READY',flush=True)\nPath('feature-input').write_text(input())\n"
         )
         self.write_rc(
-            "config.vt = {'features': {'hyperlinks': 'off', 'enhanced_keyboard': 'off', 'pixel_mouse': 'off'}}\n"
+            "config.features = {'hyperlinks': 'off', 'enhanced_keyboard': 'off', 'pixel_mouse': 'off'}\n"
         )
         original = (self.home / ".ishrc.py").read_bytes()
         cases = (
@@ -306,45 +298,56 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertNotIn("broken config", output)
 
-    def test_vt_language_override_and_cli_precedence_apply_after_rc(self):
-        """The VT namespace can select a language without changing stream's choice."""
+    def test_explicit_language_and_cli_precedence_apply_after_rc(self):
+        """The saved language beats LANG and an explicit CLI language beats both."""
         self.env["LANG"] = "en_US.UTF-8"
-        self.write_rc("config.lang = 'en'\nconfig.vt = {'lang': 'ko'}\n")
-        status, output = self.run_terminal(shell="missing-vt-shell-executable")
+        self.write_rc("config.lang = 'ko'\n")
+        status, output = self.run_terminal(shell="missing-test-shell-executable")
         self.assertEqual(status, 2, output)
         self.assertIn("셸 실행 파일", output)
         status, output = self.run_terminal(
-            "--lang", "en", shell="missing-vt-shell-executable"
+            "--lang", "en", shell="missing-test-shell-executable"
         )
         self.assertEqual(status, 2, output)
         self.assertIn("Shell executable not found", output)
 
-    def test_stream_does_not_interpret_vt_settings_or_select_vt_plugins(self):
-        """The preserved stream entry point ignores the explicitly separate namespace."""
+    def test_obsolete_namespaces_fail_before_plugins_or_shell(self):
+        """Old namespaces fail visibly instead of being migrated or ignored."""
+        plugin = self.trap_plugin()
         shell = self.trap_shell()
-        self.write_rc(
-            f"config.shell = {str(shell)!r}\nconfig.vt = {{'mouse': 'not-stream-policy', 'plugins': ['must-not-load']}}\n"
-        )
-        status, output = shared.StartupTests.terminal(self)
-        self.assertEqual(status, 0, output)
-        self.assertEqual((self.root / "shell-executed").read_text(), "executed")
-
-    def test_unknown_vt_setting_fails_before_native_shell(self):
-        """Misspellings and invalid limits cannot silently alter session policy."""
-        for value in (
-            "{'mose': 'on'}",
-            "{'scrollback_bytes': True}",
-            "{'clipboard': 'invalid'}",
-            "{'features': []}",
-            "{'features': None}",
-            "{'features': {'hyperlinks': 'auto'}}",
-            "{'features': {'enhanced_keyboard': True}}",
-            "{'features': {'unknown': 'on'}}",
-            "{'color_depth': 'auto'}",
-            "[]",
+        for assignment in (
+            "config.vt = {'mouse': 'off'}",
+            "config.integration_dir = 'old'",
         ):
-            with self.subTest(value=value):
-                self.write_rc("config.lang = 'ko'\nconfig.vt = " + value + "\n")
+            with self.subTest(assignment=assignment):
+                self.write_rc(
+                    f"config.shell = {str(shell)!r}\n"
+                    f"config.plugin_dir = {str(plugin)!r}\n"
+                    "config.plugins = ['selected']\n" + assignment + "\n"
+                )
+                status, output = self.run_terminal(shell=str(shell))
+                self.assertEqual(status, 2, output)
+                self.assertIn("AttributeError", output)
+                self.assertIn(assignment.split("=", 1)[0].strip().split(".")[1], output)
+                self.assertFalse((self.root / "shell-executed").exists())
+                self.assertFalse((self.root / "plugin-executed").exists())
+
+    def test_invalid_settings_fail_before_native_shell(self):
+        """Misspelled fields and invalid limits cannot silently alter policy."""
+        for assignment in (
+            "config.mose = 'on'",
+            "config.scrollback_bytes = True",
+            "config.clipboard = 'invalid'",
+            "config.features = []",
+            "config.features = None",
+            "config.features = {'hyperlinks': 'auto'}",
+            "config.features = {'enhanced_keyboard': True}",
+            "config.features = {'unknown': 'on'}",
+            "config.color_depth = 'auto'",
+            "config.plugins = [None]",
+        ):
+            with self.subTest(assignment=assignment):
+                self.write_rc("config.lang = 'ko'\n" + assignment + "\n")
                 status, output = self.run_terminal(shell=self.trap_shell())
                 self.assertEqual(status, 2, output)
                 self.assertIn("설정", output)
@@ -391,9 +394,7 @@ class StartupTests(unittest.TestCase):
             "def setup(api):\n"
             "    api.register_protocol('test-codec', kind='osc', prefixes=(b'7400;',), factory=Codec)\n"
         )
-        self.write_rc(
-            "config.plugin_dir = 'plugins'\nconfig.vt = {'plugins': ['codec']}\n"
-        )
+        self.write_rc("config.plugin_dir = 'plugins'\nconfig.plugins = ['codec']\n")
         log = self.root / "codec.log"
         status, output = self.run_terminal(
             "--log-file",
@@ -483,7 +484,7 @@ class StartupTests(unittest.TestCase):
             "os.write(1, b'\\x1b[38;2;17;34;51mCOLOR_RGB_CHECK\\x1b[0m\\r\\n')\n"
             "input()\n"
         )
-        self.write_rc("config.vt = {'color_depth': '24'}\n")
+        self.write_rc("config.color_depth = '24'\n")
         cases = (
             (("--no-rc",), "", False),
             (("--no-rc", "--color-depth", "24"), "", True),
@@ -550,7 +551,7 @@ class StartupTests(unittest.TestCase):
 
         language = I18N()
         language.base_path = self.root / "languages"
-        language.load("ko", create=False)
+        language.load("ko")
         with patch("ish.terminal.vt.i18n", language):
             with NativeTerminal(10, 4, lambda _: None) as terminal:
                 with patch.object(terminal._library, "ish_vt_feed", return_value=-7):
@@ -573,7 +574,7 @@ class StartupTests(unittest.TestCase):
 
         language = I18N()
         language.base_path = self.root / "languages"
-        language.load("ko", create=False)
+        language.load("ko")
         state = []
 
         async def fail():
@@ -619,7 +620,7 @@ class StartupTests(unittest.TestCase):
         ):
             self.assertEqual(main([]), 1)
         self.assertEqual(state, ["restored", "reported"])
-        self.assertIn("ish-vt 세션 오류: QUEUE_LIMIT", output.getvalue())
+        self.assertIn("ish 세션 오류: QUEUE_LIMIT", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
 
 

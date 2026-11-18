@@ -18,7 +18,7 @@ class LoadingTests(PluginFixture):
         self.addCleanup(setattr, i18n, "base_path", previous[1])
         self.addCleanup(setattr, i18n, "message", previous[2])
         i18n.base_path = self.root / "lang"
-        i18n.load("ko", create=False)
+        i18n.load("ko")
         directory = self.plugin("fixture_invalid")
         entry = directory / "__init__.py"
         entry.write_text(entry.read_text().replace("'version': '1.0'", "'version': 10"))
@@ -47,17 +47,21 @@ class LoadingTests(PluginFixture):
         self.assertIsNone(self.manager.get("fixture_unused"))
 
     def test_empty_selection_does_not_execute_plugins(self):
-        """An explicit empty list differs from the legacy all-directory policy."""
+        """An explicit empty list runs no package found in the configured directory."""
         self.plugin("fixture_unused")
         self.assertEqual(self.manager.load([]), [])
         self.assertEqual(self.executed(), [])
 
-    def test_no_argument_load_preserves_legacy_directory_discovery(self):
-        """Existing callers still load visible directories from current config."""
+    def test_loading_requires_an_explicit_selection(self):
+        """Missing or ambiguous selection cannot enable all installed plugins."""
         for name in ("fixture_first", "fixture_second", ".fixture_hidden"):
             self.plugin(name)
-        self.manager.load()
-        self.assertCountEqual(self.executed(), ["fixture_first", "fixture_second"])
+        with self.assertRaises(TypeError):
+            self.manager.load()
+        for selection in (None, "fixture_first", b"fixture_first"):
+            with self.subTest(selection=selection), self.assertRaises(TypeError):
+                self.manager.load(selection)
+        self.assertEqual(self.executed(), [])
 
     def test_explicit_root_includes_required_plugins(self):
         """Dependencies resolve beside the selected plugin, never in global config."""

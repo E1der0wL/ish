@@ -118,6 +118,115 @@ class ProtocolStreamTests(unittest.TestCase):
         self.assertEqual(stream.dropped, 2)
         self.assertTrue(b"".join(output).endswith(b"ZQ"))
 
+    def test_record_identity_spans_fragments_and_completion_callbacks(self):
+        """One record keeps its identity while capture and handle see completion."""
+        seen = []
+        stream = ProtocolStream(
+            lambda _: None,
+            lambda control: (
+                seen.append(("handle", stream.record_id, control.raw)) or True
+            ),
+            capture=lambda control: (
+                seen.append(("capture", stream.record_id, control.raw)) or False
+            ),
+        )
+        wire = b"\x1b]2;title\x1b\\"
+        self.assertIsNone(stream.record_id)
+        stream.feed(wire[:1])
+        identity = stream.record_id
+        self.assertIsNotNone(identity)
+        for byte in wire[1:-1]:
+            stream.feed(bytes((byte,)))
+            self.assertEqual(stream.record_id, identity)
+        stream.feed(wire[-1:])
+        self.assertEqual(
+            seen, [("capture", identity, wire), ("handle", identity, wire)]
+        )
+        self.assertIsNone(stream.record_id)
+        with self.assertRaises(AttributeError):
+            stream.record_id = identity
+
+    def test_abort_and_replacement_get_fresh_record_identities(self):
+        """A previous record cannot lend its cancellation to a new introducer."""
+        seen = []
+        stream = ProtocolStream(
+            lambda _: None, lambda _: seen.append(stream.record_id) or True
+        )
+        stream.feed(b"\x1b]2;partial")
+        first = stream.record_id
+        stream.feed(b"\x18")
+        self.assertIsNone(stream.record_id)
+        stream.feed(b"\x1b]2;another")
+        second = stream.record_id
+        stream.feed(b"\x1b[")
+        third = stream.record_id
+        stream.feed(b"1\x9d")
+        fourth = stream.record_id
+        stream.feed(b"2;title\x07")
+        self.assertEqual(len({first, second, third, fourth}), 4)
+        self.assertNotIn(None, (first, second, third, fourth))
+        self.assertEqual(seen, [fourth])
+        self.assertIsNone(stream.record_id)
+
+    def test_failed_completion_releases_identity_without_replaying_record(self):
+        """An adapter exception leaves no unfinished record available to cancel."""
+        seen = []
+
+        def fail(control):
+            seen.append((stream.record_id, control.raw))
+            raise RuntimeError("adapter failure")
+
+        stream = ProtocolStream(lambda _: None, fail)
+        stream.feed(b"\x1b]2;title")
+        identity = stream.record_id
+        with self.assertRaisesRegex(RuntimeError, "adapter failure"):
+            stream.feed(b"\x07")
+        self.assertEqual(seen, [(identity, b"\x1b]2;title\x07")])
+        self.assertTrue(stream.complete)
+        self.assertIsNone(stream.record_id)
+        stream.close()
+        self.assertEqual(len(seen), 1)
+
+    def test_apc_pm_sos_c1_st_complete_at_every_fragment_boundary(self):
+        """Native string terminators reach the same adapter boundary as ESC-ST."""
+        for intro, kind in ((b"\x1b_", "apc"), (b"\x1b^", "pm"), (b"\x1bX", "sos")):
+            for ending in (b"\x1b\\", b"\x9c"):
+                wire = intro + b"payload" + ending
+                for split in range(len(wire) + 1):
+                    with self.subTest(kind=kind, ending=ending, split=split):
+                        stream, events, forwarded, cancelled = self.record(
+                            wire, splits=(split,)
+                        )
+                        self.assertEqual(
+                            [event for event in events if event[0] != "text"],
+                            [(kind, b"payload", wire)],
+                        )
+                        self.assertEqual(forwarded, wire)
+                        self.assertEqual(cancelled, [])
+                        self.assertTrue(stream.complete)
+                        self.assertIsNone(stream.record_id)
+
+    def test_apc_replacement_keeps_distinct_identity_and_original_capture_bytes(self):
+        """A shared ESC boundary completes the old string without duplicating copy bytes."""
+        seen = []
+        stream = ProtocolStream(
+            lambda _: self.fail("Captured controls must not reach the native writer"),
+            lambda _: self.fail("Capture must own the controls"),
+            capture=lambda control: (
+                seen.append((stream.record_id, control.raw, control.body)) or True
+            ),
+        )
+        stream.feed(b"\x1b_Gpayload")
+        old = stream.record_id
+        stream.feed(b"\x1b[")
+        new = stream.record_id
+        self.assertNotEqual(old, new)
+        stream.feed(b"0m")
+        self.assertEqual(
+            seen, [(old, b"\x1b_Gpayload", b"Gpayload"), (new, b"\x1b[0m", b"0m")]
+        )
+        self.assertEqual(b"".join(raw for _, raw, _ in seen), b"\x1b_Gpayload\x1b[0m")
+
 
 class NativeFramingTests(unittest.TestCase):
     """Assert native observable results and adapter boundaries at every read split."""
@@ -156,6 +265,77 @@ class NativeFramingTests(unittest.TestCase):
                     self.assertEqual(
                         [effect.kind for effect in term.drain_events()], effects
                     )
+
+    def test_kitty_terminators_keep_completion_and_cancel_distinct_at_every_split(self):
+        """Native ST/ESC completion and CAN/SUB cancellation keep distinct outcomes."""
+        from ish.terminal.vt import Terminal
+
+        red = b"\xff\0\0\xff"
+        body = b"\x1b_Ga=T,f=32,s=1,v=1,q=2;" + base64.b64encode(red)
+        endings = (
+            (b"\x1b\\", True),
+            (b"\x9c", True),
+            (b"\x18", False),
+            (b"\x1a", False),
+            (b"\x1b[0m", True),
+            (b"\x1b\x18", True),
+            (b"\x1b\x1a", True),
+            (b"\x1b\n[0m", True),
+        )
+        for ending, completes in endings:
+            wire = body + ending + b"Z"
+            for cancelled in (False, True):
+                splits = range(1, len(wire) + 1) if cancelled else range(len(wire) + 1)
+                for split in splits:
+                    with (
+                        self.subTest(ending=ending, cancelled=cancelled, split=split),
+                        Terminal(8, 4, lambda _: None) as term,
+                    ):
+                        term.resize(8, 4, 1, 1)
+                        term.set_graphics(True)
+                        term.feed(wire[:split])
+                        if cancelled:
+                            term.set_graphics(False)
+                            term.set_graphics(True)
+                        term.feed(wire[split:])
+                        images = term.frame().images
+                        self.assertEqual(len(images), int(completes and not cancelled))
+                        if images:
+                            self.assertEqual(term.image(images[0].image_id).rgba, red)
+                        self.assertIn("Z", "".join(self.lines(term)))
+                        if b"\n" in ending:
+                            self.assertEqual(term.frame().cursor_y, 1)
+
+    def test_c1_st_preserves_opaque_clipboard_string_records_at_every_split(self):
+        """Native string completion must preserve an active copy's exact original bytes."""
+        from ish.terminal.clipboard import ClipboardBroker
+        from ish.terminal.host import HostProfile
+        from ish.terminal.vt import Terminal
+
+        for intro in (b"\x1b_", b"\x1b^", b"\x1bX"):
+            for ending in (b"\x9c", b"\x1b\\", b"\x1b[0m"):
+                body = intro + b"Gimage-looking-data" + ending
+                for split in range(len(body) + 1):
+                    writes = []
+                    with (
+                        self.subTest(intro=intro, ending=ending, split=split),
+                        Terminal(8, 4, lambda _: None) as term,
+                    ):
+                        broker = ClipboardBroker(
+                            reply=lambda _: None,
+                            emit=writes.append,
+                            profile=lambda: HostProfile(),
+                        )
+                        self.addCleanup(broker.close)
+                        term.clipboard = broker
+                        term.feed(b"\x1b]1337;CopyToClipboard=\x07" + body[:split])
+                        term.feed(body[split:] + b"\x1b]1337;EndCopy\x07Z")
+                        self.assertEqual(
+                            writes,
+                            ["\x1b]52;c;" + base64.b64encode(body).decode() + "\x1b\\"],
+                        )
+                        self.assertEqual(self.lines(term), ["Z", "", "", ""])
+                        self.assertEqual(term.frame().images, ())
 
     def test_independent_c0_executes_before_an_unfinished_control_completes(self):
         """A client need not finish or cancel CSI before LF and BEL take effect."""

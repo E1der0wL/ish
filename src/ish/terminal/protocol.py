@@ -19,32 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-ESC = 0x1B
-BEL = 0x07
-ST = 0x9C
-CANCEL = frozenset((0x18, 0x1A))
 MAX_STRING_BYTES = 32 * 1024 * 1024
-MAX_SEQUENCE_BYTES = 4096
-STRING_KINDS = {
-    ord("]"): "osc",
-    ord("P"): "dcs",
-    ord("_"): "apc",
-    ord("^"): "pm",
-    ord("X"): "sos",
-}
-C1_KINDS = {0x9D: "osc", 0x90: "dcs", 0x9F: "apc", 0x9E: "pm", 0x98: "sos", 0x9B: "csi"}
-C1_INTRODUCERS = {
-    0x9D: ord("]"),
-    0x90: ord("P"),
-    0x9F: ord("_"),
-    0x9E: ord("^"),
-    0x98: ord("X"),
-    0x9B: ord("["),
-}
-C1_EXECUTE = frozenset((*range(0x80, 0x90), *range(0x91, 0x98), 0x99, 0x9A))
-DCS_HEADERS = frozenset(("entry", "param", "intermediate"))
-APC_KINDS = frozenset(("apc", "pm", "sos"))
-EXECUTE = frozenset((*range(0x18), 0x19, *range(0x1C, 0x20)))
 
 
 @dataclass(frozen=True)
@@ -58,6 +33,39 @@ class Control:
 
 class ProtocolStream:
     """Preserve byte order across arbitrary PTY read fragmentation."""
+
+    ESC = 0x1B
+    BEL = 0x07
+    ST = 0x9C
+    CANCEL = frozenset((0x18, 0x1A))
+    MAX_SEQUENCE_BYTES = 4096
+    STRING_KINDS = {
+        ord("]"): "osc",
+        ord("P"): "dcs",
+        ord("_"): "apc",
+        ord("^"): "pm",
+        ord("X"): "sos",
+    }
+    C1_KINDS = {
+        0x9D: "osc",
+        0x90: "dcs",
+        0x9F: "apc",
+        0x9E: "pm",
+        0x98: "sos",
+        0x9B: "csi",
+    }
+    C1_INTRODUCERS = {
+        0x9D: ord("]"),
+        0x90: ord("P"),
+        0x9F: ord("_"),
+        0x9E: ord("^"),
+        0x98: ord("X"),
+        0x9B: ord("["),
+    }
+    C1_EXECUTE = frozenset((*range(0x80, 0x90), *range(0x91, 0x98), 0x99, 0x9A))
+    DCS_HEADERS = frozenset(("entry", "param", "intermediate"))
+    APC_KINDS = frozenset(("apc", "pm", "sos"))
+    EXECUTE = frozenset((*range(0x18), 0x19, *range(0x1C, 0x20)))
 
     def __init__(
         self,
@@ -90,6 +98,9 @@ class ProtocolStream:
         self._dcs = ""
         self.dropped = 0
         self._executed = set()
+        self._record_serial = 0
+        self._record_id = None
+        self._handling_id = None
 
     def _track_utf8(self, byte: int):
         """Track an unfinished codepoint without promoting raw C1 to controls."""
@@ -109,8 +120,23 @@ class ProtocolStream:
         """Whether input ended outside a control or a split UTF-8 codepoint."""
         return self._state == "ground" and self._utf8_left == 0
 
+    @property
+    def record_id(self):
+        """Identify the current record through completion callbacks, or None.
+
+        Fragmentation never changes this identity. Cancellation and a new
+        introducer end its lifetime; a replacement always gets a fresh value.
+        The completed record remains identifiable while capture/handle runs,
+        even though its framing buffer has already been released.
+        """
+        return self._handling_id if self._handling_id is not None else self._record_id
+
     def _start(self, byte: int, kind: str = ""):
-        self._state = "escape" if byte == ESC else "csi" if kind == "csi" else "string"
+        self._record_serial += 1
+        self._record_id = self._record_serial
+        self._state = (
+            "escape" if byte == self.ESC else "csi" if kind == "csi" else "string"
+        )
         self._kind = kind
         self._buffer = bytearray((byte,))
         self._prefix = 1
@@ -119,7 +145,8 @@ class ProtocolStream:
         self._dcs = "entry" if kind == "dcs" else ""
         self._executed.clear()
 
-    def _finish(self, suffix: int = 0):
+    def _finish(self, suffix: int = 0, *, native_suffix: bytes = b""):
+        record_id = self._record_id
         control = None
         execute = b""
         native = b""
@@ -128,7 +155,7 @@ class ProtocolStream:
             end = len(raw) - suffix if suffix else len(raw)
             boundary = end if self._kind in ("csi", "esc") else self._prefix
             positions = frozenset(
-                index for index in range(boundary) if raw[index] in EXECUTE
+                index for index in range(boundary) if raw[index] in self.EXECUTE
             )
             execute = bytes(raw[index] for index in sorted(positions - self._executed))
             native = raw
@@ -143,6 +170,7 @@ class ProtocolStream:
                     )
             control = Control(self._kind, body, raw)
         self._state = "ground"
+        self._record_id = None
         self._buffer.clear()
         self._drop = self._escaped = False
         self._utf8_left = 0
@@ -150,12 +178,17 @@ class ProtocolStream:
         # Release framing before invoking a writer: an exception after a partial
         # native write must never leave the same record available for replay.
         if control is not None:
-            if self.capture is not None and self.capture(control):
-                return
-            if execute:
-                self.write(execute)
-            if not self.handle(control):
-                self.write(self._native_bytes(native))
+            previous = self._handling_id
+            self._handling_id = record_id
+            try:
+                if self.capture is not None and self.capture(control):
+                    return
+                if execute:
+                    self.write(execute)
+                if not self.handle(control):
+                    self.write(self._native_bytes(native) + native_suffix)
+            finally:
+                self._handling_id = previous
 
     def _abort(self, ending=b"", *, preserve=False):
         raw = (
@@ -164,6 +197,7 @@ class ProtocolStream:
             else b""
         )
         self._state = "ground"
+        self._record_id = None
         self._buffer.clear()
         self._drop = self._escaped = False
         self._utf8_left = 0
@@ -182,7 +216,7 @@ class ProtocolStream:
         C1 introducers are normalized because ground itself is UTF-8-only.
         """
         self._abort(bytes((byte, 0x18)), preserve=True)
-        self._start(byte, C1_KINDS.get(byte, ""))
+        self._start(byte, self.C1_KINDS.get(byte, ""))
 
     @staticmethod
     def _without(raw, positions):
@@ -196,15 +230,18 @@ class ProtocolStream:
     @staticmethod
     def _native_bytes(raw):
         """Re-enter a C1-origin record after the native abort has reached ground."""
-        if raw and raw[0] in C1_INTRODUCERS:
-            return bytes((ESC, C1_INTRODUCERS[raw[0]])) + raw[1:]
+        if raw and raw[0] in ProtocolStream.C1_INTRODUCERS:
+            return (
+                bytes((ProtocolStream.ESC, ProtocolStream.C1_INTRODUCERS[raw[0]]))
+                + raw[1:]
+            )
         return raw
 
     def _store(self, byte):
         if self._drop:
             return
         self._buffer.append(byte)
-        limit = self.limit if self._state == "string" else MAX_SEQUENCE_BYTES
+        limit = self.limit if self._state == "string" else self.MAX_SEQUENCE_BYTES
         if len(self._buffer) > limit:
             self._buffer.clear()
             self._executed.clear()
@@ -215,7 +252,7 @@ class ProtocolStream:
 
     def _dcs_byte(self, byte):
         """Track only DCS framing: high bytes are data after its header ends."""
-        if self._dcs not in DCS_HEADERS:
+        if self._dcs not in self.DCS_HEADERS:
             return
         if 0x40 <= byte <= 0x7E:
             self._dcs = "payload"
@@ -254,14 +291,14 @@ class ProtocolStream:
                 self._track_utf8(byte)
                 # Pinned libghostty decodes ground as UTF-8. A raw C1 byte is
                 # malformed text there, not a new adapter-owned control.
-                if byte == ESC:
+                if byte == self.ESC:
                     flush()
                     if interrupted_utf8 and (self.opaque is None or not self.opaque()):
                         # A consumed adapter must not join text from opposite
                         # sides of its introducer into one native codepoint.
                         self.write(b"\x1b\x18")
                     self._start(byte)
-                elif byte in CANCEL:
+                elif byte in self.CANCEL:
                     flush()
                     self._abort()
                     self.write(bytes((byte,)))
@@ -269,18 +306,33 @@ class ProtocolStream:
                     text.append(byte)
                 continue
 
-            if byte in CANCEL:
+            if (
+                self._state == "string"
+                and self._escaped
+                and byte != ord("\\")
+                and (byte not in self.CANCEL or self._kind in self.APC_KINDS)
+            ):
+                if not self._drop:
+                    self._buffer.pop()
+                if self._kind in self.APC_KINDS:
+                    # Native APC/PM/SOS complete when ESC starts a replacement.
+                    # That ESC belongs to the new record, so opaque capture
+                    # sees it exactly once. Native replay alone needs the old
+                    # exit action plus CAN to return to ground before replay.
+                    # A following CAN/SUB cancels the new escape, not the APC
+                    # that native already completed at the preceding ESC.
+                    self._finish(native_suffix=bytes((self.ESC, 0x18)))
+                    self._start(self.ESC)
+                else:
+                    self._restart(self.ESC)
+
+            if byte in self.CANCEL:
                 self._abort(bytes((byte,)), preserve=True)
                 continue
 
-            if self._state == "string" and self._escaped and byte != ord("\\"):
-                if not self._drop:
-                    self._buffer.pop()
-                self._restart(ESC)
-
             if (
                 self._state in ("escape", "escape_intermediate", "csi")
-                and byte in EXECUTE
+                and byte in self.EXECUTE
             ):
                 if self.opaque is None or not self.opaque():
                     self.write(bytes((byte,)))
@@ -291,17 +343,28 @@ class ProtocolStream:
 
             c1_active = (
                 self._state != "string"
-                or self._kind in APC_KINDS
-                or (self._kind == "dcs" and self._dcs in DCS_HEADERS)
+                or self._kind in self.APC_KINDS
+                or (self._kind == "dcs" and self._dcs in self.DCS_HEADERS)
             )
             if c1_active:
-                if byte in C1_KINDS:
-                    if self._kind in APC_KINDS and byte in (0x98, 0x9E, 0x9F):
+                if byte in self.C1_KINDS:
+                    if self._kind in self.APC_KINDS and byte in (0x98, 0x9E, 0x9F):
                         self._store(byte)
                     else:
                         self._restart(byte)
                     continue
-                if byte == ST or byte in C1_EXECUTE:
+                if (
+                    byte == self.ST
+                    and self._state == "string"
+                    and self._kind in self.APC_KINDS
+                ):
+                    # Native APC/PM/SOS strings complete at C1 ST. Preserve the
+                    # same adapter/capture boundary as ESC-ST rather than
+                    # replaying an image through the cancellation writer.
+                    self._store(byte)
+                    self._finish(1)
+                    continue
+                if byte == self.ST or byte in self.C1_EXECUTE:
                     self._abort(bytes((byte,)), preserve=True)
                     continue
 
@@ -309,22 +372,22 @@ class ProtocolStream:
                 self._store(byte)
                 if self._escaped and byte == ord("\\"):
                     self._finish(2)
-                elif self._kind == "osc" and byte == BEL:
+                elif self._kind == "osc" and byte == self.BEL:
                     self._finish(1)
                 else:
-                    self._escaped = byte == ESC
+                    self._escaped = byte == self.ESC
                     if self._kind == "dcs":
                         self._dcs_byte(byte)
                 continue
 
-            if byte == ESC:
+            if byte == self.ESC:
                 self._restart(byte)
                 continue
             self._store(byte)
             if self._state == "escape":
-                if byte in STRING_KINDS:
+                if byte in self.STRING_KINDS:
                     self._kind, self._state, self._prefix = (
-                        STRING_KINDS[byte],
+                        self.STRING_KINDS[byte],
                         "string",
                         len(self._buffer),
                     )

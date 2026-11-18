@@ -136,7 +136,8 @@ class RasterTests(unittest.TestCase):
         self.assertEqual(uploads(kitty.before_text)[0][1], Image().rgba)
         iterm = create_presenter("iterm").plan(Frame(), lambda _: Image())
         self.assertEqual(self.png(iterm.after_text).tobytes(), Image().rgba)
-        for unsupported in ("sixel", "unknown"):
+        self.assertIsInstance(create_presenter("sixel"), RasterPresenter)
+        for unsupported in ("unknown",):
             with self.subTest(protocol=unsupported):
                 with self.assertRaises(GraphicsError):
                     create_presenter(unsupported)
