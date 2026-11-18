@@ -95,6 +95,10 @@ class StartupTests(StartupFixture, unittest.TestCase):
         result = self.cli("--diagnose", "--lang", "en")
         self.assertEqual(self.field(result.stdout, "Settings object"), "config")
         self.assertEqual(self.field(result.stdout, "Mouse capture"), "auto")
+        self.assertEqual(
+            self.field(result.stdout, "Escape sequence delay (seconds)"), "0.02"
+        )
+        self.assertIn("0.02", help_result.stdout)
         self.assertEqual(self.field(result.stdout, "History line limit"), "10000")
         self.assertEqual(self.field(result.stdout, "History byte limit"), "33554432")
         self.assertEqual(self.field(result.stdout, "Selected plugins"), "Disabled")

@@ -193,7 +193,7 @@ class PipeInputTests(ManagementFixture):
                     self.assertEqual(
                         (field.text, field.buffer.cursor_position), expected
                     )
-                    self.assertEqual(screen.app.ttimeoutlen, 0.05)
+                    self.assertEqual(screen.app.ttimeoutlen, 0.02)
                     pipe.send_bytes(b"\x1b")
                     self.assertFalse(await asyncio.wait_for(task, 0.25))
                 finally:

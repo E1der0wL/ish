@@ -112,6 +112,15 @@ class Cell:
         return bool(self.flags & 128)
 
 
+@dataclass(frozen=True, slots=True)
+class _RenderedRow:
+    """An exact native row record and its immutable Python rendering."""
+
+    record: bytes
+    runs: tuple[tuple[str, str], ...]
+    cells: tuple[Cell, ...]
+
+
 @dataclass(frozen=True)
 class SelectionState:
     """Native gesture results; the frontend owns only its input timer."""
@@ -521,6 +530,8 @@ class Terminal:
         self._reply = reply
         self.cols = cols
         self.rows = rows
+        self._rendered_columns = cols
+        self._rendered_rows: list[_RenderedRow] = []
         self.cell_width = self.cell_height = 0
         self.graphics_enabled = False
         self._inputs = None
@@ -724,7 +735,20 @@ class Terminal:
         offset = self.HEADER.size
         lines = []
         cell_rows = []
-        for _ in range(rows):
+        previous_rows = self._rendered_rows if cols == self._rendered_columns else ()
+        rendered_rows = []
+        for row in range(rows):
+            # The count and every variable-length field are part of the record.
+            # An exact match therefore ends at the next native row boundary.
+            if row < len(previous_rows):
+                previous = previous_rows[row]
+                if data.startswith(previous.record, offset):
+                    offset += len(previous.record)
+                    lines.append(list(previous.runs))
+                    cell_rows.append(previous.cells)
+                    rendered_rows.append(previous)
+                    continue
+            start = offset
             (count,) = self.COUNT.unpack_from(data, offset)
             offset += self.COUNT.size
             if count > cols:
@@ -791,8 +815,12 @@ class Terminal:
                 fragments.append(text)
             if fragments:
                 runs.append((previous_style, "".join(fragments)))
+            rendered = _RenderedRow(
+                data[start:offset], tuple(runs), tuple(native_cells)
+            )
             lines.append(runs)
-            cell_rows.append(tuple(native_cells))
+            cell_rows.append(rendered.cells)
+            rendered_rows.append(rendered)
         images = []
         if image_count > (len(data) - offset) // self.PLACEMENT.size:
             raise TerminalError(i18n.get(Message.VT_NATIVE_IMAGES))
@@ -801,6 +829,8 @@ class Terminal:
             offset += self.PLACEMENT.size
         if offset != len(data):
             raise TerminalError(i18n.get(Message.VT_NATIVE_FRAME))
+        self._rendered_columns = cols
+        self._rendered_rows = rendered_rows
         return Frame(
             lines,
             cursor_x,
@@ -1226,6 +1256,7 @@ class Terminal:
             finally:
                 self._library.ish_vt_free(self._handle)
                 self._handle = None
+                self._rendered_rows.clear()
 
     def __enter__(self) -> Terminal:
         """Keep the terminal alive for a with block."""

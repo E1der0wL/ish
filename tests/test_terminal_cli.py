@@ -314,6 +314,13 @@ class Terminal:
             )
         os.close(slave)
 
+    @property
+    def escape_key(self):
+        """Encode a scripted press using the last keyboard mode written to the host."""
+        if self.output.rfind(b"\x1b[>3u") > self.output.rfind(b"\x1b[<u"):
+            return b"\x1b[27u"
+        return b"\x1b"
+
     def send(self, data):
         """Deliver terminal bytes exactly, including native and PTK control keys."""
         data = data.encode() if isinstance(data, str) else data

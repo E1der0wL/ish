@@ -19,7 +19,7 @@ from ish.config import config
 from ish.lang import Message, i18n
 from ish.log import LOG_LEVELS, session_logging
 
-from .settings import RcError, Settings
+from .settings import ESCAPE_DELAY, RcError, Settings
 
 PROGRAM = "ish"
 LOGIN_ARGS = ("-l",)
@@ -254,7 +254,9 @@ def parse(argv=None, *, startup):
         target.add_argument(
             *names,
             help=(
-                i18n.get(message, path=config.PLUGIN_SCRIPT_DIR)
+                i18n.get(
+                    message, path=config.PLUGIN_SCRIPT_DIR, escape_delay=ESCAPE_DELAY
+                )
                 if message is not None
                 else argparse.SUPPRESS
             ),

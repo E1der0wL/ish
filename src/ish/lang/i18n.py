@@ -168,7 +168,7 @@ class Message(StrEnum):
     )
     MANAGE_HELP_KEYS_BODY = (
         auto(),
-        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. ESC / Alt parsing uses escape_delay (default 0.05 seconds).\n\nShift+PageUp / Shift+PageDown scroll internal history. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn these management windows: Tab changes focus, arrows select categories or choices, Space toggles choices, PageUp/PageDown scroll, Esc closes. In settings, Ctrl+S saves and Ctrl+E opens .ishrc.py.",
+        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. When a key starts with a lone ESC byte, the default wait is {escape_delay} seconds for a possible suffix. Increase escape_delay if Alt or arrow keys split on a slow connection. A complete enhanced Escape key report skips this wait.\n\nShift+PageUp / Shift+PageDown scroll internal history. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn these management windows: Tab changes focus, arrows select categories or choices, Space toggles choices, PageUp/PageDown scroll, Esc closes. In settings, Ctrl+S saves and Ctrl+E opens .ishrc.py.",
     )
     MANAGE_HELP_SETTINGS_BODY = (
         auto(),
@@ -371,7 +371,7 @@ class Message(StrEnum):
     STARTUP_NO_PLUGINS_HELP = auto(), "Disable all selected plugins for this session."
     STARTUP_ESCAPE_DELAY_HELP = (
         auto(),
-        "Wait SECONDS to distinguish ESC from Alt sequences (default: 0.05).",
+        "Wait SECONDS for an ambiguous ESC prefix to complete (default {escape_delay}).",
     )
     STARTUP_RC_NOT_EXECUTED = auto(), "Not executed (read-only query)"
     STARTUP_DIAGNOSE_ESCAPE_DELAY = auto(), "Escape sequence delay (seconds)"

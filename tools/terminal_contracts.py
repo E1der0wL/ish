@@ -69,8 +69,12 @@ REQUIRED_CASES = {
     ),
     "IO03": (
         "test_terminal_session.TerminalSessionTests.test_paused_exit_with_open_slave_drains_without_waiting_for_eof",
+        "test_terminal_session.TerminalSessionTests.test_failed_fork_closes_setup_pipe_and_can_be_retried",
+        "test_terminal_session.TerminalSessionTests.test_failed_initial_size_delivers_child_error_and_exit",
+        "test_terminal_session.TerminalSessionTests.test_immediate_close_reaps_child_before_exec",
     ),
     "IO04": (
+        "test_terminal_session.TerminalSessionTests.test_immediate_resize_survives_delayed_child_setup",
         "test_terminal_cursor.CursorPTYTests.test_child_first_size_already_excludes_selected_bar",
         "test_terminal_vt.TerminalVTTests.test_resize_updates_the_grid_and_native_size_report",
         "test_terminal_geometry.GeometryTests.test_complete_pair_restores_images_without_reopening_capability_probe",
@@ -126,7 +130,10 @@ REQUIRED_CASES = {
         "test_terminal_vt.TerminalVTTests.test_default_colors_and_sgr_resets_keep_host_defaults",
         "test_terminal_startup.StartupTests.test_color_depth_preserves_explicit_rgb_and_respects_ptk_environment",
     ),
-    "VT09": ("test_terminal_vt.TerminalVTTests.test_cursor_erase_and_rgb_style",),
+    "VT09": (
+        "test_terminal_vt.TerminalVTTests.test_cursor_erase_and_rgb_style",
+        "test_terminal_vt.TerminalVTTests.test_repeated_frames_isolate_lines_and_refresh_changed_cell_metadata",
+    ),
     "VT11": (
         "test_terminal_cursor.NativeCursorTests.test_native_defaults_wait_for_explicit_reset",
         "test_terminal_composition.TerminalCompositionTests.test_repeated_reset_does_not_overwrite_restored_cursor_modes",
@@ -144,6 +151,7 @@ REQUIRED_CASES = {
         "test_terminal_vt.TerminalVTTests.test_selection_never_uses_anchors_from_another_screen_or_reset",
     ),
     "IN01": (
+        "test_terminal_hookless.HooklessTests.test_negotiated_escape_closes_popup_and_preserves_continuation",
         "test_terminal_host.HostProbeTests.test_mouse_arrow_cpr_alt_and_lone_escape_keep_ptk_semantics",
         "test_terminal_vt.TerminalVTTests.test_cursor_keys_paste_and_controls_follow_terminal_modes",
     ),

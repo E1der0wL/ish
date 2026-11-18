@@ -282,8 +282,10 @@ class Scenario:
         self.result("popup-open", str(self.popup).encode())
         self.terminal.require(lambda: self.terminal.frame_has(TITLE))
 
-    def cancel_popup(self, key=b"\x1b", tail=b""):
+    def cancel_popup(self, key=None, tail=b""):
         """Cancel popup input without sending that input to the native consumer."""
+        if key is None:
+            key = self.terminal.escape_key
         self.terminal.send(b"discarded popup" + key + tail)
         self.result(f"popup-cancel-{self.popup}", b"cancelled")
         self.terminal.require(lambda: not self.terminal.state().get("popups"))
@@ -490,7 +492,8 @@ class Scenario:
             + PASTE_START
             + "Vim 한 글\nsecond line".encode()
             + PASTE_END
-            + b"\x1b:w\r"
+            + terminal.escape_key
+            + b":w\r"
         )
         self.result("vim-result", "Vim 한 글\nsecond line\n".encode())
         self.layout()

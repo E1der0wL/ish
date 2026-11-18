@@ -5,7 +5,9 @@ import fcntl
 import os
 import select
 import sys
+import termios
 import unittest
+from unittest.mock import patch
 
 from ish.lang import i18n
 from ish.runtime.fdio import FDWriter
@@ -107,16 +109,100 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         """Native stdin and the last output bytes survive immediate child termination."""
         self.start(
             "import os,sys\n"
-            "print('READY',flush=True)\n"
+            "size=os.get_terminal_size(0)\n"
+            "print(f'{size.columns}x{size.lines} READY',flush=True)\n"
             "value=sys.stdin.readline()\n"
             "os.write(1,b'FINAL:'+value.encode())\n"
         )
-        await self.require_output(b"READY\r\n")
+        await self.require_output(b"80x24 READY\r\n")
         self.session.send("native 한 글\n".encode())
         await asyncio.wait_for(self.completed.wait(), DEADLINE)
         self.assertIn("FINAL:native 한 글\r\n".encode(), self.output)
         self.assertEqual(self.exits, [0])
         self.assertEqual(self.errors, [])
+
+    async def test_immediate_resize_survives_delayed_child_setup(self):
+        """The parent sees the initial size and the shell inherits the newest size."""
+        reader, release = os.pipe()
+        chdir = os.chdir
+
+        def delayed_chdir(path):
+            os.close(release)
+            os.read(reader, 1)
+            os.close(reader)
+            chdir(path)
+
+        try:
+            with patch("ish.terminal.session.os.chdir", delayed_chdir):
+                self.start(
+                    "import os\n"
+                    "assert os.getsid(0) == os.getpid() == os.tcgetpgrp(0)\n"
+                    "print('SIZE', *os.get_terminal_size(0))\n"
+                )
+            self.assertEqual(termios.tcgetwinsize(self.session.fd), (24, 80))
+            self.session.resize(101, 33)
+        finally:
+            os.close(reader)
+            os.close(release)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertEqual(self.output, b"SIZE 101 33\r\n")
+        self.assertEqual(self.exits, [0])
+
+    async def test_failed_fork_closes_setup_pipe_and_can_be_retried(self):
+        """A spawn failure releases both ends of the initialization boundary."""
+        reader, writer = os.pipe()
+        self.session = Session(
+            [sys.executable, "-c", "print('started')"],
+            os.getcwd(),
+            self.received,
+            self.exited,
+            self.errors.append,
+        )
+        with (
+            patch("ish.terminal.session.os.pipe", return_value=(reader, writer)),
+            patch("ish.terminal.session.pty.fork", side_effect=BlockingIOError),
+            self.assertRaises(BlockingIOError),
+        ):
+            self.session.start(80, 24)
+        for fd in (reader, writer):
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        self.session.start(80, 24)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertEqual(self.output, b"started\r\n")
+        self.assertEqual(self.exits, [0])
+
+    async def test_failed_initial_size_delivers_child_error_and_exit(self):
+        """A child exiting before geometry is ready must release its parent."""
+        with patch(
+            "ish.terminal.session.termios.tcsetwinsize",
+            side_effect=OSError("size error"),
+        ):
+            self.start("raise AssertionError('child should not exec')")
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertIn(b"size error", self.output)
+        self.assertNotIn(b"AssertionError", self.output)
+        self.assertEqual(self.exits, [127])
+
+    async def test_immediate_close_reaps_child_before_exec(self):
+        """The child's foreground group already exists when start returns."""
+        reader, release = os.pipe()
+
+        def delayed_chdir(_):
+            os.close(release)
+            os.read(reader, 1)
+            os._exit(99)
+
+        try:
+            with patch("ish.terminal.session.os.chdir", delayed_chdir):
+                self.start("raise AssertionError('child should not exec')")
+            await asyncio.wait_for(self.session.close(), DEADLINE)
+            self.assertLess(self.session.returncode, 0)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(self.session.pid, os.WNOHANG)
+        finally:
+            os.close(reader)
+            os.close(release)
 
     async def test_direct_child_completion_does_not_wait_for_other_slave_handles(self):
         """A retained slave cannot keep the UI alive after its actual child exits."""

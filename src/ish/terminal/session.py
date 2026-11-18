@@ -71,24 +71,46 @@ class Session:
             env.update(TERM=TERM, COLORTERM="truecolor", TERM_PROGRAM=PROGRAM)
         else:
             env = dict(self.env)
-        self.pid, self.fd = pty.fork()
+        ready, notify = os.pipe()
+        try:
+            self.pid, self.fd = pty.fork()
+        except BaseException:
+            os.close(ready)
+            os.close(notify)
+            raise
         if self.pid == 0:
             try:
-                os.chdir(self.cwd)
+                # forkpty has already replaced any low-numbered descriptor
+                # with the child's standard terminal streams.
+                if ready > 2:
+                    os.close(ready)
                 termios.tcsetwinsize(0, (rows, cols))
+                os.close(notify)
+                os.chdir(self.cwd)
                 os.execvpe(self.argv[0], self.argv, env)
             except BaseException as exc:
-                os.write(2, f"ish: {exc}\r\n".encode(errors="replace"))
-                os._exit(127)
+                try:
+                    os.write(2, f"ish: {exc}\r\n".encode(errors="replace"))
+                finally:
+                    os._exit(127)
+        os.close(notify)
         self.size = (cols, rows)
-        os.set_blocking(self.fd, False)
-        self.writer = FDWriter(self.loop, self.fd, self.failed, on_flow=self.input_flow)
+        try:
+            self.writer = FDWriter(
+                self.loop, self.fd, self.failed, on_flow=self.input_flow
+            )
+            self.waiter = self.loop.create_task(self._wait())
+            os.set_blocking(self.fd, False)
+            # EOF follows the child's initial ioctl or exit. An immediate
+            # resize can no longer race with a later write of the startup size.
+            os.read(ready, 1)
+        finally:
+            os.close(ready)
         if self.pending_input:
             self.writer.write(self.pending_input)
             self.pending_input.clear()
         if self.output_enabled:
             self.loop.add_reader(self.fd, self._read)
-        self.waiter = self.loop.create_task(self._wait())
 
     def _read(self) -> None:
         """Deliver bounded output batches, retaining final work across pauses."""

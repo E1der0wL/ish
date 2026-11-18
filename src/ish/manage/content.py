@@ -1,6 +1,7 @@
 """Supply translated help categories to both the TUI and plain-text output."""
 
 from ish.lang import Message, i18n
+from ish.runtime.settings import ESCAPE_DELAY
 
 PAGES = (
     (Message.MANAGE_OVERVIEW, Message.MANAGE_HELP_OVERVIEW),
@@ -16,9 +17,10 @@ PAGES = (
 
 def help_pages(parser):
     """Keep command option details owned by the actual parser."""
-    return [(i18n.get(title), i18n.get(body)) for title, body in PAGES] + [
-        (i18n.get(Message.MANAGE_OPTIONS), parser.format_help())
-    ]
+    return [
+        (i18n.get(title), i18n.get(body, escape_delay=ESCAPE_DELAY))
+        for title, body in PAGES
+    ] + [(i18n.get(Message.MANAGE_OPTIONS), parser.format_help())]
 
 
 def help_text(parser):

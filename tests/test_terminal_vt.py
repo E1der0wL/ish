@@ -29,6 +29,28 @@ def displayed_colors(frame, character):
 class TerminalVTTests(unittest.TestCase):
     """Use fixed VT protocol expectations rather than a second production parser."""
 
+    def test_repeated_frames_isolate_lines_and_refresh_changed_cell_metadata(self):
+        """Client mutations, variable-size links and equal text cannot stale a row."""
+        with Terminal(16, 3, lambda _: None) as terminal:
+            terminal.feed(
+                b"\x1b]8;;https://old.test\x1b\\X\x1b]8;;\x1b\\\r\n" + "한글".encode()
+            )
+            first = terminal.frame()
+            first.lines[0].clear()
+            first.lines[1][0] = ("", "changed by caller")
+            following = terminal.frame()
+            self.assertEqual([text(following, i) for i in range(2)], ["X", "한글"])
+            self.assertEqual(following.cells[0][0].hyperlink, "https://old.test")
+            terminal.feed(
+                b"\x1b[H\x1b[4;58;2;9;8;7m\x1b]8;;https://new.test/longer\x1b\\"
+                b"X\x1b]8;;\x1b\\\x1b[0m\x1b[3;1HZ"
+            )
+            latest = terminal.frame()
+            self.assertEqual([text(latest, i) for i in range(3)], ["X", "한글", "Z"])
+            self.assertEqual(latest.cells[0][0].hyperlink, "https://new.test/longer")
+            self.assertEqual(latest.cells[0][0].underline_color, (9, 8, 7))
+            self.assertEqual(following.cells[0][0].hyperlink, "https://old.test")
+
     def test_split_unicode_and_wide_cells_keep_text_and_cursor(self):
         """UTF-8 boundaries, wide tails, and combining marks do not add characters."""
         content = "A한e\u0301Z"

@@ -2,7 +2,7 @@
 
 # None detects LANG and falls back to English; use "ko" or "en" to override.
 config.lang = None  # noqa: F821
-config.escape_delay = 0.05  # noqa: F821
+config.escape_delay = 0.02  # noqa: F821
 
 # No plugins means no UI, popup shortcut, or shell hook.
 config.plugins = []  # noqa: F821

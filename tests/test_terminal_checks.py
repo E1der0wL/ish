@@ -233,7 +233,17 @@ CASE_CONTRACTS = (
     (
         "IO03",
         "test_terminal_session.TerminalSessionTests",
-        ("test_paused_exit_with_open_slave_drains_without_waiting_for_eof",),
+        (
+            "test_paused_exit_with_open_slave_drains_without_waiting_for_eof",
+            "test_failed_fork_closes_setup_pipe_and_can_be_retried",
+            "test_failed_initial_size_delivers_child_error_and_exit",
+            "test_immediate_close_reaps_child_before_exec",
+        ),
+    ),
+    (
+        "IO04",
+        "test_terminal_session.TerminalSessionTests",
+        ("test_immediate_resize_survives_delayed_child_setup",),
     ),
     (
         "IO04 UI03",
@@ -357,7 +367,14 @@ CASE_CONTRACTS = (
         "test_terminal_startup.StartupTests",
         ("test_color_depth_preserves_explicit_rgb_and_respects_ptk_environment",),
     ),
-    ("VT09", "test_terminal_vt.TerminalVTTests", ("test_cursor_erase_and_rgb_style",)),
+    (
+        "VT09",
+        "test_terminal_vt.TerminalVTTests",
+        (
+            "test_cursor_erase_and_rgb_style",
+            "test_repeated_frames_isolate_lines_and_refresh_changed_cell_metadata",
+        ),
+    ),
     (
         "VT11",
         "test_terminal_cursor.NativeCursorTests",
@@ -387,6 +404,11 @@ CASE_CONTRACTS = (
         "VT15",
         "test_terminal_vt.TerminalVTTests",
         ("test_selection_never_uses_anchors_from_another_screen_or_reset",),
+    ),
+    (
+        "IN01",
+        "test_terminal_hookless.HooklessTests",
+        ("test_negotiated_escape_closes_popup_and_preserves_continuation",),
     ),
     (
         "IN01",

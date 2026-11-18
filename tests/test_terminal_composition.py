@@ -1046,8 +1046,9 @@ class FormattingPolicyTests(unittest.IsolatedAsyncioTestCase):
             {"hyperlinks": "off", "extended_styles": "off", "overline": "off"}
         )
         self.rich_cell()
+        fragments = [("[ZeroWidthEscape]", "\x1b[53m"), ("", "P")]
         popup = self.owner.plugins.show_popup(
-            Window(FormattedTextControl("P", focusable=True)),
+            Window(FormattedTextControl(fragments, focusable=True)),
             left=1,
             top=0,
             width=1,

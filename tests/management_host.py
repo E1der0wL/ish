@@ -140,8 +140,10 @@ class ManagementTerminal(Terminal):
                 self.send(self.host_input)
                 self.host_input.clear()
 
-    def finish(self, key=b"\x1b"):
+    def finish(self, key=None):
         """Close the management UI and require the actual outer PTY's restoration."""
+        if key is None:
+            key = self.escape_key
         if key:
             self.send(key)
         self.require(self.exited)
@@ -277,7 +279,7 @@ def restore_case(directory, case):
             if case == "restore-interrupt"
             else b"\x04"
             if case == "restore-eof"
-            else b"\x1b"
+            else terminal.escape_key
         )
         terminal.finish(key=key)
         outer_restored = termios.tcgetattr(terminal.fd) == terminal.attrs

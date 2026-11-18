@@ -26,6 +26,26 @@ def setup(api):
 class HooklessTests(unittest.TestCase):
     """A plugin never requires the native editor to surrender its command buffer."""
 
+    def test_negotiated_escape_closes_popup_and_preserves_continuation(self):
+        """The host's keyboard-mode push changes a scripted Esc press on the wire."""
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="ish-esc-")))
+        terminal = HooklessTerminal(root, shell="tcsh", plugins=True)
+        self.addCleanup(terminal.close)
+        self.assertEqual(terminal.escape_key, b"\x1b")
+        terminal.require(lambda: b"\x1b[?u" in terminal.output, STARTUP_DEADLINE)
+        terminal.send(b"\x1b[?0u")
+        terminal.require(terminal.at_prompt, STARTUP_DEADLINE)
+        self.assertEqual(terminal.escape_key, b"\x1b[27u")
+        terminal.submit("printf '%s\\n' one \\")
+        terminal.require(lambda: terminal.at_prompt(continuation=True))
+        scenario = Scenario(terminal, "tcsh", True)
+        scenario.open_popup()
+        scenario.cancel_popup(tail=b"two > continued\r")
+        terminal.result("continued", b"one\ntwo\n")
+        terminal.finish()
+        terminal.receive()
+        self.assertEqual(terminal.escape_key, b"\x1b")
+
     def run_case(self, shell, plugins):
         """Check each shell's final files, rendered UI and actual PTY restoration."""
         directory = self.enterContext(

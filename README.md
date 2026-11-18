@@ -112,7 +112,7 @@ ish --plugin-dir examples/terminal_plugins --plugin clipboard_system --clipboard
 | `--clipboard off/write/read-write` | 프로그램의 직접 클립보드 접근 권한 |
 | `--feature NAME=on/off/auto` | 기능별 정책, 자동은 지원 질의를 구현한 기능만 |
 | `--color-depth inherit/1/4/8/24` | 출력 색 깊이, 기본 PTK·환경 설정 상속 |
-| `--escape-delay SECONDS` | ESC·Alt 구분 대기, 기본 0.05초 |
+| `--escape-delay SECONDS` | Esc 단독 바이트의 후속 입력 대기, 기본 0.02초. 원격 연결에서 Alt·방향키 입력이 갈라지면 이 값을 늘리세요. |
 | `--scrollback-lines N`, `--scrollback-bytes N` | native 기록 한도, 바이트 0이면 비활성화 |
 | `--log-file [PATH]`, `--log-level LEVEL` | 선택적 파일 로그·수준 |
 | `--version`, `--diagnose` | 버전·읽기 전용 환경 진단 |

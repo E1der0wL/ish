@@ -13,7 +13,7 @@ from ish.lang.i18n import valid_language
 from ish.log import LOG_LEVELS
 from ish.runtime.startup import login_shell
 
-ESCAPE_DELAY = 0.05
+ESCAPE_DELAY = 0.02
 MIN_ESCAPE_DELAY = 0.005
 MAX_ESCAPE_DELAY = 2.0
 INTERACTIVE_ARGS = ("-i",)

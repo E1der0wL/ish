@@ -2,6 +2,7 @@
 
 import os
 import re
+import select
 import signal
 import sys
 import tempfile
@@ -373,7 +374,12 @@ class RestorationPTYTests(unittest.TestCase):
         return terminal
 
     def assert_modes(self, terminal):
-        """Compare final emitted state to literal non-default startup values."""
+        """Compare all output emitted before the observed process stop or exit."""
+        while select.select([terminal.fd], [], [], 0)[0]:
+            previous = len(terminal.output)
+            terminal.receive()
+            if len(terminal.output) == previous:  # EOF is also reported as readable.
+                break
         values = dict(INITIAL_MODES)
         for match in MODE_WRITE.finditer(terminal.output):
             values[int(match[1])] = 1 if match[2] == b"h" else 2
@@ -394,7 +400,6 @@ class RestorationPTYTests(unittest.TestCase):
         self.assertIn(QUERY, terminal.output[: first_write.start()])
         terminal.send(b"exit\r")
         terminal.require(terminal.exited)
-        terminal.receive()
         self.assertEqual(terminal.status, 0)
         self.assert_modes(terminal)
 
@@ -405,7 +410,6 @@ class RestorationPTYTests(unittest.TestCase):
                 terminal = self.terminal()
                 os.kill(terminal.pid, signum)
                 terminal.require(terminal.exited)
-                terminal.receive()
                 self.assertEqual(terminal.status, 128 + signum)
                 self.assert_modes(terminal)
 
@@ -434,7 +438,6 @@ class RestorationPTYTests(unittest.TestCase):
             return bool(pid and os.WIFSTOPPED(status))
 
         terminal.require(stopped)
-        terminal.receive()
         self.assert_modes(terminal)
         terminal.resize(29, 91)
         os.kill(terminal.pid, signal.SIGCONT)
@@ -444,7 +447,6 @@ class RestorationPTYTests(unittest.TestCase):
         self.assertEqual(terminal.state()["child_pid"], native_pid)
         terminal.send(b"exit\r")
         terminal.require(terminal.exited)
-        terminal.receive()
         self.assert_modes(terminal)
 
 

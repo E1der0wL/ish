@@ -12,7 +12,7 @@
 | FP01 | 질의가 있는 기능만 auto, 정책·관찰·사용 분리, identity 없는 선택, resize 후 off 보존, geometry·초기 색 복원 필수 조건, 실제 PTK의 형식 on/off 및 커서 정리 | `test_terminal_features.FeaturePolicyTests`, `test_terminal_composition.FormattingPolicyTests` |
 | IO01 | 3셸 × 기본형/플러그인의 native 셸·프로그램 입력 | `test_terminal_hookless.HooklessTests`의 6개 조합 |
 | IO02 | 호스트 backpressure 중 마지막 출력 보존, 3셸의 1,280행·팝업 4회·resize 8회 뒤 전체 history 비교 | `test_terminal_session.TerminalSessionTests`, `test_terminal_supplements.SustainedOutputTests` |
-| IO03 | 종료 후 열린 slave가 있어도 보류된 출력 drain | `test_terminal_session.TerminalSessionTests` |
+| IO03 | 종료 후 열린 slave가 있어도 보류된 출력 전달, PTY 시작 실패·즉시 종료 때 자원 회수 | `test_terminal_session.TerminalSessionTests` |
 | IO04 | 최초 bar 제외 크기, resize 후 native grid/size 응답, 직렬 크기 조회·실패 복귀·이미지 보존·애니메이션 재개 | `test_terminal_cursor.CursorPTYTests`, `test_terminal_vt.TerminalVTTests`, `test_terminal_geometry` |
 | IO05 | 실제 셸의 Ctrl+C/D/Z, jobs/bg/fg와 최종 파일 | 위 `HooklessTests` 6개 조합 |
 | IO06 | 최초 상태 관찰, 정상/HUP/TERM/중지·재개, 최종 renderer 실패 cleanup | `test_terminal_cursor.RestorationPTYTests`, `test_terminal_composition.TerminalCompositionTests` |
@@ -26,13 +26,13 @@
 | VT06 | 영역 scroll·RI·NEL, history 삭제와 화면 보존 | `test_terminal_contracts.BaselineContracts` |
 | VT07 | 47/1047/1048 차이, 1049 resize·중복 종료 | `test_terminal_contracts.BaselineContracts` |
 | VT08 | 기본색과 명시색 구별, RGB 채널·출력 깊이 정책 | `test_terminal_vt.TerminalVTTests`, `test_terminal_startup.StartupTests` |
-| VT09 | bold/RGB 속성을 포함한 셀 스타일 | `test_terminal_vt.TerminalVTTests`의 해당 사례만 보호. 모든 SGR 속성·blink 외관의 증명이 아님 |
+| VT09 | bold/RGB 셀 스타일, 반복 프레임 간 텍스트 독립성, 셀 스타일과 하이퍼링크 변경 | `test_terminal_vt.TerminalVTTests` |
 | VT11 | 관측한 native 커서 기본값, 반복 reset의 불변성 | `test_terminal_cursor.NativeCursorTests`, `test_terminal_composition.TerminalCompositionTests` |
 | VT12 | DECSTR 후 입력 mode와 기존 텍스트 | `test_terminal_contracts.BaselineContracts` |
 | VT13 | DEC 선그리기와 charset/reset 결과 | `test_terminal_contracts.BaselineContracts` |
 | VT14 | synchronized hold 안팎의 색상 경계 | `test_terminal_native_features.NativeFeaturesTests` |
 | VT15 | 화면 전환/reset 후 오래된 선택 anchor 거부 | `test_terminal_vt.TerminalVTTests` |
-| IN01 | PTK ESC/Alt/arrow 의미, native C0/Enter/paste encoding | `test_terminal_host.HostProbeTests`, `test_terminal_vt.TerminalVTTests` |
+| IN01 | PTK Esc·Alt·방향키, 확장 키 모드에서 팝업을 닫은 뒤 continuation 입력 전달, native C0·Enter·paste | `test_terminal_host.HostProbeTests`, `test_terminal_hookless.HooklessTests`, `test_terminal_vt.TerminalVTTests` |
 | IN02 | terminfo 기능키·수정 navigation·keypad, separator의 mode/action, 3셸의 실제 PTK→PTY 최종 입력 파일 | `test_terminal_contracts.TerminfoContracts`, `LiveQueryContracts` |
 | IN04 | 실제 입력 reader에서 paste를 하나의 이벤트로 보존 | `test_terminal_host.HostInputTests` |
 | IN06 | 호스트 focus가 없는 동안 popup close가 focus-in을 만들지 않음 | `test_terminal_composition.TerminalCompositionTests` |

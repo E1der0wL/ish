@@ -105,26 +105,47 @@ class CellEscape(str):
 class NativeChar(Char):
     """One native grapheme whose width is not recalculated by PTK."""
 
-    __slots__ = ("cell",)
+    __slots__ = ("format_key",)
 
-    def __init__(self, cell):
-        """Retain metadata in the same object that participates in PTK diffing."""
-        identity = repr(
-            (
-                cell.width,
-                cell.underline,
-                cell.underline_color,
-                cell.hyperlink,
-                cell.overline,
-            )
+    def __init__(self, cell, formats):
+        """Share style identities within this paint, including URI-only changes."""
+        key = (
+            cell.width,
+            cell.underline,
+            cell.underline_color,
+            cell.hyperlink,
+            cell.overline,
         )
-        suffix = hashlib.blake2s(identity.encode(), digest_size=8).hexdigest()
+        cached = formats.get(key)
+        if cached is None:
+            identity = repr(key).encode()
+            suffix = hashlib.blake2s(identity, digest_size=8).hexdigest()
+            cached = formats[key] = (key, suffix)
+        self.format_key, suffix = cached
         # Char.__init__ applies editor visualisations (e.g. NBSP underline).
         # Native terminal cells already have their display meaning resolved.
         self.char = cell.text
         self.style = f"{cell.style} class:vt-{suffix}"
         self.width = cell.width
-        self.cell = cell
+
+    def escape(self, profile, link, reset):
+        """Encode host-supported metadata after PTK has selected the cell style."""
+        _, underline, color, target, overline = self.format_key
+        if (
+            profile.hyperlinks
+            and target
+            and not any(ord(c) < 32 or ord(c) == 127 for c in target)
+        ):
+            link = f"\x1b]8;;{target}\x1b\\"
+        payload = link + reset
+        if profile.extended_styles:
+            payload += f"\x1b[4:{underline}m"
+        if profile.overline and overline:
+            payload += "\x1b[53m"
+        if profile.extended_styles and color is not None:
+            red, green, blue = color
+            payload += f"\x1b[58:2::{red}:{green}:{blue}m"
+        return CellEscape(payload)
 
 
 class NativeTail(Char):
@@ -173,6 +194,7 @@ class NativeWindow(Window):
             )
         xpos, ypos = write_position.xpos + move_x, write_position.ypos
         visible, mapping = {}, {}
+        formats = {}
         for row, cells in enumerate(frame.cells[: write_position.height]):
             visible[row] = (row, 0)
             target = new_screen.data_buffer[ypos + row]
@@ -183,7 +205,7 @@ class NativeWindow(Window):
                     # A clipped wide grapheme must not overwrite the neighbour.
                     target[xpos + cell.x] = Char(" ", cell.style)
                 else:
-                    head = NativeChar(cell)
+                    head = NativeChar(cell, formats)
                     target[xpos + cell.x] = head
                     for tail in range(1, cell.width):
                         target[xpos + cell.x + tail] = NativeTail(head)
@@ -384,38 +406,7 @@ class TerminalRenderer(RestoringRenderer):
                     row[x - step] is char.head for step in range(1, char.head.width)
                 ):
                     row[x] = Char(" ", char.style)
-        for y, row in screen.data_buffer.items():
-            for x, char in row.items():
-                payload = LINK_END if profile.hyperlinks else ""
-                if isinstance(char, NativeChar):
-                    cell = char.cell
-                    if (
-                        profile.hyperlinks
-                        and cell.hyperlink
-                        and not any(
-                            ord(c) < 32 or ord(c) == 127 for c in cell.hyperlink
-                        )
-                    ):
-                        payload = f"\x1b]8;;{cell.hyperlink}\x1b\\"
-                if profile.extended_styles:
-                    payload += UNDERLINE_RESET
-                if profile.overline:
-                    payload += OVERLINE_RESET
-                if isinstance(char, NativeChar):
-                    if getattr(profile, "extended_styles", False):
-                        payload += f"\x1b[4:{cell.underline}m"
-                    if profile.overline and cell.overline:
-                        payload += "\x1b[53m"
-                    if cell.underline_color is not None and getattr(
-                        profile, "extended_styles", False
-                    ):
-                        red, green, blue = cell.underline_color
-                        payload += f"\x1b[58:2::{red}:{green}:{blue}m"
-                else:
-                    if getattr(profile, "extended_styles", False):
-                        underline = self._attrs_for_style[char.style].underline
-                        payload += f"\x1b[4:{int(underline)}m"
-                screen.zero_width_escapes[y][x] = CellEscape(payload)
+        self._format_cells(screen, profile)
         frame = self.owner.control.frame
         position = self.owner.window.position
         if self.finishing or frame is None or position is None or protocol is None:
@@ -464,6 +455,37 @@ class TerminalRenderer(RestoringRenderer):
         self.after_text = plan.after_text
         if plan.repaint:
             self.invalidate_screen()
+
+    def _format_cells(self, screen, profile):
+        """Encode each distinct format once after PTK has finished its overlays."""
+        if not (profile.hyperlinks or profile.extended_styles or profile.overline):
+            # A painted cell still supersedes any zero-width escape from a widget.
+            for y, escapes in screen.zero_width_escapes.items():
+                for x in escapes.keys() & screen.data_buffer[y].keys():
+                    del escapes[x]
+            return
+        reset = (UNDERLINE_RESET if profile.extended_styles else "") + (
+            OVERLINE_RESET if profile.overline else ""
+        )
+        default_link = LINK_END if profile.hyperlinks else ""
+        widget = {}
+        native = {}
+        for y, row in screen.data_buffer.items():
+            escapes = screen.zero_width_escapes[y]
+            for x, char in row.items():
+                if isinstance(char, NativeChar):
+                    key = char.format_key
+                    if key not in native:
+                        native[key] = char.escape(profile, default_link, reset)
+                    escapes[x] = native[key]
+                else:
+                    if char.style not in widget:
+                        payload = default_link + reset
+                        if profile.extended_styles:
+                            underline = self._attrs_for_style[char.style].underline
+                            payload += f"\x1b[4:{int(underline)}m"
+                        widget[char.style] = CellEscape(payload)
+                    escapes[x] = widget[char.style]
 
     def clear_graphics(self):
         """Restore text when a raster backend erases its previously occupied cells."""
