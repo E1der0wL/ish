@@ -490,14 +490,27 @@ class StartupTests(StartupFixture, unittest.TestCase):
         )
         self.write_rc("config.color_depth = '24'\n")
         cases = (
-            (("--no-rc",), "", False),
-            (("--no-rc", "--color-depth", "24"), "", True),
-            (("--no-rc",), "DEPTH_24_BIT", True),
-            (("--no-rc", "--color-depth", "8"), "DEPTH_24_BIT", False),
-            ((), "", True),
+            (("--no-rc",), {}, "DEPTH_8_BIT"),
+            (("--no-rc",), {"COLORTERM": "truecolor"}, "DEPTH_24_BIT"),
+            (("--no-rc",), {"COLORTERM": "24bit"}, "DEPTH_24_BIT"),
+            (("--no-rc",), {"COLORTERM": "unrecognized"}, "DEPTH_8_BIT"),
+            (
+                ("--no-rc",),
+                {"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+                "DEPTH_24_BIT",
+            ),
+            (("--no-rc",), {"COLORTERM": "truecolor", "NO_COLOR": "1"}, "DEPTH_1_BIT"),
+            (
+                ("--no-rc",),
+                {"COLORTERM": "truecolor", "PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_4_BIT"},
+                "DEPTH_4_BIT",
+            ),
+            (("--color-depth", "8"), {"COLORTERM": "truecolor"}, "DEPTH_8_BIT"),
+            (("--no-rc", "--color-depth", "24"), {"NO_COLOR": "1"}, "DEPTH_24_BIT"),
+            ((), {"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_4_BIT"}, "DEPTH_24_BIT"),
         )
-        for options, environment_depth, expected_rgb in cases:
-            with self.subTest(options=options, environment_depth=environment_depth):
+        for options, environment, expected_depth in cases:
+            with self.subTest(options=options, environment=environment):
                 terminal = Terminal(
                     self.root,
                     shell=sys.executable,
@@ -510,22 +523,83 @@ class StartupTests(StartupFixture, unittest.TestCase):
                         *options,
                         "--shell-arg=" + str(script),
                     ),
-                    environment={
-                        "NO_COLOR": "",
-                        "PROMPT_TOOLKIT_COLOR_DEPTH": environment_depth,
-                    },
+                    environment=environment,
                 )
                 try:
                     terminal.require(
                         lambda terminal=terminal: terminal.frame_has("COLOR_RGB_CHECK")
                     )
-                    self.assertEqual(b"38;2;17;34;51" in terminal.output, expected_rgb)
+                    self.assertEqual(
+                        b"38;2;17;34;51" in terminal.output,
+                        expected_depth == "DEPTH_24_BIT",
+                    )
                     self.assertEqual(terminal.state()["host_adapter"], "unknown")
                     self.assertFalse(terminal.state()["host"]["hyperlinks"])
                     self.assertFalse(terminal.state()["host"]["enhanced_keyboard"])
                     terminal.send(b"\r")
                     terminal.require(terminal.exited)
                     self.assertEqual(terminal.status, 0)
+                    self.assertEqual(terminal.state()["color_depth"], expected_depth)
+                finally:
+                    terminal.close()
+
+    def test_host_color_queries_preserve_rgb_and_the_custom_indexed_palette(self):
+        """The output PTY receives exact direct and indexed colors after negotiation."""
+        script = self.root / "swatches.py"
+        script.write_text(
+            "import os\n"
+            "os.write(1, b'\\x1b[31mTHEME_RED\\x1b[38;2;17;34;51mRGB_SAMPLE\\x1b[0m\\r\\n')\n"
+            "input()\n"
+        )
+        palette = b"\x1b]4;1;rgb:bc/23/4f\x1b\\"
+        cases = (
+            (palette, {}, None, "DEPTH_8_BIT"),
+            (palette + b"\x1bP1+r524742=382f382f38\x1b\\", {}, 24, "DEPTH_24_BIT"),
+            (
+                palette + b"\x1bP1+r436f=323536\x1b\\",
+                {"COLORTERM": "truecolor"},
+                8,
+                "DEPTH_24_BIT",
+            ),
+        )
+        for reply, environment, observed, expected_depth in cases:
+            with self.subTest(reply=reply, environment=environment):
+                terminal = Terminal(
+                    self.root,
+                    shell=sys.executable,
+                    configure=False,
+                    extra_args=(
+                        "--no-rc",
+                        "--no-plugins",
+                        "--shell-arg=" + str(script),
+                    ),
+                    environment=environment,
+                )
+                try:
+                    terminal.require(
+                        lambda terminal=terminal: (
+                            b"\x1bP+q524742\x1b\\" in terminal.output
+                        )
+                    )
+                    terminal.send(reply)
+                    terminal.require(
+                        lambda terminal=terminal: terminal.frame_has(
+                            "THEME_REDRGB_SAMPLE"
+                        )
+                    )
+                    for sgr in (b"38;2;188;35;79", b"38;2;17;34;51"):
+                        self.assertEqual(
+                            sgr in terminal.output, expected_depth == "DEPTH_24_BIT"
+                        )
+                    terminal.send(b"\r")
+                    terminal.require(terminal.exited)
+                    self.assertEqual(terminal.status, 0)
+                    state = terminal.state()
+                    self.assertEqual(
+                        state["host"]["appearance"]["palette"][1], [188, 35, 79]
+                    )
+                    self.assertEqual(state["host"]["color_depth"], observed)
+                    self.assertEqual(state["color_depth"], expected_depth)
                 finally:
                     terminal.close()
 

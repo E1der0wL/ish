@@ -80,7 +80,7 @@ CLI가 저장 설정보다 우선한다. `--no-rc`는 이번 실행에서 ish �
 | `plugin_lib_dir` | `~/ish/plugin/lib` |
 | `mouse` | `auto`; `off`, `auto`, `on` |
 | `clipboard` | `write`; `off`, `write`, `read-write` |
-| `color_depth` | `inherit`; `inherit`, `1`, `4`, `8`, `24` 문자열 |
+| `color_depth` | 기본 `inherit`는 본체 터미널의 색 깊이를 따르며 알 수 없으면 PTK 기본값을 사용. 직접 지정하려면 `1`, `4`, `8`, `24` 문자열 |
 | `escape_delay` | 0.02초, 0.005~2.0. 느린 연결에서 Alt·방향키가 갈라지면 늘리세요. |
 | `scrollback_lines` | 10000, 0 이상 정수 |
 | `scrollback_bytes` | 33554432, 0이면 기록 비활성화 |

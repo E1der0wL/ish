@@ -276,6 +276,7 @@ class HostProfile:
     cursor_color_control: bool = False
     overline: bool = False
     initial_cursor_style: HostCursorStyle | None = None
+    color_depth: int | None = None
 
     @property
     def has_cell_size(self) -> bool:
@@ -605,6 +606,71 @@ def directory_uri(value: str) -> str | None:
     return None
 
 
+class _ColorDepthProbe:
+    """Observe the outer renderer at startup, independently of its RGB palette."""
+
+    QUERY = f"{ESC}P+q524742{ST}{ESC}P+q436f{ST}"
+    REPORT = re.compile(
+        r"\x1bP([01])\+r(524742|436[fF])(?:=((?:[0-9a-fA-F]{2}){0,16}))?\x1b\\\Z"
+    )
+    COLOR_COUNTS = {2: 1, 8: 4, 16: 4, 88: 4, 256: 8, 16777216: 24}
+
+    def __init__(self, write: Callable[[str], None]):
+        self.write = write
+        self.depth: int | None = None
+        self._seen: set[str] = set()
+        self._samples: tuple[str, ...] = ()
+        self._sample_received = False
+
+    @property
+    def complete(self) -> bool:
+        """A definite RGB result supersedes indexed capabilities."""
+        return self.depth == 24 or (
+            len(self._seen) == 2 and (not self._samples or self._sample_received)
+        )
+
+    def capability(self, report) -> None:
+        """Decode only requested names and concrete, representable color depths."""
+        status, name, encoded = report.groups()
+        name = name.lower()
+        if name in self._seen:
+            return
+        self._seen.add(name)
+        if status != "1" or not encoded or self.depth == 24:
+            return
+        value = bytes.fromhex(encoded)
+        if name == "436f" and value.isdigit():
+            self.depth = self.COLOR_COUNTS.get(int(value))
+        elif name == "524742":
+            # A boolean RGB capability alone does not specify channel widths.
+            widths = value.split(b"/")
+            if len(widths) in (1, 3) and all(
+                width.isdigit() and int(width) >= 8 for width in widths
+            ):
+                self.depth = 24
+
+    def sample(self, initial: str) -> None:
+        """Set, query and restore SGR in one write, without drawing a character."""
+        if self.depth == 24:
+            return
+        red, green, blue = secrets.token_bytes(3)
+        channels = f"{red}:{green}:{blue}"
+        semicolon = f"38;2;{red};{green};{blue}"
+        self._samples = (
+            semicolon,
+            f"38:2::{channels}",
+            f"38:2:0:{channels}",
+            f"38:2:{channels}",
+        )
+        self.write(f"{ESC}[0;{semicolon}m{ESC}P$qm{ST}{ESC}[0;{initial}m")
+
+    def observe_sample(self, report: str) -> None:
+        """A delayed unrelated report or an indexed approximation cannot qualify."""
+        self._sample_received = True
+        if report.removeprefix("0;") in self._samples:
+            self.depth = 24
+
+
 class HostBroker:
     """Collect one bounded probe and consume subsequent host control replies.
 
@@ -686,6 +752,7 @@ class HostBroker:
         on_clipboard_reply: Callable[[str], bool] | None = None,
         on_appearance: Callable[[HostAppearance], None] | None = None,
         on_geometry: Callable[[], None] | None = None,
+        on_color_probe: Callable[[str], None] | None = None,
     ):
         """Keep host state independent of the child VT and PTY lifetime."""
         self.features = MappingProxyType(validate_features(features))
@@ -698,6 +765,7 @@ class HostBroker:
         self.on_clipboard_reply = on_clipboard_reply
         self.on_appearance = on_appearance
         self.on_geometry = on_geometry
+        self._depth_probe = _ColorDepthProbe(on_color_probe) if on_color_probe else None
         self.input_modes_active = False
         self.pixel_mouse_active = False
         self._keys = KeyMappings()
@@ -890,6 +958,7 @@ class HostBroker:
             + "".join(f"{ESC}]4;{number};?{ST}" for number in range(PALETTE_SIZE))
             + f"{ESC}_Ga=q,i={query_id},s=1,v=1,f=24,t=d;AAAA{ST}"
             + "".join(f"{ESC}[?{mode}$p" for mode in self.RESTORE_MODES if mode != 2026)
+            + (self._depth_probe.QUERY if self._depth_probe is not None else "")
             + f"{ESC}P$qm{ST}"
             + f"{ESC}[c"
         )
@@ -982,6 +1051,7 @@ class HostBroker:
                 cursor_color_control=enabled["cursor_color"],
                 overline=enabled["overline"],
                 initial_cursor_style=self._initial_cursor_style,
+                color_depth=self._depth_probe.depth if self._depth_probe else None,
             )
             self._closed = True
             self._appearance_epoch += 1
@@ -1074,6 +1144,7 @@ class HostBroker:
             and all(mode in self._mode_values for mode in self.RESTORE_MODES)
             and self._attributes_seen
             and self._cursor_style_seen
+            and (self._depth_probe is None or self._depth_probe.complete)
         ):
             self.ready.set()
 
@@ -1515,6 +1586,18 @@ class HostBroker:
 
     def control(self, sequence: str) -> bool:
         """Consume a complete control reply; return false only for keyboard traffic."""
+        negotiating_depth = (
+            self._started
+            and not self._closed
+            and not self._restore_only
+            and self._depth_probe is not None
+        )
+        if negotiating_depth and (
+            report := self._depth_probe.REPORT.fullmatch(sequence)
+        ):
+            self._depth_probe.capability(report)
+            self._changed()
+            return True
         attributes = self.ATTRIBUTES_REPLY.fullmatch(sequence)
         if attributes:
             if self._started and not self._closed and self._sixel_support is None:
@@ -1541,6 +1624,11 @@ class HostBroker:
                 self._attributes_seen = True
                 if attributes[1] == "1":
                     self._initial_attributes = attributes[2] or "0"
+                    if negotiating_depth:
+                        self._depth_probe.sample(self._initial_attributes)
+                self._changed()
+            elif negotiating_depth and attributes[1] == "1":
+                self._depth_probe.observe_sample(attributes[2])
                 self._changed()
             return True
         mode = self.MODE_REPORT.fullmatch(sequence)

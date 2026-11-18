@@ -365,7 +365,15 @@ CASE_CONTRACTS = (
     (
         "VT08",
         "test_terminal_startup.StartupTests",
-        ("test_color_depth_preserves_explicit_rgb_and_respects_ptk_environment",),
+        (
+            "test_color_depth_preserves_explicit_rgb_and_respects_ptk_environment",
+            "test_host_color_queries_preserve_rgb_and_the_custom_indexed_palette",
+        ),
+    ),
+    (
+        "VT08",
+        "test_terminal_composition.TerminalCompositionTests",
+        ("test_indexed_output_preserves_observed_custom_palette_slots",),
     ),
     (
         "VT09",

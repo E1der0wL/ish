@@ -45,6 +45,7 @@ from .settings import (
     COLOR_DEPTHS,
     DEFAULT_CLIPBOARD,
     DEFAULT_COLOR_DEPTH,
+    inherited_color_depth,
     validate_color_depth,
 )
 from .vt import (
@@ -302,6 +303,7 @@ class TerminalApp:
         preferred_color_depth = (
             COLOR_DEPTHS[self.color_depth_policy] or ColorDepth.from_env()
         )
+        outer_color_term = os.environ.get("COLORTERM", "")
         escape_delay = validate_escape_delay(escape_delay)
         if clipboard not in CLIPBOARD_POLICIES:
             raise ValueError(
@@ -331,6 +333,7 @@ class TerminalApp:
         self.plugin_dir, self.library_dir = plugin_dir, library_dir
         self.host = HostBroker(
             features=features,
+            on_color_probe=self._write_probe if preferred_color_depth is None else None,
             on_focus=self._host_focus,
             on_graphics_error=self._graphics_error,
             on_key=self._host_key,
@@ -376,7 +379,12 @@ class TerminalApp:
             output=RestoringOutput(get_app_session().output, self),
             key_bindings=merge_key_bindings([controls, self.plugins.bindings]),
             cursor=DynamicCursorShapeConfig(self._cursor_shape),
-            color_depth=preferred_color_depth,
+            color_depth=preferred_color_depth
+            or (
+                lambda: inherited_color_depth(
+                    self.profile.color_depth, outer_color_term
+                )
+            ),
             full_screen=True,
             mouse_support=Condition(lambda: self.mouse_enabled),
             min_redraw_interval=self.FRAME_INTERVAL,
@@ -527,12 +535,16 @@ class TerminalApp:
             size = self.app.output.get_size()
             return size.columns, size.rows, 0, 0
 
+    def _write_probe(self, wire):
+        """Flush a startup query through the active application's single writer."""
+        self.app.output.write_raw(wire)
+        self.app.output.flush()
+
     async def _start(self):
         """Negotiate optional output before enabling it in the child emulator."""
         try:
             size = self.app.output.get_size()
-            self.app.output.write_raw(self.host.begin_probe(size.columns, size.rows))
-            self.app.output.flush()
+            self._write_probe(self.host.begin_probe(size.columns, size.rows))
             try:
                 await asyncio.wait_for(self.host.ready.wait(), self.PROBE_SECONDS)
             except TimeoutError:

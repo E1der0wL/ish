@@ -22,6 +22,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.widgets import TextArea
 
@@ -108,6 +109,80 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         with set_app(self.owner.app):
             self.owner.app.renderer.render(self.owner.app, self.owner.app.layout)
         return self.stream.getvalue()[before:]
+
+    async def test_indexed_output_preserves_observed_custom_palette_slots(self):
+        """A theme red and a custom upper slot must reach the host unchanged."""
+        host = self.owner.host
+        palette = [None] * 256
+        palette[1], palette[12], palette[201] = (
+            (191, 97, 108),
+            (18, 35, 52),
+            (49, 67, 87),
+        )
+        appearance = replace(host.profile.appearance, palette=tuple(palette))
+        host.profile = replace(host.profile, appearance=appearance)
+        self.owner._appearance(appearance)
+        for depth, background, expected in (
+            (ColorDepth.DEPTH_4_BIT, 12, "\x1b[31;104m"),
+            (ColorDepth.DEPTH_8_BIT, 201, "\x1b[31;48;5;201m"),
+        ):
+            with (
+                self.subTest(depth=depth),
+                patch.object(type(self.owner.app), "color_depth", depth),
+            ):
+                self.owner.vt.feed(f"\r\x1b[3;31;48;5;{background}mX\x1b[0mY".encode())
+                self.owner.app.renderer.invalidate_screen()
+                wire = self.render()
+                before, after = wire.split("X", 1)
+                self.assertIn(expected, before)
+                self.assertIn("\x1b[0m", after.split("Y", 1)[0])
+
+        # The standard xterm approximation for #6699cc is 68. Only a complete
+        # host table can improve on this without guessing any missing slot.
+        for complete, neighbor, expected in (
+            (False, 67, "38;5;68m"),
+            (True, 67, "38;5;67m"),
+            (True, 72, "38;5;72m"),
+        ):
+            with (
+                self.subTest(complete=complete, neighbor=neighbor),
+                patch.object(
+                    type(self.owner.app), "color_depth", ColorDepth.DEPTH_8_BIT
+                ),
+            ):
+                colors = [(0, 0, 0) if complete else None] * 256
+                colors[neighbor] = (102, 153, 205)
+                colors[68] = (255, 0, 255)
+                appearance = replace(host.profile.appearance, palette=tuple(colors))
+                host.profile = replace(host.profile, appearance=appearance)
+                self.owner._appearance(appearance)
+                self.owner.vt.feed(b"\r\x1b[38;2;102;153;204mZ\x1b[0m")
+                self.assertIn(expected, self.render().split("Z", 1)[0])
+
+        # Both near-white colors would map to slot 1. Preserve a contrasting
+        # second choice at 4 bits, including when the background is exact.
+        colors = [(0, 0, 0)] * 16 + [None] * 240
+        colors[1], colors[2] = (255, 255, 255), (180, 180, 180)
+        appearance = replace(host.profile.appearance, palette=tuple(colors))
+        host.profile = replace(host.profile, appearance=appearance)
+        self.owner._appearance(appearance)
+        for fg, bg, expected in (
+            (253, 254, "31;42m"),
+            (253, 255, "32;41m"),
+            (255, 254, "31;42m"),
+            (253, 253, "31;41m"),
+        ):
+            with (
+                self.subTest(fg=fg, bg=bg),
+                patch.object(
+                    type(self.owner.app), "color_depth", ColorDepth.DEPTH_4_BIT
+                ),
+            ):
+                self.owner.vt.feed(
+                    f"\r\x1b[38;2;{fg};{fg};{fg};48;2;{bg};{bg};{bg}mZ\x1b[0m".encode()
+                )
+                self.owner.app.renderer.invalidate_screen()
+                self.assertIn(expected, self.render().split("Z", 1)[0])
 
     def screen(self):
         """Interpret emitted text with an independent VT implementation."""

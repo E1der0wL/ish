@@ -27,6 +27,7 @@ COLOR_DEPTHS = {
     "8": ColorDepth.DEPTH_8_BIT,
     "24": ColorDepth.DEPTH_24_BIT,
 }
+RGB_COLOR_TERMS = frozenset(("truecolor", "24bit"))
 
 
 def validate_color_depth(value):
@@ -38,6 +39,13 @@ def validate_color_depth(value):
             choices=", ".join(COLOR_DEPTHS),
         )
     return value
+
+
+def inherited_color_depth(observed: int | None, color_term: str) -> ColorDepth | None:
+    """An indexed color count does not cap a host that also declares RGB."""
+    if color_term.lower() in RGB_COLOR_TERMS:
+        return ColorDepth.DEPTH_24_BIT
+    return COLOR_DEPTHS[str(observed)] if observed is not None else None
 
 
 @dataclass(slots=True)

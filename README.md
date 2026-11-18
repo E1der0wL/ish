@@ -66,7 +66,7 @@ config.shell = "bash"
 config.plugins = []                # 기본형은 아무 플러그인도 없음
 config.mouse = "auto"              # off / auto / on
 config.clipboard = "write"         # off / write / read-write
-config.color_depth = "inherit"     # inherit / 1 / 4 / 8 / 24
+config.color_depth = "inherit"     # 본체 터미널에 맞춤. 직접 지정할 때는 1 / 4 / 8 / 24
 config.features = {"hyperlinks": "on", "enhanced_keyboard": "auto"}
 ```
 
@@ -111,7 +111,7 @@ ish --plugin-dir examples/terminal_plugins --plugin clipboard_system --clipboard
 | `--mouse off/auto/on` | 호스트 드래그 유지 / 프로그램 요청에 따라 캡처 / 내부 선택도 사용 |
 | `--clipboard off/write/read-write` | 프로그램의 직접 클립보드 접근 권한 |
 | `--feature NAME=on/off/auto` | 기능별 정책, 자동은 지원 질의를 구현한 기능만 |
-| `--color-depth inherit/1/4/8/24` | 출력 색 깊이, 기본 PTK·환경 설정 상속 |
+| `--color-depth inherit/1/4/8/24` | 기본값 `inherit`는 본체 터미널에 맞춤. 색 깊이를 확인할 수 없으면 기존 PTK 기본값 사용 |
 | `--escape-delay SECONDS` | Esc 단독 바이트의 후속 입력 대기, 기본 0.02초. 원격 연결에서 Alt·방향키 입력이 갈라지면 이 값을 늘리세요. |
 | `--scrollback-lines N`, `--scrollback-bytes N` | native 기록 한도, 바이트 0이면 비활성화 |
 | `--log-file [PATH]`, `--log-level LEVEL` | 선택적 파일 로그·수준 |

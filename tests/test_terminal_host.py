@@ -34,6 +34,71 @@ from ish.terminal.mouse import decode_mouse
 from ish.terminal.vt import Terminal
 
 
+class ColorDepthProbeTests(unittest.TestCase):
+    """Observe color depth through complete startup requests and the PTK parser."""
+
+    def setUp(self):
+        """Capture output packets without creating a second terminal reader."""
+        self.writes, self.keys = [], []
+        self.host = HostBroker(on_color_probe=self.writes.append)
+        self.parser = HostParser(Vt100Parser(self.keys.append), self.host)
+        self.query = self.host.begin_probe(80, 24)
+
+    def test_indexed_host_and_quantified_rgb(self):
+        """An eight-bit channel report can coexist with 256 indexed colors."""
+        self.assertIn("\x1bP+q524742\x1b\\\x1bP+q436f\x1b\\", self.query)
+        self.parser.feed("a\x1bP1+r436F=323536\x1b\\\x1bP1+r524742=382f")
+        self.parser.feed("382f38\x1b\\\x1bP1$r0m\x1b\\b")
+        self.assertEqual("".join(key.data for key in self.keys), "ab")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.host.finish_probe().color_depth, 24)
+
+    def test_nonprinting_sgr_readback_before_return_to_shell(self):
+        """The sampling packet already restores the host's original attributes."""
+        self.parser.feed("\x1bP0+r524742\x1b\\")
+        with patch("secrets.token_bytes", return_value=b"\x13\x57\xaf"):
+            self.parser.feed("\x1bP1$r0;1;3;31;44m\x1b\\")
+        self.assertEqual(
+            self.writes,
+            ["\x1b[0;38;2;19;87;175m\x1bP$qm\x1b\\\x1b[0;0;1;3;31;44m"],
+        )
+        self.parser.feed("x\x1bP1$r0;38:2::19:87:175m\x1b\\y")
+        self.assertEqual(self.host.finish_probe().color_depth, 24)
+        self.host.change_attributes()
+        self.assertEqual(self.host.restore_attributes(), "\x1b[0;1;3;31;44m")
+        self.assertEqual("".join(key.data for key in self.keys), "xy")
+
+    def test_indexed_approximation_mismatch_and_late_rgb_preserve_observation(self):
+        """A quantized, unrelated or expired reply cannot upgrade 16 colors."""
+        self.parser.feed("\x1bP1+r436f=3136\x1b\\")
+        with patch("secrets.token_bytes", return_value=b"\x13\x57\xaf"):
+            self.parser.feed("\x1bP1$r0m\x1b\\")
+        self.parser.feed("\x1bP1$r0;38:5:68m\x1b\\\x1bP1$r0;38:2::19:87:176m\x1b\\")
+        self.assertEqual(self.host.finish_probe().color_depth, 4)
+        self.parser.feed("a\x1bP1$r0;38:2::19:87:175m\x1b\\\x1bP1+r524742=38\x1b\\z")
+        self.assertEqual(self.host.profile.color_depth, 4)
+        self.assertEqual("".join(key.data for key in self.keys), "az")
+
+    def test_unknown_or_cancelled_probe_preserves_initial_style(self):
+        """A failed SGR snapshot or cancellation leaves host attributes untouched."""
+        self.parser.feed("\x1bP1+r524742\x1b\\\x1bP0$r0m\x1b\\\x1bP1$r0m\x1b\\")
+        self.assertEqual(self.writes, [])
+        self.assertIsNone(self.host.finish_probe().color_depth)
+        cancelled = HostBroker(on_color_probe=self.writes.append)
+        cancelled.begin_probe(80, 24)
+        cancelled.cancel_probe()
+        cancelled.control("\x1bP1$r0;31m\x1b\\")
+        cancelled.control("\x1bP1+r436f=323536\x1b\\")
+        self.assertIsNone(cancelled.profile.color_depth)
+        self.assertEqual(self.writes, [])
+
+    def test_failed_quantified_rgb_does_not_claim_direct_color(self):
+        """Lower channel widths cannot grant 24-bit output."""
+        self.parser.feed("\x1bP1+r524742=352f362f35\x1b\\\x1bP0+r436f\x1b\\")
+        self.assertIsNone(self.host.finish_probe().color_depth)
+        self.assertEqual(self.writes, [])
+
+
 class HostProbeTests(unittest.TestCase):
     """Probe success requires both the exact acknowledgement and usable geometry."""
 

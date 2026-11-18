@@ -7,10 +7,12 @@ keep their native widths; PTK still owns layout, diffing, focus and output.
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache, partial
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout import Container, Window
 from prompt_toolkit.layout.screen import Char
+from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.renderer import Renderer
 
 from .graphics import (
@@ -228,15 +230,106 @@ class NativeWindow(Window):
 class TransactionOutput:
     """Delegate PTK output while publishing each composed frame in one flush."""
 
+    PALETTE_LIMITS = {ColorDepth.DEPTH_4_BIT: 16, ColorDepth.DEPTH_8_BIT: 256}
+    COLOR_CACHE_SIZE = 1024
+
     def __init__(self, output):
         """Wrap the existing output; do not create another stdout writer."""
         self.output = output
         self.active = False
         self.pending = None
+        self._palette = None
+        self._depth = None
+        self._indices = {}
+        self._nearest = None
 
     def __getattr__(self, name):
         """Reuse the complete PTK output implementation."""
         return getattr(self.output, name)
+
+    def use_palette(self, palette, depth):
+        """Index only observed host colors representable at the selected depth."""
+        if palette is self._palette and depth == self._depth:
+            return
+        self._palette, self._depth = palette, depth
+        self._indices.clear()
+        colors = palette[: self.PALETTE_LIMITS.get(depth, 0)]
+        for index, rgb in enumerate(colors):
+            if rgb is not None:
+                self._indices.setdefault(bytes(rgb).hex(), index)
+        self._nearest = None
+        if colors and None not in colors:
+            self._nearest = lru_cache(maxsize=self.COLOR_CACHE_SIZE)(
+                partial(self._nearest_index, colors)
+            )
+
+    @staticmethod
+    def _nearest_index(palette, color, exclude=None):
+        """Quantize a PTK RGB value against this host's complete indexed palette."""
+        try:
+            red, green, blue = bytes.fromhex(color)
+        except ValueError:
+            return None
+        indices = range(len(palette))
+        if exclude is not None:
+            indices = (index for index in indices if palette[index] != palette[exclude])
+        return min(
+            indices,
+            key=lambda index: (
+                (palette[index][0] - red) ** 2
+                + (palette[index][1] - green) ** 2
+                + (palette[index][2] - blue) ** 2
+            ),
+            default=exclude,
+        )
+
+    def _color_index(self, color):
+        """Preserve exact matches and leave named/default colors to PTK."""
+        index = self._indices.get(color)
+        if index is None and self._nearest is not None and color and len(color) == 6:
+            return self._nearest(color)
+        return index
+
+    @staticmethod
+    def _indexed_sgr(index, background):
+        """Use ordinary ANSI for the first 16 colors, including on 4-bit hosts."""
+        if index < 16:
+            base = 30 if index < 8 else 90
+            return str(base + (10 if background else 0) + index % 8)
+        return f"{48 if background else 38};5;{index}"
+
+    def set_attributes(self, attrs, color_depth):
+        """Use the observed host palette for indexed colors, retaining PTK styling."""
+        fg = self._color_index(attrs.color)
+        bg = self._color_index(attrs.bgcolor)
+        if fg is None and bg is None:
+            self.output.set_attributes(attrs, color_depth)
+            return
+        if (
+            self._depth == ColorDepth.DEPTH_4_BIT
+            and self._nearest is not None
+            and fg == bg
+            and attrs.color != attrs.bgcolor
+        ):
+            # Like PTK's 16-color output, keep distinct requested colors visible.
+            # Only change an approximation, retaining any exact theme color.
+            if attrs.bgcolor in self._indices:
+                fg = self._nearest(attrs.color, bg)
+            else:
+                bg = self._nearest(attrs.bgcolor, fg)
+        self.output.set_attributes(
+            attrs._replace(
+                color=attrs.color if fg is None else None,
+                bgcolor=attrs.bgcolor if bg is None else None,
+            ),
+            color_depth,
+        )
+        colors = []
+        if fg is not None:
+            colors.append(self._indexed_sgr(fg, False))
+        if bg is not None:
+            colors.append(self._indexed_sgr(bg, True))
+        self.output.write_raw("\x1b[" + ";".join(colors) + "m")
 
     def write_raw(self, data):
         """Delay cell metadata until PTK's attribute change has completed."""
@@ -593,6 +686,9 @@ class TerminalRenderer(RestoringRenderer):
         self.acquire_screen()
         self.enter_input_modes()
         self.finishing = is_done
+        self.transaction.use_palette(
+            self.owner.profile.appearance.palette, app.color_depth
+        )
         synchronized = self.owner.profile.synchronized_output and not is_done
         self.transaction.active = True
         try:

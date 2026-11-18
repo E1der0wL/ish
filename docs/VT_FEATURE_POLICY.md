@@ -54,7 +54,17 @@ ish --feature hyperlinks=off --feature enhanced_keyboard=auto
 
 `clipboard=off/write/read-write`는 프로그램의 접근 권한이다. 기본 `write`는 그대로 유지한다. `clipboard_protocol=on`이나 지원 응답으로 읽기 권한이 생기지 않는다. 이 기능을 꺼도 별도로 허용한 OSC 52 복사나 선택한 시스템 provider까지 끄는 것은 아니다. 전체 프로그램 접근을 막으려면 `clipboard=off`를 사용한다.
 
-색 깊이는 별도 `color_depth=inherit/1/4/8/24`가 단독으로 소유한다. 종전의 `auto`는 지원 질의가 아니라 PTK 환경 상속이었으므로 `inherit`로 이름을 바꿨다. 이전 `color_depth="auto"` 값은 오류로 거부하며 자동 변환하지 않는다. 기본 `inherit`는 `NO_COLOR`, `PROMPT_TOOLKIT_COLOR_DEPTH`, PTK의 TERM 기본값을 따른다. 터미널 이름으로 RGB를 승격하지 않는다. 명시한 `24` 등이 환경값보다 우선한다.
+색 깊이는 `color_depth=inherit/1/4/8/24`로 설정한다. CLI 또는 설정 파일에 지정한 숫자가 우선한다. 기본값 `inherit`에서는 `NO_COLOR`와 `PROMPT_TOOLKIT_COLOR_DEPTH`를 먼저 적용한다. 둘 다 없으면 호스트가 직접 RGB 지원을 확인해 주거나 바깥 환경에 `COLORTERM=truecolor` 또는 `24bit`가 선언돼 있을 때 24비트를 사용한다. 그 밖에는 호스트가 응답한 인덱스 색 수에 맞는 출력 모드를 사용하고, 정보가 없으면 PTK의 기존 기본값을 따른다. 자식 셸에 전달하는 환경 변수는 호스트 판정에 사용하지 않는다.
+
+시작 시 읽은 팔레트는 호스트의 테마 색을 결정한다. 예를 들어 팔레트의 1번은 사용자가 지정한 빨간색이다. 24비트 출력에서는 해당 테마의 RGB 값을 그린다. 16색·256색 출력에서는 관측한 팔레트에 정확히 일치하는 색을 그 슬롯으로 출력한다. 해당 모드의 팔레트를 모두 확인했다면 나머지 RGB도 실제 팔레트에서 가장 가까운 색으로 그린다. 일부만 확인한 경우에는 일치하는 슬롯을 찾을 수 없는 색에 기존 PTK 변환을 사용한다. 기본 배경을 쓰는 셀은 호스트의 투명도를 유지한다.
+
+Windows Terminal의 Ubuntu 탭에서 아래와 같이 실행하면 현재 프로필로 비교할 수 있다. 검사기는 기본 설정으로 ish를 시작하고, 같은 터미널에 직접 출력한 RGB 전경·배경, 두 팔레트 색, 기본색과 대조한다. 호스트가 보고한 색상값을 확인하고 팔레트 256개를 독립적으로 다시 조회한다. 실행할 때마다 새 결과 디렉터리를 지정한다.
+
+```sh
+cd /mnt/d/Developments/ish
+env -u NO_COLOR -u PROMPT_TOOLKIT_COLOR_DEPTH -u COLORTERM \
+    .venv/bin/python tests/terminal_color.py .cache/color-comparison
+```
 
 ## 구현 경계와 진단
 

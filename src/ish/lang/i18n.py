@@ -184,7 +184,7 @@ class Message(StrEnum):
     )
     MANAGE_HELP_INPUT_BODY = (
         auto(),
-        "Mouse: off preserves host drag selection; auto captures program/UI requests; on also enables local selection. The host can select only currently displayed cells, not hidden native history or content behind a popup.\n\nClipboard defaults to write-only access for programs. Use read-write only when reads are wanted. This is separate from the host terminal's usual copy/paste. The optional clipboard_system supplement can connect Windows/WSL or an available X11 selection. A remote session needs an actual clipboard transport.\n\nColor depth defaults to inherit from PTK/environment. Use --color-depth 24 for explicit RGB. Scrollback line/byte budgets are approximate native page budgets; a byte budget of 0 disables history.",
+        "Mouse: off preserves host drag selection; auto captures program/UI requests; on also enables local selection. The host can select only currently displayed cells, not hidden native history or content behind a popup.\n\nClipboard defaults to write-only access for programs. Use read-write only when reads are wanted. This is separate from the host terminal's usual copy/paste. The optional clipboard_system supplement can connect Windows/WSL or an available X11 selection. A remote session needs an actual clipboard transport.\n\nBy default, ish reads the host palette and uses the host color depth when available. Explicit color settings take priority. If the depth is unknown, ish uses the PTK default. Scrollback line/byte budgets are approximate native page budgets; a byte budget of 0 disables history.",
     )
     MANAGE_HELP_DIAGNOSTICS_BODY = (
         auto(),
@@ -512,7 +512,7 @@ class Message(StrEnum):
     VT_DIAGNOSE_COLOR_DEPTH = auto(), "Color depth policy"
     VT_COLOR_DEPTH_HELP = (
         auto(),
-        "Output color depth: inherit, 1, 4, 8, or 24 bits (default: inherit PTK/environment settings; this does not probe host support).",
+        "Output color depth: inherit, 1, 4, 8, or 24 bits. The default, inherit, honors color settings and checks host support, falling back to the PTK default.",
     )
     VT_DIAGNOSE_CLIPBOARD = auto(), "Child clipboard access"
     VT_CLIPBOARD_LOCKED = (
