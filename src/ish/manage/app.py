@@ -485,6 +485,7 @@ class SettingsWindow:
         self.screen = Screen(
             i18n.get(Message.MANAGE_CONFIG_TITLE),
             pages,
+            title_icon="gear",
             groups=[
                 (0, i18n.get(Message.MANAGE_PREFERENCES)),
                 (2, i18n.get(Message.MANAGE_TERMINAL_GROUP)),
@@ -495,11 +496,6 @@ class SettingsWindow:
                 ActionButton(Message.MANAGE_APPLY_KEY, self.save),
             ],
             auxiliary=[
-                (
-                    "filter",
-                    i18n.get(Message.MANAGE_FILTER),
-                    lambda: self.screen.open_filter(),
-                ),
                 ("refresh", i18n.get(Message.MANAGE_RELOAD), self.reload),
                 (
                     "open_file",

@@ -131,8 +131,8 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def test_close_keys_restore_observed_modes_cursor_and_attributes(self):
-        """Esc, Ctrl+C and Ctrl+D restore the starting values after PTK cleanup."""
-        for key in (b"\x1b", b"\x03", b"\x04"):
+        """Both sidebar Escape and Ctrl+D restore the starting values after cleanup."""
+        for key in (b"\x1b", b"\x04"):
             with self.subTest(key=key):
                 screen, host, source, parser, slave = self.fixture()
                 initial = termios.tcgetattr(slave)

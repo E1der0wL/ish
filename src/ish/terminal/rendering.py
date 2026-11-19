@@ -12,7 +12,7 @@ from functools import lru_cache, partial
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout import Container, Window
 from prompt_toolkit.layout.screen import Char
-from prompt_toolkit.output import ColorDepth
+from prompt_toolkit.output import ColorDepth, vt100
 from prompt_toolkit.renderer import Renderer
 
 from .graphics import (
@@ -109,15 +109,27 @@ class NativeChar(Char):
 
     __slots__ = ("format_key",)
 
-    def __init__(self, cell, formats):
-        """Share style identities within this paint, including URI-only changes."""
-        key = (
+    @classmethod
+    def from_cell(cls, cell, formats, narrow):
+        """Reuse immutable single-column glyphs only within this paint."""
+        metadata = (
             cell.width,
             cell.underline,
             cell.underline_color,
             cell.hyperlink,
             cell.overline,
         )
+        if cell.width != 1:
+            # Keep every wide glyph's head and tails tied to its own location.
+            return cls(cell, metadata, formats)
+        key = (cell.style, cell.text, metadata)
+        char = narrow.get(key)
+        if char is None:
+            char = narrow[key] = cls(cell, metadata, formats)
+        return char
+
+    def __init__(self, cell, key, formats):
+        """Share style identities within this paint, including URI-only changes."""
         cached = formats.get(key)
         if cached is None:
             identity = repr(key).encode()
@@ -168,6 +180,16 @@ class NativeWindow(Window):
         """Keep standard PTK focus and window registration around the grid."""
         super().__init__(content, wrap_lines=False)
         self.position = None
+        self._coordinates = lru_cache(maxsize=1)(self._grid_coordinates)
+
+    @staticmethod
+    def _grid_coordinates(x, y, width, height):
+        """Map the unwrapped VT grid to PTK coordinates for one window geometry."""
+        return {row: (row, 0) for row in range(height)}, {
+            (row, col): (y + row, x + col)
+            for row in range(height)
+            for col in range(width)
+        }
 
     def _copy_body(
         self,
@@ -195,10 +217,9 @@ class NativeWindow(Window):
                 **options,
             )
         xpos, ypos = write_position.xpos + move_x, write_position.ypos
-        visible, mapping = {}, {}
         formats = {}
+        narrow = {}
         for row, cells in enumerate(frame.cells[: write_position.height]):
-            visible[row] = (row, 0)
             target = new_screen.data_buffer[ypos + row]
             for cell in cells:
                 if cell.x >= width:
@@ -207,12 +228,10 @@ class NativeWindow(Window):
                     # A clipped wide grapheme must not overwrite the neighbour.
                     target[xpos + cell.x] = Char(" ", cell.style)
                 else:
-                    head = NativeChar(cell, formats)
+                    head = NativeChar.from_cell(cell, formats, narrow)
                     target[xpos + cell.x] = head
-                    for tail in range(1, cell.width):
-                        target[xpos + cell.x + tail] = NativeTail(head)
-            for col in range(width):
-                mapping[row, col] = (ypos + row, xpos + col)
+                    if cell.width == 2:
+                        target[xpos + cell.x + 1] = NativeTail(head)
         if options.get("has_focus"):
             new_screen.set_cursor_position(
                 self, Point(xpos + frame.cursor_x, ypos + frame.cursor_y)
@@ -221,7 +240,9 @@ class NativeWindow(Window):
                 "always_hide_cursor", False
             )
         new_screen.height = max(new_screen.height, ypos + write_position.height)
-        return visible, mapping
+        return self._coordinates(
+            xpos, ypos, width, min(len(frame.cells), write_position.height)
+        )
 
     def _apply_style(self, new_screen, write_position, parent_style):
         """Native program colours are not overridden by PTK window styles."""
@@ -450,6 +471,7 @@ class TerminalRenderer(RestoringRenderer):
         ("overline", OVERLINE_RESET),
     )
     MAX_ERROR_CHARS = 256
+    MIN_STYLE_CACHE_SIZE = 4096
     MAX_GRAPHICS_FAILURES = 3
 
     def __init__(self, owner, previous):
@@ -716,6 +738,30 @@ class TerminalRenderer(RestoringRenderer):
             self.transaction.pending = None
             self.transaction.active = False
             self.transaction.output.flush()
+            self._trim_styles()
+
+    def _trim_styles(self):
+        """Bound PTK's derived lookup tables without invalidating the screen diff."""
+        cols, rows = self.owner.size
+        # Keep room for the old and new screen even when every cell has a
+        # different color. PTK repopulates each cleared dict on its next lookup.
+        limit = max(self.MIN_STYLE_CACHE_SIZE, 2 * cols * rows)
+        caches = [self._attrs_for_style, self._style_string_has_style]
+        output_caches = getattr(self.transaction.output, "_escape_code_caches", None)
+        if output_caches is not None:
+            caches.extend(output_caches.values())
+            # Pinned PTK's indexed-color fallbacks share these memo tables. The
+            # quantization palette itself is separate and must remain intact.
+            caches.extend(
+                (
+                    vt100._16_fg_colors._cache,
+                    vt100._16_bg_colors._cache,
+                    vt100._256_colors,
+                )
+            )
+        for cache in caches:
+            if cache is not None and len(cache) > limit:
+                cache.clear()
 
     def reset(self, *args, **kwargs):
         """Delete only this renderer's graphics before restoring the terminal."""
@@ -729,5 +775,6 @@ class TerminalRenderer(RestoringRenderer):
             self.restore_metadata()
         self.transaction.output.write_raw(self.graphics.close() + self.format_reset())
         super().reset(*args, **kwargs)
+        self._attrs_for_style = self._style_string_has_style = None
         self._format_used.clear()
         self.transaction.output.flush()

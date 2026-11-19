@@ -187,7 +187,6 @@ class Screen:
         "E": Keys.ControlE,
         "R": Keys.ControlR,
         "S": Keys.ControlS,
-        "C": Keys.ControlC,
     }
 
     def __init__(
@@ -195,6 +194,7 @@ class Screen:
         title,
         pages,
         *,
+        title_icon="book",
         groups=(),
         buttons=(),
         auxiliary=(),
@@ -223,13 +223,21 @@ class Screen:
         self.groups = dict(groups)
         self.buttons = buttons
         self.icons = icons
+        self.filter_options = filter_options
+        if filter_options is None:
+            find_icon, self.find_label = "find", Message.MANAGE_FIND
+        else:
+            find_icon, self.find_label = "filter", Message.MANAGE_FILTER
         self.auxiliary = [
             AuxiliaryButton(
                 lambda key=key: getattr(self.icons(), key),
                 label,
                 action,
             )
-            for key, label, action in auxiliary
+            for key, label, action in (
+                (find_icon, i18n.get(self.find_label), self.open_find),
+                *auxiliary,
+            )
         ]
         self.button_groups = {
             button.control: group
@@ -239,7 +247,6 @@ class Screen:
         self.hover_origin = None
         for button in (*self.buttons, *self.auxiliary):
             button.control.mouse_handler = self.button_mouse(button)
-        self.filter_options = filter_options
         self.field_finished = field_finished
         self.filter_query = filter_query
         self.filtering = False
@@ -268,22 +275,9 @@ class Screen:
         self.bindings = KeyBindings()
         self._bind()
 
-        def line(fragments, style="", **kwargs):
-            return Window(
-                FormattedTextControl(fragments), style=style, height=1, **kwargs
-            )
-
         sidebar = HSplit(
             [
                 Window(height=1),
-                *(
-                    [
-                        line(title, "class:title"),
-                        Window(height=1, char="─", style="class:edge"),
-                    ]
-                    if dirty is None
-                    else []
-                ),
                 *(
                     [
                         ConditionalContainer(
@@ -301,14 +295,8 @@ class Screen:
         content = HSplit(
             [
                 Window(height=1),
-                *(
-                    [
-                        self.page_header(),
-                        Window(height=1, char="─", style="class:edge"),
-                    ]
-                    if dirty is not None
-                    else []
-                ),
+                self.page_header(),
+                Window(height=1, char="─", style="class:edge"),
                 DynamicContainer(lambda: self.pages[self.index][1]),
                 *([self.action_row()] if buttons else []),
             ],
@@ -317,7 +305,7 @@ class Screen:
         )
         base = HSplit(
             [
-                *([self.header(title)] if dirty is not None else []),
+                self.header(title, title_icon),
                 VSplit(
                     [
                         FocusPane(
@@ -480,14 +468,14 @@ class Screen:
             else:
                 self.focus_body()
 
-    def header(self, title):
-        """Display the window title and a close target across the whole settings view."""
+    def header(self, title, icon):
+        """Display the window title and close target across both panes."""
         close = FormattedTextControl(self.HEADER_CLOSE, show_cursor=False)
         close.mouse_handler = on_click(self.close)
 
         def heading():
             icons = self.icons()
-            return icons.gear + icons.gear_gap + title
+            return getattr(icons, icon) + icons.title_gap + title
 
         return VSplit(
             [
@@ -510,7 +498,7 @@ class Screen:
         return max((start for start in self.groups if start <= self.index), default=0)
 
     def page_header(self):
-        """Keep the page title and all three tool targets on one line."""
+        """Keep the current page title and its tools on one line."""
 
         def title():
             return self.pages[self.index][0]
@@ -549,7 +537,7 @@ class Screen:
                 )
 
             close = VSplit(self.buttons, height=1, align=HorizontalAlign.RIGHT)
-            return HSplit([rule, Window(height=padding), close, Window(height=padding)])
+            return HSplit([rule, close, Window(height=padding)])
 
         inline_width = sum(
             button.width for button in self.buttons
@@ -665,18 +653,11 @@ class Screen:
         if not entering_query:
             if settings:
                 actions.append(("S", Message.MANAGE_APPLY_KEY))
-            find = (
-                Message.MANAGE_FILTER
-                if self.filter_options is not None
-                else Message.MANAGE_FIND
-            )
-            actions.append(("F", find))
+            actions.append(("F", self.find_label))
         if settings and not entering_query:
             actions.extend(
                 [("E", Message.MANAGE_EDIT_KEY), ("R", Message.MANAGE_RELOAD_KEY)]
             )
-        if not settings:
-            actions.append(("C", Message.MANAGE_CLOSE_KEY))
         if not actions:
             return []
 
@@ -886,6 +867,21 @@ class Screen:
             if hasattr(widget, "begin"):
                 widget.begin()
 
+    def open_find(self):
+        """Open the current window's search from its toolbar or shortcut."""
+        if self.busy:
+            return
+        if self.filter_options is not None:
+            self.open_filter()
+            return
+        if not self.searching:
+            self.leave_edit()
+            self.return_index = self.index
+            self.searching = True
+            self.search.text = ""
+            self.app.layout.update_parents_relations()
+        self.app.layout.focus(self.search)
+
     def find(self, _):
         """Preview the first help category matching the query."""
         query = self.search.text.strip().casefold()
@@ -994,15 +990,7 @@ class Screen:
 
         @bind("c-f", filter=~filtering)
         def search(event):
-            if self.filter_options is not None:
-                self.open_filter()
-                return
-            self.leave_edit()
-            self.return_index = self.index
-            self.searching = True
-            self.search.text = ""
-            event.app.layout.update_parents_relations()
-            event.app.layout.focus(self.search)
+            self.open_find()
 
         @bind("enter", filter=searching, eager=True)
         def accept_search(event):
@@ -1136,7 +1124,6 @@ class Screen:
                 self.close()
 
         if self.dirty is None:
-            bind("c-c", eager=True)(lambda _: self.close())
             bind("c-d", eager=True)(lambda _: self.close())
 
     def release_focus(self, replaced=None):

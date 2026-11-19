@@ -68,6 +68,26 @@ class ProtocolStreamTests(unittest.TestCase):
             controls = [event for event in events if event[0] != "text"]
             self.assertEqual(controls, [])
 
+    def test_split_ground_text_preserves_incomplete_utf8_before_consumed_esc(self):
+        """Only an unfinished codepoint needs a native boundary before a plugin OSC."""
+        for tail, unfinished in (
+            (b"\xf0", True),
+            (b"\xf0\x9f", True),
+            (b"\xf0\x9f\x9a", True),
+            (b"\xf0\x9f\x9a\x80", False),
+            (b"\x80\x81\x82\x83", False),
+        ):
+            prefix = "본문".encode() + tail
+            source = prefix + b"\x1b]2;title\x07X"
+            for split in range(len(prefix) + 1):
+                with self.subTest(tail=tail, split=split):
+                    writes = []
+                    stream = ProtocolStream(writes.append, lambda record: True)
+                    stream.feed(source[:split])
+                    stream.feed(source[split:])
+                    expected = prefix + (b"\x1b\x18" if unfinished else b"") + b"X"
+                    self.assertEqual(b"".join(writes), expected)
+
     def test_oversized_payload_is_discarded_through_fragmented_terminator(self):
         """A bounded parser never reinterprets the end of a large image as text."""
         data = b"before\x1b]1337;" + b"x" * 100 + b"\x1b\\after"
@@ -77,6 +97,23 @@ class ProtocolStreamTests(unittest.TestCase):
         self.assertEqual(wire, b"beforeafter")
         self.assertFalse([event for event in events if event[0] != "text"])
         self.assertEqual(cancelled, [True])
+
+    def test_printable_spans_respect_the_exact_string_limit_and_next_record(self):
+        """A complete image may use the last byte of the budget across any split."""
+        next_record = b"\x1b]2;title\x07"
+        for prefix in (b"\x1b_G", b"\x1bP0;1q", b"\x1b]1337;File="):
+            exact = prefix + bytes(range(32, 127)) + b"\x1b\\"
+            data = exact + next_record + b"X"
+            for split in (0, len(prefix), len(prefix) + 21, len(exact) - 1):
+                with self.subTest(prefix=prefix, split=split):
+                    _, _, wire, cancelled = self.record(
+                        data, splits=(split,), limit=len(exact)
+                    )
+                    self.assertEqual((wire, cancelled), (data, []))
+                    _, _, wire, cancelled = self.record(
+                        data, splits=(split,), limit=len(exact) - 9
+                    )
+                    self.assertEqual((wire, cancelled), (next_record + b"X", [True]))
 
     def test_cancel_and_replacement_escape_recover_without_payload_leak(self):
         """Native cancellation sees buffered headers; adapters never receive them."""

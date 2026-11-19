@@ -21,8 +21,10 @@ class IconSet:
     """Choose management glyphs without requiring a private-use font by default."""
 
     label: Message
+    book: str
     gear: str
-    gear_gap: str
+    title_gap: str
+    find: str
     filter: str
     refresh: str
     open_file: str
@@ -40,8 +42,10 @@ _NERD_SMALL = Arrows(left="\uf0d9", down="\uf0d7", up="\uf0d8", right="\uf0da")
 ICON_SETS = {
     DEFAULT_ICONS: IconSet(
         label=Message.MANAGE_ICONS_UNICODE,
+        book="📖",
         gear="⚙",
-        gear_gap="  ",
+        title_gap="  ",
+        find="⌕",
         filter="⚲",
         refresh="↻",
         open_file="✎",
@@ -54,8 +58,10 @@ ICON_SETS = {
     ),
     "nerdfont": IconSet(
         label=Message.MANAGE_ICONS_NERD,
+        book="\uf518",
         gear="\uf013",
-        gear_gap=" ",
+        title_gap=" ",
+        find="\uf002",
         filter="\uf0b0",
         refresh="\uf021",
         open_file="\uf07c",

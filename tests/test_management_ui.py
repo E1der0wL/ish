@@ -175,7 +175,7 @@ class PipeInputTests(ManagementFixture):
                 input=pipe,
                 output=DummyOutput(),
             )
-            self.assertFalse(self.run_keys(screen, pipe, b"\x1b[B\r\x1b[D\x1b"))
+            self.assertFalse(self.run_keys(screen, pipe, b"\x03\x1b[B\r\x1b[D\x1b"))
             self.assertEqual(screen.index, 1)
         self.assertFalse(self.rc.exists())
 
@@ -697,15 +697,86 @@ class PublicManagementTests(ManagementFixture):
         )
         original = self.rc.read_bytes()
         terminal = self.terminal("-h")
-        terminal.require(lambda: terminal.frame_has("ish — Help"), timeout=45)
-        terminal.require(lambda: terminal.frame_has("Getting started"))
-        terminal.send(b"\x1b[B\x1b[B")
+        terminal.require(lambda: "📖  Help" in terminal.screen.display[0], timeout=45)
+        terminal.require(lambda: terminal.frame_has("▸ Getting started"))
+        y, row = next(
+            (y, row)
+            for y, row in enumerate(terminal.screen.display)
+            if "▸ Getting started" in row
+        )
+        x = row.index("▸")
+        selected = terminal.screen.buffer[y][x].bg
+        self.assertNotIn("C Close", terminal.screen.display[-1])
+        terminal.send(b"\r")
+        terminal.require(lambda: terminal.screen.buffer[y][x].bg != selected)
+        terminal.send(b"\x03" + terminal.escape_key)
+        terminal.require(lambda: terminal.screen.buffer[y][x].bg == selected)
+        terminal.send(b"\x03\x1b[B\x1b[B")
         terminal.require(lambda: terminal.frame_has(".ishrc.py"))
         terminal.finish()
         self.assertEqual(self.rc.read_bytes(), original)
         self.assertFalse(rc_marker.exists())
         self.assertFalse(plugin_marker.exists())
         self.assertFalse((self.home / ".ish.log").exists())
+
+    def test_help_title_bar_sidebar_and_close_button_layout(self):
+        """Open the Korean help and exercise both close controls in the rendered UI."""
+        for close_header in (False, True):
+            with self.subTest(close_header=close_header):
+                terminal = self.terminal("-h", language="ko")
+                terminal.require(partial(terminal.frame_has, "닫기"))
+                frame = terminal.screen.display
+                self.assertEqual(frame[0].split(), ["📖", "도움말", "×"])
+                sidebar = [row.partition("│")[0].strip() for row in frame[1:-1]]
+                self.assertEqual(next(label for label in sidebar if label), "사용 안내")
+                self.assertFalse(
+                    any("도움말" in label or "─" in label for label in sidebar)
+                )
+                self.assertNotIn("C 닫기", frame[-1])
+                button_row = next(
+                    y
+                    for y, row in enumerate(frame)
+                    if row.partition("│")[2].strip() == "닫기"
+                )
+                rule = frame[button_row - 1].partition("│")[2].strip()
+                self.assertEqual(set(rule), {"─"})
+                self.click_label(terminal, "×" if close_header else "닫기")
+                terminal.finish(key=b"")
+
+    def test_help_page_header_offers_the_same_find_by_mouse_and_keyboard(self):
+        """Preview categories in the heading; Enter opens a match and Esc cancels."""
+        terminal = self.terminal("-h", language="ko")
+
+        def header():
+            return next(
+                (
+                    line.partition("│")[2]
+                    for line in terminal.screen.display
+                    if "⌕" in line
+                ),
+                "",
+            )
+
+        terminal.require(lambda: header().strip().startswith("시작하기"))
+        self.assertTrue(header().rstrip().endswith("⌕"))
+        self.click_label(terminal, "⌕")
+        terminal.send("명령줄 옵션")
+        terminal.require(lambda: header().strip().startswith("명령줄 옵션"))
+        terminal.send(terminal.escape_key)
+        terminal.require(lambda: header().strip().startswith("시작하기"))
+        terminal.send("\x06명령줄 옵션\r")
+        terminal.require(
+            lambda: (
+                terminal.frame_has("usage: ish") or terminal.frame_has("사용법: ish")
+            )
+        )
+        terminal.send(b"\x1b[Z")  # Shift+Tab from the document to its toolbar.
+        terminal.require(lambda: "찾기" in header())
+        terminal.send(" 시작하기\r")
+        terminal.require(lambda: header().strip().startswith("시작하기"))
+        self.click_label(terminal, "×")
+        terminal.finish(key=b"")
+        self.assertFalse(self.rc.exists())
 
     def test_settings_save_from_keyboard_changes_the_actual_file(self):
         """Ctrl+S writes the next-session language and leaves the settings window open."""
@@ -1528,7 +1599,10 @@ class PublicManagementTests(ManagementFixture):
         self.assertEqual(marker.read_text(), "xx")
         help_ui = self.terminal("-h")
         help_ui.require(
-            lambda: help_ui.frame_has("ish — Help") and help_ui.frame_has("\ue0b0")
+            lambda: (
+                "\uf518 Help" in help_ui.screen.display[0]
+                and help_ui.frame_has("\ue0b0")
+            )
         )
         help_ui.resize(22, 100)
         help_ui.send(b"\x06Command-line options\r")
@@ -1565,13 +1639,14 @@ class PublicManagementTests(ManagementFixture):
         help_ui.require(lambda: visible()[:-1] == before[1:])
         self.click_cell(help_ui, x, top)
         help_ui.require(lambda: visible() == before)
-        help_ui.finish(key=b"\x03")
+        self.click_label(help_ui, "×")
+        help_ui.finish(key=b"")
         self.assertEqual(marker.read_text(), "xx")
 
     def test_help_scroll_keys_and_drag_share_the_same_document(self):
         """Move to each end of the help page and drop the thumb outside the pane."""
         terminal = self.terminal("-h", rows=22, cols=112)
-        terminal.require(lambda: terminal.frame_has("ish — Help"), timeout=45)
+        terminal.require(lambda: "📖  Help" in terminal.screen.display[0], timeout=45)
         terminal.send(b"\x06Command-line options\r")
         terminal.require(lambda: terminal.frame_has("usage: ish"))
         x, top, bottom = self.scrollbar_at_top(terminal)
@@ -1610,7 +1685,8 @@ class PublicManagementTests(ManagementFixture):
         self.assertFalse(terminal.exited())
         terminal.send(b"\x1b[1;3H")
         terminal.require(lambda: terminal.frame_has("usage: ish"))
-        terminal.finish(key=b"\x03")
+        self.click_label(terminal, "×")
+        terminal.finish(key=b"")
         self.assertFalse(self.rc.exists())
 
     def test_options_filter_belongs_to_its_page_from_sidebar_or_body(self):

@@ -205,6 +205,11 @@ class Encoder:
     MAX_COLORS = 256
     MAX_PIXELS = 4 * 1024 * 1024
     REPEAT_THRESHOLD = 4
+    # A SIXEL band has six bits per column. Literal repetitions scan in C
+    # without backtracking storage proportional to the run length.
+    MASK_RUNS = tuple(
+        re.compile(re.escape(bytes((mask,))) + b"+") for mask in range(64)
+    )
 
     def __init__(self, limit: int):
         """Bind one positive wire budget without allocating a screen buffer."""
@@ -218,11 +223,10 @@ class Encoder:
         pieces = []
         position = 0
         while position < len(values):
-            end = position + 1
-            while end < len(values) and values[end] == values[position]:
-                end += 1
+            mask = values[position]
+            end = cls.MASK_RUNS[mask].match(values, position).end()
             count = end - position
-            char = chr(values[position] + 63)
+            char = chr(mask + 63)
             pieces.append(
                 f"!{count}{char}" if count >= cls.REPEAT_THRESHOLD else char * count
             )
@@ -281,9 +285,7 @@ class Encoder:
                         plane[col] |= bit
             for index, plane in sorted(planes.items()):
                 # Trailing zero columns carry no pixels and need not be sent.
-                while plane and not plane[-1]:
-                    plane.pop()
-                append(f"#{index}" + self._runs(plane) + "$")
+                append(f"#{index}" + self._runs(plane.rstrip(b"\x00")) + "$")
             if top + 6 < height:
                 append("-")
         append("\x1b\\")

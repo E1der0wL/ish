@@ -172,7 +172,6 @@ def _style(tokens):
         {
             "": surface,
             "surface": surface,
-            "title": f"{accent} bold",
             "header": f"fg:{contrast_ink(colors['selection'], colors['text'])} {bar} bold",
             "section.title": f"{accent} bold",
             "muted": muted,

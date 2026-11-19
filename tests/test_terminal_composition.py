@@ -110,6 +110,54 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
             self.owner.app.renderer.render(self.owner.app, self.owner.app.layout)
         return self.stream.getvalue()[before:]
 
+    async def test_changing_rgb_cells_bound_style_history_and_preserve_output(self):
+        """A stream of fresh foregrounds and backgrounds can revisit an evicted style."""
+        from prompt_toolkit.output import vt100
+
+        renderer = self.owner.app.renderer
+        for depth, red in (
+            (ColorDepth.DEPTH_4_BIT, "91"),
+            (ColorDepth.DEPTH_8_BIT, "38;5;196"),
+            (ColorDepth.DEPTH_24_BIT, "38;2;255;0;0"),
+        ):
+            with (
+                self.subTest(depth=depth),
+                patch.object(type(self.owner.app), "color_depth", depth),
+                patch.object(renderer, "MIN_STYLE_CACHE_SIZE", 8),
+            ):
+                first = b"\x1b[H\x1b[0;38;2;255;0;0mR\x1b[0mZ"
+                self.owner.vt.feed(first)
+                self.render()
+                for frame in range(32):
+                    body = bytearray(b"\x1b[H")
+                    for col in range(10):
+                        value = frame * 10 + col
+                        lo, hi = value % 256, value // 256
+                        body.extend(
+                            f"\x1b[38;2;67;{hi};{lo};48;2;{lo};{hi};31m".encode()
+                        )
+                        body.extend(b" " if col % 2 else b"X")
+                    self.owner.vt.feed(bytes(body))
+                    self.render()
+                limit = self.outer_size.rows * self.outer_size.columns * 2
+                for cache in (
+                    renderer._attrs_for_style,
+                    renderer._style_string_has_style,
+                    self.output._escape_code_caches[depth],
+                    vt100._16_fg_colors._cache,
+                    vt100._16_bg_colors._cache,
+                    vt100._256_colors,
+                ):
+                    self.assertLessEqual(len(cache), limit)
+                self.owner.vt.feed(first)
+                wire = self.render()
+                self.assertRegex(wire.split("R", 1)[0], rf"\x1b\[(?:0;)?{red}m")
+                self.assertIn("\x1b[0m", wire.split("R", 1)[1].split("Z", 1)[0])
+                self.assertEqual(self.screen().display[0][:2], "RZ")
+        renderer.reset()
+        self.assertIsNone(renderer._attrs_for_style)
+        self.assertIsNone(renderer._style_string_has_style)
+
     async def test_indexed_output_preserves_observed_custom_palette_slots(self):
         """A theme red and a custom upper slot must reach the host unchanged."""
         host = self.owner.host

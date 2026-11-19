@@ -68,6 +68,18 @@ def read_pixels(wire):
 class SixelEncoderTests(unittest.TestCase):
     """Exact binary transparency, independent palette planes, and hard budgets."""
 
+    def test_all_column_masks_at_the_repeat_threshold(self):
+        """Every printable SIXEL mask survives short and long adjacent runs."""
+        image = Image.new("RGBA", (64 * 8, 6))
+        x = 0
+        for width in (3, 5):
+            for mask in range(64):
+                for bit in range(6):
+                    if mask & (1 << bit):
+                        image.paste((255, 0, 0, 255), (x, bit, x + width, bit + 1))
+                x += width
+        self.assertEqual(read_pixels(encode(image, 4096)).tobytes(), image.tobytes())
+
     def test_sparse_pixels_bands_and_repeat_preserve_transparency(self):
         """Sparse pixels bands and repeat preserve transparency."""
         image = Image.new("RGBA", (20, 13))

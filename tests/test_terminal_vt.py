@@ -63,6 +63,26 @@ class TerminalVTTests(unittest.TestCase):
                 self.assertEqual(text(frame), content)
                 self.assertEqual((frame.cursor_x, frame.cursor_y), (5, 0))
 
+    def test_scrolled_region_preserves_row_links_and_stationary_text(self):
+        """Duplicate visible glyphs keep their own link when only the body scrolls."""
+        with Terminal(12, 5, lambda _: None) as terminal:
+            terminal.feed(b"header\r\n")
+            for name in ("old", "new", "end"):
+                terminal.feed(
+                    f"\x1b]8;;https://{name}.test\x1b\\한\x1b]8;;\x1b\\\r\n".encode()
+                )
+            terminal.feed(b"footer")
+            first = terminal.frame()
+            terminal.feed(b"\x1b[2;4r\x1b[S\x1b[1;1HHEADER\x1b[4;1Hnew line")
+            scrolled = terminal.frame()
+            self.assertEqual(
+                [text(scrolled, i) for i in range(5)],
+                ["HEADER", "한", "한", "new line", "footer"],
+            )
+            self.assertEqual(first.cells[1][0].hyperlink, "https://old.test")
+            self.assertEqual(scrolled.cells[1][0].hyperlink, "https://new.test")
+            self.assertEqual(scrolled.cells[2][0].hyperlink, "https://end.test")
+
     def test_cursor_erase_and_rgb_style(self):
         """Cursor motion and erase preserve the remaining cells and explicit style."""
         with Terminal(12, 4, lambda _: None) as terminal:

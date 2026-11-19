@@ -737,17 +737,30 @@ class Terminal:
         cell_rows = []
         previous_rows = self._rendered_rows if cols == self._rendered_columns else ()
         rendered_rows = []
+        rows_by_record = None
         for row in range(rows):
             # The count and every variable-length field are part of the record.
             # An exact match therefore ends at the next native row boundary.
+            previous = None
             if row < len(previous_rows):
-                previous = previous_rows[row]
-                if data.startswith(previous.record, offset):
-                    offset += len(previous.record)
-                    lines.append(list(previous.runs))
-                    cell_rows.append(previous.cells)
-                    rendered_rows.append(previous)
-                    continue
+                candidate = previous_rows[row]
+                if data.startswith(candidate.record, offset):
+                    previous = candidate
+                else:
+                    # Scrolling can move an unchanged record to a different row.
+                    # Try one record length at this position, then decode normally
+                    # on a miss. The length alone never permits reuse.
+                    if rows_by_record is None:
+                        rows_by_record = {item.record: item for item in previous_rows}
+                    previous = rows_by_record.get(
+                        data[offset : offset + len(candidate.record)]
+                    )
+            if previous is not None:
+                offset += len(previous.record)
+                lines.append(list(previous.runs))
+                cell_rows.append(previous.cells)
+                rendered_rows.append(previous)
+                continue
             start = offset
             (count,) = self.COUNT.unpack_from(data, offset)
             offset += self.COUNT.size

@@ -16,6 +16,7 @@ boundary and counted; already executed C0 effects are not rolled back.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -38,7 +39,9 @@ class ProtocolStream:
     BEL = 0x07
     ST = 0x9C
     CANCEL = frozenset((0x18, 0x1A))
+    GROUND_CONTROL = re.compile(b"[" + bytes((ESC, *CANCEL)) + b"]")
     MAX_SEQUENCE_BYTES = 4096
+    PRINTABLE = re.compile(rb"[ -~]+")
     STRING_KINDS = {
         ord("]"): "osc",
         ord("P"): "dcs",
@@ -157,10 +160,12 @@ class ProtocolStream:
             positions = frozenset(
                 index for index in range(boundary) if raw[index] in self.EXECUTE
             )
-            execute = bytes(raw[index] for index in sorted(positions - self._executed))
             native = raw
             body = raw[self._prefix : end]
             if positions:
+                execute = bytes(
+                    raw[index] for index in sorted(positions - self._executed)
+                )
                 native = self._without(raw, positions)
                 if boundary > self._prefix:
                     body = bytes(
@@ -243,12 +248,15 @@ class ProtocolStream:
         self._buffer.append(byte)
         limit = self.limit if self._state == "string" else self.MAX_SEQUENCE_BYTES
         if len(self._buffer) > limit:
-            self._buffer.clear()
-            self._executed.clear()
-            self._drop = True
-            self.dropped += 1
-            if self.cancel is not None:
-                self.cancel()
+            self._overflow()
+
+    def _overflow(self):
+        self._buffer.clear()
+        self._executed.clear()
+        self._drop = True
+        self.dropped += 1
+        if self.cancel is not None:
+            self.cancel()
 
     def _dcs_byte(self, byte):
         """Track only DCS framing: high bytes are data after its header ends."""
@@ -278,32 +286,43 @@ class ProtocolStream:
             if data:
                 self.write(data)
             return
-        text = bytearray()
-
-        def flush():
-            if text:
-                self.write(bytes(text))
-                text.clear()
-
-        for byte in data:
+        pending_text = b""
+        pos = 0
+        end = len(data)
+        while pos < end:
+            byte = data[pos]
+            pos += 1
             if self._state == "ground":
+                if byte != self.ESC and byte not in self.CANCEL:
+                    start = pos - 1
+                    if pos < end and data[pos] != self.ESC:
+                        control = self.GROUND_CONTROL.search(data, pos)
+                        pos = control.start() if control else end
+                    # A UTF-8 prefix still missing a byte is at most three
+                    # bytes long. Short runs inherit the preceding read's tail.
+                    if data[pos - 1] < 0x80:
+                        self._utf8_left = 0
+                    else:
+                        for tail in data[max(start, pos - 3) : pos]:
+                            self._track_utf8(tail)
+                    pending_text = data[start:pos]
+                    continue
                 interrupted_utf8 = bool(self._utf8_left)
                 self._track_utf8(byte)
+                if pending_text:
+                    self.write(pending_text)
+                    pending_text = b""
                 # Pinned libghostty decodes ground as UTF-8. A raw C1 byte is
                 # malformed text there, not a new adapter-owned control.
                 if byte == self.ESC:
-                    flush()
                     if interrupted_utf8 and (self.opaque is None or not self.opaque()):
                         # A consumed adapter must not join text from opposite
                         # sides of its introducer into one native codepoint.
                         self.write(b"\x1b\x18")
                     self._start(byte)
-                elif byte in self.CANCEL:
-                    flush()
+                else:
                     self._abort()
                     self.write(bytes((byte,)))
-                else:
-                    text.append(byte)
                 continue
 
             if (
@@ -369,6 +388,23 @@ class ProtocolStream:
                     continue
 
             if self._state == "string":
+                # Printable payload cannot terminate or restart a string. A DCS
+                # header and the byte after an ESC still need individual parsing.
+                if (
+                    0x20 <= byte <= 0x7E
+                    and not self._escaped
+                    and self._dcs not in self.DCS_HEADERS
+                ):
+                    start = pos - 1
+                    pos = self.PRINTABLE.match(data, start).end()
+                    if not self._drop:
+                        remaining = self.limit - len(self._buffer)
+                        if pos - start > remaining:
+                            pos = start + remaining + 1
+                            self._overflow()
+                        else:
+                            self._buffer.extend(memoryview(data)[start:pos])
+                    continue
                 self._store(byte)
                 if self._escaped and byte == ord("\\"):
                     self._finish(2)
@@ -409,7 +445,8 @@ class ProtocolStream:
                     self._finish()
             elif 0x40 <= byte <= 0x7E:
                 self._finish()
-        flush()
+        if pending_text:
+            self.write(pending_text)
 
     def close(self):
         """Discard an unfinished record; never display its payload as user text."""

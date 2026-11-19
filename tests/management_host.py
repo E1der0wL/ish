@@ -196,15 +196,26 @@ def host_case(directory, case, *, require_resize=False):
         terminal = ManagementTerminal(
             directory, "-h" if case == "help" else "-c", host=True
         )
-        terminal.require(
-            lambda: terminal.frame_has(
-                "ish — Help" if case == "help" else "⚙  Settings"
-            ),
-            timeout=45,
-        )
+        title = "📖  Help" if case == "help" else "⚙  Settings"
+        terminal.require(lambda: title in terminal.screen.display[0], timeout=45)
         if case == "help":
-            terminal.send(b"\x1b[B\x1b[B")
+            terminal.send(b"\x03\x1b[B\x1b[B")
             terminal.require(lambda: terminal.frame_has(".ishrc.py"))
+            toolbar_y, toolbar = next(
+                (y, line)
+                for y, line in enumerate(terminal.screen.display)
+                if "⌕" in line
+            )
+            column, row = toolbar.index("⌕") + 1, toolbar_y + 1
+            terminal.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m")
+            terminal.send(b"Command-line options")
+            terminal.require(lambda: terminal.frame_has("usage: ish"))
+            assert (
+                "Command-line options"
+                in terminal.screen.display[toolbar_y].partition("│")[2]
+            )
+            terminal.send(terminal.escape_key)
+            terminal.require(lambda: terminal.screen.display[toolbar_y] == toolbar)
             if require_resize:
                 print("\r\nResize this Windows Terminal window once.\r\n", flush=True)
                 terminal.require(lambda: len(terminal.sizes) > 1, timeout=180)
@@ -294,18 +305,12 @@ def restore_case(directory, case):
         terminal = ManagementTerminal(
             directory / "session", "-h" if help_case else "-c", host=True
         )
-        terminal.require(
-            lambda: terminal.frame_has("ish — Help" if help_case else "⚙  Settings"),
-            timeout=45,
-        )
-        key = (
-            b"\x03"
-            if case == "restore-interrupt"
-            else b"\x04"
-            if case == "restore-eof"
-            else terminal.escape_key
-        )
-        terminal.finish(key=key)
+        title = "📖  Help" if help_case else "⚙  Settings"
+        terminal.require(lambda: title in terminal.screen.display[0], timeout=45)
+        if case == "restore-interrupt":
+            terminal.send(b"\x03\x1b[B\x1b[B")
+            terminal.require(lambda: terminal.frame_has(".ishrc.py"))
+        terminal.finish(key=b"\x04" if case == "restore-eof" else terminal.escape_key)
         outer_restored = termios.tcgetattr(terminal.fd) == terminal.attrs
         terminal.close()
         terminal = None
