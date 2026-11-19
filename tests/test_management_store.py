@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import codecs
+import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -34,6 +36,94 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertIsNone(store.error)
         self.assertIsNone(store.save({}))
         self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_saved_appearance_is_available_to_help_without_rc_execution(self):
+        """Help reads both selected styles without rerunning user Python."""
+        marker = self.root / "rc-counter"
+        self.path.write_text(
+            "from pathlib import Path\n"
+            f"with Path({str(marker)!r}).open('a') as stream:\n"
+            "    stream.write('x')\n"
+            "config.ui_palette = {'accent': 'blue-500'}\n"
+            "config.ui_icons = 'unicode'\n"
+            "config.color_depth = '4'\n"
+        )
+        self.assertEqual(
+            SettingsStore.read_appearance(self.path),
+            {"ui_palette": {"accent": "blue-500"}, "ui_icons": "unicode"},
+        )
+        self.assertFalse(marker.exists())
+        store = self.store()
+        self.assertIsNone(store.error)
+        choice = {"selection": "violet-800", "accent": "#1a2b3c"}
+        store.save({"ui_palette": choice, "ui_icons": "nerdfont"})
+        self.assertEqual(
+            SettingsStore.read_appearance(self.path),
+            {"ui_palette": choice, "ui_icons": "nerdfont"},
+        )
+        self.assertEqual(marker.read_text(), "x")
+        next_session = load(self.path)
+        self.assertEqual(next_session.ui_palette, choice)
+        self.assertEqual(next_session.ui_icons, "nerdfont")
+        self.assertEqual(next_session.color_depth, "4")
+        store.save({"ui_palette": {}})
+        self.assertEqual(
+            SettingsStore.read_appearance(self.path),
+            {"ui_palette": {}, "ui_icons": "nerdfont"},
+        )
+
+    def test_help_palette_falls_back_for_unknown_or_unreadable_sources(self):
+        """Skipped Python expressions and special files must not affect help."""
+        self.assertEqual(SettingsStore.read_appearance(self.path), {})
+        self.assertFalse(self.path.exists())
+        for tail in (
+            "config.ui_palette = choose_palette()",
+            "config.ui_palette['accent'] = 'slate-800'",
+            "if active: config.ui_palette = {}",
+            "config.ui_palette = {'accent': 'madeup-400'}",
+            "config.ui_palette = {'accent': '#1a2b3g'}",
+            "config.ui_palette = {",
+        ):
+            with self.subTest(tail=tail):
+                self.path.write_text(
+                    "config.ui_palette = {'accent': 'blue-500'}\n" + tail
+                )
+                self.assertEqual(SettingsStore.read_appearance(self.path), {})
+        self.path.unlink()
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(self.path)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from ish.manage.store import SettingsStore;"
+                    "assert SettingsStore.read_appearance(sys.argv[1]) == {}",
+                    str(self.path),
+                ],
+                timeout=15,
+                check=True,
+            )
+
+    def test_unsupported_or_computed_icon_mode_keeps_the_literal_palette(self):
+        """Each help preference falls back independently of the other one."""
+        source = "config.ui_palette = {'accent': 'orange-300'}\nconfig.ui_icons = 'nerdfont'\n"
+        for tail in (
+            "config.ui_icons = 'unknown'",
+            "if active: config.ui_icons = 'unicode'",
+            "config.ui_icons = get_mode()",
+        ):
+            with self.subTest(tail=tail):
+                self.path.write_text(source + tail)
+                self.assertEqual(
+                    SettingsStore.read_appearance(self.path),
+                    {"ui_palette": {"accent": "orange-300"}},
+                )
+        self.path.write_text("config.ui_icons = 'unknown'\n")
+        self.assertIn("ui_icons", str(self.store().error))
+        self.path.write_text(source + "config.ui_palette.clear()")
+        self.assertEqual(
+            SettingsStore.read_appearance(self.path), {"ui_icons": "nerdfont"}
+        )
 
     def test_save_reuses_validation_and_executes_rc_only_on_explicit_load(self):
         """The Python file runs once at load, never during validation or save."""

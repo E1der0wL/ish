@@ -12,7 +12,11 @@ import os
 from .clipboard_wire import MAX_BYTES, TIMEOUT_SECONDS
 from .x11_clipboard import X11Clipboard, read_bounded
 
-PLUGIN_META = {"version": "1.0.0", "description": "Windows and X11 text clipboard"}
+PLUGIN_META = {
+    "version": "1.0.0",
+    "description": "Windows and X11 text clipboard",
+    "category": "module",
+}
 TERMINAL_API = 1
 TARGET = "auto"
 

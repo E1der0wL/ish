@@ -16,6 +16,9 @@ from pathlib import Path
 
 from ish.lang import Message, i18n
 
+from .icons import validate_icons
+from .palette import validate_palette
+
 
 class SettingsStore:
     """Own one rc snapshot and an isolated, literal-only block at its end.
@@ -31,6 +34,7 @@ class SettingsStore:
     STAGE_PREFIX = ".ish-settings-"
     BACKUP_PREFIX = ".ishrc-backup-"
     OBJECT = "config"
+    APPEARANCE = {"ui_palette": validate_palette, "ui_icons": validate_icons}
     DEFAULT_NEWLINE = "\n"
     NEW_FILE_MODE = 0o600
 
@@ -41,6 +45,11 @@ class SettingsStore:
         self.loader = loader
         self.no_rc = no_rc
         self.settings = settings_type()
+        self._field_names = frozenset(item.name for item in fields(self.settings))
+        # A first failed rc still needs a complete form. Later failures retain
+        # the validated settings from the most recent successful load or save.
+        self.settings.validate(self.path.parent)
+        self.writes = 0
         self.error = None
         self._original = None
         self._target = self.path
@@ -66,6 +75,58 @@ class SettingsStore:
         text = raw.decode(encoding)
         newline = "\r\n" if "\r\n" in text else cls.DEFAULT_NEWLINE
         return text, encoding, newline
+
+    @classmethod
+    def _field(cls, target):
+        """Identify a direct assignment to the public config object."""
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == cls.OBJECT
+        ):
+            return target.attr
+        return None
+
+    @classmethod
+    def read_appearance(cls, path):
+        """Read literal UI overrides for interactive help without evaluating the rc."""
+        try:
+            # A special file at the rc path must not block a read-only query.
+            with open(
+                path,
+                "rb",
+                opener=lambda name, flags: os.open(
+                    name, flags | getattr(os, "O_NONBLOCK", 0)
+                ),
+            ) as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    return {}
+                statements = ast.parse(source.read(), filename=os.fspath(path)).body
+        except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
+            return {}
+        pending = set(cls.APPEARANCE)
+        overrides = {}
+        for node in reversed(statements):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+            else:
+                target = None
+            field = cls._field(target)
+            if field in pending:
+                try:
+                    overrides[field] = cls.APPEARANCE[field](
+                        ast.literal_eval(node.value)
+                    )
+                except (ValueError, TypeError, RecursionError):
+                    pass
+            # A later conditional or in-place edit makes an earlier literal
+            # ambiguous for that field only. A final managed assignment wins.
+            pending.difference_update(cls._field(item) for item in ast.walk(node))
+            if not pending:
+                break
+        return overrides
 
     @classmethod
     def _block(cls, text):
@@ -95,13 +156,11 @@ class SettingsStore:
                 if (
                     not isinstance(node, ast.Assign)
                     or len(node.targets) != 1
-                    or not isinstance(node.targets[0], ast.Attribute)
-                    or not isinstance(node.targets[0].value, ast.Name)
-                    or node.targets[0].value.id != cls.OBJECT
-                    or node.targets[0].attr in values
+                    or (name := cls._field(node.targets[0])) is None
+                    or name in values
                 ):
                     raise ValueError
-                values[node.targets[0].attr] = ast.literal_eval(node.value)
+                values[name] = ast.literal_eval(node.value)
         except (SyntaxError, ValueError, TypeError) as error:
             raise ValueError(i18n.get(Message.MANAGE_STORE_BLOCK)) from error
         return "".join(lines[:start]), values
@@ -109,30 +168,28 @@ class SettingsStore:
     def reload(self):
         """Replace the snapshot after an explicit reload or external editor return."""
         self.error = None
-        self.settings = self.settings_type()
-        self._managed = {}
         try:
-            # Keep a complete, editable fallback even when arbitrary rc code
-            # fails before returning settings or leaves invalid partial values.
-            self.settings.validate(self.path.parent)
-            self._target = self.path.resolve()
-            self._identity = self._identity_of(self.path)
-            self._original = (
-                self.path.read_bytes() if self._identity is not None else None
-            )
-            text, self._encoding, self._newline = self._decode(self._original or b"")
-            self._prefix, self._managed = self._block(text)
-            if not self.no_rc:
-                self.settings = self.loader(self.path)
+            target = self.path.resolve()
+            identity = self._identity_of(self.path)
+            original = self.path.read_bytes() if identity is not None else None
+            text, encoding, newline = self._decode(original or b"")
+            prefix, managed = self._block(text)
+            if self.no_rc:
+                settings = self.settings_type()
+                settings.validate(self.path.parent)
+            else:
+                settings = self.loader(self.path)
             if (
-                self.path.resolve() != self._target
-                or self._identity_of(self.path) != self._identity
+                self.path.resolve() != target
+                or self._identity_of(self.path) != identity
             ):
                 raise ValueError(i18n.get(Message.MANAGE_STORE_CHANGED))
-            if (
-                self.path.read_bytes() if self._identity is not None else None
-            ) != self._original:
+            if (self.path.read_bytes() if identity is not None else None) != original:
                 raise ValueError(i18n.get(Message.MANAGE_STORE_CHANGED))
+            self.settings = settings
+            self._target, self._identity, self._original = target, identity, original
+            self._encoding, self._newline = encoding, newline
+            self._prefix, self._managed = prefix, managed
         except (
             OSError,
             ValueError,
@@ -183,6 +240,16 @@ class SettingsStore:
             raise
         return path
 
+    def validated(self, changes: Mapping):
+        """Validate proposed values against the current snapshot without writing it."""
+        selected = copy.deepcopy(self.settings)
+        for name, value in changes.items():
+            if name not in self._field_names:
+                raise ValueError(i18n.get(Message.MANAGE_STORE_FIELD, name=name))
+            setattr(selected, name, copy.deepcopy(value))
+        selected.validate(self.path.parent)
+        return selected
+
     def save(self, changes: Mapping):
         """Validate and atomically replace only explicitly changed field assignments.
 
@@ -195,17 +262,11 @@ class SettingsStore:
             raise ValueError(i18n.get(Message.MANAGE_STORE_VALUE, name="changes"))
         if not changes:
             return None
-        selected = copy.deepcopy(self.settings)
-        allowed = {item.name for item in fields(selected)}
-        for name, value in changes.items():
-            if name not in allowed:
-                raise ValueError(i18n.get(Message.MANAGE_STORE_FIELD, name=name))
-            setattr(selected, name, copy.deepcopy(value))
-        selected.validate(self.path.parent)
+        selected = self.validated(changes)
         managed = dict(self._managed)
         for name in changes:
             managed[name] = self._literal(getattr(selected, name), name)
-        if set(managed).difference(allowed):
+        if set(managed).difference(self._field_names):
             raise ValueError(i18n.get(Message.MANAGE_STORE_BLOCK))
         lines = [self.START]
         lines.extend(
@@ -244,6 +305,7 @@ class SettingsStore:
                 )
             self._unchanged()
             os.replace(staged, self._target)
+            self.writes += 1
         finally:
             staged.unlink(missing_ok=True)
         self._original = raw

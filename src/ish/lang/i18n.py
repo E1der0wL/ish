@@ -48,44 +48,106 @@ class Message(StrEnum):
         "--config can be combined only with --home, --lang and --no-rc.",
     )
     MANAGE_HELP_TITLE = auto(), "ish — Help"
-    MANAGE_CONFIG_TITLE = auto(), "ish — Settings"
+    MANAGE_CONFIG_TITLE = auto(), "Settings"
+    MANAGE_UI_ICONS = auto(), "Icon style"
+    MANAGE_ICONS_UNICODE = auto(), "Unicode"
+    MANAGE_ICONS_NERD = auto(), "Nerd Font"
     MANAGE_OVERVIEW = auto(), "Getting started"
     MANAGE_KEYS = auto(), "Keys and navigation"
     MANAGE_SETTINGS = auto(), "Configuration"
     MANAGE_PLUGINS = auto(), "Plugins and supplements"
+    MANAGE_PLUGIN_PAGE = auto(), "Plugins"
+    MANAGE_MODULE_PAGE = auto(), "Modules"
     MANAGE_FEATURES = auto(), "Host features"
     MANAGE_INPUT = auto(), "Input and display"
     MANAGE_DIAGNOSTICS = auto(), "Diagnostics and logs"
     MANAGE_LIMITS = auto(), "Support and limits"
     MANAGE_OPTIONS = auto(), "Command-line options"
     MANAGE_GENERAL = auto(), "Language and startup"
-    MANAGE_HELP_KEYS = auto(), "↑↓ Category   Tab Focus   PgUp/PgDn Scroll   Esc Close"
-    MANAGE_CONFIG_KEYS = (
+    MANAGE_FIND = auto(), "Find"
+    MANAGE_SCROLL = auto(), "Scroll"
+    MANAGE_PREFERENCES = auto(), "Preferences"
+    MANAGE_TERMINAL_GROUP = auto(), "Terminal"
+    MANAGE_EXTENSIONS_GROUP = auto(), "Extensions"
+    MANAGE_GUIDE = auto(), "Guide"
+    MANAGE_REFERENCE = auto(), "Reference"
+    MANAGE_PALETTE = auto(), "UI palette"
+    MANAGE_ROLE_COLORS = auto(), "Role colors"
+    MANAGE_PALETTE_NOTE = (
         auto(),
-        "Tab Focus   Space Select   Ctrl+S Save   Ctrl+E Edit file   Esc Cancel",
+        "Choose a role, then a color family and shade for help and settings.",
     )
-    MANAGE_SAVE = auto(), "Save and close"
+    MANAGE_PALETTE_BACKGROUND = auto(), "Background"
+    MANAGE_PALETTE_TEXT = auto(), "Text"
+    MANAGE_PALETTE_ACCENT = auto(), "Accent"
+    MANAGE_PALETTE_MUTED = auto(), "Secondary text"
+    MANAGE_PALETTE_EDGE = auto(), "Divider"
+    MANAGE_PALETTE_SELECTION = auto(), "Selection background"
+    MANAGE_PALETTE_ERROR = auto(), "Error"
+    MANAGE_PALETTE_FAMILY = auto(), "Color family"
+    MANAGE_COLOR_SLATE = auto(), "Slate"
+    MANAGE_COLOR_GRAY = auto(), "Gray"
+    MANAGE_COLOR_ZINC = auto(), "Zinc"
+    MANAGE_COLOR_NEUTRAL = auto(), "Neutral"
+    MANAGE_COLOR_STONE = auto(), "Stone"
+    MANAGE_COLOR_RED = auto(), "Red"
+    MANAGE_COLOR_ORANGE = auto(), "Orange"
+    MANAGE_COLOR_AMBER = auto(), "Amber"
+    MANAGE_COLOR_YELLOW = auto(), "Yellow"
+    MANAGE_COLOR_LIME = auto(), "Lime"
+    MANAGE_COLOR_GREEN = auto(), "Green"
+    MANAGE_COLOR_EMERALD = auto(), "Emerald"
+    MANAGE_COLOR_TEAL = auto(), "Teal"
+    MANAGE_COLOR_CYAN = auto(), "Cyan"
+    MANAGE_COLOR_SKY = auto(), "Sky"
+    MANAGE_COLOR_BLUE = auto(), "Blue"
+    MANAGE_COLOR_INDIGO = auto(), "Indigo"
+    MANAGE_COLOR_VIOLET = auto(), "Violet"
+    MANAGE_COLOR_PURPLE = auto(), "Purple"
+    MANAGE_COLOR_FUCHSIA = auto(), "Fuchsia"
+    MANAGE_COLOR_PINK = auto(), "Pink"
+    MANAGE_COLOR_ROSE = auto(), "Rose"
+    MANAGE_PALETTE_HOST = auto(), "Default"
+    MANAGE_PALETTE_CUSTOM = auto(), "Custom"
+    MANAGE_PALETTE_HEX_ERROR = auto(), "Enter six HEX digits, for example 1A2B3C."
+    MANAGE_PALETTE_INVALID = (
+        auto(),
+        "Unknown UI palette role or color. Use blue-500, default or a color such as #1A2B3C.",
+    )
+    MANAGE_APPLY_KEY = auto(), "Save"
+    MANAGE_EDIT_KEY = auto(), "Edit file"
+    MANAGE_RELOAD_KEY = auto(), "Reload settings"
+    MANAGE_CLOSE_KEY = auto(), "Close"
+    MANAGE_SAVED = auto(), "Changes saved."
+    MANAGE_DISCARDED = auto(), "Draft discarded."
+    MANAGE_FILTER = auto(), "Filter options"
+    MANAGE_FILTER_APPLY = auto(), "Apply"
+    MANAGE_FILTER_EMPTY = auto(), "No matching options"
+    MANAGE_FILTER_ACTIVE = auto(), "Filter: {query}"
+    MANAGE_DIRTY = auto(), "Unsaved changes"
+    MANAGE_LOADING = auto(), "Working…"
+    MANAGE_SAVE_AFTER_CATALOG = (
+        auto(),
+        "Save again after the package list finishes loading.",
+    )
+    MANAGE_LOG_DISABLED = auto(), "Off"
     MANAGE_CANCEL = auto(), "Cancel"
     MANAGE_EDIT = auto(), "Edit .ishrc.py"
-    MANAGE_RELOAD = auto(), "Reload / discard draft"
+    MANAGE_RELOAD = auto(), "Reload settings (discard unsaved changes)"
     MANAGE_CONFIG_OBJECT = (
         auto(),
         "Assign settings on config; do not replace or delete the config object.",
     )
-    MANAGE_REFRESH = auto(), "Refresh list"
     MANAGE_FILE = auto(), "Settings file: {path}"
     MANAGE_ERROR = auto(), "Cannot complete this action: {error}"
+    MANAGE_EDIT_RESTORED = auto(), "Previous value restored. {error}"
     MANAGE_READ_ERROR = (
         auto(),
         "The settings file could not be loaded. Edit the file to fix it; saving is disabled.\n{error}",
     )
-    MANAGE_NEXT_SESSION = (
-        auto(),
-        "This window changes saved choices for the next session. No plugins or native engine are started here.",
-    )
     MANAGE_UNSAVED = (
         auto(),
-        "There are unsaved changes. Save or cancel before opening or reloading the file.",
+        "There are unsaved changes. Save or cancel before opening the file.",
     )
     MANAGE_RELOADED = auto(), "Settings reloaded from disk."
     MANAGE_EDITOR_MISSING = (
@@ -94,35 +156,109 @@ class Message(StrEnum):
     )
     MANAGE_EDITOR_STATUS = auto(), "The editor exited with status {status}."
     MANAGE_LANG = auto(), "Language"
+    MANAGE_DESC_LANG = auto(), "Automatic follows LANG and falls back to English."
+    MANAGE_DESC_SHELL = auto(), "Enter the name or path of the shell to start."
+    MANAGE_DESC_CWD = auto(), "Enter the directory where the shell should start."
+    MANAGE_DESC_ESCAPE_DELAY = (
+        auto(),
+        "Seconds to wait for the rest of an Esc or Alt key sequence.",
+    )
+    MANAGE_DESC_UI_ICONS = auto(), "Choose the symbols used in help and settings."
+    MANAGE_DESC_LOG_FILE = (
+        auto(),
+        "Write diagnostic messages here. Leave empty to turn logging off.",
+    )
+    MANAGE_DESC_LOG_LEVEL = auto(), "Record messages at this level or higher."
+    MANAGE_DESC_PLUGIN_DIR = (
+        auto(),
+        "Finish editing this directory to see its plugins and modules.",
+    )
+    MANAGE_DESC_PLUGIN_LIB_DIR = auto(), "Store Python packages needed by plugins here."
+    MANAGE_DESC_MOUSE = auto(), "Automatic lets programs request the mouse when needed."
+    MANAGE_DESC_CLIPBOARD = auto(), "Choose how programs can access the host clipboard."
+    MANAGE_DESC_COLOR_DEPTH = (
+        auto(),
+        "Choose the color depth used to draw shell output.",
+    )
+    MANAGE_DESC_SCROLLBACK_LINES = (
+        auto(),
+        "Approximate number of lines to retain in history.",
+    )
+    MANAGE_DESC_SCROLLBACK_BYTES = (
+        auto(),
+        "Limit history memory in bytes. Use 0 to disable history.",
+    )
+    MANAGE_DESC_HYPERLINKS = auto(), "Let the host open links printed by programs."
+    MANAGE_DESC_EXTENDED_STYLES = (
+        auto(),
+        "Draw colored, double and other styled underlines.",
+    )
+    MANAGE_DESC_OVERLINE = auto(), "Draw a line above text that requests it."
+    MANAGE_DESC_CURSOR_COLOR = auto(), "Show the cursor color requested by a program."
+    MANAGE_DESC_ITERM_GRAPHICS = (
+        auto(),
+        "Display inline images using the iTerm protocol.",
+    )
+    MANAGE_DESC_KITTY_GRAPHICS = (
+        auto(),
+        "Display inline images using the Kitty protocol.",
+    )
+    MANAGE_DESC_SIXEL_GRAPHICS = auto(), "Display inline images using SIXEL."
+    MANAGE_DESC_DESKTOP_NOTIFICATIONS = (
+        auto(),
+        "Forward program notifications to the host terminal.",
+    )
+    MANAGE_DESC_SYNCHRONIZED_OUTPUT = (
+        auto(),
+        "Present a group of screen changes in one update.",
+    )
+    MANAGE_DESC_ENHANCED_KEYBOARD = (
+        auto(),
+        "Read extended key reports from the host terminal.",
+    )
+    MANAGE_DESC_PIXEL_MOUSE = auto(), "Use pixel coordinates for precise pointer input."
+    MANAGE_DESC_CLIPBOARD_PROTOCOL = (
+        auto(),
+        "Use the host’s extended clipboard protocol when permitted.",
+    )
+    MANAGE_DESC_SCHEME_NOTIFICATIONS = (
+        auto(),
+        "Follow light or dark appearance changes from the host.",
+    )
+    MANAGE_PLUGIN_SELECTION = auto(), "Enabled plugins"
+    MANAGE_MODULE_SELECTION = auto(), "Enabled modules"
     MANAGE_LANG_AUTO = auto(), "Automatic — LANG, then English"
     MANAGE_LANG_EN = auto(), "English"
     MANAGE_LANG_KO = auto(), "Korean"
     MANAGE_SHELL = auto(), "Shell executable"
     MANAGE_CWD = auto(), "Starting directory"
-    MANAGE_LOG_FILE = auto(), "Log file (empty: disabled)"
+    MANAGE_LOG_FILE = auto(), "Log file"
     MANAGE_LOG_LEVEL = auto(), "Log level"
-    MANAGE_ESCAPE = auto(), "ESC / Alt sequence wait (seconds)"
+    MANAGE_ESCAPE = auto(), "Esc / Alt wait (s)"
     MANAGE_PLUGIN_DIR = auto(), "Plugin directory"
     MANAGE_LIBRARY_DIR = auto(), "Plugin dependency directory"
     MANAGE_PLUGIN_NOTE = (
         auto(),
-        "UI plugins and protocol supplements use the same directory and selection list. Only selected modules load at the next startup. Browsing this list does not run plugin code or install dependencies.",
+        "Choose plugins for the next session. A package listed on both pages is enabled once.",
+    )
+    MANAGE_MODULE_NOTE = (
+        auto(),
+        "Choose terminal protocol, key and clipboard modules from the shared plugin directory.",
+    )
+    MANAGE_NO_MODULES = (
+        auto(),
+        "No modules are declared in the selected plugin directory.",
     )
     MANAGE_NO_PLUGINS = (
         auto(),
-        "No plugins found. Choose a directory containing plugin packages and refresh the list.",
+        "No plugins found in this directory.",
     )
     MANAGE_PLUGIN_UNAVAILABLE = auto(), "{name} — unavailable: {error}"
     MANAGE_PLUGIN_MISSING = auto(), "Selected plugin is missing from this directory."
-    MANAGE_FEATURE_NOTE = (
-        auto(),
-        "These are user choices, not detected support. Actual host support has not been queried in this window. Automatic is offered only where ish implements a support query; geometry and restoration requirements still apply to On.",
-    )
     MANAGE_ON = auto(), "On"
     MANAGE_OFF = auto(), "Off"
     MANAGE_AUTO = auto(), "Automatic"
-    MANAGE_QUERY = auto(), "Support query: {query}"
-    MANAGE_UNQUERIED = auto(), "No support query; choose On or Off."
+    MANAGE_QUERY = auto(), "Automatic checks host support at startup with {query}."
     MANAGE_MOUSE = auto(), "Mouse policy"
     MANAGE_CLIPBOARD = auto(), "Program clipboard access"
     MANAGE_CLIPBOARD_WRITE = auto(), "Write only"
@@ -168,15 +304,15 @@ class Message(StrEnum):
     )
     MANAGE_HELP_KEYS_BODY = (
         auto(),
-        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. When a key starts with a lone ESC byte, the default wait is {escape_delay} seconds for a possible suffix. Increase escape_delay if Alt or arrow keys split on a slow connection. A complete enhanced Escape key report skips this wait.\n\nShift+PageUp / Shift+PageDown scroll internal history. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn these management windows: Tab changes focus, arrows select categories or choices, Space toggles choices, PageUp/PageDown scroll, Esc closes. In settings, Ctrl+S saves and Ctrl+E opens .ishrc.py.",
+        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. When a key starts with a lone ESC byte, the default wait is {escape_delay} seconds for a possible suffix. Increase escape_delay if Alt or arrow keys split on a slow connection. A complete enhanced Escape key report skips this wait.\n\nShift+PageUp / Shift+PageDown scroll internal history. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn the sidebar, Up/Down moves within a group, Tab/Shift+Tab changes groups, and Enter/Space/Right opens the page. Drag the divider or use Ctrl+Left/Right in the sidebar to change its width. In settings, Ctrl+F opens the option filter for the current page from either pane. Each page keeps its own filter while the window is open. In help, Ctrl+F finds a help category. Click a category to open its page. The shortcut bar lists Ctrl and Alt combinations for the current pane. Scroll the focused pane with Alt+Up/Down, Alt+PgUp/PgDn or Alt+Home/End. Alt+Left/Right scrolls long single-line fields without moving the cursor. Use the wheel or drag the scrollbar thumb to scroll the pane under the pointer.\n\nIn settings, click inside a value field to edit it, or use Up/Down to choose a field and Enter to edit it. Click outside a text, number or HEX field to accept a valid value. An invalid value reverts to the value at the start of the edit, with the reason in the status bar. Enter and Save keep invalid input open for correction. Esc cancels just the current edit. While editing a number, Up/Down adjusts it by one step. Tab and Shift+Tab cycle between the form, the lower-right buttons, and the tools to the right of the page title. Tab from the form selects Cancel. Press Right to select Save. Status and progress appear on the lower left. Long warnings wrap within that space. Outside an edit, hovering over a button in the active pane focuses it until the pointer leaves. Keyboard navigation keeps its selection. Click to run it or use Left/Right within the group and press Enter or Space. Click the form background or press Esc to return from a button to the form. Ctrl+S saves your changes and keeps settings open. Ctrl+E opens .ishrc.py and Ctrl+R reloads it. Close settings with the title bar × or Esc from the sidebar.",
     )
     MANAGE_HELP_SETTINGS_BODY = (
         auto(),
-        "Use ish --config to edit language, selected plugins, host features and other session choices. Save and close writes only edited values; Cancel does not write. Changes apply at the next startup.\n\nThe one settings file is ~/ish/.ishrc.py, or DIR/.ishrc.py with --home DIR. It is Python code evaluated once when starting a session or loading the settings window. Help, version and diagnose never evaluate it.\n\nExample:\n  config.lang = 'ko'\n  config.plugins = []\n  config.mouse = 'auto'\n  config.features = {'hyperlinks': 'on'}\n\nExplicit CLI choices override this file. Language order is explicit setting (CLI first), LANG, then English. --no-rc skips the file. The settings window preserves your Python code and appends one managed block, backs up the prior file and rejects conflicting edits.\n\nEdit .ishrc.py uses VISUAL, EDITOR, or vi without invoking a shell. Save or cancel draft changes before editing the file.",
+        "Use ish --config to edit language, UI colors, plugins and session settings. Press Ctrl+S or click Save to write your changes. Cancel restores the last saved or loaded values. You can continue editing after either action. Closing discards the remaining unsaved edits. Changes apply at the next startup.\n\nThe one settings file is ~/ish/.ishrc.py, or DIR/.ishrc.py with --home DIR. It is Python code evaluated once when starting a session or loading the settings window. Interactive help reads a literal config.ui_palette dictionary and a literal config.ui_icons string without executing the file. Computed values use their individual defaults in help. Version and diagnostics also skip rc execution.\n\nExample:\n  config.lang = 'ko'\n  config.plugins = []\n  config.mouse = 'auto'\n  config.ui_palette = {'accent': 'blue-300'}\n  config.features = {'hyperlinks': 'on'}\n\nIn UI palette, click a role, a color family and a swatch to preview a color. There are 22 families with nine shades each, from 100 (light) to 900 (dark). Choose a role with Up/Down and press Enter or Space to edit. Up/Down changes the family and Left/Right changes the shade. The selected shade is underlined. Default uses the host color. For Custom, type six digits such as 1A2B3C after the fixed HEX # prefix. Enter applies the color and Esc cancels the edit. The palette styles help and settings. Under Language and startup, Icon style lets you preview Unicode or Nerd Font symbols. Unicode is the default. For Nerd Font icons, select a Nerd Font in your host terminal and save the setting (config.ui_icons = 'nerdfont'). For shell output, use config.color_depth.\n\nExplicit CLI choices override this file. Language order is explicit setting (CLI first), LANG, then English. --no-rc skips the file. The settings window preserves your Python code and appends one managed block, backs up the prior file and rejects conflicting edits.\n\nEdit .ishrc.py uses VISUAL, EDITOR, or vi without invoking a shell. Save or cancel draft changes before editing the file.",
     )
     MANAGE_HELP_PLUGINS_BODY = (
         auto(),
-        "UI plugins and protocol supplements share PluginManager, plugin_dir and config.plugins. No second loader or directory is needed.\n\nDefault sources: ~/ish/plugin/script\nDefault dependencies: ~/ish/plugin/lib\n\nEach plugin is a directory with NAME.py or __init__.py and literal PLUGIN_META metadata. Put a trusted package there, refresh the settings list, and select it. Turning it off removes it from the saved selection; source files stay on disk.\n\nA plugin may add bars, popups, search, keys, output protocols or a clipboard provider through the existing API. Configuring a protocol does not enable a UI plugin. Python changes apply at the next session without rebuilding the native engine.\n\n--plugin NAME selects this session's list; --no-plugins disables all. Plugin code is trusted Python and can install its declared dependencies when actually loaded, never while merely browsing settings.",
+        "UI plugins and protocol supplements share PluginManager, plugin_dir and config.plugins. No second loader or directory is needed.\n\nDefault sources: ~/ish/plugin/script\nDefault dependencies: ~/ish/plugin/lib\n\nEach plugin is a directory with NAME.py or __init__.py and literal PLUGIN_META metadata. Place a trusted package there and select it in settings. If settings are already open, save any edits before using Ctrl+R to reload the file and package lists. Turning it off removes it from the saved selection; source files stay on disk.\n\nA plugin may add bars, popups, search, keys, output protocols or a clipboard provider through the existing API. Configuring a protocol does not enable a UI plugin. Python changes apply at the next session without rebuilding the native engine.\n\n--plugin NAME selects this session's list; --no-plugins disables all. Plugin code is trusted Python and can install its declared dependencies when actually loaded, never while merely browsing settings.",
     )
     MANAGE_HELP_FEATURES_BODY = (
         auto(),
@@ -346,6 +482,7 @@ class Message(StrEnum):
     STARTUP_SETTING_LIST = auto(), "{name} must be a list of strings"
     STARTUP_SETTING_PLUGINS = auto(), "plugins must contain nonempty names"
     STARTUP_SETTING_PATH = auto(), "{name} must be a path"
+    STARTUP_PATH_RESOLUTION = auto(), "Cannot resolve {name}: {error}"
     STARTUP_SETTING_LEVEL = auto(), "log_level must be one of {levels}"
     STARTUP_SETTING_ESCAPE = (
         auto(),

@@ -23,7 +23,7 @@ libghostty의 독립 OSC parser로 소유 여부를 확인한다. 제목·색상
 ```python
 from ish.terminal.extensions import ProtocolResult
 
-PLUGIN_META = {"version": "1.0.0"}
+PLUGIN_META = {"version": "1.0.0", "category": "module"}
 TERMINAL_API = 1
 
 
@@ -71,7 +71,7 @@ Python 플러그인은 기존 PluginManager와 동일한 사용자 권한으로 
 ```python
 from ish.terminal.host import StructuredKey
 
-PLUGIN_META = {"version": "1.0.0"}
+PLUGIN_META = {"version": "1.0.0", "category": "module"}
 TERMINAL_API = 1
 
 def setup(api):

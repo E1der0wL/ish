@@ -8,6 +8,8 @@ from pathlib import Path
 from prompt_toolkit.output import ColorDepth
 
 from ish.lang import Message
+from ish.manage.icons import DEFAULT_ICONS, validate_icons
+from ish.manage.palette import validate_palette
 from ish.runtime.settings import Settings as BaseSettings
 from ish.runtime.settings import SettingsError
 from ish.runtime.settings import load as load_common
@@ -57,12 +59,16 @@ class Settings(BaseSettings):
     scrollback_lines: int = DEFAULT_SCROLLBACK_LINES
     scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES
     color_depth: str = DEFAULT_COLOR_DEPTH
+    ui_palette: dict[str, str] = field(default_factory=dict)
+    ui_icons: str = DEFAULT_ICONS
     features: dict[str, str] = field(default_factory=dict)
 
     def validate(self, base: Path):
         """Reject invalid policies before acquiring a terminal or native library."""
         BaseSettings.validate(self, base)
         self.color_depth = validate_color_depth(self.color_depth)
+        self.ui_palette = validate_palette(self.ui_palette)
+        self.ui_icons = validate_icons(self.ui_icons)
         if not isinstance(self.features, dict):
             raise SettingsError(Message.VT_FEATURES_MAPPING)
         self.features = validate_features(self.features)

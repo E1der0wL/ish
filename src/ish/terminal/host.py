@@ -813,14 +813,27 @@ class HostBroker:
         self._cancelled = False
         self._restore_only = False
 
+    def _query_attributes(self) -> str:
+        """Ask for color support before the initial SGR, allowing a read-only answer."""
+        query = self._depth_probe.QUERY if self._depth_probe is not None else ""
+        return query + f"{ESC}P$qm{ST}"
+
     def begin_restore_probe(self) -> str:
-        """Observe only state needed by a PTK screen, without feature selection."""
+        """Observe PTK screen state and optional text color depth without VT features."""
         if self._started or self._closed:
             raise RuntimeError(i18n.get(Message.VT_HOST_PROBE_ONCE))
         self._started = self._restore_only = True
-        return f"{ESC}P$q q{ST}{ESC}P$qm{ST}" + "".join(
-            f"{ESC}[?{mode}$p" for mode in self.SCREEN_MODES
+        return (
+            f"{ESC}P$q q{ST}"
+            + self._query_attributes()
+            + f"{ESC}[?2026$p"
+            + "".join(f"{ESC}[?{mode}$p" for mode in self.SCREEN_MODES)
         )
+
+    @property
+    def can_open_sync_frame(self) -> bool:
+        """Open a bounded update only when the host reported the mode initially reset."""
+        return self._closed and self._mode_values.get(2026) == 2
 
     @property
     def adapter(self) -> HostAdapter:
@@ -958,8 +971,7 @@ class HostBroker:
             + "".join(f"{ESC}]4;{number};?{ST}" for number in range(PALETTE_SIZE))
             + f"{ESC}_Ga=q,i={query_id},s=1,v=1,f=24,t=d;AAAA{ST}"
             + "".join(f"{ESC}[?{mode}$p" for mode in self.RESTORE_MODES if mode != 2026)
-            + (self._depth_probe.QUERY if self._depth_probe is not None else "")
-            + f"{ESC}P$qm{ST}"
+            + self._query_attributes()
             + f"{ESC}[c"
         )
 
@@ -1014,9 +1026,11 @@ class HostBroker:
     def finish_probe(self) -> HostProfile:
         """Freeze probe results under host policy; late replies cannot upgrade them."""
         if not self._closed:
+            color_depth = self._depth_probe.depth if self._depth_probe else None
             if self._restore_only:
                 self.profile = HostProfile(
-                    initial_cursor_style=self._initial_cursor_style
+                    initial_cursor_style=self._initial_cursor_style,
+                    color_depth=color_depth,
                 )
                 self._closed = True
                 self.ready.set()
@@ -1051,7 +1065,7 @@ class HostBroker:
                 cursor_color_control=enabled["cursor_color"],
                 overline=enabled["overline"],
                 initial_cursor_style=self._initial_cursor_style,
-                color_depth=self._depth_probe.depth if self._depth_probe else None,
+                color_depth=color_depth,
             )
             self._closed = True
             self._appearance_epoch += 1
@@ -1122,6 +1136,8 @@ class HostBroker:
         return self.profile
 
     def _changed(self) -> None:
+        if self._depth_probe is not None and not self._depth_probe.complete:
+            return
         if self._restore_only:
             if (
                 all(mode in self._mode_values for mode in self.SCREEN_MODES)
@@ -1144,7 +1160,6 @@ class HostBroker:
             and all(mode in self._mode_values for mode in self.RESTORE_MODES)
             and self._attributes_seen
             and self._cursor_style_seen
-            and (self._depth_probe is None or self._depth_probe.complete)
         ):
             self.ready.set()
 
@@ -1587,10 +1602,7 @@ class HostBroker:
     def control(self, sequence: str) -> bool:
         """Consume a complete control reply; return false only for keyboard traffic."""
         negotiating_depth = (
-            self._started
-            and not self._closed
-            and not self._restore_only
-            and self._depth_probe is not None
+            self._started and not self._closed and self._depth_probe is not None
         )
         if negotiating_depth and (
             report := self._depth_probe.REPORT.fullmatch(sequence)

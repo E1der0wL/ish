@@ -47,14 +47,21 @@ class WireHost(io.StringIO):
         super().__init__()
         self.master, self.reply, self.keys = master, reply, keys
         self.queried = False
+        self.writes = []
+        self.sync_mode = None
 
     def write(self, value):
         """Interleave ordinary keys with replies on the same real PTY input."""
         result = super().write(value)
+        self.writes.append(value)
         if "\x1bP$q q\x1b\\" in value and not self.queried:
             self.queried = True
             if self.reply:
                 parts = ["a" if self.keys else "", "\x1bP1$r3 q\x1b\\"]
+                if self.sync_mode is not None and "\x1b[?2026$p" in value:
+                    parts.append(f"\x1b[?2026;{self.sync_mode}$y")
+                if "\x1bP+q524742\x1b\\" in value:
+                    parts.append("\x1bP1+r524742=382F382F38\x1b\\")
                 parts.extend(
                     f"\x1b[?{mode};{state}$y" for mode, state in self.MODES.items()
                 )
@@ -66,7 +73,7 @@ class WireHost(io.StringIO):
 class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
     """Verify output state and final key consumers without loading a VT engine."""
 
-    def fixture(self, *, reply=True, keys=False):
+    def fixture(self, *, reply=True, keys=False, palette=lambda: {}, sizes=None):
         """Use PTK's genuine descriptor parser with a responding outer terminal."""
         master, slave = os.openpty()
         self.addCleanup(os.close, slave)
@@ -78,14 +85,14 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
         host = WireHost(master, reply=reply, keys=keys)
         output = Vt100_Output(
             host,
-            lambda: Size(rows=12, columns=60),
+            lambda: sizes[-1] if sizes else Size(rows=12, columns=60),
             term="xterm-256color",
             enable_cpr=False,
         )
         screen = Screen(
             "Management",
             [("Page", TextArea(text="Body", read_only=True))],
-            "Close",
+            palette=palette,
             input=source,
             output=output,
         )
@@ -142,20 +149,40 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_probe_precedes_paint_and_keeps_interleaved_keys_in_order(self):
-        """Only restoration queries are sent; typed keys have their original consumer."""
-        screen, host, _, _, _ = self.fixture(keys=True)
+        """UI colors and restoration share the reader without requesting VT features."""
+        with patch.dict(
+            os.environ,
+            {"NO_COLOR": "", "COLORTERM": "", "PROMPT_TOOLKIT_COLOR_DEPTH": ""},
+        ):
+            screen, host, _, _, _ = self.fixture(
+                keys=True, palette=lambda: {"text": "blue-500"}
+            )
         keys = []
         screen.bindings.add("a")(lambda event: keys.append("a"))
         screen.bindings.add("b")(lambda event: keys.append("b"))
         await self.finish(screen, host)
         wire = host.getvalue()
         probe = wire[: wire.index("\x1b[?1049h")]
-        expected = "\x1bP$q q\x1b\\\x1bP$qm\x1b\\" + "".join(
-            f"\x1b[?{mode}$p" for mode in WireHost.MODES
+        expected = (
+            "\x1bP$q q\x1b\\\x1bP+q524742\x1b\\\x1bP+q436f\x1b\\\x1bP$qm\x1b\\\x1b[?2026$p"
+            + "".join(f"\x1b[?{mode}$p" for mode in WireHost.MODES)
         )
         self.assertEqual(probe, expected)
+        self.assertIn("38;2;59;130;246", wire[wire.index("\x1b[?1049h") :])
         self.assertEqual(keys, ["a", "b"])
         self.assert_restored(wire)
+
+    async def test_explicit_ptk_color_depth_skips_the_optional_management_probe(self):
+        """Respect the user's output policy without loading a terminal session."""
+        with patch.dict(
+            os.environ, {"NO_COLOR": "", "PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_8_BIT"}
+        ):
+            screen, host, _, _, _ = self.fixture(palette=lambda: {"text": "blue-500"})
+            await self.finish(screen, host)
+        self.assertEqual(screen.app.color_depth.value, "DEPTH_8_BIT")
+        self.assertNotIn("\x1bP+q", host.getvalue())
+        self.assertNotIn("38;2;59;130;246", host.getvalue())
+        self.assert_restored(host.getvalue())
 
     async def test_external_editor_handoff_restores_then_reenters_the_screen(self):
         """PTK in_terminal sees original modes and termios before executing code."""
@@ -193,6 +220,58 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def test_resize_publishes_content_without_a_blank_or_host_reset(self):
+        """A burst of size changes retains screen ownership and paints the final size."""
+        for mode in (None, 1, 2):
+            with self.subTest(initial_sync=mode):
+                sizes = [Size(rows=20, columns=80)]
+                screen, host, _, _, _ = self.fixture(sizes=sizes)
+                host.sync_mode = mode
+                ready = asyncio.Event()
+                screen.app.after_render += lambda _, ready=ready: ready.set()
+                task = asyncio.create_task(screen.app.run_async())
+                try:
+                    await asyncio.wait_for(ready.wait(), 3)
+                    for rows, cols in ((45, 170), (18, 62), (36, 120)):
+                        ready.clear()
+                        host.writes.clear()
+                        sizes.append(Size(rows=rows - 2, columns=cols - 10))
+                        screen.app._on_resize()
+                        sizes.append(Size(rows=rows, columns=cols))
+                        screen.app._on_resize()
+                        await asyncio.wait_for(ready.wait(), 3)
+                        parts = host.writes
+                        wire = "".join(parts)
+                        self.assertIn("Body", wire)
+                        for part in parts:
+                            if "\x1b[J" in part:
+                                self.assertIn("Body", part)
+                        for reset in (
+                            "\x1b[?1049",
+                            "\x1b[?2004",
+                            "\x1b[?1003",
+                            "\x1b[6n",
+                        ):
+                            self.assertNotIn(reset, wire)
+                        self.assertEqual(wire.count("Body"), 1)
+                        if mode == 2:
+                            self.assertLess(
+                                wire.index("\x1b[?2026h"), wire.index("Body")
+                            )
+                            self.assertLess(
+                                wire.index("Body"), wire.index("\x1b[?2026l")
+                            )
+                        else:
+                            self.assertNotIn("\x1b[?2026h", wire)
+                            self.assertNotIn("\x1b[?2026l", wire)
+                    os.write(host.master, b"\x04")
+                    await asyncio.wait_for(task, 3)
+                    self.assert_restored(host.getvalue())
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
     async def test_unanswered_probe_does_not_restore_late_unobserved_values(self):
         """Unknown state stays unknown after timeout; a late report cannot replace it."""
         screen, host, _, _, _ = self.fixture(reply=False)
@@ -208,7 +287,6 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
             screen = Screen(
                 "Help",
                 [("Page", TextArea(text="Body"))],
-                "Close",
                 input=source,
                 output=DummyOutput(),
             )

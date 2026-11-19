@@ -7,38 +7,30 @@ execute code.
 from __future__ import annotations
 
 import ast
-import importlib.metadata
 import importlib.util
+import os
 import re
 import sys
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
-from importlib.metadata import PackageNotFoundError
+from enum import StrEnum
 from itertools import count, islice
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.utils import canonicalize_name
-from packaging.version import InvalidVersion
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ish.config import config
 from ish.lang import Message, i18n
 from ish.log import get_logger
 
-from .dependencies import (
-    PACKAGE_ENTRY,
-    PYTHON_SOURCE_SUFFIX,
-    has_distribution_files,
-    has_duplicate_metadata,
-    has_import,
-    install_dependency,
-)
+from . import PACKAGE_ENTRY, PYTHON_SOURCE_SUFFIX
 from .metadata import DependencySpec, split_requirement
 
-__all__ = ["PluginManager", "PluginInfo", "PluginCandidate"]
+if TYPE_CHECKING:
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+
+__all__ = ["PluginManager", "PluginInfo", "PluginCandidate", "PluginCategory"]
 
 PLUGIN_META = "PLUGIN_META"
 
@@ -59,6 +51,22 @@ def _metadata_list(value: object) -> list[str]:
     return list(value)
 
 
+class PluginCategory(StrEnum):
+    """Declare where the package appears in settings, independently of its setup API."""
+
+    PLUGIN = "plugin"
+    MODULE = "module"
+    BOTH = "both"
+
+    @classmethod
+    def declared(cls, value):
+        """Keep packages with unrecognized display metadata in the general catalog."""
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.PLUGIN
+
+
 @dataclass
 class PluginInfo:
     """Loaded plugin module and its declared version and dependency metadata."""
@@ -75,6 +83,9 @@ class PluginInfo:
     )
     dependencies: List[str] = field(
         default_factory=list, metadata={NORMALIZER: _metadata_list}
+    )
+    category: PluginCategory = field(
+        default=PluginCategory.PLUGIN, metadata={NORMALIZER: PluginCategory.declared}
     )
 
     @classmethod
@@ -244,7 +255,7 @@ class PluginManager:
         )
 
         for candidate in candidate_files:
-            if candidate.exists() and candidate.is_file():
+            if candidate.is_file():
                 return candidate
         return None
 
@@ -289,12 +300,28 @@ class PluginManager:
         A candidate is not a readiness or compatibility claim. Loading still
         validates dependencies and the selected execution API at session start.
         """
-        if not self.script_dir.exists():
-            return ()
-        candidates = []
-        for directory in sorted(self.script_dir.iterdir(), key=lambda item: item.name):
-            if not directory.is_dir() or directory.name.startswith(self.HIDDEN_PREFIX):
-                continue
+        return tuple(self.iter_candidates())
+
+    def iter_candidates(self, *, cancelled=None):
+        """Yield candidates in display order so a closed catalog can stop reading."""
+        root = self.script_dir
+        if cancelled is not None and cancelled():
+            return
+        try:
+            entries = os.scandir(root)
+        except FileNotFoundError:
+            return
+        with entries:
+            names = []
+            for item in entries:
+                if cancelled is not None and cancelled():
+                    return
+                if not item.name.startswith(self.HIDDEN_PREFIX) and item.is_dir():
+                    names.append(item.name)
+        for name in sorted(names):
+            if cancelled is not None and cancelled():
+                return
+            directory = root / name
             entry = directory
             info = None
             error = None
@@ -313,10 +340,7 @@ class PluginManager:
                     raise ValueError(i18n.get(Message.PM_LOAD_FAIL, plugin_file=entry))
             except Exception as failure:
                 error = str(failure)
-            candidates.append(
-                PluginCandidate(directory.name, entry or directory, info, error)
-            )
-        return tuple(candidates)
+            yield PluginCandidate(directory.name, entry or directory, info, error)
 
     def _is_version_allowed(
         self, installed: str, spec: str | SpecifierSet | None
@@ -324,6 +348,9 @@ class PluginManager:
         """Check a PEP 440 constraint and log and reject invalid constraints."""
         if not spec:
             return True
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import InvalidVersion
+
         try:
             allowed = spec if isinstance(spec, SpecifierSet) else SpecifierSet(spec)
             return allowed.contains(installed)
@@ -342,12 +369,19 @@ class PluginManager:
         self, requirement: Requirement, seen=None, checked=None
     ) -> bool:
         """Validate the active distribution tree and its files without importing it."""
+        from importlib import metadata
+
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+
+        from .dependencies import has_distribution_files, has_duplicate_metadata
+
         seen = set() if seen is None else seen
         checked = set() if checked is None else checked
         key = (canonicalize_name(requirement.name), frozenset(requirement.extras))
         try:
-            distribution = importlib.metadata.distribution(requirement.name)
-        except PackageNotFoundError:
+            distribution = metadata.distribution(requirement.name)
+        except metadata.PackageNotFoundError:
             return False
         if not self._is_version_allowed(distribution.version, requirement.specifier):
             return False
@@ -397,6 +431,8 @@ class PluginManager:
             return False
         name = dependency.import_name
         if not import_parents:
+            from .dependencies import has_import
+
             return has_import(name)
         try:
             return importlib.util.find_spec(name) is not None
@@ -408,6 +444,8 @@ class PluginManager:
 
     def _ensure_library(self, library: str) -> bool:
         """Use an available dependency or install and validate it before loading a plugin."""
+        from packaging.requirements import InvalidRequirement
+
         try:
             return self._is_library_available(library) or self._install_library(library)
         except InvalidRequirement as exc:
@@ -418,6 +456,8 @@ class PluginManager:
 
     def _dependency_constraints(self) -> list[str]:
         """Preserve requirements declared by plugins already registered in this session."""
+        from packaging.requirements import InvalidRequirement
+
         constraints = []
         for info in self.registry.list_info():
             for dependency in info.dependencies:
@@ -459,6 +499,8 @@ class PluginManager:
         Pass an argument vector rather than a shell string, and report installation
         failures as False.
         """
+        from .dependencies import install_dependency
+
         if not self.lib_dir or not self.python_exe:
             self.logger.warning(i18n.get(Message.PIP_INSTALL_FAIL, library=library))
             return False

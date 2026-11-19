@@ -20,6 +20,8 @@ from packaging.utils import canonicalize_name
 
 from ish.lang import Message, i18n
 
+from . import PACKAGE_ENTRY, PYTHON_SOURCE_SUFFIX
+
 INSTALL_LOCK_SUFFIX = ".install.lock"
 _LOCK_MODE = 0o600
 _STAGE_PREFIX = ".install-"
@@ -38,11 +40,9 @@ _PIP_INSTALL = (
 _PIP_TARGET = "--target"
 _PIP_CONSTRAINT = "--constraint"
 _DIST_NAME = "Name"
-PYTHON_SOURCE_SUFFIX = ".py"
 _BYTECODE = ".pyc"
 _BYTECODE_DIR = "__pycache__"
 _NATIVE_EXTENSIONS = (".so", ".pyd")
-PACKAGE_ENTRY = "__init__" + PYTHON_SOURCE_SUFFIX
 _COMPARE_BYTES = 128 * 1024
 _MISSING_MODULE = object()
 _RECORD = "RECORD"

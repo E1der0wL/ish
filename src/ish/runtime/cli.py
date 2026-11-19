@@ -340,7 +340,7 @@ def parse(argv=None, *, startup):
     if args.help:
         from ish.manage.app import help_window
 
-        help_window(parser)
+        help_window(parser, no_rc=args.no_rc)
         return parser, args, True
     if args.version:
         print(i18n.get(startup.version, version=__version__))

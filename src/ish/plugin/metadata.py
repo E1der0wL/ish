@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from packaging.requirements import Requirement
+if TYPE_CHECKING:
+    from packaging.requirements import Requirement
 
 IMPORT_SEPARATOR = "|"
 
@@ -26,6 +28,8 @@ class DependencySpec:
     @classmethod
     def parse(cls, value: str) -> DependencySpec:
         """Parse ish's import override while delegating PEP 508 to packaging."""
+        from packaging.requirements import Requirement
+
         specification, origin = split_requirement(value)
         requirement = Requirement(specification.strip())
         return cls(specification, requirement, origin or requirement.name)

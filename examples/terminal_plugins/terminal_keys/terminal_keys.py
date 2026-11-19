@@ -6,7 +6,11 @@ selecting this plugin. This example does not detect or alter host key bindings.
 
 from ish.terminal.host import StructuredKey
 
-PLUGIN_META = {"version": "1.0.0", "description": "Explicit terminal key mapping"}
+PLUGIN_META = {
+    "version": "1.0.0",
+    "description": "Explicit terminal key mapping",
+    "category": "module",
+}
 TERMINAL_API = 1
 KEY_MAPPINGS = {"\x1b[9001~": StructuredKey("f13", 57376)}
 

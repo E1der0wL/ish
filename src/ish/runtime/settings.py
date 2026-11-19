@@ -65,6 +65,20 @@ def validate_escape_delay(value):
     return float(value)
 
 
+def setting_path(value, base: Path, *, name: str) -> Path | None:
+    """Resolve a setting against the rc directory used by the next session."""
+    if value is None and name != "cwd":
+        return None
+    if not isinstance(value, (str, Path)) or not str(value) or "\0" in str(value):
+        raise SettingsError(Message.STARTUP_SETTING_PATH, name=name)
+    try:
+        return (base / Path(value).expanduser()).resolve()
+    except RuntimeError as error:
+        raise SettingsError(
+            Message.STARTUP_PATH_RESOLUTION, name=name, error=error
+        ) from error
+
+
 @dataclass(slots=True)
 class Settings:
     """Hold next-session choices; PluginManager remains responsible for loading."""
@@ -88,7 +102,12 @@ class Settings:
             raise SettingsError(Message.STARTUP_SETTING_SHELL)
         if "/" in self.shell or self.shell.startswith("~"):
             # Keep the selected symlink name: providers may interpret argv[0].
-            self.shell = os.path.abspath(base / Path(self.shell).expanduser())
+            try:
+                self.shell = os.path.abspath(base / Path(self.shell).expanduser())
+            except RuntimeError as error:
+                raise SettingsError(
+                    Message.STARTUP_PATH_RESOLUTION, name="shell", error=error
+                ) from error
         for name in ("plugins", "shell_args"):
             values = getattr(self, name)
             if not isinstance(values, (list, tuple)) or any(
@@ -100,17 +119,7 @@ class Settings:
             raise SettingsError(Message.STARTUP_SETTING_PLUGINS)
         self.plugins = list(dict.fromkeys(self.plugins))
         for name in PATH_OPTIONS:
-            value = getattr(self, name)
-            if value is None and name != "cwd":
-                continue
-            if (
-                not isinstance(value, (str, Path))
-                or not str(value)
-                or "\0" in str(value)
-            ):
-                raise SettingsError(Message.STARTUP_SETTING_PATH, name=name)
-            path = Path(value).expanduser()
-            setattr(self, name, (base / path).resolve())
+            setattr(self, name, setting_path(getattr(self, name), base, name=name))
         if (
             not isinstance(self.log_level, str)
             or self.log_level.upper() not in LOG_LEVELS

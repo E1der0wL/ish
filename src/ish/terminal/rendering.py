@@ -389,6 +389,9 @@ class Composition(Container):
 class RestoringRenderer(Renderer):
     """Share PTK screen ownership and observed-state restoration across UIs."""
 
+    SYNC_START = "\x1b[?2026h"
+    SYNC_END = "\x1b[?2026l"
+
     def __init__(self, owner, previous, *, output=None):
         """Keep one broker as the source of initial host state."""
         self.owner = owner
@@ -446,8 +449,6 @@ class TerminalRenderer(RestoringRenderer):
         ("extended_styles", UNDERLINE_RESET),
         ("overline", OVERLINE_RESET),
     )
-    SYNC_START = "\x1b[?2026h"
-    SYNC_END = "\x1b[?2026l"
     MAX_ERROR_CHARS = 256
     MAX_GRAPHICS_FAILURES = 3
 

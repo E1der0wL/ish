@@ -153,6 +153,20 @@ class ManagementTerminal(Terminal):
         if termios.tcgetattr(self.fd) != self.attrs:
             raise AssertionError("Management did not restore outer termios")
 
+    def close_settings(self):
+        """Click the close control in the actual settings title bar."""
+
+        def close_column():
+            row = self.screen.buffer[0]
+            return next(
+                (col + 1 for col in range(self.cols) if row[col].data == "×"), None
+            )
+
+        self.require(close_column)
+        column = close_column()
+        self.send(f"\x1b[<0;{column};1M\x1b[<0;{column};1m")
+        self.finish(key=b"")
+
     def close(self):
         """Clean fixture processes and restore the actual host even after failure."""
         try:
@@ -184,7 +198,7 @@ def host_case(directory, case, *, require_resize=False):
         )
         terminal.require(
             lambda: terminal.frame_has(
-                "ish — Help" if case == "help" else "ish — Settings"
+                "ish — Help" if case == "help" else "⚙  Settings"
             ),
             timeout=45,
         )
@@ -197,14 +211,24 @@ def host_case(directory, case, *, require_resize=False):
             terminal.finish()
             assert rc.read_bytes() == original
         elif case == "save":
-            # General -> language -> Korean, then the public save binding.
-            terminal.send(b"\r\x1b[B\x1b[B \x13")
-            terminal.finish(key=b"")
+            # Choose Korean, then Tab to Cancel and move right to activate Save.
+            terminal.send(b"\r\r\x1b[B\x1b[B\r\t\x1b[C\r")
             from ish.terminal.settings import load
 
+            terminal.require(lambda: load(rc).lang == "ko")
+            terminal.close_settings()
             assert load(rc).lang == "ko"
         else:
-            terminal.finish(key=b"\x03" if case == "interrupt" else b"\x04")
+            # Navigate after the control key to prove the same window still accepts
+            # input. Escape from the sidebar must be its first actual close.
+            key = b"\x03" if case == "interrupt" else b"\x04"
+            terminal.send(key + b"\x1b[B")
+            terminal.require(
+                lambda: (
+                    terminal.frame_has("▸ UI palette") and terminal.frame_has("Accent")
+                )
+            )
+            terminal.finish()
             assert rc.read_bytes() == original
         result.update(
             status="passed",
@@ -266,12 +290,12 @@ def restore_case(directory, case):
             raise AssertionError(
                 ("Host rejected selected starting state", before, selected)
             )
-        help_case = case == "restore-help"
+        help_case = case in ("restore-help", "restore-interrupt", "restore-eof")
         terminal = ManagementTerminal(
             directory / "session", "-h" if help_case else "-c", host=True
         )
         terminal.require(
-            lambda: terminal.frame_has("ish — Help" if help_case else "ish — Settings"),
+            lambda: terminal.frame_has("ish — Help" if help_case else "⚙  Settings"),
             timeout=45,
         )
         key = (
