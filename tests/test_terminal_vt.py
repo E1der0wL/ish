@@ -36,10 +36,15 @@ class TerminalVTTests(unittest.TestCase):
                 b"\x1b]8;;https://old.test\x1b\\X\x1b]8;;\x1b\\\r\n" + "한글".encode()
             )
             first = terminal.frame()
+            with self.assertRaises(AttributeError):
+                first.cells[1][0].text = "changed"
             first.lines[0].clear()
             first.lines[1][0] = ("", "changed by caller")
             following = terminal.frame()
             self.assertEqual([text(following, i) for i in range(2)], ["X", "한글"])
+            self.assertEqual(
+                [(c.x, c.width) for c in following.cells[1][:2]], [(0, 2), (2, 2)]
+            )
             self.assertEqual(following.cells[0][0].hyperlink, "https://old.test")
             terminal.feed(
                 b"\x1b[H\x1b[4;58;2;9;8;7m\x1b]8;;https://new.test/longer\x1b\\"

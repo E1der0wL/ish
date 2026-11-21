@@ -42,6 +42,9 @@ DEFAULT_LIBRARY = bundled_vt_library() or (
 )
 COLOR_FG = 1
 COLOR_BG = 2
+INDEX_FG = 4
+INDEX_BG = 8
+PALETTE_CLASS = "class:vt-palette-"
 STYLE_FLAGS = (
     (1, "bold"),
     (2, "italic"),
@@ -303,6 +306,8 @@ def _style(
     bg_red: int,
     bg_green: int,
     bg_blue: int,
+    fg_index: int,
+    bg_index: int,
 ) -> str:
     parts = [
         f"fg:#{red:02x}{green:02x}{blue:02x}" if colors & COLOR_FG else "fg:default",
@@ -313,6 +318,10 @@ def _style(
     parts.extend(name for bit, name in STYLE_FLAGS if flags & bit)
     if flags & 0x700:
         parts.append("underline")
+    if colors & (INDEX_FG | INDEX_BG):
+        fg = str(fg_index) if colors & INDEX_FG else ""
+        bg = str(bg_index) if colors & INDEX_BG else ""
+        parts.append(f"{PALETTE_CLASS}{fg}_{bg}")
     return " ".join(parts)
 
 
@@ -490,7 +499,7 @@ class Terminal:
     }
     HEADER = struct.Struct("<7I2Q5IQ4I")
     # The native snapshot carries color presence separately from RGB values.
-    CELL = struct.Struct("<HB6B4I3BI")
+    CELL = struct.Struct("<HB8B4I3BI")
     PLACEMENT = struct.Struct("<IIQii6Iii")
     IMAGE_HEADER = struct.Struct("<IIQ")
     IMAGE_CONTEXT = struct.Struct("<12I16s")
@@ -780,6 +789,8 @@ class Terminal:
                     bg_red,
                     bg_green,
                     bg_blue,
+                    fg_index,
+                    bg_index,
                     length,
                     x,
                     width,
@@ -805,7 +816,16 @@ class Terminal:
                 )
                 offset = end + link_length
                 style = _style(
-                    flags, colors, red, green, blue, bg_red, bg_green, bg_blue
+                    flags,
+                    colors,
+                    red,
+                    green,
+                    blue,
+                    bg_red,
+                    bg_green,
+                    bg_blue,
+                    fg_index,
+                    bg_index,
                 )
                 native_cells.append(
                     Cell(

@@ -26,6 +26,8 @@ SAMPLES = {
     b"SWATCH_RGB_FG": b"38;2;123;45;67",
     b"SWATCH_RGB_BG": b"48;2;20;60;120",
     b"SWATCH_THEME_RED": b"31",
+    b"SWATCH_BOLD_RED": b"1;31",
+    b"SWATCH_BOLD_BLUE": b"1;34",
     b"SWATCH_INDEX_BG": b"48;5;166",
     b"SWATCH_DEFAULT": b"0",
 }
@@ -125,6 +127,8 @@ def compare_host(output, observed_palette):
             b"SWATCH_RGB_FG": ([123, 45, 67], None),
             b"SWATCH_RGB_BG": (None, [20, 60, 120]),
             b"SWATCH_THEME_RED": (palette[b"4;1"], None),
+            b"SWATCH_BOLD_RED": (palette[b"4;1"], None),
+            b"SWATCH_BOLD_BLUE": (palette[b"4;4"], None),
             b"SWATCH_INDEX_BG": (None, palette[b"4;166"]),
             b"SWATCH_DEFAULT": (None, None),
         }
@@ -154,6 +158,11 @@ def compare_host(output, observed_palette):
             pair["equal"] = all(
                 pair["direct"][k] == pair["ish"][k] for k in ("fg", "bg")
             )
+            if marker in (b"SWATCH_THEME_RED", b"SWATCH_BOLD_RED", b"SWATCH_BOLD_BLUE"):
+                if pair["direct"]["host_sgr"] != pair["ish"]["host_sgr"]:
+                    raise AssertionError(
+                        ("Host palette or intensity differs", marker, pair)
+                    )
             samples[marker.decode()] = pair
     finally:
         if initial is not None:

@@ -14,6 +14,8 @@ from prompt_toolkit.layout import Container, Window
 from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.output import ColorDepth, vt100
 from prompt_toolkit.renderer import Renderer
+from prompt_toolkit.styles import DynamicStyle
+from prompt_toolkit.styles.base import DEFAULT_ATTRS
 
 from .graphics import (
     GraphicsCapabilityError,
@@ -21,6 +23,7 @@ from .graphics import (
     Rect,
     create_presenter,
 )
+from .vt import PALETTE_CLASS
 
 LINK_END = "\x1b]8;;\x1b\\"
 UNDERLINE_RESET = "\x1b[59m"
@@ -248,6 +251,27 @@ class NativeWindow(Window):
         """Native program colours are not overridden by PTK window styles."""
 
 
+class PaneStyle(DynamicStyle):
+    """Keep native indices distinct in PTK's attribute comparison and screen diff."""
+
+    def get_attrs_for_style_str(self, style_str, default=DEFAULT_ATTRS):
+        """Carry a native cell's palette references through PTK's style cache."""
+        attrs = super().get_attrs_for_style_str(style_str, default)
+        _, marker, suffix = style_str.partition(PALETTE_CLASS)
+        if not marker:
+            return attrs
+        fg, sep, bg = suffix.partition(" ")[0].partition("_")
+        if not sep or not all(
+            not s or s.isascii() and s.isdigit() and len(s) <= 3 and int(s) < 256
+            for s in (fg, bg)
+        ):
+            return attrs
+        return attrs._replace(
+            color=f"{fg}/{attrs.color}" if fg else attrs.color,
+            bgcolor=f"{bg}/{attrs.bgcolor}" if bg else attrs.bgcolor,
+        )
+
+
 class TransactionOutput:
     """Delegate PTK output while publishing each composed frame in one flush."""
 
@@ -320,11 +344,24 @@ class TransactionOutput:
             return str(base + (10 if background else 0) + index % 8)
         return f"{48 if background else 38};5;{index}"
 
+    def _channel(self, color, depth):
+        """Use the native index when representable, otherwise quantize its RGB."""
+        if color and "/" in color:
+            number, color = color.split("/", 1)
+            index = int(number)
+            if depth != ColorDepth.DEPTH_1_BIT and (
+                depth != ColorDepth.DEPTH_4_BIT or index < 16
+            ):
+                return color, index
+        return color, self._color_index(color)
+
     def set_attributes(self, attrs, color_depth):
         """Use the observed host palette for indexed colors, retaining PTK styling."""
         self._applied_format = None
-        fg = self._color_index(attrs.color)
-        bg = self._color_index(attrs.bgcolor)
+        foreground, fg = self._channel(attrs.color, color_depth)
+        background, bg = self._channel(attrs.bgcolor, color_depth)
+        if foreground != attrs.color or background != attrs.bgcolor:
+            attrs = attrs._replace(color=foreground, bgcolor=background)
         if fg is None and bg is None:
             self.output.set_attributes(attrs, color_depth)
             return
@@ -509,6 +546,7 @@ class TerminalRenderer(RestoringRenderer):
         self._cursor_changed = False
         self._format_used = set()
         super().__init__(owner, previous, output=self.transaction)
+        self.style = PaneStyle(lambda: previous.style)
 
     def compose(self, screen):
         """Attach metadata to visible cells and plan graphics under the floats."""

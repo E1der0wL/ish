@@ -468,10 +468,9 @@ class SixelInputTests(unittest.TestCase):
         self.assertEqual(
             (self.terminal.frame().cursor_x, self.terminal.frame().cursor_y), (3, 1)
         )
-        self.assertEqual(self.terminal.frame().cells[1][2].text, "Z")
-        self.assertEqual(
-            self.terminal.frame().cells[1][2].style, "fg:#cc6666 bg:#81a2be"
-        )
+        restored = self.terminal.frame().cells[1][2]
+        self.assertEqual((restored.text, restored.flags), ("Z", 0))
+        self.assertEqual((restored.fg, restored.bg), ((204, 102, 102), (129, 162, 190)))
         self.terminal.feed(b"\x1b[H\x1b[?8452h" + self.WIRE)
         self.assertEqual(self.terminal.frame().cursor_x, 2)
 

@@ -587,10 +587,11 @@ class StartupTests(StartupFixture, unittest.TestCase):
                             "THEME_REDRGB_SAMPLE"
                         )
                     )
-                    for sgr in (b"38;2;188;35;79", b"38;2;17;34;51"):
-                        self.assertEqual(
-                            sgr in terminal.output, expected_depth == "DEPTH_24_BIT"
-                        )
+                    self.assertIn(b"\x1b[31m", terminal.output)
+                    self.assertEqual(
+                        b"38;2;17;34;51" in terminal.output,
+                        expected_depth == "DEPTH_24_BIT",
+                    )
                     terminal.send(b"\r")
                     terminal.require(terminal.exited)
                     self.assertEqual(terminal.status, 0)

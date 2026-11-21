@@ -380,7 +380,10 @@ CASE_CONTRACTS = (
     (
         "VT08",
         "test_terminal_composition.TerminalCompositionTests",
-        ("test_indexed_output_preserves_observed_custom_palette_slots",),
+        (
+            "test_indexed_output_preserves_observed_custom_palette_slots",
+            "test_truecolor_preserves_palette_identity_and_local_overrides",
+        ),
     ),
     (
         "VT09",

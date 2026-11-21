@@ -25,7 +25,7 @@
 | VT05 | 문자 삽입·삭제·반복·지우기, terminfo 편집 결과 | `test_terminal_contracts.BaselineContracts`, `TerminfoContracts` |
 | VT06 | 영역 scroll·RI·NEL, history 삭제와 화면 보존 | `test_terminal_contracts.BaselineContracts` |
 | VT07 | 47/1047/1048 차이, 1049 resize·중복 종료 | `test_terminal_contracts.BaselineContracts` |
-| VT08 | 기본색과 명시색 구별, RGB 채널·출력 깊이 정책 | `test_terminal_vt.TerminalVTTests`, `test_terminal_startup.StartupTests` |
+| VT08 | 기본색·팔레트 번호·직접 RGB 구별, 굵기와 출력 깊이, RGB가 같은 두 슬롯과 프로그램의 팔레트 재지정·복원 | `test_terminal_vt.TerminalVTTests`, `test_terminal_startup.StartupTests`, `test_terminal_composition.TerminalCompositionTests` |
 | VT09 | bold/RGB 셀 스타일, 반복 프레임 간 텍스트 독립성, 셀 스타일과 하이퍼링크 변경 | `test_terminal_vt.TerminalVTTests` |
 | VT11 | 관측한 native 커서 기본값, 반복 reset의 불변성 | `test_terminal_cursor.NativeCursorTests`, `test_terminal_composition.TerminalCompositionTests` |
 | VT12 | DECSTR 후 입력 mode와 기존 텍스트 | `test_terminal_contracts.BaselineContracts` |

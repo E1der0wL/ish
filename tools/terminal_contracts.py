@@ -133,6 +133,7 @@ REQUIRED_CASES = {
         "test_terminal_startup.StartupTests.test_color_depth_preserves_explicit_rgb_and_respects_ptk_environment",
         "test_terminal_startup.StartupTests.test_host_color_queries_preserve_rgb_and_the_custom_indexed_palette",
         "test_terminal_composition.TerminalCompositionTests.test_indexed_output_preserves_observed_custom_palette_slots",
+        "test_terminal_composition.TerminalCompositionTests.test_truecolor_preserves_palette_identity_and_local_overrides",
     ),
     "VT09": (
         "test_terminal_vt.TerminalVTTests.test_cursor_erase_and_rgb_style",

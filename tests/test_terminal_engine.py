@@ -20,7 +20,7 @@ from ish.terminal.engine import EngineError, check_library
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def artifact(*, abi=7, headers=b"1.0.1", version=b"1.0.1", missing=None):
+def artifact(*, abi=8, headers=b"1.0.1", version=b"1.0.1", missing=None):
     """Expose independently chosen metadata without emulating terminal state."""
     return SimpleNamespace(
         ish_vt_abi=Mock(return_value=abi),
@@ -40,7 +40,7 @@ class EngineTests(unittest.TestCase):
         """Engine input support does not imply an iTerm decoder or a host backend."""
         library = artifact()
         info = check_library(library)
-        self.assertEqual(info.bridge_abi, 7)
+        self.assertEqual(info.bridge_abi, 8)
         self.assertEqual(info.header_version, "1.0.1")
         self.assertEqual(info.version, "1.0.1")
         self.assertEqual(info.native_inputs, ("kitty",))
@@ -54,7 +54,7 @@ class EngineTests(unittest.TestCase):
             language.load("ko")
             cases = (
                 (SimpleNamespace(), "메타데이터 진입점 ish_vt_abi"),
-                (artifact(abi=3), "필요한 ABI 7"),
+                (artifact(abi=3), "필요한 ABI 8"),
                 (artifact(version=b"\xff"), "native 버전이 올바르지"),
                 (artifact(headers=b"1.1.0"), "검증되지 않은 libghostty-vt"),
                 (artifact(missing=b"kitty_graphics"), "필요한 기능 kitty_graphics"),
@@ -75,10 +75,10 @@ class EngineTests(unittest.TestCase):
 
     def test_abi_rejection_precedes_other_calls(self):
         """No metadata or state ABI is invoked after the bridge number differs."""
-        for abi in (5, 6, 9):
+        for abi in (5, 6, 7, 9):
             with self.subTest(abi=abi):
                 library = artifact(abi=abi)
-                with self.assertRaisesRegex(EngineError, f"ABI {abi}.*required ABI 7"):
+                with self.assertRaisesRegex(EngineError, f"ABI {abi}.*required ABI 8"):
                     check_library(library)
                 for name in (
                     "ish_vt_headers",
@@ -141,7 +141,7 @@ class EngineTests(unittest.TestCase):
         info = check_library(library)
         self.assertEqual(
             (info.bridge_abi, info.header_version, info.version, info.native_inputs),
-            (7, "1.0.1", "1.0.1", ("kitty",)),
+            (8, "1.0.1", "1.0.1", ("kitty",)),
         )
 
 

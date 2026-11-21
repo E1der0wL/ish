@@ -19,6 +19,8 @@
 #define ISH_IDENTITY_BYTES 128u
 #define ISH_COLOR_FG 1u
 #define ISH_COLOR_BG 2u
+#define ISH_INDEX_FG 4u
+#define ISH_INDEX_BG 8u
 #define ISH_KITTY_PLACEHOLDER 0x10EEEEu
 #define ISH_APPEARANCE_BYTES (259u * 4u)
 #define ISH_NOTIFICATION_BYTES (16u * 1024u)
@@ -623,6 +625,8 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
     GhosttyTerminalScreen screen;
     GhosttyRenderStateColors palette = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
     CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_COLORS, &palette));
+    GhosttyColorRgb defaults[256];
+    CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, defaults));
     CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor));
     CHECK(ghostty_terminal_get(state->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen));
     CHECK(ghostty_render_state_get(state->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &state->rows));
@@ -663,11 +667,21 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
             if (bg_result != GHOSTTY_SUCCESS && bg_result != GHOSTTY_NO_VALUE) return bg_result;
             if (fg_result == GHOSTTY_NO_VALUE) { fg = default_fg; fg_result = default_fg_result; }
             if (bg_result == GHOSTTY_NO_VALUE) { bg = default_bg; bg_result = default_bg_result; }
+            GhosttyStyleColor fg_source = style.fg_color, bg_source = style.bg_color;
+            GhosttyCellContentTag content;
+            CHECK(ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CONTENT_TAG, &content));
+            if (content == GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE) {
+                bg_source.tag = GHOSTTY_STYLE_COLOR_PALETTE;
+                CHECK(ghostty_cell_get(raw, GHOSTTY_CELL_DATA_COLOR_PALETTE, &bg_source.value.palette));
+            } else if (content == GHOSTTY_CELL_CONTENT_BG_COLOR_RGB) {
+                bg_source.tag = GHOSTTY_STYLE_COLOR_RGB;
+            }
             if (reverse.value) {
                 /* PTK's unset FG/BG refer to distinct host defaults. Move each
                  * inherited channel to its host slot, then reverse the rendered
                  * pair. Explicit RGBs cancel this swap; SGR inverse composes by XOR. */
                 swap_colors(&fg, &fg_result, &bg, &bg_result);
+                GhosttyStyleColor tmp = fg_source; fg_source = bg_source; bg_source = tmp;
                 style.flags ^= GHOSTTY_STYLE_FLAG_INVERSE;
             }
             bool selected = false;
@@ -675,6 +689,17 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
             if (selected) style.flags ^= GHOSTTY_STYLE_FLAG_INVERSE;
             uint8_t colors = (fg_result == GHOSTTY_SUCCESS ? ISH_COLOR_FG : 0) |
                 (bg_result == GHOSTTY_SUCCESS ? ISH_COLOR_BG : 0);
+            uint8_t fg_index = 0, bg_index = 0;
+            if (fg_source.tag == GHOSTTY_STYLE_COLOR_PALETTE) {
+                fg_index = fg_source.value.palette;
+                if (!memcmp(&defaults[fg_index], &palette.palette[fg_index], sizeof(fg)))
+                    colors |= ISH_INDEX_FG;
+            }
+            if (bg_source.tag == GHOSTTY_STYLE_COLOR_PALETTE) {
+                bg_index = bg_source.value.palette;
+                if (!memcmp(&defaults[bg_index], &palette.palette[bg_index], sizeof(bg)))
+                    colors |= ISH_INDEX_BG;
+            }
             GhosttyBuffer text = {.ptr = state->grapheme.data, .cap = state->grapheme.cap};
             int result = ghostty_render_state_row_cells_get(state->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &text);
             if (result == GHOSTTY_OUT_OF_SPACE) {
@@ -691,7 +716,7 @@ int ish_vt_frame(Terminal *state, const uint8_t **out, size_t *len) {
             if (!text.len || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == ISH_KITTY_PLACEHOLDER) {
                 text.ptr = (uint8_t *)" "; text.len = 1;
             }
-            uint8_t metadata[9] = {(uint8_t)style.flags, (uint8_t)(style.flags >> 8), colors, fg.r, fg.g, fg.b, bg.r, bg.g, bg.b};
+            uint8_t metadata[] = {(uint8_t)style.flags, (uint8_t)(style.flags >> 8), colors, fg.r, fg.g, fg.b, bg.r, bg.g, bg.b, fg_index, bg_index};
             CHECK(append(buffer, metadata, sizeof(metadata))); CHECK(number(buffer, (uint32_t)text.len));
             CHECK(number(buffer, x)); CHECK(number(buffer, wide == GHOSTTY_CELL_WIDE_WIDE ? 2 : 1));
             GhosttyColorRgb underline = {0};

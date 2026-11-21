@@ -232,6 +232,30 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
                 self.owner.app.renderer.invalidate_screen()
                 self.assertIn(expected, self.render().split("Z", 1)[0])
 
+    async def test_truecolor_preserves_palette_identity_and_local_overrides(self):
+        """Identical RGBs in separate slots and literal colors retain their meaning."""
+        host = self.owner.host
+        palette = [None] * 256
+        palette[1] = palette[201] = (191, 97, 108)
+        appearance = replace(host.profile.appearance, palette=tuple(palette))
+        host.profile = replace(host.profile, appearance=appearance)
+        self.owner._appearance(appearance)
+        with patch.object(type(self.owner.app), "color_depth", ColorDepth.DEPTH_24_BIT):
+            for setup, sgr, expected in (
+                (b"", b"1;31;48;5;201", "\x1b[31;48;5;201m"),
+                (b"", b"38;5;201;41", "\x1b[38;5;201;41m"),
+                (b"", b"1;38;2;191;97;108", "38;2;191;97;108"),
+                (b"\x1b]4;1;#123456\x1b\\", b"31", "38;2;18;52;86"),
+                (b"\x1b]104;1\x1b\\", b"31", "\x1b[31m"),
+            ):
+                with self.subTest(sgr=sgr, setup=setup):
+                    self.owner.vt.feed(setup + b"\r\x1b[0;" + sgr + b"mZ\x1b[0m")
+                    self.owner.app.renderer.invalidate_screen()
+                    prefix = self.render().split("Z", 1)[0]
+                    self.assertIn(expected, prefix)
+                    if sgr.startswith(b"1;"):
+                        self.assertTrue(self.screen().buffer[0][0].bold)
+
     def screen(self):
         """Interpret emitted text with an independent VT implementation."""
         import pyte
