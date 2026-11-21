@@ -33,6 +33,7 @@ REQUIRED_CASES = {
     ),
     "MG01": (
         "test_management_ui.PublicManagementTests.test_help_is_categorized_readonly_and_does_not_execute_rc_or_plugins",
+        "test_management_ui.PublicManagementTests.test_icon_style_previews_and_help_reads_only_the_saved_selection",
         "test_management_ui.PublicManagementTests.test_settings_save_from_keyboard_changes_the_actual_file",
         "test_management_ui.PublicManagementTests.test_external_editor_uses_literal_argv_and_reload_recovers_invalid_rc",
         "test_management_ui.PublicManagementTests.test_editor_interrupt_leaves_no_child_and_restores_the_terminal",

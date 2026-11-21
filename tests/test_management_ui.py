@@ -1600,8 +1600,7 @@ class PublicManagementTests(ManagementFixture):
         help_ui = self.terminal("-h")
         help_ui.require(
             lambda: (
-                "\uf518 Help" in help_ui.screen.display[0]
-                and help_ui.frame_has("\ue0b0")
+                "󰋗 Help" in help_ui.screen.display[0] and help_ui.frame_has("\ue0b0")
             )
         )
         help_ui.resize(22, 100)

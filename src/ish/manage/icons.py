@@ -58,7 +58,7 @@ ICON_SETS = {
     ),
     "nerdfont": IconSet(
         label=Message.MANAGE_ICONS_NERD,
-        book="\uf518",
+        book="\U000f02d7",
         gear="\uf013",
         title_gap=" ",
         find="\uf002",
