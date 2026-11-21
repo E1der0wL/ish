@@ -9,7 +9,7 @@
 | MG01 | 카테고리 도움말·실제 설정 저장·외부 편집기·플러그인 비실행·기능 선택 | `test_management_ui` |
 | MG02 | 원본 보존·외부 수정 충돌·symlink·설정 객체 identity·비실행 메타데이터 | `test_management_store` |
 | MG03 | 관리 창의 시작 상태 복원·관측 중 입력 순서·편집기 handoff·지연 응답 거부 | `test_management_restore` |
-| FP01 | 질의가 있는 기능만 auto, 정책·관찰·사용 분리, identity 없는 선택, resize 후 off 보존, geometry·초기 색 복원 필수 조건, 실제 PTK의 형식 on/off 및 커서 정리 | `test_terminal_features.FeaturePolicyTests`, `test_terminal_composition.FormattingPolicyTests` |
+| FP01 | 질의가 있는 기능만 auto, 정책·관찰·사용 분리, identity 없는 선택, resize 후 off 보존, geometry·초기 색 복원 필수 조건, 실제 PTK의 서식 on/off 및 커서 정리. 같은 서식의 연속 문자, 굵기 변경·줄 이동 후의 링크와 밑줄 복원을 수신 화면에서 확인 | `test_terminal_features.FeaturePolicyTests`, `test_terminal_composition.FormattingPolicyTests`, `TerminalCompositionTests` |
 | IO01 | 3셸 × 기본형/플러그인의 native 셸·프로그램 입력 | `test_terminal_hookless.HooklessTests`의 6개 조합 |
 | IO02 | 호스트 backpressure 중 마지막 출력 보존, 3셸의 1,280행·팝업 4회·resize 8회 뒤 전체 history 비교 | `test_terminal_session.TerminalSessionTests`, `test_terminal_supplements.SustainedOutputTests` |
 | IO03 | 종료 후 열린 slave가 있어도 보류된 출력 전달, PTY 시작 실패·즉시 종료 때 자원 회수 | `test_terminal_session.TerminalSessionTests` |

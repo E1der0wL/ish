@@ -301,10 +301,36 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("https://old.example/", wire)
         self.assertGreater(wire.rfind("\x1b]8;;\x1b\\"), wire.index("X"))
 
+    async def test_contiguous_text_shares_format_until_ptk_resets_it(self):
+        """Keep adjacent glyphs together and restore decorations after SGR changes."""
+        from ish.terminal.vt import Terminal
+
+        self.rich_host()
+        link = "\x1b]8;;https://example.test/run\x1b\\"
+        close_link = "\x1b]8;;\x1b\\"
+        data = f"\x1b[4:3;53m{link}A한B\x1b[1mCDE\r\nFGH{close_link}\x1b[0mJKL"
+        self.owner.vt.feed(data.encode())
+        wire = self.render()
+        for run in ("A한B", "CDE", "FGH", "JKL"):
+            self.assertIn(run, wire)
+        # Read the emitted stream as a receiving terminal, including PTK's
+        # attribute reset when switching to bold or moving to the second row.
+        with Terminal(12, 6, lambda _: None) as host:
+            host.feed(self.stream.getvalue().encode())
+            first, second = host.frame().cells[:2]
+            for cell in (*first[:6], *second[:3]):
+                self.assertEqual(cell.hyperlink, "https://example.test/run")
+                self.assertEqual(cell.underline, 3)
+                self.assertTrue(cell.overline)
+            for cell in second[3:6]:
+                self.assertIsNone(cell.hyperlink)
+                self.assertEqual(cell.underline, 0)
+                self.assertFalse(cell.overline)
+
     async def test_widget_underline_replaces_native_curly_underline(self):
         """PTK's ordinary underline is explicit after a native curly cell."""
         self.rich_host()
-        self.owner.vt.feed(b"\x1b[4:3mN\x1b[0m")
+        self.owner.vt.feed(b"\x1b[4:3mNN\x1b[0m")
         popup = self.owner.plugins.show_popup(
             Window(FormattedTextControl([("underline", "P")], focusable=True)),
             left=1,
@@ -316,6 +342,7 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(wire, re.escape("\x1b[4:3mN"))
         self.assertRegex(wire, re.escape("\x1b[4:1mP"))
         self.owner.plugins.close_popup(popup)
+        self.assertIn("\x1b[4:3mN", self.render())
 
     async def test_popup_input_focus_results_and_stale_completion(self):
         """Real pipe keystrokes reach only the focused live popup or native queue."""

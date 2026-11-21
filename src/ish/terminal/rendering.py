@@ -259,6 +259,7 @@ class TransactionOutput:
         self.output = output
         self.active = False
         self.pending = None
+        self._applied_format = None
         self._palette = None
         self._depth = None
         self._indices = {}
@@ -321,6 +322,7 @@ class TransactionOutput:
 
     def set_attributes(self, attrs, color_depth):
         """Use the observed host palette for indexed colors, retaining PTK styling."""
+        self._applied_format = None
         fg = self._color_index(attrs.color)
         bg = self._color_index(attrs.bgcolor)
         if fg is None and bg is None:
@@ -352,17 +354,26 @@ class TransactionOutput:
             colors.append(self._indexed_sgr(bg, True))
         self.output.write_raw("\x1b[" + ";".join(colors) + "m")
 
+    def reset_attributes(self):
+        """PTK can reset SGR between cells, including when moving to another row."""
+        self._applied_format = None
+        self.output.reset_attributes()
+
     def write_raw(self, data):
         """Delay cell metadata until PTK's attribute change has completed."""
         if isinstance(data, CellEscape):
             self.pending = data
         else:
+            self._applied_format = None
             self.output.write_raw(data)
 
     def write(self, data):
         """Apply metadata immediately before the corresponding visible text."""
-        if self.pending is not None:
-            self.output.write_raw(str(self.pending))
+        pending = self.pending
+        if pending is not None:
+            if pending != self._applied_format:
+                self.output.write_raw(str(pending))
+                self._applied_format = pending
             self.pending = None
         self.output.write(data)
 
@@ -370,6 +381,12 @@ class TransactionOutput:
         """Suppress intermediate PTK flushes inside a presentation."""
         if not self.active:
             self.output.flush()
+
+    def finish(self):
+        """Forget screen-local formatting even if a frame was interrupted."""
+        self.pending = self._applied_format = None
+        self.active = False
+        self.output.flush()
 
 
 class Composition(Container):
@@ -728,9 +745,7 @@ class TerminalRenderer(RestoringRenderer):
         finally:
             if synchronized:
                 self.output.write_raw(self.SYNC_END)
-            self.transaction.pending = None
-            self.transaction.active = False
-            self.transaction.output.flush()
+            self.transaction.finish()
             self._trim_styles()
 
     def _trim_styles(self):

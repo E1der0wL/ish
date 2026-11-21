@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from wcwidth import iter_graphemes
 
@@ -91,8 +92,7 @@ SPECIAL_KEYS = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class Cell:
+class Cell(NamedTuple):
     """One native grapheme at an exact grid position; wide tails are omitted."""
 
     x: int

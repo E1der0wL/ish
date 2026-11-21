@@ -126,6 +126,11 @@ CASE_CONTRACTS = (
     ),
     (
         "FP01",
+        "test_terminal_composition.TerminalCompositionTests",
+        ("test_contiguous_text_shares_format_until_ptk_resets_it",),
+    ),
+    (
+        "FP01",
         "test_terminal_composition.FormattingPolicyTests",
         (
             "test_default_formats_reach_native_cells_without_host_identity",

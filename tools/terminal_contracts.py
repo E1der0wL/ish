@@ -49,6 +49,7 @@ REQUIRED_CASES = {
         "test_management_store.DiscoveryTests.test_metadata_listing_is_inert_and_does_not_claim_dependency_readiness",
     ),
     "FP01": (
+        "test_terminal_composition.TerminalCompositionTests.test_contiguous_text_shares_format_until_ptk_resets_it",
         "test_terminal_features.FeaturePolicyTests.test_auto_is_rejected_without_an_implemented_support_query",
         "test_terminal_features.FeaturePolicyTests.test_on_and_off_do_not_rewrite_observed_support",
         "test_terminal_features.FeaturePolicyTests.test_auto_uses_anonymous_replies_and_never_a_version_name",
