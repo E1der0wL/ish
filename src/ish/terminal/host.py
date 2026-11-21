@@ -23,13 +23,14 @@ from urllib.parse import quote
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyPress
-from prompt_toolkit.keys import Keys
+from prompt_toolkit.keys import KEY_ALIASES, Keys
 
 from ish.lang import Message, i18n
 
 from .features import FEATURES, FeatureState, observation, resolve
 from .features import validate as validate_features
 from .hosts import UNKNOWN, HostAdapter, identify_host
+from .identity import CONTROL_TEXT, NAMED_TEXT
 from .mouse import decode_mouse
 from .vt import ALT, CTRL, SHIFT
 
@@ -164,17 +165,6 @@ NAMED_KEYS = {
     "end": Keys.End,
     **{f"f{number}": Keys(f"f{number}") for number in range(1, 25)},
 }
-NAMED_TEXT = {"escape": ESC, "enter": "\r", "tab": "\t", "backspace": "\x7f"}
-CONTROL_TEXT = {
-    " ": "\x00",
-    "@": "\x00",
-    "[": ESC,
-    "\\": "\x1c",
-    "]": "\x1d",
-    "^": "\x1e",
-    "_": "\x1f",
-    "?": "\x7f",
-}
 CONTROL_KEYS = {
     " ": Keys.ControlAt,
     "@": Keys.ControlAt,
@@ -304,6 +294,38 @@ class StructuredKey:
     # Capture the source contract at receipt. A later host negotiation cannot
     # turn a queued conventional keystroke into a physical press/release pair.
     release_events: bool = False
+
+    @property
+    def input_text(self):
+        """Keep the produced text separate from the unshifted key identity."""
+        if len(self.key) != 1:
+            return None
+        if self.text is not None:
+            return self.text
+        if self.modifiers & SHIFT:
+            if self.shifted and chr(self.shifted).isprintable():
+                return chr(self.shifted)
+            if "a" <= self.key <= "z":
+                return self.key.upper()
+        return self.key
+
+    def matches_shortcut(self, binding):
+        """Test a PTK single-key binding against the whole observed stroke."""
+        if self.action == "release":
+            return False
+        if binding == Keys.Any:
+            return True
+        if self.modifiers & ALT:
+            # PTK exposes Alt as two widget keys; neither alone owns the stroke.
+            return False
+        if self.modifiers in (0, SHIFT) and len(self.key) == 1:
+            return self.input_text == binding
+        ctrl = bool(self.modifiers & CTRL)
+        name = "@" if ctrl and self.key == " " else self.key
+        stroke = (
+            ("c-" if ctrl else "") + ("s-" if self.modifiers & SHIFT else "") + name
+        )
+        return KEY_ALIASES.get(stroke, stroke) == KEY_ALIASES.get(binding, binding)
 
 
 class KeyMappings:
@@ -580,11 +602,7 @@ def _legacy_keys(event: StructuredKey) -> list[KeyPress]:
         except ValueError:
             return [KeyPress(Keys.Ignore, "")]
         return prefix + [KeyPress(key, text)]
-    text = event.text
-    if text is None:
-        text = chr(event.shifted) if modifiers & SHIFT and event.shifted else name
-        if modifiers & SHIFT and "a" <= text <= "z":
-            text = text.upper()
+    text = event.input_text if len(event.key) == 1 else name
     return prefix + [KeyPress(character, character) for character in text]
 
 

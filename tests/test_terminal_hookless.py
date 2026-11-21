@@ -26,6 +26,67 @@ def setup(api):
 class HooklessTests(unittest.TestCase):
     """A plugin never requires the native editor to surrender its command buffer."""
 
+    def test_unbound_keys_follow_foreground_keyboard_mode(self):
+        """One host stroke submits in Bash or reaches raw stdin in its requested format."""
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="ish-keys-")))
+        terminal = HooklessTerminal(root, shell="bash", plugins=False)
+        self.addCleanup(terminal.close)
+        terminal.require(lambda: b"\x1b[?u" in terminal.output, STARTUP_DEADLINE)
+        terminal.send(b"\x1b[?0u")
+        terminal.require(terminal.at_prompt, STARTUP_DEADLINE)
+        self.assertEqual(terminal.escape_key, b"\x1b[27u")
+        press = b"\x1b[13;2u"
+        release = b"\x1b[13;2:3u"
+        terminal.send(b"printf ok > submitted" + press + release)
+        terminal.result("submitted", b"ok")
+        terminal.require(terminal.at_prompt)
+
+        repeat = b"\x1b[13;2:2u"
+        pages = b"\x1b[5;2~\x1b[6;2~"
+        raw = b"\r\r"
+        xterm = b"\x1b[27;2;13~" * 2
+        cases = (
+            (
+                b"",
+                pages + b"\x1b[9;2u\x1b[97;4u\x1b[91;5u",
+                raw + pages + b"\x1b[Z\x1bA\x1b",
+            ),
+            (b"\x1b[>4;1m", b"", xterm),
+            (b"\x1b[>4;2m", b"", xterm),
+            (
+                b"\x1b[>11u",
+                b"\r\t\x03",
+                press + repeat + release + b"\x1b[13u\x1b[9u\x1b[99;5u",
+            ),
+            (b"\x1b[<u", b"", xterm),
+            (b"\x1b[>4;0m", b"", raw),
+            (b"\x1b[?1049h", pages, raw + pages),
+            (b"\x1b[?1049l", b"", raw),
+            (b"\x1b[>4;2m\x1b[!p", b"", raw),
+            (b"\x1b[>4;2m\x1b[>4n", b"", raw),
+            (b"\x1b[>4;1m\x1bc", b"", raw),
+        )
+        (root / "capture.py").write_text(
+            "import os, tty\nfrom pathlib import Path\ntty.setraw(0)\n"
+            f"for i, mode in enumerate({[mode for mode, _, _ in cases]!r}):\n"
+            " os.write(1, mode + f'\\r\\nKEY_STAGE_{i}\\r\\n'.encode())\n"
+            " data = b''\n"
+            " while not data.endswith(b'|done|'): data += os.read(0, 1024)\n"
+            " Path(f'key-{i}').write_bytes(data)\n"
+        )
+        terminal.submit(f"{shlex.quote(sys.executable)} capture.py")
+        for i, (mode, extra, expected) in enumerate(cases):
+            with self.subTest(mode=mode):
+                terminal.require(
+                    lambda marker=f"KEY_STAGE_{i}": terminal.frame_has(marker)
+                )
+                terminal.send(
+                    press + repeat + release + extra + b"\x1b[200~|done|\x1b[201~"
+                )
+                terminal.result(f"key-{i}", expected + b"|done|")
+        terminal.require(terminal.at_prompt)
+        terminal.finish()
+
     def test_negotiated_escape_closes_popup_and_preserves_continuation(self):
         """The host's keyboard-mode push changes a scripted Esc press on the wire."""
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="ish-esc-")))

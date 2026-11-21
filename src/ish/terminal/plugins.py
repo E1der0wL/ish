@@ -194,6 +194,12 @@ class Plugins:
         self.owner.vt.scroll_prompts(delta)
         self.owner.app.invalidate()
 
+    def scroll_pages(self, pages):
+        """Move the native history viewport by pages with one line of overlap."""
+        if self._closed:
+            raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
+        self.owner.scroll(pages * max(1, self.owner.size[1] - 1))
+
     def select_output(self, x, y):
         """Select marked native output at a viewport cell, if available."""
         if self._closed:
@@ -276,17 +282,36 @@ class Plugins:
         self.owner.app.invalidate()
         return index
 
-    def bind(self, *keys):
+    def bind(self, *keys, primary_only=False):
         """Register an explicit plugin shortcut, enabled only while loaded."""
         if self._closed:
             raise RuntimeError(i18n.get(Message.VT_PLUGIN_CLOSED))
         if len(keys) != 1:
             raise ValueError(i18n.get(Message.VT_PLUGIN_KEY))
-        register = self.bindings.add(*keys, eager=True)
+        enabled = (
+            Condition(
+                lambda: (
+                    self.owner.app.layout.has_focus(self.owner.window)
+                    and not self.owner.vt.alternate
+                )
+            )
+            if primary_only
+            else True
+        )
+        register = self.bindings.add(*keys, eager=True, filter=enabled)
 
         def decorate(handler):
             @wraps(handler)
             def guarded(event):
+                press = event.key_sequence[-1]
+                stroke = getattr(press, "structured_key", None)
+                if (
+                    stroke is not None
+                    and self.owner.app.layout.has_focus(self.owner.window)
+                    and not stroke.matches_shortcut(keys[0])
+                ):
+                    self.owner.control.forward_key(event)
+                    return
                 scope = _TaskScope(self.popups[-1] if self.popups else None)
                 token = self._scope.set(scope)
                 try:

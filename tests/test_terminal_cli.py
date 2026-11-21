@@ -643,6 +643,12 @@ class TerminalWaitTests(unittest.TestCase):
             terminal.require(lambda: False, timeout=0)
 
 
+def with_history_keys(test):
+    """Select the optional page bindings only for tests that browse history."""
+    test.history_keys = True
+    return test
+
+
 @unittest.skipUnless(TCSH, "tcsh is required")
 class TerminalCLIFixture(unittest.TestCase):
     """Reuse a real CLI session without changing the default capture policy."""
@@ -653,7 +659,15 @@ class TerminalCLIFixture(unittest.TestCase):
         """Start an isolated shell occupying the entire outer terminal."""
         directory = self.enterContext(tempfile.TemporaryDirectory(prefix="ish-cli-"))
         self.root = Path(directory)
-        self.terminal = Terminal(self.root, extra_args=self.terminal_args)
+        args = self.terminal_args
+        if getattr(getattr(self, self._testMethodName), "history_keys", False):
+            args += (
+                "--plugin-dir",
+                str(ROOT / "examples/terminal_plugins"),
+                "--plugin",
+                "terminal_history",
+            )
+        self.terminal = Terminal(self.root, extra_args=args)
         self.addCleanup(self.terminal.close)
         self.terminal.require(self.terminal.at_prompt, STARTUP_DEADLINE)
         self.require_full_screen()
@@ -845,6 +859,7 @@ class TerminalCLITests(TerminalCLIFixture):
         terminal.submit("stty size > returned-size")
         terminal.result("returned-size", b"33 110\n")
 
+    @with_history_keys
     def test_scrolled_output_keeps_anchor_until_native_input_and_resize(self):
         """New output preserves historical cells; typing returns to current stdin."""
         terminal = self.terminal
@@ -897,6 +912,7 @@ class TerminalCLITests(TerminalCLIFixture):
         terminal.require(terminal.at_prompt)
         self.require_full_screen()
 
+    @with_history_keys
     def test_native_mouse_modes_receive_only_the_requested_wire_events(self):
         """A raw consumer records exact SGR and legacy coordinates and filtering."""
         terminal = self.terminal
@@ -979,6 +995,7 @@ class TerminalCLITests(TerminalCLIFixture):
         self.require_full_screen()
 
     @unittest.skipUnless(shutil.which("vim"), "vim is required")
+    @with_history_keys
     def test_vim_mouse_changes_cursor_and_keeps_primary_history_separate(self):
         """Real Vim consumes mouse events while alternate output stays out of history."""
         terminal = self.terminal
@@ -1068,6 +1085,7 @@ class LocalMouseCLITests(TerminalCLIFixture):
 
     terminal_args = ("--mouse", "on")
 
+    @with_history_keys
     def test_shell_history_navigation_and_paste_return_to_live_input(self):
         """History keys and wheels scroll output; pasted text edits the live shell."""
         terminal = self.terminal

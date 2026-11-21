@@ -7,6 +7,7 @@ another implementation. Host output support is a separate presentation fact.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -100,6 +101,10 @@ class InputPipeline:
         b"1337;FileEnd",
     )
     KITTY_IMAGE = b"G"
+    # libghostty's legacy default encodes some modified controls even before an
+    # application opts in. Its public keyboard flags cover Kitty negotiation only.
+    MODIFY_OTHER_KEYS = re.compile(rb">0*4(?:;0*([012])?)?m")
+    RESET_OTHER_KEYS = re.compile(rb">(?:0*4n|m)")
 
     def __init__(self, terminal: Terminal, engine: EngineInfo, *, reply=None):
         """Select image ownership once, independently of host negotiations."""
@@ -132,6 +137,7 @@ class InputPipeline:
         self._notifications = None
         self._before_notification = None
         self._started = False
+        self.modified_keys_requested = False
         self._closed = False
         self._cancelled_image_record = None
         self._stream = ProtocolStream(
@@ -285,6 +291,15 @@ class InputPipeline:
                 return True
         if cancelled_image and self._is_image(control):
             return True
+        if control.kind == "csi":
+            if control.body.startswith(b">"):
+                setting = self.MODIFY_OTHER_KEYS.fullmatch(control.body)
+                if setting:
+                    self.modified_keys_requested = setting[1] in (b"1", b"2")
+                elif self.RESET_OTHER_KEYS.fullmatch(control.body):
+                    self.modified_keys_requested = False
+            elif control.body == b"!p":
+                self.modified_keys_requested = False
         if (
             self._notifications is not None
             and control.kind == "osc"
@@ -294,6 +309,7 @@ class InputPipeline:
             self._before_notification()
             return self._notifications.handle(control)
         if control.kind == "esc" and control.body == b"c":
+            self.modified_keys_requested = False
             self._protocols.cancel()
             if self._sixel is not None:
                 self._sixel.reset()

@@ -55,7 +55,7 @@ python3.12 -m venv .venv
 | Tab | native 셸에 전달한다. 셸의 기존 키 설정과 completion 동작을 사용한다. |
 | F2 / F10 / Esc | 다른 키와 마찬가지로 셸이나 foreground 프로그램에 전달한다. ish UI 단축키로 예약하지 않는다. |
 | 휠 | 일반 화면에서는 이전/다음 출력 3줄을 탐색한다. live 화면에서 프로그램이 마우스를 요청했다면 그 프로그램으로 보낸다. |
-| Shift+PageUp / Shift+PageDown | primary 화면의 출력을 화면 높이에서 한 줄을 뺀 만큼 탐색한다. alternate 화면에서는 프로그램에 원래 키를 전달한다. |
+| Shift+PageUp / Shift+PageDown (선택형 `terminal_history`) | primary 화면의 출력을 화면 높이에서 한 줄을 뺀 만큼 탐색한다. alternate 화면에서는 프로그램에 원래 키를 전달한다. |
 | 왼쪽 드래그 | 프로그램이 마우스를 요청하지 않았거나 과거 출력을 보고 있다면 텍스트를 선택한다. 놓으면 clipboard와 PRIMARY 복사를 요청한다. |
 | 더블 / 트리플 클릭 | 로컬 선택 경로에서 native 단어 / 줄 선택을 사용한다. |
 | Alt+드래그 | 로컬 선택 경로에서 사각형 영역을 선택한다. 선택 방식은 press 시 결정한다. |

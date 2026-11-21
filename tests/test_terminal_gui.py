@@ -5,6 +5,7 @@ import os
 import secrets
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -140,6 +141,12 @@ class TerminalGuiTests(unittest.TestCase):
         ]
         if self._testMethodName != "test_base_has_no_plugin_ui_or_reserved_keys":
             command += plugin_options(self.directory)
+        if self._testMethodName == "test_native_shell_and_image_popup_composition":
+            shutil.copytree(
+                ROOT / "examples/terminal_plugins/terminal_history",
+                self.directory / "plugins/terminal_history",
+            )
+            command += ["--plugin", "terminal_history"]
         self.process = subprocess.Popen(
             command,
             env=self.env,

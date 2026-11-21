@@ -38,7 +38,7 @@
 
 키보드 전용 팝업은 auto 캡처를 켜지 않는다. tracking과 1016 좌표 형식은 별도로 관리한다. 모드 전환·popup·reset·resize에서 이전 gesture와 native 누름 상태를 정리하며, 캡처를 끈 뒤 도착한 보고를 일반 입력으로 실행하지 않는다. `off`는 플러그인과 프로그램 요청보다 우선한다.
 
-호스트 드래그는 현재 보이는 셀을 선택한다. libghostty 내부에만 있는 history, 팝업 뒤 글자까지 호스트가 선택하는 기능은 아니다. 내부 history는 Shift+PageUp/Down으로 이동할 수 있다.
+호스트 드래그는 현재 보이는 셀을 선택한다. libghostty 내부에만 있는 history, 팝업 뒤 글자까지 호스트가 선택하는 기능은 아니다. 선택형 `terminal_history` 플러그인은 기본 화면에서 Shift+PageUp/Down으로 내부 history를 이동한다.
 
 ## 기본 명세와 이번 변경
 

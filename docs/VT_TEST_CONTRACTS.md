@@ -32,7 +32,7 @@
 | VT13 | DEC 선그리기와 charset/reset 결과 | `test_terminal_contracts.BaselineContracts` |
 | VT14 | synchronized hold 안팎의 색상 경계 | `test_terminal_native_features.NativeFeaturesTests` |
 | VT15 | 화면 전환/reset 후 오래된 선택 anchor 거부 | `test_terminal_vt.TerminalVTTests` |
-| IN01 | PTK Esc·Alt·방향키, 확장 키 모드에서 팝업을 닫은 뒤 continuation 입력 전달, native C0·Enter·paste | `test_terminal_host.HostProbeTests`, `test_terminal_hookless.HooklessTests`, `test_terminal_vt.TerminalVTTests` |
+| IN01 | PTK Esc·Alt·방향키, 팝업 종료 후 continuation 입력, native C0·Enter·paste. Bash의 Shift+Enter 제출과 프로그램의 일반·xterm·Kitty 모드별 PTY 수신 바이트, 모드 복귀와 기본 화면·대체 화면의 미예약 페이지 키 | `test_terminal_host.HostProbeTests`, `test_terminal_hookless.HooklessTests`, `test_terminal_vt.TerminalVTTests` |
 | IN02 | terminfo 기능키·수정 navigation·keypad, separator의 mode/action, 3셸의 실제 PTK→PTY 최종 입력 파일 | `test_terminal_contracts.TerminfoContracts`, `LiveQueryContracts` |
 | IN04 | 실제 입력 reader에서 paste를 하나의 이벤트로 보존 | `test_terminal_host.HostInputTests` |
 | IN06 | 호스트 focus가 없는 동안 popup close가 focus-in을 만들지 않음 | `test_terminal_composition.TerminalCompositionTests` |

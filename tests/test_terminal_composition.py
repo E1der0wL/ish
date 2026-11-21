@@ -897,10 +897,11 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         await self.check_alt_key_popup_close(plugin_binding=False)
 
     async def check_alt_key_popup_open(self, *, mixed_prefix):
-        """A consumed fallback cannot become input in a newly opened editor."""
+        """A widget's consumed fallback cannot become input in a nested editor."""
         self.rich_host()
         await self.start_input()
         self.owner.app.renderer.enter_input_modes()
+        parent = self.owner.plugins.show_popup(TextArea(), width=8, height=2)
         editor = TextArea(multiline=False)
         popup = None
         combined_matches = []
@@ -947,6 +948,7 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.owner.app.layout.current_control, editor.control)
         self.assertIsNotNone(popup)
         self.owner.plugins.close_popup(popup)
+        self.owner.plugins.close_popup(parent)
 
     async def test_plugin_escape_open_consumes_alt_remainder_before_popup_input(self):
         """Opening a popup on Alt's Escape keeps X out while accepting separate Y."""

@@ -34,6 +34,7 @@ from ish.runtime.settings import ESCAPE_DELAY, INTERACTIVE_ARGS, validate_escape
 from . import diagnostics
 from .clipboard import ClipboardBroker
 from .host import HostBroker, HostInput, directory_uri
+from .identity import NAMED_TEXT
 from .mouse import DEFAULT_MOUSE, decode_mouse, validate_mouse_policy
 from .notifications import Notifications
 from .plugins import Plugins
@@ -121,21 +122,20 @@ class TerminalControl(UIControl):
         )
     )
     MODIFIERS = {"c": CTRL, "s": SHIFT, "a": ALT}
+    TEXT_KEYS = {text: name for name, text in NAMED_TEXT.items()}
 
     def __init__(self, owner: TerminalApp):
         """Bind terminal input without reserving application shortcut keys."""
         self.owner = owner
         self.frame = None
         self.bindings = KeyBindings()
-        self.bindings.add(Keys.Any, eager=True)(self._key)
+        self.bindings.add(Keys.Any, eager=True)(self.forward_key)
         for key in Keys:
             if key not in self.SKIP_KEYS:
-                self.bindings.add(key, eager=True)(self._key)
+                self.bindings.add(key, eager=True)(self.forward_key)
         self.bindings.add(Keys.BracketedPaste, eager=True)(self._paste)
         self.bindings.add(Keys.Vt100MouseEvent, eager=True)(self._mouse)
-        self.bindings.add(Keys.Ignore, eager=True)(self._key)
-        self.bindings.add("s-pageup", eager=True)(self._page)
-        self.bindings.add("s-pagedown", eager=True)(self._page)
+        self.bindings.add(Keys.Ignore, eager=True)(self.forward_key)
         self._widget_mouse = (
             load_mouse_bindings()
             .get_bindings_for_keys((Keys.Vt100MouseEvent,))[0]
@@ -193,18 +193,7 @@ class TerminalControl(UIControl):
         # Scroll/selection changes invalidate explicitly. Hover must not redraw.
         return NotImplemented
 
-    def _page(self, event):
-        """Browse primary history; alternate-screen programs retain these keys."""
-        try:
-            if self.owner.vt.alternate:
-                self._key(event)
-            else:
-                direction = -1 if event.key_sequence[-1].key == Keys.ShiftPageUp else 1
-                self.owner.scroll(direction * max(1, self.owner.size[1] - 1))
-        except Exception as exc:
-            self.owner._failed(exc)
-
-    def _key(self, event):
+    def forward_key(self, event):
         """Forward control/text bytes and encode special keys for the child modes."""
         try:
             if self.owner.stopping:
@@ -232,9 +221,12 @@ class TerminalControl(UIControl):
                 modifiers |= self.MODIFIERS.get(part, 0)
             return self.owner.vt.encode_key(base, modifiers)
         if len(event.data) == 1:
-            # C0 bytes retain Ctrl+C/D and CR/LF semantics. Printable keys use
-            # the child's encoder. Multi-character input is already committed
-            # text (or an unsupported outer key sequence), never a key name.
+            # A conventional host cannot distinguish Tab from Ctrl+I, or Enter
+            # from Ctrl+M. Use their conventional editing-key identities.
+            if event.data in self.TEXT_KEYS:
+                return self.owner.vt.encode_key(self.TEXT_KEYS[event.data])
+            if parts[:-1] == ["c"] and len(base) == 1 and "a" <= base <= "z":
+                return self.owner.vt.encode_key(base, CTRL)
             return self.owner.vt.encode_key(event.data)
         return event.data.encode("utf-8")
 
@@ -486,7 +478,9 @@ class TerminalApp:
         ):
             return True
         self.live()
-        data = self.vt.encode_key(key.key, key.modifiers, action=key.action)
+        data = self.vt.encode_key(
+            key.key, key.modifiers, action=key.action, input_text=key.input_text
+        )
         self.session.send(data)
         if key.action == "release":
             self.pressed_keys.pop(key.codepoint, None)
@@ -501,7 +495,9 @@ class TerminalApp:
         """Finish delivered physical key events before changing their consumer."""
         for key in self.pressed_keys.values():
             self.session.send(
-                self.vt.encode_key(key.key, key.modifiers, action="release")
+                self.vt.encode_key(
+                    key.key, key.modifiers, action="release", input_text=key.input_text
+                )
             )
         self.pressed_keys.clear()
 

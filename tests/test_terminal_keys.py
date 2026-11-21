@@ -285,6 +285,26 @@ class KeyMappingPTYTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.owner.pressed_keys, {})
             self.assertEqual(self.owner.plugins.popups, [])
 
+    async def test_terminal_shortcuts_do_not_claim_partial_modified_keys(self):
+        """Enter/Escape bindings consume exact presses; modified input goes to stdin."""
+        composition.TerminalCompositionTests.rich_host(self)
+        handled = []
+        for binding in ("enter", "escape"):
+            self.owner.plugins.bind(binding)(
+                lambda event, name=binding: handled.append(name)
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.owner.session.argv = [sys.executable, "-c", READER, str(root)]
+            await self.start_input()
+            self.owner.app.renderer.enter_input_modes()
+            self.owner.session.start(*self.owner.size)
+            await self.wait_for(lambda: (root / "ready").exists())
+            self.pipe.send_text("\x1b[13;2u\x1b[120;3u\x1b[27u\r|done|")
+            await self.wait_for(lambda: (root / "finished").exists())
+            self.assertEqual((root / "received").read_bytes(), b"\r\x1bx|done|")
+            self.assertEqual(handled, ["escape", "enter"])
+
     async def test_unknown_responses_never_leak_to_stdin_and_paste_keeps_native_policy(
         self,
     ):

@@ -24,7 +24,7 @@ from ish.lang import Message, i18n
 from ish.runtime.distribution import bundled_vt_library
 
 from .engine import EngineError, check_library
-from .identity import IDENTITY, TERM, key_bytes
+from .identity import IDENTITY, LEGACY_F3, TERM, legacy_control
 from .inputs import InputPipeline
 
 SHIFT = 1
@@ -1216,7 +1216,12 @@ class Terminal:
         return flags.value
 
     def encode_key(
-        self, key: str, modifiers: int = 0, *, action: str = "press"
+        self,
+        key: str,
+        modifiers: int = 0,
+        *,
+        action: str = "press",
+        input_text: str | None = None,
     ) -> bytes:
         """Encode a named key or text with the terminal's current input modes.
 
@@ -1230,7 +1235,9 @@ class Terminal:
         native_action = self.KEY_ACTIONS[action]
         if modifiers & ~(SHIFT | CTRL | ALT):
             raise ValueError(i18n.get(Message.VT_KEY_MODIFIERS))
-        text = key.encode("utf-8")
+        text = (input_text if input_text is not None and len(key) == 1 else key).encode(
+            "utf-8"
+        )
         if len(text) > MAX_BUFFER:
             raise ValueError(i18n.get(Message.VT_INPUT_LIMIT))
         if key in SPECIAL_KEYS:
@@ -1238,20 +1245,33 @@ class Terminal:
                 "ish_vt_key", text, b"", 0, 0, modifiers, native_action
             )
             if key == "f3" and self.keyboard_flags == 0:
-                return key_bytes(key, encoded)
-            return encoded
-        if len(key) != 1:
+                return LEGACY_F3.get(encoded, encoded)
+        elif len(key) != 1:
             if modifiers or action != "press":
                 raise ValueError(i18n.get(Message.VT_KEY_COUNT))
             return text
-        point = ord(key)
-        if point < 32 or point == 127:
-            if action == "release":
-                return b""
-            return (b"\x1b" if modifiers & ALT else b"") + text
-        return self._bytes(
-            "ish_vt_key", b"", text, len(text), point, modifiers, native_action
-        )
+        else:
+            point = ord(key)
+            if point < 32 or point == 127:
+                if action == "release":
+                    return b""
+                return (b"\x1b" if modifiers & ALT else b"") + text
+            encoded = self._bytes(
+                "ish_vt_key", b"", text, len(text), point, modifiers, native_action
+            )
+        if (
+            modifiers
+            and (
+                encoded.startswith(b"\x1b[27;")
+                and encoded.endswith(b"~")
+                or encoded.startswith(b"\x1b[")
+                and encoded.endswith(b"u")
+            )
+            and not self._inputs.modified_keys_requested
+            and not self.keyboard_flags
+        ):
+            return legacy_control(key, alt=modifiers & ALT, ctrl=modifiers & CTRL)
+        return encoded
 
     def encode_paste(self, text: str | bytes) -> bytes:
         """Encode an explicit user paste, honoring native bracketed-paste mode."""

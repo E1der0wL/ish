@@ -139,6 +139,7 @@ ish --plugin-dir examples/terminal_plugins --plugin clipboard_system --clipboard
 - `terminal_bar`: 하단 한 줄
 - `terminal_popup`: F2 팝업
 - `terminal_search`: Ctrl+F 스크롤백 검색
+- `terminal_history`: 기본 화면에서 Shift+PgUp·Shift+PgDn으로 이전 출력 탐색. 선택하지 않으면 두 키는 프로그램에 전달됩니다.
 - `clipboard_system`: Windows/WSL 또는 X11 클립보드 연결, 추가 UI 없음
 
 선택한 플러그인의 전용 키는 Vim 등 실행 중 프로그램에서도 소비될 수 있습니다. `--no-plugins`는 이번 세션에서 모두 끄고, 반복한 `--plugin NAME`은 이번 세션의 목록을 지정합니다. 플러그인은 사용자의 권한으로 실행되는 Python 코드이며, 실제 로드 때 선언한 의존성을 설치할 수 있습니다.
