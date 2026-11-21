@@ -1,6 +1,6 @@
 # ish-vt 기본 계약 보강과 검증
 
-> 통합 전 검증 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 검사기·`ish-vt` 명령은 제거됐다. 현재 실행·검증 방법은 [사용 안내](VT_USAGE.md)와 [개발 안내](DEVELOPMENT.md)를 참고한다.
+> 통합 전 검증 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 검사기·`ish-vt` 명령은 제거됐다. 현재 실행·검증 방법은 [사용 안내](../VT_USAGE.md)와 [개발 안내](../DEVELOPMENT.md)를 참고한다.
 
 후속 입력·클립보드·보완 모듈 및 terminfo 전수 분류는 [최신 보강 결과](VT_SUPPLEMENTS_RESULT.md)를 참고한다. 아래 수치와 미검증 판정은 이 문서 작성 당시의 기록이다.
 
@@ -14,7 +14,7 @@ PTK의 첫 화면 변경 전에 호스트의 변경 대상 모드·커서·SGR�
 
 원점 모드는 대체 화면에서 나가기 전에 복원하여 원래 화면의 커서 위치를 다시 이동시키지 않는다. PTK 정리 후 마우스·focus·paste·wrap 등 확인한 상태를 복원하며, 반복 reset은 복원된 상태를 다시 덮지 않는다. SIGTSTP는 PTK handoff로 화면과 시작 termios를 복원한 뒤 프로세스를 중지한다. SIGCONT 후 동일 native 셸과 PTY를 재사용하고 새 크기로 다시 그린다. 이미 종료 중이면 중지하지 않는다.
 
-첫 PTY 생성도 첫 레이아웃 계산 이후로 옮겼다. 플러그인이 하단 행을 사용하는 경우 자식의 최초 크기부터 해당 행을 제외한다. [복원 순서·소유권·한계](VT_RESTORATION.md).
+첫 PTY 생성도 첫 레이아웃 계산 이후로 옮겼다. 플러그인이 하단 행을 사용하는 경우 자식의 최초 크기부터 해당 행을 제외한다. [복원 순서·소유권·한계](../VT_RESTORATION.md).
 
 ### 기본 키·질의·terminfo — IN01/02, HX01/02
 
@@ -42,7 +42,7 @@ libghostty의 legacy 수정키+F3 출력이 광고한 terminfo와 다른 결함�
 | 초기 크기 | 자식 첫 실행 줄에서 실제 PTY 크기를 파일로 기록. 기본형과 3행 bar 구분 |
 | 누락 방어 | `tools/check_terminal.py`와 독립 필수 목록을 유지. skip·빈 모듈·누락은 실패 |
 
-명세 **48개 ID에 연결된 개별 테스트 74개**와 검사기 자체의 핵심 사례 5개도 실제 수집 suite에서 정확히 한 번 존재해야 한다. 삭제·이름 변경·중복·`load_tests` 은폐를 실행 전에 거부한다. 기존 공통 runner에 선택적 수집 검증을 연결했으며 stream의 기본 호출은 그대로다. [사례 연결표와 보장 범위](VT_TEST_CONTRACTS.md).
+명세 **48개 ID에 연결된 개별 테스트 74개**와 검사기 자체의 핵심 사례 5개도 실제 수집 suite에서 정확히 한 번 존재해야 한다. 삭제·이름 변경·중복·`load_tests` 은폐를 실행 전에 거부한다. 기존 공통 runner에 선택적 수집 검증을 연결했으며 stream의 기본 호출은 그대로다. [사례 연결표와 보장 범위](../VT_TEST_CONTRACTS.md).
 
 실제 호스트 검증은 `tests/terminal_matrix.py`와 `tests/terminal_restore.py`를 사용한다. 마우스·검색 조작은 `tests/terminal_interaction.py`가 별도로 요구한다. 자동 입력과 실제 호스트 응답 검증을 물리 키보드·IME·픽셀 검증으로 보고하지 않는다.
 

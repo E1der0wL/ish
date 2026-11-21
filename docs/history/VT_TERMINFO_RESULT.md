@@ -1,6 +1,6 @@
 # ish-vt terminfo 추가 대조 결과
 
-> 통합 전 검증 기록이다. 현재 제품과 XTVERSION 이름은 `ish`로 통일됐다. 아래 이름·stream 보존 설명은 당시 결과이며 현재 실행 방법은 [사용 안내](VT_USAGE.md)를 참고한다.
+> 통합 전 검증 기록이다. 현재 제품과 XTVERSION 이름은 `ish`로 통일됐다. 아래 이름·stream 보존 설명은 당시 결과이며 현재 실행 방법은 [사용 안내](../VT_USAGE.md)를 참고한다.
 
 2026-11-17의 추가 검증이다. [이전 완료 기록](VT_BASELINE_RESULT.md)의 188/287 결과와 실제 Windows Terminal 기록은 당시 결과로 보존한다. 이 문서는 **ish-vt**의 libghostty-vt + PTK 경로만 다룬다. ish 2.0.0의 stream 실행·지원 범위는 변경하지 않았다.
 

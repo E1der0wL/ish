@@ -111,7 +111,7 @@ config.plugin_dir = "/absolute/path/to/ish/examples/terminal_plugins"
 config.plugins = ["terminal_bar", "terminal_popup"]
 ```
 
-`--plugin NAME`은 이번 세션의 선택 목록을 대체한다. `--no-plugins`는 저장된 선택을 이번 세션에서 끈다. 실제 로딩과 의존성 검사는 기존 PluginManager가 담당한다. API는 [보완 모듈 문서](VT_PROTOCOL_PLUGINS.md)를 참고한다.
+`--plugin NAME`은 이번 세션의 선택 목록을 대체한다. `--no-plugins`는 저장된 선택을 이번 세션에서 끈다. 설정창의 **확장 → 플러그인**에서 하단 바·팝업 같은 일반 플러그인을, **확장 → 모듈**에서 키·클립보드 같은 보완 모듈을 선택한다. 실제 로딩과 의존성 검사는 같은 PluginManager가 담당한다. [분류별 예제 목록](../README.md#플러그인과-보완-모듈) · [플러그인 개발](PLUGINS.md) · [보완 모듈 API](VT_PROTOCOL_PLUGINS.md)
 
 ## 기능별 정책
 

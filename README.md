@@ -4,6 +4,12 @@ ish는 **libghostty-vt + prompt_toolkit(PTK)** 기반 터미널입니다. 명령
 
 **기본형은 추가 UI와 셸 hook이 없습니다.** Bash·zsh·tcsh를 Linux/WSL에서 검증합니다. 본체 터미널의 모든 기능을 원문 통과시키는 프로그램은 아니며 지원 범위는 아래에 설명합니다.
 
+| 하려는 일 | 바로가기 |
+|---|---|
+| 셸 시작, 설정 저장, 호스트 기능 선택 | [현재 버전 사용법](docs/VT_USAGE.md) |
+| 하단 바·팝업 플러그인 작성, 등록, 사용 | [플러그인 개발](docs/PLUGINS.md) · [보완 모듈 API](docs/VT_PROTOCOL_PLUGINS.md) |
+| 직접 빌드하거나 검증 범위 확인 | [빌드와 검증 실행](docs/DEVELOPMENT.md) · [자동 회귀 명세](docs/VT_TEST_CONTRACTS.md) · [Windows Terminal/WSL 비교 기록](docs/VT_PARITY.md) |
+
 ## 시작하기
 
 설치된 실행 파일이 있다면:
@@ -128,7 +134,7 @@ config.features = {"hyperlinks": "on", "enhanced_keyboard": "auto"}
 
 설정창의 **플러그인** 페이지에서 소스·의존성 경로와 일반 플러그인을 관리하고, **모듈** 페이지에서 터미널 보완 모듈을 선택합니다. 패키지의 `PLUGIN_META["category"]`에 `"module"`을 쓰면 모듈 페이지에, `"both"`를 쓰면 양쪽에 표시됩니다. 기본값은 `"plugin"`입니다. 양쪽에 표시되는 패키지의 체크 상태와 실행 순서는 공유됩니다. 누락된 선택은 플러그인 페이지에서 해제할 수 있습니다.
 
-저장소 샘플 사용:
+저장소 루트에서 이번 세션에 사용할 예제를 고를 수 있습니다.
 
 ```sh
 ish --plugin-dir examples/terminal_plugins --plugin terminal_bar --plugin terminal_popup
@@ -136,15 +142,26 @@ ish --plugin-dir examples/terminal_plugins --plugin terminal_search
 ish --plugin-dir examples/terminal_plugins --plugin clipboard_system --clipboard read-write
 ```
 
-- `terminal_bar`: 하단 한 줄
-- `terminal_popup`: F2 팝업
-- `terminal_search`: Ctrl+F 스크롤백 검색
-- `terminal_history`: 기본 화면에서 Shift+PgUp·Shift+PgDn으로 이전 출력 탐색. 선택하지 않으면 두 키는 프로그램에 전달됩니다.
-- `clipboard_system`: Windows/WSL 또는 X11 클립보드 연결, 추가 UI 없음
+### 플러그인
+
+| 패키지 | 사용 방법 |
+|---|---|
+| [terminal_bar](examples/terminal_plugins/terminal_bar/terminal_bar.py) | 하단에 상태 바 한 줄을 표시합니다. |
+| [terminal_commands](examples/terminal_plugins/terminal_commands/__init__.py) | 셸이 OSC 133 표시를 보낼 때 F6·F7로 프롬프트를 이동하고 F8·F9로 마지막 출력을 선택하거나 복사합니다. |
+| [terminal_history](examples/terminal_plugins/terminal_history/__init__.py) | 기본 화면에서 Shift+PgUp·Shift+PgDn으로 이전 출력을 봅니다. Vim의 대체 화면에서는 키가 Vim에 전달됩니다. |
+| [terminal_popup](examples/terminal_plugins/terminal_popup/terminal_popup.py) | F2로 입력 팝업을 열고 닫습니다. |
+| [terminal_search](examples/terminal_plugins/terminal_search/__init__.py) | Ctrl+F로 스크롤백을 검색합니다. |
+
+### 모듈
+
+| 패키지 | 보완하는 기능 |
+|---|---|
+| [clipboard_system](examples/terminal_plugins/clipboard_system/__init__.py) | 프로그램의 클립보드 요청을 WSL의 Windows 클립보드 또는 X11에 연결합니다. |
+| [terminal_keys](examples/terminal_plugins/terminal_keys/terminal_keys.py) | 호스트 단축키가 `CSI 9001 ~`를 보내도록 설정한 경우 해당 입력을 F13으로 해석합니다. |
+
+두 목록은 저장소의 [예제 폴더](examples/terminal_plugins)를 설정창의 플러그인 경로로 지정했을 때 표시되는 항목입니다.
 
 선택한 플러그인의 전용 키는 Vim 등 실행 중 프로그램에서도 소비될 수 있습니다. `--no-plugins`는 이번 세션에서 모두 끄고, 반복한 `--plugin NAME`은 이번 세션의 목록을 지정합니다. 플러그인은 사용자의 권한으로 실행되는 Python 코드이며, 실제 로드 때 선언한 의존성을 설치할 수 있습니다.
-
-[보완 모듈 API](docs/VT_PROTOCOL_PLUGINS.md), [샘플 코드](examples/terminal_plugins)를 참고하세요.
 
 ## 주요 옵션
 
@@ -186,3 +203,5 @@ uv run --no-sync python tests/management_host.py .cache/management-host-new
 ```
 
 [AGENTS.md](AGENTS.md)의 계약·소유권·명명 규칙을 따릅니다. 자동 PTY 테스트, 실제 호스트 응답, 화면 외관·물리 입력 검증은 구분합니다. 상세 계약은 [검증 명세](docs/VT_TEST_CONTRACTS.md), [기능 정책](docs/VT_FEATURE_POLICY.md), [복원](docs/VT_RESTORATION.md)에 정리합니다.
+
+초기 VT 실험과 제품 통합 전 감사 결과는 [과거 실험 기록](docs/history/README.md)에 모았습니다.

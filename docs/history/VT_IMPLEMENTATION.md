@@ -1,6 +1,6 @@
 # ish-vt 보완 모듈과 기본 동작 보강
 
-> 통합 전 구현 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 `config.vt`·별도 stream 설정·`ish-vt` 명령은 제공하지 않는다. 현재 평면 설정과 실행 방법은 [사용 안내](VT_USAGE.md)를 참고한다.
+> 통합 전 구현 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 `config.vt`·별도 stream 설정·`ish-vt` 명령은 제공하지 않는다. 현재 평면 설정과 실행 방법은 [사용 안내](../VT_USAGE.md)를 참고한다.
 
 > 이 문서는 이전 구현 단계의 기록이다. 이후 기본 계약·종료 복원·ABI 4 변경과 검증은 [기본 계약 보강 결과](VT_BASELINE_RESULT.md)를 참고한다.
 
@@ -22,7 +22,7 @@
 
 기존 iTerm 이미지 변환기를 같은 registry에 연결했다. 외부 등록은 native OSC parser가 모른다고 확인한 숫자 OSC 명령부터 제공한다. APC/DCS/CSI 전체를 공개하거나 미확인 바이트를 호스트로 전달하는 방식이 아니다. factory·handler는 동기 계약이며 잘못 반환한 coroutine/Task/Future도 취소한다. 모듈 실패 후 같은 입력을 다른 해석기로 재전달하지 않는다. 실패한 route는 닫고 나머지 출력을 계속 처리한다.
 
-업데이트한 libghostty가 동일 계약 검증을 통과하면 `engine.NATIVE_PROTOCOLS`에 이름·kind·prefix를 정확히 등록한다. 이때 보완 factory를 호출하지 않으므로 모듈과 decoder 의존성을 제거할 수 있다. 이미지 출력, 클립보드 권한, UI 포커스와 호스트 표현은 별도 책임으로 남는다. [작성·제거 절차](VT_PROTOCOL_PLUGINS.md).
+업데이트한 libghostty가 동일 계약 검증을 통과하면 `engine.NATIVE_PROTOCOLS`에 이름·kind·prefix를 정확히 등록한다. 이때 보완 factory를 호출하지 않으므로 모듈과 decoder 의존성을 제거할 수 있다. 이미지 출력, 클립보드 권한, UI 포커스와 호스트 표현은 별도 책임으로 남는다. [작성·제거 절차](../VT_PROTOCOL_PLUGINS.md).
 
 고정 엔진의 `ghostty_terminal_vt_write_until()`도 검토했다. 같은 native parser의 string/ground 경계를 제공하지만 소비한 바이트는 이미 엔진에 적용된다. 따라서 클립보드 broker가 보류해야 하는 응답이나 iTerm Copy 본문을 현재 경로에서 그대로 먼저 해석시키면 순서와 수집 경계가 달라진다. 이번에는 기존 broker를 유지하고 프레이밍을 보강했다. 이후 이 API로 전체 프레이밍을 대체하려면 native clipboard callback과 보류 계약을 함께 연결해야 한다. 화면을 가진 두 번째 libghostty를 단순 scanner로 추가하지 않았다.
 
@@ -65,13 +65,13 @@
 | UI09 | 호스트/PTK의 접근성 경계 유지 | 실제 screen reader·IME·모든 폰트/배율은 미검증. 제품 완성으로 판정하지 않음 |
 | IM08 | 기존 이미지 오류/host gate 유지 | 이미지 디코딩 성공과 호스트 표시 성공을 구분. WT의 SIXEL을 새로 연결하지 않음 |
 
-개별 B 항목의 기존 회귀를 위 기능군 설명으로 대체하지 않는다. [변경 전 명세의 전체 목록](VT_BASELINE_AUDIT.md)과 [terminfo 카탈로그](VT_TERMINFO_CATALOG.md)는 누락 점검 기준으로 보존한다.
+개별 B 항목의 기존 회귀를 위 기능군 설명으로 대체하지 않는다. [변경 전 명세의 전체 목록](VT_BASELINE_AUDIT.md)과 [terminfo 카탈로그](../VT_TERMINFO_CATALOG.md)는 누락 점검 기준으로 보존한다.
 
 ## 제품 사용
 
 기존 `~/ish/.ishrc.py`의 `config.vt`에 VT 정책과 플러그인 선택을 저장한다. 공통 설정 → VT 설정 → CLI 순서로 적용한다. `config.plugins`는 기존 stream 선택으로 남기며 VT에서 자동 로드하지 않는다. 플러그인 선택이 없는 기본형은 바·팝업·검색 UI·UI 전용 단축키·셸 hook을 설치하지 않는다.
 
-언어는 명시한 설정(CLI 우선), `LANG`, 영어 순이다. help/version/diagnose는 rc·플러그인·native 라이브러리를 실행하거나 파일을 생성하지 않는다. 파일 로그는 opt-in이며 native 본문 대신 심각도 및 프로토콜 실패 횟수를 기록한다. 진단 콘솔 출력은 터미널을 복원한 뒤 수행한다. [실행·설정 예제](VT_USAGE.md).
+언어는 명시한 설정(CLI 우선), `LANG`, 영어 순이다. help/version/diagnose는 rc·플러그인·native 라이브러리를 실행하거나 파일을 생성하지 않는다. 파일 로그는 opt-in이며 native 본문 대신 심각도 및 프로토콜 실패 횟수를 기록한다. 진단 콘솔 출력은 터미널을 복원한 뒤 수행한다. [실행·설정 예제](../VT_USAGE.md).
 
 libghostty-vt는 고정된 1.0.1, private bridge는 ABI **3**다. 이전 ABI를 잘못 로드하면 실행 전에 재빌드를 요구한다. `python tools/build_ghostty_vt.py --bridge-only`로 기존 고정 엔진을 재사용해 bridge를 빌드할 수 있다.
 

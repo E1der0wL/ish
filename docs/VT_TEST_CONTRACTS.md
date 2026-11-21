@@ -1,8 +1,8 @@
 # 기본 명세와 유지할 자동 회귀 사례
 
-2026-11-18. [기본 지원 명세](VT_BASELINE_AUDIT.md), 보완 모듈·기능 정책·선택 확장 계약의 ID에 연결된 필수 회귀를 삭제·이름 변경으로부터 보호한다. 정확한 목록은 아래 검사 코드가 소유한다. 이것은 명세 전체의 합격표가 아니다. 각 행은 아래의 특정 자동 사례만 뜻하며, 물리 입력·픽셀·실제 호스트 증거는 [기능 정책 검증](VT_FEATURE_POLICY.md), [보완 모듈 검증](VT_SUPPLEMENTS_RESULT.md), [이전 검증 결과](VT_BASELINE_RESULT.md)에서 별도로 판정한다.
+2026-11-18. [기본 지원 명세](history/VT_BASELINE_AUDIT.md), 보완 모듈·기능 정책·선택 확장 계약의 ID에 연결된 필수 회귀를 삭제·이름 변경으로부터 보호한다. 정확한 목록은 아래 검사 코드가 소유한다. 이것은 명세 전체의 합격표가 아니다. 각 행은 아래의 특정 자동 사례만 뜻하며, 물리 입력·픽셀·실제 호스트 증거는 [기능 정책 검증](VT_FEATURE_POLICY.md), [보완 모듈 검증](history/VT_SUPPLEMENTS_RESULT.md), [이전 검증 결과](history/VT_BASELINE_RESULT.md)에서 별도로 판정한다.
 
-정확한 `module.Class.test_method` 목록은 [tools/terminal_contracts.py](../tools/terminal_contracts.py)의 `REQUIRED_CASES`가 소유한다. 같은 테스트가 여러 명세의 일부를 검증할 수 있지만 실행은 한 번만 한다. 아래 설명은 해당 사례의 범위이며, 같은 ID의 나머지 조합을 검증 완료로 만들지 않는다.
+정확한 `module.Class.test_method` 목록은 `tools/terminal_contracts.py`의 `REQUIRED_CASES`가 소유한다. 같은 테스트가 여러 명세의 일부를 검증할 수 있지만 실행은 한 번만 한다. 아래 설명은 해당 사례의 범위이며, 같은 ID의 나머지 조합을 검증 완료로 만들지 않는다.
 
 | ID | 보호하는 자동 사례 | 테스트 경계 |
 |---|---|---|
@@ -80,5 +80,5 @@
 
 - IN05의 실제 IME, UI09의 접근성, 물리 마우스·검색 키·클립보드·픽셀 결과는 자동 선언에 새로 통과 표시하지 않는다.
 - HX05 BEL의 실제 호스트 효과 및 HX06 제목의 실제 호스트 결과는 자동 사례와 따로 확인한다.
-- terminfo 287개의 [이전 후속 대조](VT_TERMINFO_RESULT.md)는 당시 범위의 기록이다. 이번 IM05/IM06·OPT01/OPT02 자동 사례 추가가 전 상태 조합·전 호스트 표현이나 전체 선택 확장의 지원을 뜻하지 않는다. 기존 명시적 차이와 이번 native placement·알림 범위 제한은 별도로 남는다.
+- terminfo 287개의 [이전 후속 대조](history/VT_TERMINFO_RESULT.md)는 당시 범위의 기록이다. 이번 IM05/IM06·OPT01/OPT02 자동 사례 추가가 전 상태 조합·전 호스트 표현이나 전체 선택 확장의 지원을 뜻하지 않는다. 기존 명시적 차이와 이번 native placement·알림 범위 제한은 별도로 남는다.
 - 실제 Windows Terminal 검사와 GitHub workflow 실행 여부는 로컬 회귀와 따로 기록한다.

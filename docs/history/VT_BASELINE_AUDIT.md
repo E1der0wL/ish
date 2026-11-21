@@ -1,6 +1,6 @@
 # ish-vt 기본 지원 명세와 연결 상태 감사
 
-> 제품 통합 이후 실행·설정 안내는 [사용 안내](VT_USAGE.md)가 기준이다. 아래의 stream 경로·`ish-vt` 명령·과거 CI 판정은 감사 당시 기록이며 현재 제품에는 적용하지 않는다. 명세 ID와 시험 근거는 계속 참조한다.
+> 제품 통합 이후 실행·설정 안내는 [사용 안내](../VT_USAGE.md)가 기준이다. 아래의 stream 경로·`ish-vt` 명령·과거 CI 판정은 감사 당시 기록이며 현재 제품에는 적용하지 않는다. 명세 ID와 시험 근거는 계속 참조한다.
 
 > 이 문서는 2026-11-16의 변경 전 감사 기록이다. 이후 구현과 검증 결과는 [보완 모듈 리팩토링 결과](VT_IMPLEMENTATION.md)와 [기본 계약 보강 결과](VT_BASELINE_RESULT.md)를 참고한다. 아래의 ABI 1·미연결 표시는 당시 상태이며 현재 지원 판정으로 사용하지 않는다.
 
@@ -23,7 +23,7 @@
 | 설정·시작 옵션 | `.ishrc.py`, 언어, 진단, 로그, 시작 옵션의 제품 경로 | 실험 CLI 일부만 있음. stream의 완성도를 승계하지 않음 |
 | 이번 감사 | 경계·공통 의존성 확인만 | 기본 지원 명세 및 연결·검증 상태 감사 |
 
-근거: [`pyproject.toml`](../pyproject.toml), [`HOOKLESS_VT.md`](HOOKLESS_VT.md), [`terminal/__main__.py`](../src/ish/terminal/__main__.py), [`stream/startup.py`](../src/ish/stream/startup.py). VT의 실패를 stream의 실패로, stream의 385개 회귀 통과를 VT의 합성 검증으로 해석하지 않는다.
+두 진입점은 감사 당시 `pyproject.toml`, `src/ish/terminal/__main__.py`, `src/ish/stream/startup.py`에서 확인했다. 이전 stream 소스는 저장소에서 `git show 04a3d4e1:src/ish/stream/startup.py`로 열 수 있다. VT 검증 수치와 stream 회귀 385개의 범위는 각각의 실행 경로에 한정된다. [당시 VT 실험 기록](HOOKLESS_VT.md)
 
 ### 1.2 고정된 대조 대상
 
@@ -194,7 +194,7 @@ Native 직접 등록은 8개다. Clipboard 2개와 RIS의 앞단 처리를 고�
 
 ### 4.2 나머지 terminal option 29개 전수
 
-위 19개와 합하여 48개이다. invalid/max sentinel은 제외했다. 로컬 [`terminal.h`](../.cache/ghostty-vt/install/include/ghostty/vt/terminal.h)의 2034줄 이후를 기준으로 한다. 이 로컬 1.0.1 헤더가 감사 기준이며 온라인 최신 문서와 구분한다.
+위 19개와 합하여 48개이다. invalid/max sentinel은 제외했다. 로컬 `.cache/ghostty-vt/install/include/ghostty/vt/terminal.h`의 2034줄 이후를 기준으로 한다. 이 로컬 1.0.1 헤더가 감사 기준이며 온라인 최신 문서와 구분한다.
 
 | 번호 / option | 현재 상태 |
 |---|---|
@@ -267,7 +267,7 @@ Native 직접 등록은 8개다. Clipboard 2개와 RIS의 앞단 처리를 고�
 
 ## 5. terminfo 광고와 전수 검증이 필요한 항목
 
-실제 Ubuntu `xterm-256color` 287개 capability를 읽었다. [전체 카탈로그와 그룹별 판정](VT_TERMINFO_CATALOG.md)에 이름·종류·원래 값을 보존했다. **모든 실제 entry**를 향후 검증 목록으로 사용해야 한다. 아래 주요 차이는 확정된 실패 재현과 정적 결손 후보를 구분한다.
+실제 Ubuntu `xterm-256color` 287개 capability를 읽었다. [전체 카탈로그와 그룹별 판정](../VT_TERMINFO_CATALOG.md)에 이름·종류·원래 값을 보존했다. **모든 실제 entry**를 향후 검증 목록으로 사용해야 한다. 아래 주요 차이는 확정된 실패 재현과 정적 결손 후보를 구분한다.
 
 | 묶음 | 대표 entry | 현재 확인된 간극 |
 |---|---|---|
@@ -305,17 +305,17 @@ Native 직접 등록은 8개다. Clipboard 2개와 RIS의 앞단 처리를 고�
 
 ## 7. 보존된 검증 증거와 신뢰 범위
 
-- [`terminal-final.log`](../.cache/hookless-vt/terminal-final.log): 324개 회귀 통과 및 lint/format 통과 기록. 실제 native library를 사용하는 테스트와 PTY/PTK 회귀가 포함된다.
-- [`stream-final.log`](../.cache/hookless-vt/stream-final.log): 별도 stream 385개 회귀 통과 기록.
-- [`host-confirmed/summary.json`](../.cache/hookless-vt/host-confirmed/summary.json): 셸 3개 × 기본형/플러그인형 6개 통과.
+- `.cache/hookless-vt/terminal-final.log`: 324개 회귀 통과 및 lint/format 통과 기록. 실제 native library를 사용하는 테스트와 PTY/PTK 회귀가 포함된다.
+- `.cache/hookless-vt/stream-final.log`: 별도 stream 385개 회귀 통과 기록.
+- `.cache/hookless-vt/host-confirmed/summary.json`: 셸 3개 × 기본형/플러그인형 6개 통과.
 - `host-final`은 120×36→82×36→120×36, `host-confirmed`는 120×36→120×24→120×36. 총 12 case 실행에서 24회 변경. native 프로그램 SIGWINCH와 Vim 행/열 값으로 전달을 확인했다.
-- [`source-manifest.json`](../.cache/hookless-vt/host-confirmed/source-manifest.json)의 36개 SHA256은 감사 시점 현재 파일과 모두 일치했다. **모든 테스트 파일과 실제 .so 바이너리까지 묶인 manifest는 아니다.**
+- `.cache/hookless-vt/host-confirmed/source-manifest.json`의 36개 SHA256은 감사 시점 현재 파일과 모두 일치했다. **모든 테스트 파일과 실제 .so 바이너리까지 묶인 manifest는 아니다.**
 - 이 manifest는 `host-confirmed`에만 있으며 `host-final`에는 같은 소스 manifest가 없다. 두 실행의 소스 동일성을 같은 수준으로 증명하지 않는다.
 - W 입력은 제어기가 outer PTY에 쓴 바이트이며 응답은 실제 WT 것이다. 각 result의 `pixel_verification`/`gui_keyboard_verification`은 **not performed**다.
 - UI의 한글·emoji가 파일에 정확히 저장된 것과, host 픽셀·폰트·IME가 정확히 보였다는 것은 다른 증거다.
 - 현재 worktree에는 `.cache/terminal-test/evidence`가 없다. Kitty/Xvfb·WezTerm·xterm GUI 테스트 소스가 있다는 이유로 이 작업본에서 실행했다고 간주하지 않는다.
 
-`.cache`의 헤더·검증 기록은 Git에서 제외된 로컬 자료다. 이 문서를 커밋하더라도 GitHub 독자가 근거 링크를 모두 열 수 있는 것은 아니다. 공개 검증 때는 버전·manifest와 결과를 별도 artifact로 보존해야 한다.
+`.cache`의 헤더·검증 기록은 Git에서 제외된 로컬 자료다. 위 경로는 당시 저장소 루트를 기준으로 한다. 공개 검증 때는 버전·manifest와 결과를 별도 artifact로 보존해야 한다.
 
 ### 7.1 검증 공백
 

@@ -1,6 +1,6 @@
 # 셸 hook 없는 VT 실험
 
-> 통합 전 실험 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 경로·`ish-vt` 명령은 제거됐다. 현재 실행·설정 방법은 [사용 안내](VT_USAGE.md)를 참고한다.
+> 통합 전 실험 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 경로·`ish-vt` 명령은 제거됐다. 현재 실행·설정 방법은 [사용 안내](../VT_USAGE.md)를 참고한다.
 
 `codex/hookless-vt`는 `experiment/prompt-stream`의 `04a3d4e`에서 분기한 별도 worktree다. 기존 브랜치와 폴더는 수정하지 않는다. `ish` 명령은 기존 출력 직접 전달 경로이며, 이번 실험은 `ish-vt`에서만 실행한다. tmux나 Zellij를 실행하지 않는다.
 
@@ -25,7 +25,7 @@ uv run --no-sync ish-vt --shell tcsh \
   --plugin terminal_bar --plugin terminal_popup
 ```
 
-`--cwd DIR`로 시작 디렉터리를 고른다. 기본 시작 인수는 `-i`이며 `--login` 또는 `--shell-arg`로 변경할 수 있다. 공통 `.ishrc.py`의 시작 설정을 재사용하고 VT 전용 선택은 `config.vt`에 둔다. 언어·플러그인·마우스·스크롤백·로그 옵션은 [VT 사용 설정](VT_USAGE.md)을 참고한다. 네이티브 Windows와 macOS 실행은 이번 검증 범위에 없다.
+`--cwd DIR`로 시작 디렉터리를 고른다. 기본 시작 인수는 `-i`이며 `--login` 또는 `--shell-arg`로 변경할 수 있다. 공통 `.ishrc.py`의 시작 설정을 재사용하고 VT 전용 선택은 `config.vt`에 둔다. 언어·플러그인·마우스·스크롤백·로그 옵션은 [VT 사용 설정](../VT_USAGE.md)을 참고한다. 네이티브 Windows와 macOS 실행은 이번 검증 범위에 없다.
 
 플러그인은 기존 PluginManager가 읽는다. `--plugin NAME`은 중복 없이 명시한 이름을 선택하며, 기본 스크립트·라이브러리 경로는 공통 PluginManager 설정을 따른다. `--plugin-dir DIR`, `--library-dir DIR`로 경로를 지정할 수 있다. `module:setup` 실험 로더는 제거했다. 플러그인은 `PLUGIN_META`, `TERMINAL_API = 1`, `setup(api)`를 제공한다. 변경은 새 세션에 적용된다.
 

@@ -32,7 +32,16 @@ Windows Terminal에서도 저장소의 새 가상환경으로 시작할 수 있�
 wsl.exe -d Ubuntu --cd /mnt/d/Developments/ish --exec .venv/bin/ish --shell tcsh
 ```
 
-실제 호스트 검증은 [기능 정책 및 결과](VT_FEATURE_POLICY.md), 실행 옵션은 [사용 안내](VT_USAGE.md)를 참고한다. 옮긴 `.cache`에는 이전 실패·성공 증거를 그대로 보존했다. 이 안의 과거 임시 실행 스크립트에는 C 드라이브 절대 경로가 남아 있을 수 있으므로 새 실행에는 저장소의 `tests/terminal_matrix.py`, `tests/terminal_features.py` 등 유지되는 도구를 사용한다.
+## Windows Terminal에서 검증하기
+
+Windows Terminal 안에서 WSL을 열고 저장소 루트에서 실행한다. 결과 디렉터리는 검사마다 새 경로를 지정한다. 첫 번째 명령에서는 안내에 따라 창 크기를 바꾼다.
+
+```sh
+uv run --no-sync python tests/terminal_matrix.py .cache/host-new-run --require-resize
+uv run --no-sync python tests/management_host.py .cache/management-host-new
+```
+
+자동 테스트가 보장하는 범위는 [회귀 명세](VT_TEST_CONTRACTS.md)에, 호스트에서 관찰한 응답과 렌더링 결과는 [기능 정책](VT_FEATURE_POLICY.md)과 [비교 기록](VT_PARITY.md)에 있다. 이전 실행의 로그는 당시 개발 환경의 `.cache`에 보관한다.
 
 ## 관리 범위
 
