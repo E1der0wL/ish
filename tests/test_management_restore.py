@@ -10,9 +10,11 @@ import termios
 import unittest
 from unittest.mock import patch
 
-from prompt_toolkit.application import in_terminal
+from prompt_toolkit.application import Application, in_terminal
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_input, create_pipe_input
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.widgets import TextArea
@@ -171,6 +173,69 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("38;2;59;130;246", wire[wire.index("\x1b[?1049h") :])
         self.assertEqual(keys, ["a", "b"])
         self.assert_restored(wire)
+
+    async def test_close_retires_only_mouse_before_passing_typeahead_to_next_app(self):
+        """A second real PTK app receives typing, paste and fresh mouse after handoff."""
+        screen, host, source, _, _ = self.fixture()
+        move = b"\x1b[<35;8;2M"
+        paste = b"35;8;2M literal " + move
+        await self.finish(
+            screen,
+            host,
+            key=b"\x04A" + move + b"\x1b[200~" + paste + b"\x1b[201~B",
+        )
+        wire = host.getvalue()
+        captured = wire.index("\x1b[?1003h")
+        retired = wire.index("\x1b[?1003l", captured)
+        self.assertLess(retired, wire.index("\x1b[?1049l"))
+        self.assertNotIn("\x1b[?1003h", wire[retired:])
+        self.assert_restored(wire)
+
+        received = []
+        bindings = KeyBindings()
+        for key in (Keys.Any, Keys.BracketedPaste, Keys.Vt100MouseEvent, Keys.Escape):
+            bindings.add(key, eager=True)(lambda e: received.append(e.data))
+        bindings.add("c-d", eager=True)(lambda e: e.app.exit())
+        next_app = Application(
+            key_bindings=bindings, input=source, output=DummyOutput()
+        )
+        ready = asyncio.Event()
+        next_app.after_render += lambda _: ready.set()
+        task = asyncio.create_task(next_app.run_async())
+        try:
+            await asyncio.wait_for(ready.wait(), 3)
+            os.write(host.master, move + b"\x1b\x04")
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(received, ["A", paste.decode(), "B", move.decode(), "\x1b"])
+
+    async def test_split_reports_keys_and_paste_survive_management_handoff(self):
+        """Continue only the old partial control on the next caller-owned PTK reader."""
+        mouse = b"\x1b[<35;8;2M"
+        for prefix, suffix, expected in (
+            (mouse[:-1], b"MZ", ["Z"]),
+            (b"\x1b[", b"AZ", ["\x1b[A", "Z"]),
+            (b"\x1b", b"xZ", ["\x1b", "x", "Z"]),
+            (b"\x1b[?1003;", b"2$yZ", ["Z"]),
+            (b"\x1b[23;", b"9RZ", ["Z"]),
+            (b"\x1b]11;rgb:", b"ff/00/00\x07Z", ["Z"]),
+            (b"\x1bP1$r0;", b"1m\x1b\\Z", ["Z"]),
+            (b"\x1b", b"]11;rgb:ff/00/00\x07Z", ["Z"]),
+            (b"\x1b[20", b"0~hello\x1b[201~Z", ["hello", "Z"]),
+            (b"\x1b[200~hello\x1b[20", b"1~Z", ["hello", "Z"]),
+        ):
+            with self.subTest(prefix=prefix):
+                screen, host, source, original, _ = self.fixture()
+                await self.finish(screen, host, key=b"\x04" + prefix)
+                # No reader has touched the suffix. The caller owns this read.
+                with source.raw_mode():
+                    os.write(host.master, suffix + mouse)
+                    keys = source.read_keys()
+                self.assertEqual([k.data for k in keys], expected + [mouse.decode()])
+                self.assertIs(source.vt100_parser, original)
 
     async def test_explicit_ptk_color_depth_skips_the_optional_management_probe(self):
         """Respect the user's output policy without loading a terminal session."""

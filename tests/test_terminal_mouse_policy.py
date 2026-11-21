@@ -144,8 +144,10 @@ class MousePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\x1b[?1003l", disabled)
         click = self.owner.plugins.show_popup(TextArea(multiline=False), mouse=True)
         self.assertIn("\x1b[?1003h", self.render())
+        before = self.stream.tell()
         self.owner.plugins.close_popup(click)
-        self.assertIn("\x1b[?1003l", self.render())
+        self.assertIn("\x1b[?1003l", self.stream.getvalue()[before:])
+        self.assertNotIn("\x1b[?1003l", self.render())
         self.owner.plugins.close_popup(popup)
         self.assertIn("\x1b[?1003h", self.render())
         self.owner._output(b"\x1b[?1003l")
@@ -172,6 +174,45 @@ class MousePolicyTests(unittest.IsolatedAsyncioTestCase):
             repeated = self.render() + self.render()
             for mode in (*TRACKING, 1016):
                 self.assertNotIn(f"\x1b[?{mode}h", repeated)
+
+    async def test_popup_mouse_handoff_preserves_actual_native_input(self):
+        """Filter queued and split popup reports, retaining new native reports and paste."""
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "after-popup"
+            self.owner.session.argv = [
+                sys.executable,
+                "-c",
+                "import os, sys, tty; from pathlib import Path; tty.setraw(0); "
+                "os.write(1,b'\\x1b[?1003h\\x1b[?1006h\\x1b[?2004h'); data=b''\n"
+                "while not data.endswith(b'END'): data += os.read(0,1024)\n"
+                "target=Path(sys.argv[1]); tmp=target.with_suffix('.tmp'); "
+                "tmp.write_bytes(data); tmp.replace(target); os.read(0,1)",
+                str(result),
+            ]
+            await self.start_input()
+            self.owner.session.start(*self.owner.size)
+            async with asyncio.timeout(DEADLINE):
+                while not self.owner.vt.mouse_reporting:
+                    await asyncio.sleep(0.001)
+            popup = self.owner.plugins.show_popup(TextArea(multiline=False), mouse=True)
+            self.render()
+            closed = asyncio.Event()
+
+            @self.owner.plugins.bind("f2")
+            def close(event):
+                self.owner.plugins.close_popup(popup)
+                closed.set()
+
+            self.pipe.send_text("\x1bOQ\x1b[<35;5;3Mx\x1b[<35;")
+            await asyncio.wait_for(closed.wait(), DEADLINE)
+            self.pipe.send_text("4;2M\x1b[<35;2;2M\x1b[200~35;4;2M literal\x1b[201~END")
+            async with asyncio.timeout(DEADLINE):
+                while not result.exists():
+                    await asyncio.sleep(0.001)
+            self.assertEqual(
+                result.read_bytes(),
+                b"x\x1b[<35;2;2M\x1b[200~35;4;2M literal\x1b[201~END",
+            )
 
     async def test_reports_after_capture_end_cannot_click_a_keyboard_popup(self):
         """Queued mouse bytes are consumed before PTK dispatches a new widget."""

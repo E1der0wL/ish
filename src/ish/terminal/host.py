@@ -1806,7 +1806,9 @@ class HostParser:
     def __init__(self, parser, broker: HostBroker):
         """Install framing ahead of a single existing PTK key parser."""
         self.parser, self.broker = parser, broker
+        self._return_to = None
         self._pending = ""
+        self._retired_control = False
         self._paste = False
         self._discard = None
         self._discard_escape = False
@@ -1814,10 +1816,36 @@ class HostParser:
     def reset(self, request: bool = False) -> None:
         """Reset both parsers when PTK explicitly resets its input state."""
         self._pending = ""
+        self._retired_control = False
         self._paste = False
         self._discard = None
         self._discard_escape = False
         self.parser.reset(request=request)
+        self._return_parser()
+
+    def retire_mouse(self):
+        """Only an unfinished control from the old screen can be a stale report."""
+        self._retired_control = (
+            bool(self._pending) and not self._paste and self._discard is None
+        )
+
+    def return_when_complete(self, source):
+        """Return the borrowed parser after the old surface's last control."""
+        self.retire_mouse()
+        if self._retired_control or self._paste or self._discard:
+            self._return_to = source
+        else:
+            source.vt100_parser = self.parser
+
+    def _return_parser(self):
+        if self._return_to is not None and not (
+            self._retired_control or self._paste or self._discard
+        ):
+            self._return_to.vt100_parser = self.parser
+            self._return_to = None
+            tail, self._pending = self._pending, ""
+            if tail:
+                self.parser.feed(tail)
 
     def flush(self) -> None:
         """Flush a lone Escape, but never reclassify partial controls as typing."""
@@ -1829,7 +1857,9 @@ class HostParser:
         ):
             self.parser.feed(self._pending)
             self._pending = ""
+            self._retired_control = False
         self.parser.flush()
+        self._return_parser()
 
     def _key(self, sequence: str) -> bool:
         if sequence.startswith(ESC + "[?") and sequence.endswith("u"):
@@ -1963,7 +1993,12 @@ class HostParser:
         if data:
             self.broker.seal_keys()
         self._pending += data
-        while self._pending:
+        while self._pending and (
+            self._return_to is None
+            or self._retired_control
+            or self._paste
+            or self._discard is not None
+        ):
             if self._discard is not None:
                 if not self._drain_discard():
                     break
@@ -1997,6 +2032,10 @@ class HostParser:
             if len(self._pending) == 1:
                 break
             kind = self._pending[1]
+            if kind not in ("[", "]", "P", "_", "^"):
+                self._retired_control = False
+                if self._return_to is not None:
+                    break
             if kind == ESC or kind in self.C1_PREFIXES:
                 # A user's Escape can immediately precede a host reply (or a
                 # legacy Alt+arrow). Keep its introducer in this framing layer;
@@ -2011,12 +2050,14 @@ class HostParser:
                     if final is None or boundary.start() < final.start():
                         consume = boundary[0] in "\x18\x1a"
                         self._pending = self._pending[boundary.start() + int(consume) :]
+                        self._retired_control = False
                         self.broker.dropped_controls += 1
                         continue
                 if final is None:
                     if len(self._pending) > self.MAX_CONTROL:
                         self._pending = ""
                         self._discard = "csi"
+                        self._retired_control = False
                         self.broker.dropped_controls += 1
                     break
                 end = final.end()
@@ -2047,6 +2088,7 @@ class HostParser:
                         self._discard_escape = self._pending.endswith(ESC)
                         self._pending = ""
                         self._discard = "osc" if kind == "]" else "string"
+                        self._retired_control = False
                         self.broker.dropped_controls += 1
                     break
                 end = min(endings)
@@ -2055,6 +2097,23 @@ class HostParser:
                 self._pending = self._pending[2:]
                 continue
             sequence, self._pending = self._pending[:end], self._pending[end:]
+            if self._retired_control:
+                self._retired_control = False
+                if (
+                    len(sequence) <= self.MAX_CONTROL
+                    and decode_mouse(sequence) is not None
+                ):
+                    continue
+                if self._return_to is not None and sequence != PASTE_START:
+                    # The next PTK reader owns keyboard input. Replies to the
+                    # retired host, including CPR, must finish with that host.
+                    if kind == "[" and len(sequence) <= self.MAX_CONTROL:
+                        key = self.parser._get_match(sequence)
+                        if key is None:
+                            self._key(sequence)
+                        elif key not in (Keys.CPRResponse, Keys.Vt100MouseEvent):
+                            self.parser.feed(sequence)
+                    continue
             if sequence.endswith("\x9c"):
                 sequence = sequence[:-1] + ST
             if sequence == PASTE_START:
@@ -2090,6 +2149,8 @@ class HostParser:
                 else:
                     self.broker.dropped_controls += 1
 
+        self._return_parser()
+
 
 class HostInput(Input):
     """Wrap a PTK VT input without adding another descriptor reader.
@@ -2101,11 +2162,16 @@ class HostInput(Input):
     def __init__(self, source: Input, broker: HostBroker):
         """Attach to the version-pinned VT parser without creating an input source."""
         parser = getattr(source, "vt100_parser", None)
-        if parser is None or isinstance(parser, HostParser):
+        if isinstance(parser, HostParser) and parser._return_to is source:
+            # The next ish screen can adopt a split report in place, along with
+            # its retirement boundary, without creating a nested reader.
+            parser.broker, parser._return_to = broker, None
+            self.parser = parser
+        elif parser is None or isinstance(parser, HostParser):
             raise TypeError(i18n.get(Message.VT_HOST_INPUT))
+        else:
+            self.parser = HostParser(parser, broker)
         self.source = source
-        self._parser = parser
-        self.parser = HostParser(parser, broker)
         source.vt100_parser = self.parser
         self._initial_termios = None
 
@@ -2124,6 +2190,10 @@ class HostInput(Input):
     def flush_keys(self):
         """Use the framed parser for PTK's Escape flush."""
         return self.source.flush_keys()
+
+    def retire_mouse(self):
+        """Keep a split report with its old surface until the final byte arrives."""
+        self.parser.retire_mouse()
 
     def flush(self):
         """Delegate the input lifecycle operation."""
@@ -2175,4 +2245,4 @@ class HostInput(Input):
     def restore_parser(self):
         """Release interception without closing a caller-owned PTK input."""
         if self.source.vt100_parser is self.parser:
-            self.source.vt100_parser = self._parser
+            self.parser.return_when_complete(self.source)

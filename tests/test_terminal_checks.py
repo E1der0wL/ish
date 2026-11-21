@@ -83,6 +83,8 @@ CASE_CONTRACTS = (
         "test_management_restore.ManagementRestoreTests",
         (
             "test_close_keys_restore_observed_modes_cursor_and_attributes",
+            "test_close_retires_only_mouse_before_passing_typeahead_to_next_app",
+            "test_split_reports_keys_and_paste_survive_management_handoff",
             "test_probe_precedes_paint_and_keeps_interleaved_keys_in_order",
             "test_external_editor_handoff_restores_then_reenters_the_screen",
             "test_unanswered_probe_does_not_restore_late_unobserved_values",
@@ -493,7 +495,10 @@ CASE_CONTRACTS = (
     (
         "IN07",
         "test_terminal_mouse_policy.MousePolicyTests",
-        ("test_auto_mouse_reaches_actual_pty_consumer_and_file_once",),
+        (
+            "test_auto_mouse_reaches_actual_pty_consumer_and_file_once",
+            "test_popup_mouse_handoff_preserves_actual_native_input",
+        ),
     ),
     (
         "IN07",

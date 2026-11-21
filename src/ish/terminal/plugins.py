@@ -419,6 +419,7 @@ class Plugins:
             self.owner.app.layout.focus(self.owner.window)
         if not self.popups:
             self.owner.focus_terminal(True)
+        self.owner.app.retire_mouse()
         self.owner.app.invalidate()
         return True
 

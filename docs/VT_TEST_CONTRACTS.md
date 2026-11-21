@@ -8,7 +8,7 @@
 |---|---|---|
 | MG01 | 카테고리 도움말·실제 설정 저장·외부 편집기·플러그인 비실행·기능 선택 | `test_management_ui` |
 | MG02 | 원본 보존·외부 수정 충돌·symlink·설정 객체 identity·비실행 메타데이터 | `test_management_store` |
-| MG03 | 관리 창의 시작 상태 복원·관측 중 입력 순서·편집기 handoff·지연 응답 거부 | `test_management_restore` |
+| MG03 | 관리 창의 시작 상태 복원, 관측 중 입력 순서, 편집기 전환, 지연 응답 거부. 종료 시점에 나뉘어 들어온 마우스 보고·방향키·Alt 조합·붙여넣기를 다음 PTK 입력에서 확인 | `test_management_restore` |
 | FP01 | 질의가 있는 기능만 auto, 정책·관찰·사용 분리, identity 없는 선택, resize 후 off 보존, geometry·초기 색 복원 필수 조건, 실제 PTK의 서식 on/off 및 커서 정리. 같은 서식의 연속 문자, 굵기 변경·줄 이동 후의 링크와 밑줄 복원을 수신 화면에서 확인 | `test_terminal_features.FeaturePolicyTests`, `test_terminal_composition.FormattingPolicyTests`, `TerminalCompositionTests` |
 | IO01 | 3셸 × 기본형/플러그인의 native 셸·프로그램 입력 | `test_terminal_hookless.HooklessTests`의 6개 조합 |
 | IO02 | 호스트 backpressure 중 마지막 출력 보존, 3셸의 1,280행·팝업 4회·resize 8회 뒤 전체 history 비교 | `test_terminal_session.TerminalSessionTests`, `test_terminal_supplements.SustainedOutputTests` |
@@ -36,7 +36,7 @@
 | IN02 | terminfo 기능키·수정 navigation·keypad, separator의 mode/action, 3셸의 실제 PTK→PTY 최종 입력 파일 | `test_terminal_contracts.TerminfoContracts`, `LiveQueryContracts` |
 | IN04 | 실제 입력 reader에서 paste를 하나의 이벤트로 보존 | `test_terminal_host.HostInputTests` |
 | IN06 | 호스트 focus가 없는 동안 popup close가 focus-in을 만들지 않음 | `test_terminal_composition.TerminalCompositionTests` |
-| IN07 | auto 정책의 마우스가 실제 PTY 파일 소비자에게 한 번 전달, 실제 Vim의 클릭·휠과 primary history 분리 | `test_terminal_mouse_policy.MousePolicyTests`, `test_terminal_cli.TerminalCLITests` |
+| IN07 | auto 정책의 마우스가 실제 PTY 소비자에게 한 번 전달됨. 팝업을 닫을 때 기존 보고를 걸러낸 뒤 새 마우스 보고·키·붙여넣기가 프로그램에 도착하는지 파일로 확인. 실제 Vim의 클릭·휠과 primary history 분리 | `test_terminal_mouse_policy.MousePolicyTests`, `test_terminal_cli.TerminalCLITests` |
 | IN09 | 기본/키보드 UI에서 host 선택 유지, native 단어·줄 선택 | `test_terminal_mouse_policy.MousePolicyTests`, `test_terminal_selection.SelectionTests` |
 | IN10 | alternate가 primary history를 빌리지 않음 | `test_terminal_vt.TerminalVTTests` |
 | IN12 | native history 검색·선택, 실제 PTK 검색 단축키의 소비자 | `test_terminal_contracts.SearchContracts`, `test_terminal_composition.TerminalCompositionTests` |

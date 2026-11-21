@@ -12,6 +12,8 @@ from functools import lru_cache, partial
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Container, Window
 from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.output import ColorDepth, vt100
@@ -473,12 +475,32 @@ class Composition(Container):
 
 
 class ScreenApplication(Application):
-    """Keep ownership across resizes."""
+    """Keep ownership across resizes and retire mouse input when the screen closes."""
 
     def _on_resize(self):
         """Coalesce notifications, including a shrink and return to the old size."""
         self.renderer.resize_pending = True
         self.invalidate()
+
+    def retire_mouse(self):
+        """Discard reports already decoded for a closing popup or screen."""
+        if not self.renderer._screen_owned:
+            return
+        queue = self.key_processor.input_queue
+        if queue:
+            kept = [key for key in queue if key.key != Keys.Vt100MouseEvent]
+            queue.clear()
+            queue.extend(kept)
+        retire = getattr(self.input, "retire_mouse", None)
+        if retire is not None:
+            retire()
+        if not self.renderer.mouse_support():
+            self.renderer.release_mouse()
+
+    def exit(self, *args, **kwargs):
+        """Switch off capture at the close decision, before PTK's final repaint."""
+        super().exit(*args, **kwargs)
+        self.retire_mouse()
 
 
 class TerminalApplication(ScreenApplication):
@@ -620,7 +642,8 @@ class RestoringRenderer(Renderer):
             previous.style,
             previous.output if output is None else output,
             full_screen=True,
-            mouse_support=previous.mouse_support,
+            mouse_support=previous.mouse_support
+            & Condition(lambda: not owner.app.is_done),
             cpr_not_supported_callback=previous.cpr_not_supported_callback,
         )
 
@@ -640,6 +663,14 @@ class RestoringRenderer(Renderer):
         """Apply the observed cursor after PTK resets its own cursor changes."""
         if self._screen_owned:
             self.output.write_raw(self.owner.host.restore_cursor_shape())
+
+    def release_mouse(self):
+        """Flush tracking shutdown without releasing the rest of the screen."""
+        if self._mouse_support_enabled:
+            self.output.disable_mouse_support()
+            self._mouse_support_enabled = False
+            self.output.write_raw(self.owner.host.mouse_mode(False))
+            self.output.flush()
 
     def repaint_viewport(self):
         """Anchor PTK's relative diff after a host shrink, clamp or reflow."""
@@ -680,6 +711,10 @@ class RestoringRenderer(Renderer):
         """Restore owned state on exit and PTK's external-command suspension."""
         if not self._screen_owned:
             return super().reset(*args, **kwargs)
+        if self.owner.app.is_done:
+            # Covers EOF/cancellation and any reports PTK read before this last
+            # reset. Leave the descriptor and the restored caller's input alone.
+            self.owner.app.retire_mouse()
         self.output.write_raw(self.owner.host.restore_modes(before_screen=True))
         super().reset(*args, **kwargs)
         self.restore_cursor_shape()
