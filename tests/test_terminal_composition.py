@@ -288,6 +288,170 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.owner.plugins.popups, [])
         self.assertEqual(self.owner.plugins.bindings.bindings, [])
 
+    async def test_resize_burst_repaints_at_origin_without_flushing_a_blank(self):
+        """Even a shrink back to the old size requires one anchored, populated paint."""
+        self.owner.vt.feed(b"\x1b[?1049h\x1b[HEDITOR\x1b[5;9HZ")
+        await self.start_input()
+        ready = asyncio.Event()
+        self.owner.app.after_render += lambda _: ready.set()
+        writes = []
+        with patch.object(self.stream, "write", side_effect=lambda s: writes.append(s)):
+            for final in (Size(rows=10, columns=40), Size(rows=10, columns=40)):
+                writes.clear()
+                ready.clear()
+                self.outer_size = Size(rows=3, columns=7)
+                self.owner.app._on_resize()
+                # PTY output or an animation may request a paint during a drag.
+                # It must not send the transient dimensions to the child.
+                self.owner.app._redraw()
+                self.assertEqual(writes, [])
+                self.outer_size = final
+                self.owner.app._on_resize()
+                await asyncio.wait_for(ready.wait(), DEADLINE)
+                paints = [chunk for chunk in writes if "\x1b[J" in chunk]
+                self.assertEqual(len(paints), 1, writes)
+                self.assertIn("EDITOR", paints[0])
+                self.assertIn("\x1b[1;1H", paints[0][: paints[0].index("EDITOR")])
+                for reset in ("\x1b[?1049", "\x1b[?1004l", "\x1b[?2004l"):
+                    self.assertNotIn(reset, "".join(writes))
+
+    async def test_silent_alternate_screen_resizes_with_its_bar_without_child_output(
+        self,
+    ):
+        """A static full-screen program can keep its pixels and never answer SIGWINCH."""
+        import termios
+
+        self.owner.plugins.set_bar(Window(FormattedTextControl("BAR")), rows=1)
+        self.owner.session.argv = [
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'\\x1b[?1049h\\x1b[HSTATIC'); input()",
+        ]
+        await self.start_input()
+        self.owner.session.start(*self.owner.size)
+        painted = asyncio.Event()
+        self.owner.app.after_render += lambda _: painted.set()
+        async with asyncio.timeout(DEADLINE):
+            while "STATIC" not in self.stream.getvalue():
+                painted.clear()
+                await painted.wait()
+            start = self.stream.tell()
+            self.outer_size = Size(rows=10, columns=40)
+            self.owner.app._on_resize()
+            while "BAR" not in self.stream.getvalue()[start:]:
+                painted.clear()
+                await painted.wait()
+        self.assertEqual(termios.tcgetwinsize(self.owner.session.fd), (9, 40))
+        self.assertTrue(self.screen().display[0].startswith("STATIC"))
+        self.assertTrue(self.screen().display[-1].startswith("BAR"))
+
+    async def test_drag_publishes_child_frame_before_advancing_to_next_size(self):
+        """Observe an actual PTY reply when a newer host resize overtook it."""
+        import termios
+
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "go"
+            self.owner.session.argv = [
+                sys.executable,
+                "-c",
+                "import os,sys,time,pathlib\n"
+                "os.write(1,b'\\x1b[?1049h\\x1b[HSTART')\n"
+                "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.002)\n"
+                "last = None\n"
+                "while True:\n"
+                " size = os.get_terminal_size(1)\n"
+                " if size != last:\n"
+                "  os.write(1, f'\\x1b[HFRAME{size.columns}x{size.lines}'.encode()); last = size\n"
+                " time.sleep(.002)\n",
+                str(gate),
+            ]
+            await self.start_input()
+            frames = []
+            self.owner.app.after_render += lambda _: frames.append(
+                self.screen().display[0].rstrip()
+            )
+            self.owner.session.start(*self.owner.size)
+            async with asyncio.timeout(DEADLINE):
+                while "START" not in frames:
+                    await asyncio.sleep(0.002)
+                self.outer_size = Size(rows=10, columns=30)
+                self.owner.app._on_resize()
+                # The first loop turn delivers the resize even without a PTK invalidate.
+                await asyncio.sleep(0)
+                self.assertEqual(termios.tcgetwinsize(self.owner.session.fd), (10, 30))
+                for columns in (34, 36, 40):
+                    self.outer_size = Size(rows=12, columns=columns)
+                    self.owner.app._on_resize()
+                    await asyncio.sleep(0)
+                    self.assertEqual(
+                        termios.tcgetwinsize(self.owner.session.fd), (10, 30)
+                    )
+                gate.touch()
+                while "FRAME40x12" not in frames:
+                    await asyncio.sleep(0.002)
+            self.assertLess(frames.index("FRAME30x10"), frames.index("FRAME40x12"))
+            self.assertFalse({"FRAME34x12", "FRAME36x12"}.intersection(frames))
+            self.assertTrue(self.screen().display[0].startswith("FRAME40x12"))
+
+    async def test_resize_collects_split_pty_paints_and_honors_a_frame_end(self):
+        """Inspect successive real PTK frames while the child waits between writes."""
+        self.owner.session.argv = [
+            sys.executable,
+            "-c",
+            "import os, time, tty\n"
+            "tty.setraw(0)\n"
+            "os.write(1, b'\\x1b[?1049hREADY')\n"
+            "for columns, rows in ((12, 9), (30, 10), (40, 10)):\n"
+            " while os.get_terminal_size() != (columns, rows): time.sleep(.001)\n"
+            " os.write(1, b'\\x1b[2J\\x1b[HPARTIAL')\n"
+            " os.read(0, 1)\n"
+            " final = f'\\x1b[HEDGE-{columns} '.encode()\n"
+            " if columns == 40: final = b'\\x1b[?2026h'+final+b'\\x1b[?2026l'\n"
+            " os.write(1, final)\n"
+            "os.read(0, 1)\n",
+        ]
+        await self.start_input()
+        frames = []
+        self.owner.app.after_render += lambda _: frames.append(
+            self.screen().display[0].strip()
+        )
+        partial = asyncio.Event()
+        output = self.owner.session.output
+
+        def receive(data):
+            output(data)
+            if b"PARTIAL" in data:
+                partial.set()
+
+        self.owner.session.output = receive
+        self.owner.session.start(*self.owner.size)
+        async with asyncio.timeout(DEADLINE):
+            while "READY" not in frames:
+                await asyncio.sleep(0.002)
+            # The long last interval can only pass if the child's explicit
+            # frame end presents immediately, even after an unframed prefix.
+            for columns, rows, interval, expected in (
+                (12, 9, 0.1, ["7;1;9;12"]),
+                (30, 10, 0.1, ["1;13;9;30", "10;1;10;30"]),
+                (40, 10, DEADLINE * 2, ["1;31;10;40"]),
+            ):
+                with patch.object(self.owner.app, "RESIZE_BURST_SECONDS", interval):
+                    partial.clear()
+                    start = self.stream.tell()
+                    self.outer_size = Size(rows=rows, columns=columns)
+                    self.owner.app._on_resize()
+                    await partial.wait()
+                    rectangles = re.findall(
+                        r"\x1b\[([0-9;]+)\$z", self.stream.getvalue()[start:]
+                    )
+                    self.assertEqual(rectangles, expected)
+                    self.owner.app.invalidate()
+                    await asyncio.sleep(0.005)
+                    self.owner.session.send(b"g")
+                    while f"EDGE-{columns}" not in frames:
+                        await asyncio.sleep(0.002)
+        self.assertFalse(any("PARTIAL" in row for row in frames), frames)
+
     async def test_popup_covering_either_half_of_wide_grapheme_restores_it(self):
         """An opaque float must never expose half a glyph or hide its own text."""
         for left, expected in ((1, "AX B"), (2, "A XB")):

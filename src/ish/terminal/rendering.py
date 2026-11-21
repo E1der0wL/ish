@@ -6,9 +6,11 @@ keep their native widths; PTK still owns layout, diffing, focus and output.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from functools import lru_cache, partial
 
+from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout import Container, Window
 from prompt_toolkit.layout.screen import Char
@@ -37,6 +39,11 @@ class RestoringOutput:
         """Do not allow constructor/reset cursor writes before the first probe."""
         self.output, self.owner = output, owner
         self.host = owner.host
+        self.frame_size = None
+
+    def get_size(self):
+        """Use one host size throughout a paint, including layout and mouse mapping."""
+        return self.frame_size or self.output.get_size()
 
     @property
     def ready(self):
@@ -237,7 +244,11 @@ class NativeWindow(Window):
                         target[xpos + cell.x + 1] = NativeTail(head)
         if options.get("has_focus"):
             new_screen.set_cursor_position(
-                self, Point(xpos + frame.cursor_x, ypos + frame.cursor_y)
+                self,
+                Point(
+                    xpos + min(width - 1, frame.cursor_x),
+                    ypos + min(write_position.height - 1, frame.cursor_y),
+                ),
             )
             new_screen.show_cursor = frame.cursor_visible and not options.get(
                 "always_hide_cursor", False
@@ -461,15 +472,149 @@ class Composition(Container):
         self.owner.app.renderer.compose(screen)
 
 
+class ScreenApplication(Application):
+    """Keep ownership across resizes."""
+
+    def _on_resize(self):
+        """Coalesce notifications, including a shrink and return to the old size."""
+        self.renderer.resize_pending = True
+        self.invalidate()
+
+
+class TerminalApplication(ScreenApplication):
+    """Publish matching VT and PTY sizes together when the outer viewport changes."""
+
+    CHILD_PAINT_WAIT = 0.16
+    RESIZE_BURST_SECONDS = 0.012
+
+    def __init__(self, *, prepare_resize, **kwargs):
+        """Leave initial sizing and normal keyboard-driven paints immediate."""
+        self._prepare_resize = prepare_resize
+        self._resize_handle = self._paint_timer = None
+        self._prepared_size = None
+        self._waiting_for_child = False
+        self._resize_frame_ready = False
+        self.painting_prepared = False
+        super().__init__(**kwargs)
+
+    def _queue_resize(self):
+        """Run at the first event-loop opportunity and read the latest size there."""
+        if self._resize_handle is None:
+            self._resize_handle = asyncio.get_running_loop().call_soon(
+                self._apply_resize
+            )
+
+    def _on_resize(self):
+        """Do not wait for an ordinary PTK redraw to notify a resizing child."""
+        if (
+            not self.is_running
+            or self._running_in_terminal
+            or self.renderer._last_size is None
+        ):
+            return super()._on_resize()
+        self.renderer.resize_pending = True
+        if not self._waiting_for_child and not self._resize_frame_ready:
+            self._queue_resize()
+
+    def _apply_resize(self):
+        """Notify the child before composing any cells at the new geometry."""
+        self._resize_handle = None
+        if self.is_done or not self.is_running or self._running_in_terminal:
+            return
+        size = self.output.get_size()
+        if self._paint_timer is not None:
+            self._paint_timer.cancel()
+            self._paint_timer = None
+        self._prepared_size = size
+        self._waiting_for_child, reading = self._prepare_resize(size)
+        if self._waiting_for_child:
+            self._allow_child_paint(reading)
+        else:
+            self._paint_resize()
+
+    def _allow_child_paint(self, reading):
+        """Start the static-screen fallback only while the PTY reader can deliver output."""
+        if reading and self._paint_timer is None:
+            self._paint_timer = asyncio.get_running_loop().call_later(
+                self.CHILD_PAINT_WAIT, self._paint_resize
+            )
+        elif not reading and self._paint_timer is not None:
+            self._paint_timer.cancel()
+            self._paint_timer = None
+
+    def _paint_resize(self):
+        """Present the prepared grid once before negotiating another size."""
+        self._paint_timer = None
+        self._waiting_for_child = False
+        self._resize_frame_ready = True
+        self._redraw()
+
+    def resize_output_received(self, *, frame_closed):
+        """Collect an unframed resize burst once; a declared frame end can paint now."""
+        if not self._waiting_for_child:
+            if not self._resize_frame_ready or not frame_closed:
+                return self._resize_frame_ready
+        if self._paint_timer is not None:
+            self._paint_timer.cancel()
+        self._waiting_for_child = False
+        self._resize_frame_ready = True
+        loop = asyncio.get_running_loop()
+        if frame_closed:
+            self._paint_timer = loop.call_soon(self._paint_resize)
+        else:
+            self._paint_timer = loop.call_later(
+                self.RESIZE_BURST_SECONDS, self._paint_resize
+            )
+        return True
+
+    def _redraw(self, render_as_done=False):
+        """Measure once; both a SIGWINCH and an output-driven paint can see a resize first."""
+        if render_as_done:
+            for handle in (self._resize_handle, self._paint_timer):
+                if handle is not None:
+                    handle.cancel()
+            self._resize_handle = self._paint_timer = self._prepared_size = None
+            self._waiting_for_child = False
+            self._resize_frame_ready = False
+        elif self._running_in_terminal or not self.is_running:
+            return super()._redraw(render_as_done)
+        elif self._resize_frame_ready and self._paint_timer is not None:
+            # An ordinary invalidate must not expose the middle of this burst.
+            return
+        size = self.output.get_size()
+        if self.renderer._last_size is not None and not render_as_done:
+            if self._waiting_for_child:
+                if self._paint_timer is None:
+                    _, reading = self._prepare_resize(self._prepared_size)
+                    self._allow_child_paint(reading)
+                return
+            if size != (self._prepared_size or self.renderer._last_size):
+                self._queue_resize()
+                if not self._resize_frame_ready:
+                    return
+            elif self._resize_handle is not None and not self._resize_frame_ready:
+                return
+        self.painting_prepared = self._resize_frame_ready
+        self._resize_frame_ready = False
+        self.output.frame_size = size
+        try:
+            super()._redraw(render_as_done)
+        finally:
+            self.output.frame_size = None
+            self.painting_prepared = False
+
+
 class RestoringRenderer(Renderer):
     """Share PTK screen ownership and observed-state restoration across UIs."""
 
     SYNC_START = "\x1b[?2026h"
     SYNC_END = "\x1b[?2026l"
 
-    def __init__(self, owner, previous, *, output=None):
+    def __init__(self, owner, previous, *, output=None, sync_resize=False):
         """Keep one broker as the source of initial host state."""
         self.owner = owner
+        self.resize_pending = False
+        self._sync_resize = sync_resize
         self._screen_owned = False
         super().__init__(
             previous.style,
@@ -496,12 +641,40 @@ class RestoringRenderer(Renderer):
         if self._screen_owned:
             self.output.write_raw(self.owner.host.restore_cursor_shape())
 
+    def repaint_viewport(self):
+        """Anchor PTK's relative diff after a host shrink, clamp or reflow."""
+        self.output.cursor_goto(1, 1)
+        self._cursor_pos = Point(0, 0)
+        self._last_screen = None
+
     def render(self, app, layout, is_done=False):
-        """Avoid all painting until the initial observations are closed."""
+        """Paint one geometry without releasing host modes or publishing an empty frame."""
         if not self.owner.presentation_ready:
             return
         self.acquire_screen()
-        super().render(app, layout, is_done=is_done)
+        destination = app.output
+        size = destination.get_size()
+        resized = (
+            not is_done
+            and self._last_size is not None
+            and (self.resize_pending or self._last_size != size)
+        )
+        self.resize_pending = False
+        synchronize = (
+            resized and self._sync_resize and self.owner.host.can_open_sync_frame
+        )
+        destination.frame_size = size
+        try:
+            if synchronize:
+                self.output.write_raw(self.SYNC_START)
+            if resized:
+                self.repaint_viewport()
+            super().render(app, layout, is_done=is_done)
+        finally:
+            destination.frame_size = None
+            if synchronize:
+                self.output.write_raw(self.SYNC_END)
+                self.output.flush()
 
     def reset(self, *args, **kwargs):
         """Restore owned state on exit and PTK's external-command suspension."""
@@ -519,6 +692,7 @@ class RestoringRenderer(Renderer):
 class TerminalRenderer(RestoringRenderer):
     """Extend the pinned PTK renderer with native metadata and graphics."""
 
+    ERASE_RECTANGLE = "\x1b[{top};{left};{bottom};{right}$z"
     FORMAT_RESETS = (
         ("hyperlinks", LINK_END),
         ("extended_styles", UNDERLINE_RESET),
@@ -658,6 +832,33 @@ class TerminalRenderer(RestoringRenderer):
             self.output.write_raw(cleanup)
             self.invalidate_screen()
         self.after_text = ""
+
+    def clear_exposed(self, size):
+        """Queue default-background gutters outside the last painted TUI bounds."""
+        old = self._last_size
+        if old is None or not self._screen_owned:
+            return False
+        regions = []
+        if size.columns > old.columns:
+            regions.append((1, old.columns + 1, min(old.rows, size.rows), size.columns))
+        if size.rows > old.rows:
+            regions.append((old.rows + 1, 1, size.rows, size.columns))
+        if not regions:
+            return False
+        self.output.reset_attributes()
+        self._last_style = None
+        for top, left, bottom, right in regions:
+            self.output.write_raw(
+                self.ERASE_RECTANGLE.format(
+                    top=top, left=left, bottom=bottom, right=right
+                )
+            )
+        return True
+
+    def repaint_viewport(self):
+        """Rebuild host image placements together with the text in the resized frame."""
+        self.clear_graphics()
+        super().repaint_viewport()
 
     @staticmethod
     def _image_content(frame):

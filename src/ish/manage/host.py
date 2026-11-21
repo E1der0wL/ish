@@ -5,15 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 
-from prompt_toolkit.application import Application, get_app_session
-from prompt_toolkit.data_structures import Point
+from prompt_toolkit.application import get_app_session
 from prompt_toolkit.input.typeahead import store_typeahead
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.output.vt100 import Vt100_Output
 
 from ish.terminal.features import FEATURES
 from ish.terminal.host import HostBroker, HostInput
-from ish.terminal.rendering import RestoringOutput, RestoringRenderer
+from ish.terminal.rendering import RestoringOutput, RestoringRenderer, ScreenApplication
 from ish.terminal.settings import inherited_color_depth
 
 from .palette import PanelStyle
@@ -73,47 +72,7 @@ class Presentation:
         self.presentation_ready = True
 
 
-class ManagementOutput(RestoringOutput):
-    """Give layout, mouse mapping and terminal output the same dimensions per frame."""
-
-    def __init__(self, output, owner):
-        """Read directly from the host outside an active paint."""
-        super().__init__(output, owner)
-        self.frame_size = None
-
-    def get_size(self):
-        """Reuse this paint's geometry for every widget and hit target."""
-        return self.frame_size or self.output.get_size()
-
-
-class ManagementRenderer(RestoringRenderer):
-    """Repaint the owned alternate screen in place when its dimensions change."""
-
-    def render(self, app, layout, is_done=False):
-        """Submit a resized screen with a known origin and optional host buffering."""
-        size = self.output.get_size()
-        resized = (
-            not is_done and self._last_size is not None and self._last_size != size
-        )
-        synchronize = resized and self.owner.host.can_open_sync_frame
-        self.output.frame_size = size
-        try:
-            if synchronize:
-                self.output.write_raw(self.SYNC_START)
-            if resized:
-                # After a shrink the physical cursor may have moved. Anchor
-                # the relative writes of the new PTK frame at the known origin.
-                self.output.cursor_goto(1, 1)
-                self._cursor_pos = Point(0, 0)
-            return super().render(app, layout, is_done)
-        finally:
-            self.output.frame_size = None
-            if synchronize:
-                self.output.write_raw(self.SYNC_END)
-                self.output.flush()
-
-
-class ManagementApplication(Application):
+class ManagementApplication(ScreenApplication):
     """Restore observed host state on close and on PTK external-editor handoff."""
 
     def __init__(self, *, input=None, output=None, color_depth=None, **kwargs):
@@ -127,7 +86,7 @@ class ManagementApplication(Application):
         )
         super().__init__(
             input=self.source,
-            output=ManagementOutput(destination, self.presentation),
+            output=RestoringOutput(destination, self.presentation),
             color_depth=preferred_depth
             or (
                 lambda: inherited_color_depth(
@@ -137,14 +96,12 @@ class ManagementApplication(Application):
             **kwargs,
         )
         self.presentation.app = self
-        self.renderer = ManagementRenderer(self.presentation, self.renderer)
+        self.renderer = RestoringRenderer(
+            self.presentation, self.renderer, sync_resize=True
+        )
         # Apply pane emphasis after PTK resolves both widget and inline swatch colors.
         merged = self.renderer.style
         self.renderer.style = PanelStyle(lambda: merged)
-
-    def _on_resize(self):
-        """Coalesce geometry changes without publishing an empty screen between frames."""
-        self.invalidate()
 
     async def run_async(self, *args, **kwargs):
         """Temporarily wrap caller-owned input without closing it or adding readers."""

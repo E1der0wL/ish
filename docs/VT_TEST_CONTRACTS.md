@@ -13,7 +13,7 @@
 | IO01 | 3셸 × 기본형/플러그인의 native 셸·프로그램 입력 | `test_terminal_hookless.HooklessTests`의 6개 조합 |
 | IO02 | 호스트 backpressure 중 마지막 출력 보존, 3셸의 1,280행·팝업 4회·resize 8회 뒤 전체 history 비교 | `test_terminal_session.TerminalSessionTests`, `test_terminal_supplements.SustainedOutputTests` |
 | IO03 | 종료 후 열린 slave가 있어도 보류된 출력 전달, PTY 시작 실패·즉시 종료 때 자원 회수 | `test_terminal_session.TerminalSessionTests` |
-| IO04 | 최초 bar 제외 크기, resize 후 native grid/size 응답, 직렬 크기 조회·실패 복귀·이미지 보존·애니메이션 재개 | `test_terminal_cursor.CursorPTYTests`, `test_terminal_vt.TerminalVTTests`, `test_terminal_geometry` |
+| IO04 | 최초 bar 제외 크기, resize 후 native grid/size 응답, 직렬 크기 조회·실패 복귀·이미지 보존·애니메이션 재개, 연속 resize 중 빈 화면 단독 전송 방지, 키 입력 없이 Vim 본문·상태 줄·커서 복원, 응답하는 TUI의 이전 레이아웃 재전송 방지, 첫 이벤트 루프 차례에 PTY 크기 변경, 응답 대기 중 여러 크기는 마지막 값만 반영하고 준비된 PTY 화면 표시, 가로·세로·대각선 확대에서 새로 노출된 격자만 정리, 분할된 PTY 다시 그리기 병합과 명시적인 동기화 종료 반영, 호스트 픽셀 조회 지연과 무출력 TUI에서의 복구 | `test_terminal_cursor.CursorPTYTests`, `test_terminal_vt.TerminalVTTests`, `test_terminal_geometry`, `test_terminal_composition.TerminalCompositionTests`, `test_terminal_cli.TerminalCLITests` |
 | IO05 | 실제 셸의 Ctrl+C/D/Z, jobs/bg/fg와 최종 파일 | 위 `HooklessTests` 6개 조합 |
 | IO06 | 최초 상태 관찰, 정상/HUP/TERM/중지·재개, 최종 renderer 실패 cleanup | `test_terminal_cursor.RestorationPTYTests`, `test_terminal_composition.TerminalCompositionTests` |
 | IO07 | native 처리 실패를 정상 feed로 보고하지 않음 | `test_terminal_contracts.BaselineContracts` |

@@ -338,6 +338,10 @@ class Plugins:
             self.close_popup(scope.popup)
         self.owner.app.invalidate()
 
+    def bar_height(self, rows):
+        """Reserve the same rows for PTY sizing and layout, leaving one for the shell."""
+        return min(self._bar_rows, max(0, rows - 1))
+
     def set_bar(self, content=None, *, rows=1, mouse=False):
         """Reserve a bounded bottom region; removing it restores the full grid."""
         if self._closed:
@@ -352,7 +356,7 @@ class Plugins:
             HSplit(
                 [to_container(content)],
                 height=lambda: Dimension.exact(
-                    min(rows, max(0, self.owner.app.output.get_size().rows - 1))
+                    self.bar_height(self.owner.app.output.get_size().rows)
                 ),
             )
             if content is not None

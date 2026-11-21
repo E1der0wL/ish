@@ -250,7 +250,30 @@ CASE_CONTRACTS = (
     (
         "IO04",
         "test_terminal_session.TerminalSessionTests",
-        ("test_immediate_resize_survives_delayed_child_setup",),
+        (
+            "test_immediate_resize_survives_delayed_child_setup",
+            "test_fullscreen_burst_reannounces_the_final_real_pty_size_once",
+            "test_settled_resize_does_not_signal_a_replacement_foreground_job",
+        ),
+    ),
+    (
+        "IO04",
+        "test_terminal_composition.TerminalCompositionTests",
+        (
+            "test_resize_burst_repaints_at_origin_without_flushing_a_blank",
+            "test_silent_alternate_screen_resizes_with_its_bar_without_child_output",
+            "test_drag_publishes_child_frame_before_advancing_to_next_size",
+            "test_resize_collects_split_pty_paints_and_honors_a_frame_end",
+        ),
+    ),
+    (
+        "IO04",
+        "test_terminal_cli.TerminalCLITests",
+        (
+            "test_vim_resize_restores_visible_document_and_cursor_without_input",
+            "test_resized_tui_paints_its_new_edges_without_replaying_the_old_layout",
+            "test_primary_tui_also_paints_new_edges_without_replaying_the_old_layout",
+        ),
     ),
     (
         "IO04 UI03",
@@ -278,6 +301,7 @@ CASE_CONTRACTS = (
         "test_terminal_geometry.AppGeometryTests",
         (
             "test_resize_keeps_images_and_stdin_while_pty_output_waits_for_geometry",
+            "test_resized_tui_does_not_repaint_while_pixel_queries_block_its_output",
             "test_geometry_timeout_disables_images_and_resumes_native_text",
             "test_resize_restarts_animation_without_further_child_output",
             "test_popup_escape_adjacent_to_geometry_response_never_reaches_stdin",

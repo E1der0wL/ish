@@ -148,6 +148,58 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.output, b"SIZE 101 33\r\n")
         self.assertEqual(self.exits, [0])
 
+    async def test_fullscreen_burst_reannounces_the_final_real_pty_size_once(self):
+        """A foreground job can resample a final size whose first notification it missed."""
+        self.start(
+            "import os,signal\n"
+            "signals={signal.SIGWINCH}\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK,signals)\n"
+            "print('READY',flush=True)\n"
+            "for n in range(3):\n"
+            " signal.sigwait(signals)\n"
+            " print(n,*os.get_terminal_size(),flush=True)\n"
+        )
+        await self.require_output(b"READY\r\n")
+        self.session.resize(90, 26, confirm_burst=True)
+        await self.require_output(b"0 90 26\r\n")
+        self.session.resize(101, 33, confirm_burst=True)
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        self.assertEqual(
+            self.output.splitlines(), [b"READY", b"0 90 26", b"1 101 33", b"2 101 33"]
+        )
+        self.assertEqual(self.exits, [0])
+
+    async def test_settled_resize_does_not_signal_a_replacement_foreground_job(self):
+        """A new job can acquire the controlling PTY before the resize burst settles."""
+        self.start(
+            "import os,signal\n"
+            "signal.signal(signal.SIGWINCH,lambda *_: print('OLD',flush=True))\n"
+            "print('READY',flush=True)\n"
+            "input()\n"
+            "pid=os.fork()\n"
+            "if pid: os.waitpid(pid,0)\n"
+            "else:\n"
+            " signal.signal(signal.SIGTTOU,signal.SIG_IGN)\n"
+            " os.setpgid(0,0)\n"
+            " signal.signal(signal.SIGWINCH,lambda *_: print('NEW',flush=True))\n"
+            " os.tcsetpgrp(0,os.getpgrp())\n"
+            " print('SWITCHED',flush=True)\n"
+            " input()\n"
+        )
+        await self.require_output(b"READY\r\n")
+        self.session.resize(88, 25, confirm_burst=True)
+        await self.require_output(b"OLD\r\n")
+        self.session.resize(96, 26, confirm_burst=True)
+        self.session.send(b"\n")
+        await self.require_output(b"SWITCHED\r\n")
+        await asyncio.sleep(self.session.RESIZE_SETTLE_SECONDS + 0.05)
+        self.session.send(b"\n")
+        await asyncio.wait_for(self.completed.wait(), DEADLINE)
+        tail = self.output.split(b"SWITCHED\r\n")[1]
+        self.assertNotIn(b"OLD", tail)
+        self.assertNotIn(b"NEW", tail)
+        self.assertEqual(self.exits, [0])
+
     async def test_failed_fork_closes_setup_pipe_and_can_be_retried(self):
         """A spawn failure releases both ends of the initialization boundary."""
         reader, writer = os.pipe()

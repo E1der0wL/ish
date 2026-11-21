@@ -13,7 +13,6 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app_session, set_app
 from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.cursor_shapes import CursorShape, DynamicCursorShapeConfig
@@ -38,7 +37,13 @@ from .identity import NAMED_TEXT
 from .mouse import DEFAULT_MOUSE, decode_mouse, validate_mouse_policy
 from .notifications import Notifications
 from .plugins import Plugins
-from .rendering import Composition, NativeWindow, RestoringOutput, TerminalRenderer
+from .rendering import (
+    Composition,
+    NativeWindow,
+    RestoringOutput,
+    TerminalApplication,
+    TerminalRenderer,
+)
 from .selection import SelectionController
 from .session import Session
 from .settings import (
@@ -233,7 +238,8 @@ class TerminalControl(UIControl):
     def create_content(self, width, height):
         """Resize the VT/PTY together and expose one immutable rendered frame."""
         width, height = max(1, width), max(1, height)
-        self.owner.resize(width, height)
+        if not self.owner.app.painting_prepared:
+            self.owner.resize(width, height)
         self.frame = self.owner.vt.frame()
         frame = self.frame
         return UIContent(
@@ -363,7 +369,8 @@ class TerminalApp:
         self.plugins = Plugins(self, self.window)
         controls = KeyBindings()
         controls.add(Keys.Ignore, eager=True, is_global=True)(self._control)
-        self.app = Application(
+        self.app = TerminalApplication(
+            prepare_resize=self._prepare_resize,
             layout=Layout(
                 Composition(self.plugins.body, self), focused_element=self.window
             ),
@@ -751,6 +758,22 @@ class TerminalApp:
         self.clipboard.copy_selection(text.encode("utf-8"))
         self.app.invalidate()
 
+    def _prepare_resize(self, size):
+        """Resize the foreground PTY before sampling its next presentation."""
+        cols = max(1, size.columns)
+        rows = max(1, size.rows - self.plugins.bar_height(size.rows))
+        changed = self.size != (cols, rows)
+        self.resize(cols, rows)
+        wait_for_child = changed and self.session.pid is not None
+        cleared = (
+            wait_for_child
+            and self.vt.alternate
+            and self.app.renderer.clear_exposed(size)
+        )
+        if self._publish_geometry(self.app.output) or cleared:
+            self.app.output.flush()
+        return wait_for_child, self.session.output_enabled
+
     def resize(self, cols, rows):
         """Keep the emulated grid and controlling PTY on the same pane dimensions."""
         self.host.refresh_geometry(*self._geometry())
@@ -771,7 +794,7 @@ class TerminalApp:
             self.selection.reset()
             self.clipboard.cancel_paste()
             self.vt.resize(cols, rows, *cell)
-            self.session.resize(cols, rows)
+            self.session.resize(cols, rows, confirm_burst=self.vt.alternate)
             self.size = (cols, rows)
         if self.session.pid is not None and not pending:
             enabled = self.profile.image_protocol is not None
@@ -805,25 +828,31 @@ class TerminalApp:
         self.vt.feed(data)
         self._drain_effects()
         serial = self.vt.render_hold_serial
-        if self.vt.synchronized_output:
-            if serial != self.hold_serial:
+        held = self.vt.synchronized_output
+        started = serial != self.hold_serial
+        self.hold_serial = serial
+        frame_closed = not held and (started or self.hold_timer is not None)
+        if held:
+            if started:
                 if self.hold_timer is not None:
                     self.hold_timer.cancel()
                 self.hold_timer = asyncio.get_running_loop().call_later(
                     self.RENDER_HOLD_SECONDS, self.release_hold
                 )
-                self.hold_serial = serial
-        elif self.hold_timer is not None:
-            self.hold_timer.cancel()
-            self.hold_timer = None
+        else:
+            if self.hold_timer is not None:
+                self.hold_timer.cancel()
+                self.hold_timer = None
         if self.vt.alternate != alternate:
+            self.session.cancel_resize_notice()
             self.selection.reset()
             self.clipboard.cancel_paste()
             self.pressed_buttons.clear()
             self.native_buttons.clear()
         elif not self.vt.mouse_reporting:
             self.native_buttons.clear()
-        self.app.invalidate()
+        if held or not self.app.resize_output_received(frame_closed=frame_closed):
+            self.app.invalidate()
         if self.animation is None and self.profile.image_protocol is not None:
             self._animate()
 
@@ -909,18 +938,25 @@ class TerminalApp:
             output.write_raw(f"\x1b]7;{uri}\x1b\\")
             self.cwd_changed = False
 
+    def _publish_geometry(self, output):
+        """Allow pixel queries to resume child output even while a paint is pending."""
+        if self.stopping or self.app.is_done:
+            return False
+        geometry = self.host.take_geometry_query()
+        if geometry is None:
+            return False
+        serial, query = geometry
+        output.write_raw(query)
+        if self.geometry_timer is not None:
+            self.geometry_timer.cancel()
+        self.geometry_timer = asyncio.get_running_loop().call_later(
+            self.PROBE_SECONDS, self.host.expire_geometry, serial
+        )
+        return True
+
     def publish_effects(self, output):
         """Serialize queued effects through the same presentation output."""
-        if not self.stopping and not self.app.is_done:
-            geometry = self.host.take_geometry_query()
-            if geometry is not None:
-                serial, query = geometry
-                output.write_raw(query)
-                if self.geometry_timer is not None:
-                    self.geometry_timer.cancel()
-                self.geometry_timer = asyncio.get_running_loop().call_later(
-                    self.PROBE_SECONDS, self.host.expire_geometry, serial
-                )
+        self._publish_geometry(output)
         for control in self.control_output:
             output.write_raw(control)
         self.control_output.clear()

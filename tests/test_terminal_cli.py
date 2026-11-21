@@ -42,6 +42,27 @@ print('LIVE_NATIVE_OUTPUT', flush=True)
 Path('native-result').write_text(sys.stdin.readline())
 """
 
+RESIZE_TUI = r"""import os
+import signal
+import sys
+
+def draw(*_):
+    cols, rows = os.get_terminal_size(1)
+    label = "BEFORE" if cols == 100 else "AFTER"
+    os.write(1, f"\x1b[H\x1b[2J{label}\x1b[{rows};{cols-3}HEDGE".encode())
+
+signal.signal(signal.SIGWINCH, draw)
+alternate = "--primary" not in sys.argv
+if alternate:
+    os.write(1, b"\x1b[?1049h")
+try:
+    draw()
+    input()
+finally:
+    if alternate:
+        os.write(1, b"\x1b[?1049l")
+"""
+
 KEY_READER = """import os
 import termios
 import tty
@@ -643,13 +664,52 @@ class TerminalWaitTests(unittest.TestCase):
             terminal.require(lambda: False, timeout=0)
 
 
+@unittest.skipUnless(TCSH, "tcsh is required")
+def start_resize_editor(terminal):
+    """Open a numbered document and let Vim report geometry without requesting a redraw."""
+    lines = [
+        f"row-{number:03d} | " + "abcdefghijklmnop" * 5 for number in range(1, 101)
+    ]
+    (terminal.root / "resize.txt").write_text("\n".join(lines) + "\n")
+    (terminal.root / "resize.vim").write_text(
+        "set nowrap noshowmode noruler noshowcmd laststatus=2 scrolloff=0\n"
+        "set statusline=VIM-RESIZE\n"
+        "normal! 18G15|\n"
+        "autocmd VimEnter,VimResized * call writefile([printf('%dx%d', &columns, &lines)], 'vim-size')\n"
+    )
+    terminal.submit(
+        "vim -Nu NONE -n -i NONE --cmd 'set shortmess+=F' -S resize.vim resize.txt"
+    )
+
+
+def resize_editor_visible(terminal):
+    """Check the emitted outer rows, status line and physical cursor at the new size."""
+    rows, cols = terminal.rows, terminal.cols
+    size = terminal.root / "vim-size"
+    if not size.exists() or size.read_text().strip() != f"{cols}x{rows}":
+        return False
+    display = terminal.screen.display
+    if display[-2].strip() != "VIM-RESIZE" or display[-1].strip():
+        return False
+    document = (terminal.root / "resize.txt").read_text().splitlines()
+    first = display[0][:7]
+    if not first.startswith("row-") or not first[4:].isdigit():
+        return False
+    index = int(first[4:]) - 1
+    return (
+        0 <= index <= 17
+        and display[:-2]
+        == [line[:cols].ljust(cols) for line in document[index : index + rows - 2]]
+        and (terminal.screen.cursor.x, terminal.screen.cursor.y) == (14, 17 - index)
+    )
+
+
 def with_history_keys(test):
     """Select the optional page bindings only for tests that browse history."""
     test.history_keys = True
     return test
 
 
-@unittest.skipUnless(TCSH, "tcsh is required")
 class TerminalCLIFixture(unittest.TestCase):
     """Reuse a real CLI session without changing the default capture policy."""
 
@@ -858,6 +918,50 @@ class TerminalCLITests(TerminalCLIFixture):
         self.require_full_screen()
         terminal.submit("stty size > returned-size")
         terminal.result("returned-size", b"33 110\n")
+
+    @unittest.skipUnless(shutil.which("vim"), "vim is required")
+    def test_vim_resize_restores_visible_document_and_cursor_without_input(self):
+        """Shrink both axes and expand while Vim is idle, then edit at the shown cursor."""
+        terminal = self.terminal
+        start_resize_editor(terminal)
+        terminal.require(lambda: resize_editor_visible(terminal))
+        for rows, cols in ((8, 24), (34, 118), (11, 41), (ROWS, COLS)):
+            for delta in (3, 2, 1):
+                terminal.resize(rows + delta, cols + delta)
+                terminal.receive()
+            terminal.resize(rows, cols)
+            terminal.require(lambda: resize_editor_visible(terminal))
+        original = (self.root / "resize.txt").read_text().splitlines(keepends=True)
+        original[17] = original[17][:14] + "!" + original[17][15:]
+        terminal.send("r!:wq\r")
+        terminal.result("resize.txt", "".join(original).encode())
+        terminal.require(terminal.at_prompt)
+
+    def require_resized_tui(self, *arguments):
+        """Inspect the resize stream as well as the TUI's final screen."""
+        terminal = self.terminal
+        (self.root / "resize-tui.py").write_text(RESIZE_TUI)
+        terminal.submit(shlex.join([sys.executable, "resize-tui.py", *arguments]))
+        terminal.require(lambda: terminal.screen.display[-1].endswith("EDGE"))
+        start = len(terminal.output)
+        terminal.resize(32, 118)
+        terminal.require(
+            lambda: (
+                terminal.screen.display[0].startswith("AFTER")
+                and terminal.screen.display[-1].endswith("EDGE")
+            )
+        )
+        self.assertNotIn(b"BEFORE", terminal.output[start:])
+        terminal.send(b"\r")
+        terminal.require(terminal.at_prompt)
+
+    def test_resized_tui_paints_its_new_edges_without_replaying_the_old_layout(self):
+        """A responsive alternate-screen program draws the new geometry first."""
+        self.require_resized_tui()
+
+    def test_primary_tui_also_paints_new_edges_without_replaying_the_old_layout(self):
+        """Programs that keep terminal history can own their full-screen layout too."""
+        self.require_resized_tui("--primary")
 
     @with_history_keys
     def test_scrolled_output_keeps_anchor_until_native_input_and_resize(self):

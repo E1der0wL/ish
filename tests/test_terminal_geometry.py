@@ -370,6 +370,32 @@ class AppGeometryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(owner.plugins.manager)
                 self.assertEqual(owner.plugins.popups, [])
 
+    async def test_resized_tui_does_not_repaint_while_pixel_queries_block_its_output(
+        self,
+    ):
+        """A delayed host reply must not consume the child's presentation allowance."""
+        async with self.terminal() as (owner, pipe, grid, stream), asyncio.timeout(5):
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(owner.app, "CHILD_PAINT_WAIT", 0.02),
+                patch.object(owner, "PROBE_SECONDS", 3),
+            ):
+                result = Path(directory) / "input"
+                await self.start_child(owner, result, image=b"\x1b[?1049h" + self.IMAGE)
+                while "CHILD_READY" not in stream.getvalue():
+                    await asyncio.sleep(0.01)
+                start = stream.tell()
+                await self.begin_resize(owner, grid, stream)
+                pipe.send_text("resize-input\r")
+                while not result.exists():
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.08)
+                self.assertNotIn("CHILD_READY", stream.getvalue()[start:])
+                pipe.send_bytes(b"\x1b[6;22;11t\x1b[4;220;550t")
+                while "LATE_OUTPUT" not in stream.getvalue()[start:]:
+                    await asyncio.sleep(0.01)
+                self.assertEqual(result.read_text(), "resize-input")
+
     async def test_resize_restarts_animation_without_further_child_output(self):
         """Geometry recovery restarts native frames after the old timer has stopped."""
         animation = (

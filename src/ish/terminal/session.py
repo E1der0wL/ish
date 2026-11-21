@@ -24,6 +24,7 @@ class Session:
     SHUTDOWN_SECONDS = 2
     SHUTDOWN_INTERVAL = 0.05
     MAX_PENDING_INPUT = 4 * 1024 * 1024
+    RESIZE_SETTLE_SECONDS = 0.35
 
     def __init__(
         self,
@@ -57,6 +58,7 @@ class Session:
         self.pending_input = bytearray()
         self._output_done = None
         self._final_remaining = None
+        self._resize_group = self._resize_notice = None
 
     def start(self, cols: int, rows: int) -> None:
         """Create the shell's controlling terminal before starting background work."""
@@ -193,11 +195,47 @@ class Session:
             except Exception as exc:
                 self.failed(exc)
 
-    def resize(self, cols: int, rows: int) -> None:
-        """Advertise only the pane's dimensions to the child terminal."""
+    def resize(self, cols: int, rows: int, *, confirm_burst=False) -> None:
+        """Advertise real dimensions; a full-screen job may miss the last coalesced signal."""
         if self.fd is not None and not self.closed and self.size != (cols, rows):
+            group = self._foreground_group() if confirm_burst else None
+            repeated = group is not None and group == self._resize_group
+            self.cancel_resize_notice()
             termios.tcsetwinsize(self.fd, (rows, cols))
             self.size = (cols, rows)
+            if group is not None:
+                self._resize_group = group
+                self._resize_notice = self.loop.call_later(
+                    self.RESIZE_SETTLE_SECONDS, self._settle_resize, repeated
+                )
+
+    def _foreground_group(self):
+        try:
+            group = os.tcgetpgrp(self.fd)
+        except OSError:
+            return None
+        return group if group > 0 and group != os.getpgrp() else None
+
+    def cancel_resize_notice(self):
+        """Retire a burst when its foreground screen or PTY is released."""
+        if self._resize_notice is not None:
+            self._resize_notice.cancel()
+        self._resize_group = self._resize_notice = None
+
+    def _settle_resize(self, repeated):
+        """Remind only the original foreground job, once, without a fictitious resize."""
+        group = self._resize_group
+        self.cancel_resize_notice()
+        if (
+            repeated
+            and group is not None
+            and self.returncode is None
+            and self._foreground_group() == group
+        ):
+            try:
+                os.killpg(group, signal.SIGWINCH)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     def set_output_enabled(self, enabled: bool) -> None:
         """Apply backpressure without changing the child or consuming its output."""
@@ -218,6 +256,7 @@ class Session:
         if self.closed:
             return
         self.closed = True
+        self.cancel_resize_notice()
         self.pending_input.clear()
         if self.fd is None:
             return
