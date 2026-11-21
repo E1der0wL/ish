@@ -536,33 +536,26 @@ class TerminalRenderer(RestoringRenderer):
             for p in self.owner.plugins.opaque_positions
         )
         content = self._image_content(frame)
-        scene = (
-            content,
-            self.graphics.scene_key(
-                frame, origin=origin, clip=clip, occluders=occluders
-            ),
-        )
+        viewport = {"origin": origin, "clip": clip, "occluders": occluders}
         if (
             self._host_failures >= self.MAX_GRAPHICS_FAILURES
             or content == self._rejected_content
-            or scene == self._limited_scene
+            or (
+                self._limited_scene is not None
+                and (content, self.graphics.scene_key(frame, **viewport))
+                == self._limited_scene
+            )
         ):
             self.clear_graphics()
             return
         try:
-            plan = self.graphics.plan(
-                frame,
-                self.owner.vt.image,
-                origin=origin,
-                clip=clip,
-                occluders=occluders,
-            )
+            plan = self.graphics.plan(frame, self.owner.vt.image, **viewport)
         except (GraphicsLimitError, GraphicsCapabilityError) as exc:
             # Resource policy must not terminate an otherwise usable shell.
             # Structural/native errors still propagate instead of being hidden.
             self.graphics_error = str(exc)
             self.graphics_failure_count += 1
-            self._limited_scene = scene
+            self._limited_scene = content, self.graphics.scene_key(frame, **viewport)
             self.clear_graphics()
             return
         self.graphics_error = None

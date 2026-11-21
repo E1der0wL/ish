@@ -201,6 +201,24 @@ class SixelPresenterTests(unittest.TestCase):
         )
         self.presenter = RasterPresenter("sixel")
 
+    def blank_rows(self, background=None):
+        """Provide explicit undecorated cells underneath partial-alpha pixels."""
+        return tuple(
+            tuple(
+                SimpleNamespace(
+                    x=x,
+                    width=1,
+                    text=" ",
+                    underline=0,
+                    overline=False,
+                    style="",
+                    bg=background,
+                )
+                for x in range(self.frame.cols)
+            )
+            for _ in range(self.frame.rows)
+        )
+
     def test_page_origin_padding_popup_occlusion_and_restoration(self):
         """Page origin padding popup occlusion and restoration."""
         first = self.presenter.plan(self.frame, lambda _: self.asset)
@@ -244,21 +262,7 @@ class SixelPresenterTests(unittest.TestCase):
     def test_partial_alpha_flattens_known_blank_background_and_preserves_holes(self):
         """Partial alpha flattens known blank background and preserves holes."""
         self.asset.rgba = bytes((255, 0, 0, 128)) * 15 + bytes((0, 0, 0, 0))
-        self.frame.cells = tuple(
-            tuple(
-                SimpleNamespace(
-                    x=x,
-                    width=1,
-                    text=" ",
-                    underline=0,
-                    overline=False,
-                    style="",
-                    bg=None,
-                )
-                for x in range(self.frame.cols)
-            )
-            for _ in range(self.frame.rows)
-        )
+        self.frame.cells = self.blank_rows()
         self.presenter.background = (0, 0, 255)
         first = self.presenter.plan(self.frame, lambda _: self.asset)
         pixel = read_pixels(first.after_text).getpixel((2, 2))
@@ -283,21 +287,7 @@ class SixelPresenterTests(unittest.TestCase):
     ):
         """Partial alpha prefers explicit cell color and rejects unknown defaults."""
         self.asset.rgba = bytes((255, 0, 0, 128)) * 16
-        self.frame.cells = tuple(
-            tuple(
-                SimpleNamespace(
-                    x=x,
-                    width=1,
-                    text=" ",
-                    underline=0,
-                    overline=False,
-                    style="",
-                    bg=(0, 255, 0),
-                )
-                for x in range(self.frame.cols)
-            )
-            for _ in range(self.frame.rows)
-        )
+        self.frame.cells = self.blank_rows((0, 255, 0))
         self.presenter.background = (0, 0, 255)
         first = self.presenter.plan(self.frame, lambda _: self.asset)
         pixel = read_pixels(first.after_text).getpixel((2, 2))
@@ -315,6 +305,32 @@ class SixelPresenterTests(unittest.TestCase):
         )
         with self.assertRaises(GraphicsCapabilityError):
             self.presenter.plan(self.frame, lambda _: self.asset)
+
+    def test_clipped_alpha_tracks_wide_heads_crossing_the_visible_edge(self):
+        """A grapheme starting left of a clipped image still owns its second column."""
+        self.frame.cells = self.blank_rows((0, 0, 255))
+        self.asset.rgba = bytes((255, 0, 0, 128)) * 16
+        view = {"origin": (4, 2), "clip": Rect(7, 4, 1, 2)}
+        first = self.presenter.plan(self.frame, lambda _: self.asset, **view)
+        pixel = read_pixels(first.after_text).getpixel((7, 4))
+        self.assertLessEqual(abs(pixel[0] - 128), 1)
+        self.assertLessEqual(abs(pixel[2] - 127), 1)
+        rows = list(self.frame.cells)
+        row = rows[1]
+        # Column 2 is part of the source image but outside the presentation clip.
+        outside = SimpleNamespace(**(vars(row[2]) | {"text": "X"}))
+        rows[1] = (*row[:2], outside, *row[3:])
+        self.frame.cells = tuple(rows)
+        same = self.presenter.plan(
+            self.frame, lambda _: self.fail("asset read"), **view
+        )
+        self.assertEqual(same.after_text, first.after_text)
+        self.assertFalse(same.repaint)
+        wide = SimpleNamespace(**(vars(row[0]) | {"text": "한", "width": 2}))
+        rows[1] = (wide, *rows[1][2:])
+        self.frame.cells = tuple(rows)
+        with self.assertRaises(GraphicsCapabilityError):
+            self.presenter.plan(self.frame, lambda _: self.asset, **view)
 
 
 class SixelInputTests(unittest.TestCase):

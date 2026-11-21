@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import secrets
 import zlib
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -127,6 +128,17 @@ def _image_scene(frame, origin, clip, occluders):
         clip,
         tuple(occluders),
     )
+
+
+def _viewport(frame, origin, clip):
+    bounds = Rect(
+        *origin, frame.cols * frame.cell_width, frame.rows * frame.cell_height
+    )
+    if clip is not None:
+        bounds = bounds.intersect(clip)
+    if bounds is None:
+        return None
+    return bounds.intersect(Rect(0, 0, max(0, bounds.right), max(0, bounds.bottom)))
 
 
 class DisabledPresenter:
@@ -328,12 +340,7 @@ class GraphicsPresenter:
             raise GraphicsError("Image presentation requires negotiated cell pixels")
         if len(occluders) > MAX_OCCLUDERS or len(frame.images) > MAX_IMAGES:
             raise GraphicsLimitError("Too many image placements or popup rectangles")
-        viewport = Rect(origin[0], origin[1], frame.cols * cw, frame.rows * ch)
-        viewport = viewport.intersect(clip) if clip is not None else viewport
-        if viewport is not None:
-            viewport = viewport.intersect(
-                Rect(0, 0, max(0, viewport.right), max(0, viewport.bottom))
-            )
+        viewport = _viewport(frame, origin, clip)
 
         assets = dict(self._assets)
         retired = set(self._retired)
@@ -544,13 +551,46 @@ class RasterPresenter:
         self._wire = ""
 
     def scene_key(self, frame, *, origin=(0, 0), clip=None, occluders=()) -> tuple:
-        """Below-text acceptance also depends on the cells under native images."""
-        cells = (
-            frame.cells
-            if self.protocol == "sixel" or any(p.layer == 1 for p in frame.images)
-            else ()
+        """Only cells under a placement can affect its acceptance or alpha blend."""
+        geometry = _image_scene(frame, origin, clip, occluders)
+        cells = getattr(frame, "cells", ())
+        if not cells or not frame.images:
+            return geometry, self.background, ()
+        if len(frame.images) > MAX_IMAGES or len(cells) != frame.rows:
+            return geometry, self.background, cells
+        viewport = _viewport(frame, origin, clip)
+        regions = set()
+        for p in frame.images:
+            if viewport is None or (self.protocol != "sixel" and p.layer != 1):
+                continue
+            bounds = Rect(origin[0] + p.x, origin[1] + p.y, p.width, p.height)
+            visible = viewport.intersect(bounds)
+            if visible is not None:
+                cw, ch = frame.cell_width, frame.cell_height
+                regions.add(
+                    (
+                        (visible.x - origin[0]) // cw,
+                        (visible.right - origin[0] + cw - 1) // cw,
+                        (visible.y - origin[1]) // ch,
+                        (visible.bottom - origin[1] + ch - 1) // ch,
+                    )
+                )
+        # Never retain more cell references than the viewport, even when many
+        # placements overlap. A dense scene can reuse the native row tuples.
+        area = sum(
+            (right - left) * (bottom - top) for left, right, top, bottom in regions
         )
-        return (*_image_scene(frame, origin, clip, occluders), cells, self.background)
+        if area >= frame.cols * frame.rows:
+            return geometry, self.background, cells
+        spans = []
+        for left, right, top, bottom in sorted(regions):
+            for row in cells[top:bottom]:
+                # Native rows omit wide tails. Select every grapheme whose
+                # half-open cell interval overlaps this placement.
+                start = bisect_right(row, left, key=lambda cell: cell.x + cell.width)
+                end = bisect_left(row, right, lo=start, key=lambda cell: cell.x)
+                spans.append(row[start:end])
+        return geometry, self.background, tuple(spans)
 
     def _erase(self, coverage):
         if coverage is None:
@@ -679,13 +719,7 @@ class RasterPresenter:
         scene = self.scene_key(frame, origin=origin, clip=clip, occluders=occluders)
         if scene == self._scene:
             return GraphicsPlan(after_text=self._wire)
-        viewport = Rect(origin[0], origin[1], frame.cols * cw, frame.rows * ch)
-        if clip is not None:
-            viewport = viewport.intersect(clip)
-        if viewport is not None:
-            viewport = viewport.intersect(
-                Rect(0, 0, max(0, viewport.right), max(0, viewport.bottom))
-            )
+        viewport = _viewport(frame, origin, clip)
         visible = []
         for placement in sorted(
             frame.images, key=lambda p: (p.layer, p.z, p.image_id, p.id)

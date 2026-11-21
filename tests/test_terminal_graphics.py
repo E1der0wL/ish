@@ -583,6 +583,7 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
 
         screen = pyte.Screen(self.outer_size.columns, self.outer_size.rows)
         text_wire = re.sub("\x1b_G.*?\x1b\\\\", "", self.stream.getvalue(), flags=re.S)
+        text_wire = re.sub(r"\x1bP0;1q[^\x1b]*\x1b\\", "", text_wire)
         # Pyte does not implement colon SGR parameters; text expectations do not
         # depend on underline styles. The composition suite checks those bytes.
         text_wire = re.sub("\x1b\\[[0-9;:]*:[0-9;:]*m", "", text_wire)
@@ -751,6 +752,41 @@ class GraphicsRendererTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.image_generation, original.image_generation)
         self.assertIn("\x1b]1337;File=", restored)
         self.assertIsNone(self.renderer.graphics_error)
+
+    async def test_sixel_updates_outside_text_without_rebuilding_or_clearing(self):
+        """Deliver new text and the original raster; retry a blocked layer on overlap."""
+        from ish.terminal import sixel
+        from ish.terminal.host import HostBroker
+
+        broker = HostBroker()
+        broker.begin_probe(12, 6)
+        for reply in ("\x1b[6;2;2t", "\x1b[?1;4c", "\x1b[?80;2$y"):
+            self.assertTrue(broker.control(reply))
+        broker.finish_probe()
+        self.owner.host = broker
+        self.show_image(z=-1)
+        with patch("ish.terminal.sixel.encode", wraps=sixel.encode) as encoder:
+            first = self.render()
+            raster = re.search(r"\x1bP0;1q.*?\x1b\\", first, re.S).group()
+            self.assertIn(";2;100;0;0", raster)
+            self.owner.vt.feed(b"\x1b[1;8HOUT")
+            changed = self.render()
+            self.assertIn("OUT", self.screen().display[0])
+            self.assertIn(raster, changed)
+            self.assertNotIn("\x1b[2J", changed)
+            self.assertEqual(encoder.call_count, 1)
+
+            self.owner.vt.feed(b"\x1b[1;1HX")
+            self.assertNotIn(raster, self.render())
+            self.assertEqual(self.renderer.graphics_failure_count, 1)
+            self.write_label("NEXT")
+            self.render()
+            self.assertIn("NEXT", self.screen().display[-1])
+            self.assertEqual(self.renderer.graphics_failure_count, 1)
+            self.owner.vt.feed(b"\x1b[1;1H ")
+            self.assertIn(raster, self.render())
+            self.assertIsNone(self.renderer.graphics_error)
+            self.assertEqual(encoder.call_count, 2)
 
     async def test_overline_only_blocks_raster_then_recovers_without_image_change(self):
         """Real native overline survives instead of being covered by an outer PNG."""

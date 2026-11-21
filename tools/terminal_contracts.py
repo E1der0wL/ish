@@ -321,11 +321,13 @@ REQUIRED_CASES = {
         "test_terminal_sixel.SixelPtyTests.test_child_output_cuts_pixels_and_input_reaches_its_result_file",
     ),
     "IM06": (
+        "test_terminal_graphics.GraphicsRendererTests.test_sixel_updates_outside_text_without_rebuilding_or_clearing",
         "test_terminal_sixel.SixelEncoderTests.test_sparse_pixels_bands_and_repeat_preserve_transparency",
         "test_terminal_sixel.SixelEncoderTests.test_all_transparent_and_color_255_do_not_share_an_alpha_sentinel",
         "test_terminal_sixel.SixelEncoderTests.test_partial_alpha_is_rejected_without_silent_background_flattening",
         "test_terminal_sixel.SixelEncoderTests.test_wire_pixel_and_zero_budgets_are_bounded",
         "test_terminal_sixel.SixelPresenterTests.test_page_origin_padding_popup_occlusion_and_restoration",
+        "test_terminal_sixel.SixelPresenterTests.test_clipped_alpha_tracks_wide_heads_crossing_the_visible_edge",
         "test_terminal_sixel.SixelPresenterTests.test_unchanged_scene_reuses_wire_and_erasure_requests_text_repaint",
         "test_terminal_sixel.SixelPresenterTests.test_rejection_preserves_previous_cleanup_and_below_text_contract",
         "test_terminal_sixel.SixelPresenterTests.test_partial_alpha_flattens_known_blank_background_and_preserves_holes",

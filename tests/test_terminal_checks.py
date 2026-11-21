@@ -680,6 +680,11 @@ CASE_CONTRACTS = (
     ),
     (
         "IM06",
+        "test_terminal_graphics.GraphicsRendererTests",
+        ("test_sixel_updates_outside_text_without_rebuilding_or_clearing",),
+    ),
+    (
+        "IM06",
         "test_terminal_sixel.SixelEncoderTests",
         (
             "test_sparse_pixels_bands_and_repeat_preserve_transparency",
@@ -693,6 +698,7 @@ CASE_CONTRACTS = (
         "test_terminal_sixel.SixelPresenterTests",
         (
             "test_page_origin_padding_popup_occlusion_and_restoration",
+            "test_clipped_alpha_tracks_wide_heads_crossing_the_visible_edge",
             "test_unchanged_scene_reuses_wire_and_erasure_requests_text_repaint",
             "test_rejection_preserves_previous_cleanup_and_below_text_contract",
             "test_partial_alpha_flattens_known_blank_background_and_preserves_holes",
