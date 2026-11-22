@@ -1,6 +1,6 @@
 # ish 설정 안내
 
-현재 제품은 libghostty-vt + PTK 기반 **ish** 하나다. 설치된 `ish`, 소스의 `python -m ish`가 같은 경로이며 예전 stream 실행기와 `ish-vt` 별칭은 제공하지 않는다. 지원 범위·제약은 [README](../README.md), 구현 계약은 [AGENTS.md](../AGENTS.md)를 참고한다.
+현재 제품은 libghostty-vt + PTK 기반 **ish** 하나다. 설치된 `ish`, 소스의 `python -m ish`가 같은 경로이며 예전 stream 실행기와 `ish-vt` 별칭은 제공하지 않는다. 처음 실행하는 방법은 [README](../README.md), 지원 범위와 제약은 [기능 정책](VT_FEATURE_POLICY.md)과 [SIXEL 안내](VT_SIXEL.md), 구현 계약은 [AGENTS.md](../AGENTS.md)를 참고한다.
 
 ## TUI로 익히기
 
@@ -121,11 +121,27 @@ UI·키·출력·클립보드 보완 모듈은 같은 `config.plugins`와 `plugi
 설정 창에서 플러그인 경로 편집을 마치면 해당 폴더의 플러그인·모듈 목록이 갱신된다. 원래 폴더에 패키지를 추가한 경우 변경분을 저장한 뒤 ↻ 또는 Ctrl+R로 설정 파일과 목록을 함께 다시 읽는다. 선택 해제는 파일 삭제가 아니다. `.py` 수정과 선택 변경은 다음 세션에 적용하고 실행 중 교체하지 않는다.
 
 ```python
-config.plugin_dir = "/absolute/path/to/ish/examples/terminal_plugins"
-config.plugins = ["terminal_bar", "terminal_popup"]
+config.plugin_dir = "/absolute/path/to/ish/bundles/plugins"
+config.plugins = ["terminal_history", "terminal_search"]
 ```
 
-`--plugin NAME`은 이번 세션의 선택 목록을 대체한다. `--no-plugins`는 저장된 선택을 이번 세션에서 끈다. 설정창의 **확장 → 플러그인**에서 하단 바·팝업 같은 일반 플러그인을, **확장 → 모듈**에서 키·클립보드 같은 보완 모듈을 선택한다. 실제 로딩과 의존성 검사는 같은 PluginManager가 담당한다. [분류별 예제 목록](../README.md#플러그인과-보완-모듈) · [플러그인 개발](PLUGINS.md) · [보완 모듈 API](VT_PROTOCOL_PLUGINS.md)
+저장소의 [플러그인](../bundles/plugins)과 [모듈](../bundles/modules)은 각각의 폴더에서 직접 선택할 수 있다. 두 종류를 함께 사용하려면 원하는 패키지 폴더를 같은 `plugin_dir` 아래에 복사하고 `config.plugins`에 이름을 나열한다. 기본 경로는 `~/ish/plugin/script/`다.
+
+`--plugin NAME`은 이번 세션의 선택 목록을 대체한다. `--no-plugins`는 저장된 선택을 이번 세션에서 끈다. 설정창의 **확장 → 플러그인**에서 하단 바·팝업 같은 일반 플러그인을, **확장 → 모듈**에서 키·클립보드 같은 보완 모듈을 선택한다. 실제 로딩과 의존성 검사는 같은 PluginManager가 담당한다. [플러그인 개발](PLUGINS.md) · [보완 모듈 API](VT_PROTOCOL_PLUGINS.md)
+
+### 번들 플러그인
+
+| 패키지 | 사용 방법 |
+|---|---|
+| [terminal_commands](../bundles/plugins/terminal_commands/__init__.py) | 셸이 OSC 133 표시를 보낼 때 F6·F7로 프롬프트를 이동하고 F8·F9로 마지막 출력을 선택하거나 복사합니다. |
+| [terminal_history](../bundles/plugins/terminal_history/__init__.py) | 기본 화면에서 Shift+PgUp·Shift+PgDn으로 이전 출력을 봅니다. Vim의 대체 화면에서는 키가 Vim에 전달됩니다. |
+| [terminal_search](../bundles/plugins/terminal_search/__init__.py) | Ctrl+F로 스크롤백을 검색합니다. |
+
+### 번들 모듈
+
+| 패키지 | 보완하는 기능 |
+|---|---|
+| [clipboard_system](../bundles/modules/clipboard_system/__init__.py) | 프로그램의 클립보드 요청을 WSL의 Windows 클립보드 또는 X11에 연결합니다. |
 
 ## 기능별 정책
 

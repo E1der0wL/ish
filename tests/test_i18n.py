@@ -18,7 +18,7 @@ from ish.lang.i18n import I18N, Message
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT_SOURCES = (
     "src/ish",
-    "examples/terminal_plugins",
+    "bundles",
 )
 
 

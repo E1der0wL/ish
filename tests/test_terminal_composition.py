@@ -578,12 +578,26 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bytes(self.owner.session.pending_input).endswith(b"NATIVE"))
         self.assertNotIn(b"POPUP", self.owner.session.pending_input)
 
+    def load_test_ui(self, directory):
+        """Load the fixture with its own import path and result directory."""
+        from terminal_scenarios import install_ui_fixture
+
+        root = Path(directory)
+        self.enterContext(patch.object(sys, "path", sys.path.copy()))
+        with patch.dict(os.environ, {"HOME": str(root)}):
+            self.owner.plugins.load(
+                ["terminal_check"],
+                directory=install_ui_fixture(root),
+                library_dir=root / "libraries",
+            )
+        entry = self.owner.plugins.get("terminal_check")
+        self.addCleanup(sys.modules.pop, entry.__name__, None)
+
     async def test_installed_bar_renders_its_configured_text(self):
         """An external package reads a typed setting and paints it in the public UI."""
-        self.owner.plugin_settings = {"terminal_bar": {"label": "MY BAR"}}
-        self.owner.plugins.load(
-            ("terminal_bar",), directory=ROOT / "examples/terminal_plugins"
-        )
+        self.owner.plugin_settings = {"terminal_check": {"label": "MY BAR"}}
+        with tempfile.TemporaryDirectory() as directory:
+            self.load_test_ui(directory)
         self.render()
         self.assertEqual(self.screen().display[-1].strip(), "MY BAR")
 
@@ -838,14 +852,10 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(marker.exists())
             self.assertEqual(self.owner.plugins.bindings.bindings, [])
 
-    async def test_shipped_popup_accept_cancel_and_global_toggle(self):
-        """The shipped plugins use real PTK input without leaking typed text to stdin."""
+    async def test_external_popup_accept_cancel_and_global_toggle(self):
+        """A loaded UI plugin consumes real PTK input without leaking it to stdin."""
         with tempfile.TemporaryDirectory() as directory:
-            self.owner.plugins.load(
-                ["terminal_bar", "terminal_popup"],
-                directory=ROOT / "examples" / "terminal_plugins",
-                library_dir=Path(directory) / "libraries",
-            )
+            self.load_test_ui(directory)
             opened = asyncio.Event()
 
             def rendered(_):
@@ -1276,7 +1286,7 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_selected_search_popup_routes_real_keys_to_native_history(self):
         """Ctrl+F/Enter/Ctrl+P/Escape select history without sending editor input."""
         self.owner.plugins.load(
-            ("terminal_search",), directory=ROOT / "examples/terminal_plugins"
+            ("terminal_search",), directory=ROOT / "bundles/plugins"
         )
         self.owner.vt.feed(b"old needle\r\n" + b"filler\r\n" * 10 + b"new needle\r\n")
         self.render()

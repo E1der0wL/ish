@@ -52,24 +52,35 @@ from prompt_toolkit.layout import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
 
-PLUGIN_META = {"version": "1", "requirements": [], "dependencies": []}
+PLUGIN_META = {
+    "version": "1",
+    "settings": {
+        "label": {"title": "Bar text", "description": "Text in the test bar.", "default": "HOOKLESS TEST BAR"},
+    },
+}
 TERMINAL_API = 1
 
 def setup(api):
     root = Path.home()
-    api.set_bar(Window(FormattedTextControl("HOOKLESS TEST BAR")), rows=1)
+    api.set_bar(Window(FormattedTextControl(api.settings_for("terminal_check")["label"])), rows=1)
     sequence = 0
+    popup = None
+
+    def finish(value):
+        nonlocal popup
+        if api.close_popup(popup, value):
+            popup = None
+            kind = "cancel" if value is None else "value"
+            (root / f"popup-{kind}-{sequence}").write_text("cancelled" if value is None else value)
+
     @api.bind("f2")
-    def open_popup(event):
-        nonlocal sequence
+    def toggle(event):
+        nonlocal sequence, popup
+        if popup is not None:
+            finish(None)
+            return
         sequence += 1
-        identity = sequence
         keys = KeyBindings()
-        popup = None
-        def finish(value):
-            if api.close_popup(popup, value):
-                kind = "cancel" if value is None else "value"
-                (root / f"popup-{kind}-{identity}").write_text("cancelled" if value is None else value)
         @keys.add("escape", eager=True)
         @keys.add("c-c", eager=True)
         @keys.add("c-d", eager=True)
@@ -81,7 +92,7 @@ def setup(api):
         title = Window(FormattedTextControl("HOOKLESS TEST POPUP"), height=1)
         content = HSplit([title, field], key_bindings=keys)
         popup = api.show_popup(content, width=42, height=4)
-        (root / "popup-open").write_text(str(identity))
+        (root / "popup-open").write_text(str(sequence))
 '''
 RAW_READER = r"""import json
 import os
@@ -178,6 +189,14 @@ Path('load-result').write_text(str(len(received)) + '\n' + hashlib.sha256(receiv
 """
 
 
+def install_ui_fixture(root: Path) -> Path:
+    """Make the PTY and composition tests load the same external UI package."""
+    directory = root / "plugins" / "terminal_check"
+    directory.mkdir(parents=True)
+    (directory / "terminal_check.py").write_text(POPUP_PLUGIN, encoding="utf-8")
+    return directory.parent
+
+
 def prepare(root: Path, shell: str, plugins: bool) -> list[str]:
     """Use isolated native rc files, never a production shell integration script."""
     if shutil.which(shell) is None:
@@ -191,12 +210,10 @@ def prepare(root: Path, shell: str, plugins: bool) -> list[str]:
     (root / "load-reader.py").write_text(LOAD_READER, encoding="utf-8")
     arguments = []
     if plugins:
-        directory = root / "plugins" / "terminal_check"
-        directory.mkdir(parents=True)
-        (directory / "terminal_check.py").write_text(POPUP_PLUGIN, encoding="utf-8")
+        scripts = install_ui_fixture(root)
         arguments = [
             "--plugin-dir",
-            str(directory.parent),
+            str(scripts),
             "--plugin-lib-dir",
             str(root / "libraries"),
             "--plugin",

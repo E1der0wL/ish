@@ -1,6 +1,6 @@
 # 셸 hook 없는 VT 실험
 
-> 통합 전 실험 기록이다. 현재 제품은 VT 기반 `ish` 하나이며 아래의 stream 경로·`ish-vt` 명령은 제거됐다. 현재 실행·설정 방법은 [사용 안내](../VT_USAGE.md)를 참고한다.
+> 통합 전 실험 기록이다. 아래 명령과 경로는 당시 체크아웃을 기준으로 한다. 현재 VT 기반 `ish`의 실행·설정 방법은 [사용 안내](../VT_USAGE.md)에, 현재 배포하는 플러그인은 [플러그인 폴더](../../bundles/plugins)에 있다.
 
 `codex/hookless-vt`는 `experiment/prompt-stream`의 `04a3d4e`에서 분기한 별도 worktree다. 기존 브랜치와 폴더는 수정하지 않는다. `ish` 명령은 기존 출력 직접 전달 경로이며, 이번 실험은 `ish-vt`에서만 실행한다. tmux나 Zellij를 실행하지 않는다.
 

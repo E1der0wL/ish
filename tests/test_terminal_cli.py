@@ -723,7 +723,7 @@ class TerminalCLIFixture(unittest.TestCase):
         if getattr(getattr(self, self._testMethodName), "history_keys", False):
             args += (
                 "--plugin-dir",
-                str(ROOT / "examples/terminal_plugins"),
+                str(ROOT / "bundles/plugins"),
                 "--plugin",
                 "terminal_history",
             )

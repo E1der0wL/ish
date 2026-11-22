@@ -49,12 +49,12 @@ PLUGIN_META = {
 
 ## 팝업과 단축키
 
-팝업은 PTK 컨테이너로 작성한다. `api.bind("f2")`로 여는 키를 등록하고, `api.show_popup(...)`이 반환한 팝업을 `api.close_popup(...)`에 넘겨 닫는다. 팝업 안의 Enter·Esc 처리는 팝업 위젯에 둔다. [F2 팝업 예제](../examples/terminal_plugins/terminal_popup/terminal_popup.py)
+팝업은 PTK 컨테이너로 작성한다. `api.bind("c-f")`로 여는 키를 등록하고, `api.show_popup(...)`이 반환한 팝업을 `api.close_popup(...)`에 넘겨 닫는다. 팝업 안의 Enter·Esc 처리는 팝업 위젯에 둔다. [검색 팝업 구현](../bundles/plugins/terminal_search/__init__.py)
 
-등록한 단축키는 Vim 같은 프로그램을 사용하는 중에도 실행될 수 있다. 대체 화면과 팝업에서는 키를 원래 프로그램이나 위젯에 맡기려면 `api.bind(..., primary_only=True)`를 쓴다. 터미널의 기본 화면에 포커스가 있는지를 기준으로 한다. [스크롤백 단축키 예제](../examples/terminal_plugins/terminal_history/__init__.py)
+등록한 단축키는 Vim 같은 프로그램을 사용하는 중에도 실행될 수 있다. 대체 화면과 팝업에서는 키를 원래 프로그램이나 위젯에 맡기려면 `api.bind(..., primary_only=True)`를 쓴다. 터미널의 기본 화면에 포커스가 있는지를 기준으로 한다. [스크롤백 단축키 예제](../bundles/plugins/terminal_history/__init__.py)
 
 ## 보완 모듈 개발
 
 `PLUGIN_META`의 `category`를 `"module"`로 지정하면 **확장 → 모듈**에 표시된다. `"both"`는 양쪽 페이지에 표시되고, 생략하면 **플러그인**에 표시된다. 세 경우 모두 플러그인 경로와 `config.plugins` 선택 목록을 공유한다.
 
-출력 프로토콜·호스트 키 매핑·클립보드 제공자는 같은 `setup(api)`에서 각 기능의 등록 메서드를 호출한다. 메서드별 입력과 수명, 실제 예제는 [보완 모듈 API](VT_PROTOCOL_PLUGINS.md)와 [설정창 분류별 예제 목록](../README.md#플러그인과-보완-모듈)에 있다.
+출력 프로토콜·호스트 키 매핑·클립보드 제공자는 같은 `setup(api)`에서 각 기능의 등록 메서드를 호출한다. 메서드별 입력과 수명, 실제 예제는 [보완 모듈 API](VT_PROTOCOL_PLUGINS.md)와 [설정창 분류별 번들 목록](VT_USAGE.md#번들-플러그인)에 있다.

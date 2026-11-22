@@ -72,7 +72,7 @@ TEST_PROGRAMS = ("infocmp", "tput", "Xvfb", "xclip")
 NATIVE_PROBE = b"VT_READY"
 LINT_PATHS = (
     "src/ish",
-    "examples/terminal_plugins",
+    "bundles",
     "tools/build_distribution.py",
     "tools/build_ghostty_vt.py",
     "tools/check_runtime.py",

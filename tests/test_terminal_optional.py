@@ -319,13 +319,13 @@ class OptionalCompositionTests(unittest.IsolatedAsyncioTestCase):
                     owner.vt.close()
 
     async def test_opt_in_command_keys_use_native_output_and_existing_clipboard(self):
-        """F8/F9 act through the sample plugin while ordinary input reaches PTY."""
+        """F8/F9 act through the command navigation plugin while ordinary input reaches PTY."""
         async with self.terminal() as (owner, pipe, _), asyncio.timeout(5):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 owner.plugins.load(
                     ("terminal_commands",),
-                    directory=self.ROOT / "examples/terminal_plugins",
+                    directory=self.ROOT / "bundles/plugins",
                     library_dir=root / "libraries",
                 )
                 clipboard = _Clipboard()
@@ -371,7 +371,7 @@ class OptionalCompositionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(owner.plugins.errors, [])
 
     async def test_default_has_no_reserved_command_keys_or_notification_output(self):
-        """Without the sample plugin, F9 remains native input and effects stay off."""
+        """Without the command navigation plugin, F9 remains native input and effects stay off."""
         async with self.terminal() as (owner, pipe, stream), asyncio.timeout(5):
             owner._output(b"\x1b]9;hidden\x07\x1b]99;;hidden2\x07\x1b]99;i=q:p=?;\x07")
             pipe.send_bytes(b"\x1b[20~")

@@ -292,7 +292,6 @@
     "vt_bar_height": "하단 바 높이가 올바르지 않습니다",
     "vt_popup_unavailable": "팝업을 추가로 열 수 없습니다",
     "vt_popup_geometry": "팝업 크기는 양수여야 합니다",
-    "vt_sample_bar": "ish | 기본 터미널 | F2 팝업",
     "vt_description": "셸 hook 없이 libghostty-vt + PTK 터미널에서 기본 셸을 실행합니다. 기본형에는 UI 플러그인이 없습니다.",
     "vt_version": "ish {version}",
     "vt_login_help": "기본 셸을 -l 인수로 시작합니다. 셸 시작 파일은 변경하지 않습니다.",
@@ -481,6 +480,5 @@
     "startup_diagnose_plugin_lib": "플러그인 라이브러리 디렉터리",
     "startup_diagnose_log_file": "로그 파일",
     "startup_diagnose_log_level": "로그 수준",
-    "startup_plugin_cleanup": "플러그인 setup은 정리 함수 또는 None을 반환해야 합니다",
-    "startup_sample_popup": "플러그인 팝업 | Enter 확인 | Esc 취소"
+    "startup_plugin_cleanup": "플러그인 setup은 정리 함수 또는 None을 반환해야 합니다"
 }

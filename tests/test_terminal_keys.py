@@ -19,7 +19,6 @@ import test_terminal_composition as composition
 from ish.terminal.app import InputProcessor
 from ish.terminal.host import HostBroker, HostParser, StructuredKey
 
-ROOT = Path(__file__).resolve().parents[1]
 DEADLINE = 5
 WIRE = "\x1b[9001~"
 F13 = StructuredKey("f13", 57376)
@@ -241,13 +240,10 @@ class KeyMappingPTYTests(unittest.IsolatedAsyncioTestCase):
             while not predicate():
                 await asyncio.sleep(0.001)
 
-    async def test_sample_plugin_keys_follow_popup_focus_and_actual_pty_consumer(self):
+    async def test_registered_keys_follow_popup_focus_and_actual_pty_consumer(self):
         """The same mapped X edits a popup or reaches stdin, never both."""
-        self.owner.plugins.load(
-            ("terminal_keys",), directory=ROOT / "examples/terminal_plugins"
-        )
         self.owner.plugins.register_keys(
-            "letter", {"\x1b[9002~": StructuredKey("x", 120)}
+            "test_keys", {WIRE: F13, "\x1b[9002~": StructuredKey("x", 120)}
         )
         self.assertEqual(self.owner.plugins.popups, [])
         self.assertEqual(self.owner.plugins.bindings.bindings, [])

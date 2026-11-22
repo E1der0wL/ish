@@ -9,7 +9,7 @@
 Linux x86_64/WSL에서 저장소 루트를 기준으로 실행한다. Python 환경은 이 위치의 `.venv`로 새로 생성한다. `uv`와 Python 3.12.14 이상·3.13 미만이 필요하며, native 빌드에는 C 컴파일러·curl·tar·xz, 전체 검사에는 Bash·zsh·tcsh·Vim·ncurses 도구·Xvfb·xclip·util-linux·libX11이 필요하다. 현재 WSL 환경에는 이 도구들이 준비되어 있다.
 
 ```sh
-cd /mnt/d/Developments/ish
+# 자신이 내려받은 저장소 폴더에서 실행한다.
 uv sync --frozen --group dev
 
 # 새로 복제했거나 native 빌드가 없을 때
@@ -26,7 +26,7 @@ uv run --no-sync python tools/check_terminal.py
 
 이전 환경에서 검증한 Linux native 라이브러리는 `.cache/ghostty-vt/install/lib`에 상대 symlink와 함께 보존했다. 새로 빌드할 때는 기존 checksum 고정 빌드 도구를 사용한다. 가상환경과 native 바이너리는 Git에 커밋하지 않는다.
 
-Windows Terminal에서도 저장소의 새 가상환경으로 시작할 수 있다.
+이 개발 PC에서는 Windows Terminal에서도 아래 명령으로 시작할 수 있다. 다른 위치에 내려받았다면 `--cd` 뒤의 경로를 자신의 저장소 폴더로 바꾼다.
 
 ```powershell
 wsl.exe -d Ubuntu --cd /mnt/d/Developments/ish --exec .venv/bin/ish --shell tcsh

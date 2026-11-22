@@ -18,14 +18,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from examples.terminal_plugins import clipboard_system as sample
+from bundles.modules.clipboard_system import SystemClipboard
 
 from ish.terminal.clipboard import MAX_TEXT, ClipboardBroker
 from ish.terminal.host import HostProfile
 
 ST = b"\x1b\\"
 ROOT = Path(__file__).resolve().parents[1]
-SAMPLE_DIR = ROOT / "examples" / "terminal_plugins"
+MODULE_DIR = ROOT / "bundles/modules"
 TEXT_MIME = b"dGV4dC9wbGFpbg=="
 
 
@@ -379,22 +379,22 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
             ({"DISPLAY": ":fixture"}, "x11"),
             ({"WAYLAND_DISPLAY": "fixture"}, None),
         ):
-            provider = sample.SystemClipboard(env=env)
+            provider = SystemClipboard(env=env)
             self.assertEqual(provider.target, target)
             await provider.aclose()
-        provider = sample.SystemClipboard(target="windows", env={"DISPLAY": ":fixture"})
+        provider = SystemClipboard(target="windows", env={"DISPLAY": ":fixture"})
         with self.assertRaises(OSError):
             await provider.read()
         await provider.aclose()
 
-    async def test_sample_loads_through_existing_plugin_manager_without_ui_or_io(self):
+    async def test_module_loads_through_existing_plugin_manager_without_ui_or_io(self):
         """Resolve package-relative worker imports through the one supported loader."""
         from types import SimpleNamespace
 
         from ish.plugin.manager import PluginManager
 
         with tempfile.TemporaryDirectory() as directory:
-            manager = PluginManager(script_dir=SAMPLE_DIR, lib_dir=Path(directory))
+            manager = PluginManager(script_dir=MODULE_DIR, lib_dir=Path(directory))
             manager.load(names=["clipboard_system"])
             module = manager.get("clipboard_system")
             self.assertIsNotNone(module)
@@ -419,7 +419,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "clipboard"
             write = "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
             read = "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes().decode('utf-16-le').encode('utf-8'))"
-            provider = sample.SystemClipboard(
+            provider = SystemClipboard(
                 env={
                     **os.environ,
                     "WSL_INTEROP": "fixture",
@@ -430,12 +430,12 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with (
                     patch.object(
-                        sample.SystemClipboard,
+                        SystemClipboard,
                         "WINDOWS_WRITE",
                         (sys.executable, "-c", write, str(path)),
                     ),
                     patch.object(
-                        sample.SystemClipboard,
+                        SystemClipboard,
                         "WINDOWS_READ",
                         (sys.executable, "-c", read, str(path)),
                     ),
@@ -453,7 +453,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_subprocess_output_is_bounded_and_cancellation_reaps_children(self):
         """A large or stalled helper cannot retain unbounded memory or orphan a child."""
-        provider = sample.SystemClipboard(
+        provider = SystemClipboard(
             env={
                 **os.environ,
                 "WSL_INTEROP": "fixture",
@@ -463,7 +463,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         try:
             with patch.object(
-                sample.SystemClipboard,
+                SystemClipboard,
                 "WINDOWS_READ",
                 (
                     sys.executable,
@@ -475,7 +475,7 @@ class SystemProviderTests(unittest.IsolatedAsyncioTestCase):
                     await provider.read()
                 self.assertEqual(error.exception.errno, errno.EFBIG)
             with patch.object(
-                sample.SystemClipboard,
+                SystemClipboard,
                 "WINDOWS_READ",
                 (sys.executable, "-c", "import time; time.sleep(60)"),
             ):
@@ -581,7 +581,7 @@ class X11ProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         """Create a fresh provider and retain independent owner processes for cleanup."""
-        self.provider = sample.SystemClipboard(env=self.env)
+        self.provider = SystemClipboard(env=self.env)
         self.external = []
 
     async def asyncTearDown(self):
@@ -683,9 +683,7 @@ class X11ProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_display_cannot_replace_existing_selection(self):
         """A failed connection neither redirects a write nor destroys earlier content."""
         await self.provider.write("keep")
-        broken = sample.SystemClipboard(
-            target="x11", env={**self.env, "DISPLAY": ":65530"}
-        )
+        broken = SystemClipboard(target="x11", env={**self.env, "DISPLAY": ":65530"})
         try:
             with self.assertRaises(OSError):
                 await broken.write("lost")

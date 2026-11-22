@@ -173,7 +173,7 @@ class InteractionTerminal(HostTerminal):
             arguments.extend(
                 (
                     "--plugin-dir",
-                    str(ROOT / "examples/terminal_plugins"),
+                    str(ROOT / "bundles/plugins"),
                     "--plugin",
                     "terminal_search",
                 )
@@ -417,10 +417,7 @@ def main():
     directory = args.directory.resolve()
     if directory.exists():
         parser.error("기존 증거를 덮어쓰지 않도록 새 결과 디렉터리를 지정하세요")
-    if (
-        args.with_search
-        and not (ROOT / "examples/terminal_plugins/terminal_search").is_dir()
-    ):
+    if args.with_search and not (ROOT / "bundles/plugins/terminal_search").is_dir():
         parser.error("선택 검색 플러그인이 준비되지 않았습니다")
     directory.mkdir(parents=True)
     cases = tuple(case for case in CASES if args.case is None or case[0] in args.case)

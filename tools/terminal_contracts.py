@@ -385,7 +385,7 @@ REQUIRED_CASES = {
         "test_terminal_keys.InputProcessorResponseTests.test_batched_cursor_report_preserves_adjacent_prefix_keys",
         "test_terminal_keys.InputProcessorResponseTests.test_individual_cursor_report_preserves_pending_prefix",
         "test_terminal_keys.InputProcessorResponseTests.test_reinserted_batch_filters_only_report_and_preserves_order",
-        "test_terminal_keys.KeyMappingPTYTests.test_sample_plugin_keys_follow_popup_focus_and_actual_pty_consumer",
+        "test_terminal_keys.KeyMappingPTYTests.test_registered_keys_follow_popup_focus_and_actual_pty_consumer",
         "test_terminal_keys.KeyMappingPTYTests.test_terminal_shortcuts_do_not_claim_partial_modified_keys",
         "test_terminal_keys.KeyMappingPTYTests.test_unknown_responses_never_leak_to_stdin_and_paste_keeps_native_policy",
         "test_terminal_terminfo.RemainingTerminfoContracts.test_advertised_inventory_has_no_unreviewed_entries",

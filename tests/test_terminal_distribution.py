@@ -35,7 +35,8 @@ DOCUMENTS = (
     "README.md",
     "AGENTS.md",
     "docs/VT_USAGE.md",
-    "examples/terminal_plugins/terminal_popup/terminal_popup.py",
+    "bundles/plugins/terminal_search/__init__.py",
+    "bundles/modules/clipboard_system/__init__.py",
 )
 RESOURCES = (
     "src/ish/terminal/native/bridge.c",
@@ -133,7 +134,7 @@ class SourceIdentityTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             source_digest(self.root)
 
-    def test_published_guide_and_examples_change_identity(self):
+    def test_published_guide_and_bundles_change_identity(self):
         """The artifact identity covers the usage instructions shipped to users."""
         original = source_digest(self.root)
         for relative in DOCUMENTS:
@@ -147,10 +148,10 @@ class SourceIdentityTests(unittest.TestCase):
                     path.write_bytes(content)
 
     def test_published_guide_keeps_local_links_and_excludes_caches(self):
-        """Relocated users receive editable examples without development bytecode."""
-        cache = self.root / "examples/terminal_plugins/terminal_popup/__pycache__"
+        """Relocated users receive editable bundles without development bytecode."""
+        cache = self.root / "bundles/plugins/terminal_search/__pycache__"
         cache.mkdir()
-        (cache / "terminal_popup.cpython-312.pyc").write_bytes(b"not a source file")
+        (cache / "__init__.cpython-312.pyc").write_bytes(b"not a source file")
         destination = self.directory / "release"
         copy_documentation(self.root, destination)
         files = sorted(

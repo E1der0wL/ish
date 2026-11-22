@@ -23,7 +23,7 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
-DOCUMENTATION_PATHS = ("README.md", "AGENTS.md", "docs", "examples")
+DOCUMENTATION_PATHS = ("README.md", "AGENTS.md", "docs", "bundles")
 LAUNCHERS = ("ish",)
 SOURCE_PATHS = (
     "src",

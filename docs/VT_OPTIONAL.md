@@ -41,7 +41,7 @@ OSC 99 지원 질의는 요청의 검증된 `i`를 그대로 돌려주며 `p=tit
 `terminal_commands`는 명시적으로 선택하는 예제 플러그인이다. 저장소의 예제를 직접 사용하려면 플러그인 디렉터리를 지정한다.
 
 ```sh
-ish --plugin-dir /path/to/ish/examples/terminal_plugins --plugin terminal_commands
+ish --plugin-dir /path/to/ish/bundles/plugins --plugin terminal_commands
 ```
 
 | 키 | 동작 |

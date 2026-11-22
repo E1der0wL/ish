@@ -143,7 +143,7 @@ class TerminalGuiTests(unittest.TestCase):
             command += plugin_options(self.directory)
         if self._testMethodName == "test_native_shell_and_image_popup_composition":
             shutil.copytree(
-                ROOT / "examples/terminal_plugins/terminal_history",
+                ROOT / "bundles/plugins/terminal_history",
                 self.directory / "plugins/terminal_history",
             )
             command += ["--plugin", "terminal_history"]

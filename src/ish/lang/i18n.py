@@ -591,10 +591,7 @@ class Message(StrEnum):
     # Optional plugin registration, rendering and shell integration.
     STARTUP_PLUGIN_CLEANUP = auto(), "Plugin setup must return a cleanup or None"
 
-    # Native-stream diagnostics and optional sample UI.
-    STARTUP_SAMPLE_POPUP = auto(), "Plugin popup | Enter accepts | Esc cancels"
-
-    # Hookless VT plugin selection and optional sample UI.
+    # VT plugin selection and diagnostics.
     VT_PLUGIN_HELP = (
         auto(),
         "Load terminal plugin NAME; repeat to select more (none by default).",
@@ -612,7 +609,6 @@ class Message(StrEnum):
     VT_BAR_HEIGHT = auto(), "Invalid bar height"
     VT_POPUP_UNAVAILABLE = auto(), "Cannot open another popup"
     VT_POPUP_GEOMETRY = auto(), "Popup geometry must be positive"
-    VT_SAMPLE_BAR = auto(), "ish | native terminal | F2 popup"
     VT_DESCRIPTION = (
         auto(),
         "Run a native shell in a hookless libghostty-vt + PTK terminal; no UI plugins by default.",
