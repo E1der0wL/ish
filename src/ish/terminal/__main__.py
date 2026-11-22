@@ -59,6 +59,7 @@ def main(argv=None):
                     dump_state=args.dump_state,
                     plugins=args.plugin,
                     plugin_dir=args.plugin_dir,
+                    plugin_settings=args.plugin_settings,
                     library_dir=args.plugin_lib_dir,
                     clipboard=args.clipboard,
                     mouse=args.mouse,

@@ -37,6 +37,25 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertIsNone(store.save({}))
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_retired_divider_and_invalid_programs_do_not_reset_other_help_options(self):
+        """Keep the comment roles when reading an existing palette; validate program commands."""
+        self.path.write_text(
+            "config.ui_palette = {'edge': 'red-900', 'muted2': 'sky-300'}\n"
+            "config.browser = 'browser --new-window'\n"
+        )
+        self.assertEqual(self.store().settings.ui_palette, {"muted2": "sky-300"})
+        self.assertEqual(
+            SettingsStore.read_help_options(self.path),
+            {"ui_palette": {"muted2": "sky-300"}, "browser": "browser --new-window"},
+        )
+        store = self.store()
+        for field in ("editor", "browser"):
+            for bad in (123, '"unfinished', "'' --arg", "program\x00"):
+                with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
+                    store.save({field: bad})
+        self.path.write_text(self.path.read_text() + "config.browser = str(123)\n")
+        self.assertNotIn("browser", SettingsStore.read_help_options(self.path))
+
     def test_saved_appearance_is_available_to_help_without_rc_execution(self):
         """Help reads both selected styles without rerunning user Python."""
         marker = self.root / "rc-counter"
@@ -49,7 +68,7 @@ class SettingsStoreTests(unittest.TestCase):
             "config.color_depth = '4'\n"
         )
         self.assertEqual(
-            SettingsStore.read_appearance(self.path),
+            SettingsStore.read_help_options(self.path),
             {"ui_palette": {"accent": "blue-500"}, "ui_icons": "unicode"},
         )
         self.assertFalse(marker.exists())
@@ -58,7 +77,7 @@ class SettingsStoreTests(unittest.TestCase):
         choice = {"selection": "violet-800", "accent": "#1a2b3c"}
         store.save({"ui_palette": choice, "ui_icons": "nerdfont"})
         self.assertEqual(
-            SettingsStore.read_appearance(self.path),
+            SettingsStore.read_help_options(self.path),
             {"ui_palette": choice, "ui_icons": "nerdfont"},
         )
         self.assertEqual(marker.read_text(), "x")
@@ -68,13 +87,33 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(next_session.color_depth, "4")
         store.save({"ui_palette": {}})
         self.assertEqual(
-            SettingsStore.read_appearance(self.path),
+            SettingsStore.read_help_options(self.path),
             {"ui_palette": {}, "ui_icons": "nerdfont"},
         )
 
+    def test_named_help_palette_requires_an_unambiguous_literal(self):
+        """A later rebind is independent; mutations, aliases and computed values are not."""
+        direct = "theme: dict = {'accent2': 'rose-700'}\n"
+        use = "config.ui_palette = theme\n"
+        for source, expected in (
+            (direct + use, {"accent2": "rose-700"}),
+            (direct + use + "theme = {}\n", {"accent2": "rose-700"}),
+            (direct + "theme['accent2'] = 'lime-500'\n" + use, None),
+            (direct + use + "theme.clear()\n", None),
+            (direct + "alias = theme\n" + use + "alias.clear()\n", None),
+            ("theme = make_theme()\n" + use, None),
+            (direct + "match value:\n    case {'theme': theme}: pass\n" + use, None),
+            (use + direct, None),
+        ):
+            with self.subTest(source=source):
+                self.path.write_text(source + "config.ui_icons = 'unicode'\n")
+                appearance = SettingsStore.read_help_options(self.path)
+                self.assertEqual(appearance.get("ui_palette"), expected)
+                self.assertEqual(appearance["ui_icons"], "unicode")
+
     def test_help_palette_falls_back_for_unknown_or_unreadable_sources(self):
         """Skipped Python expressions and special files must not affect help."""
-        self.assertEqual(SettingsStore.read_appearance(self.path), {})
+        self.assertEqual(SettingsStore.read_help_options(self.path), {})
         self.assertFalse(self.path.exists())
         for tail in (
             "config.ui_palette = choose_palette()",
@@ -88,7 +127,7 @@ class SettingsStoreTests(unittest.TestCase):
                 self.path.write_text(
                     "config.ui_palette = {'accent': 'blue-500'}\n" + tail
                 )
-                self.assertEqual(SettingsStore.read_appearance(self.path), {})
+                self.assertEqual(SettingsStore.read_help_options(self.path), {})
         self.path.unlink()
         if hasattr(os, "mkfifo"):
             os.mkfifo(self.path)
@@ -97,7 +136,7 @@ class SettingsStoreTests(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "import sys; from ish.manage.store import SettingsStore;"
-                    "assert SettingsStore.read_appearance(sys.argv[1]) == {}",
+                    "assert SettingsStore.read_help_options(sys.argv[1]) == {}",
                     str(self.path),
                 ],
                 timeout=15,
@@ -115,14 +154,14 @@ class SettingsStoreTests(unittest.TestCase):
             with self.subTest(tail=tail):
                 self.path.write_text(source + tail)
                 self.assertEqual(
-                    SettingsStore.read_appearance(self.path),
+                    SettingsStore.read_help_options(self.path),
                     {"ui_palette": {"accent": "orange-300"}},
                 )
         self.path.write_text("config.ui_icons = 'unknown'\n")
         self.assertIn("ui_icons", str(self.store().error))
         self.path.write_text(source + "config.ui_palette.clear()")
         self.assertEqual(
-            SettingsStore.read_appearance(self.path), {"ui_icons": "nerdfont"}
+            SettingsStore.read_help_options(self.path), {"ui_icons": "nerdfont"}
         )
 
     def test_save_reuses_validation_and_executes_rc_only_on_explicit_load(self):

@@ -158,6 +158,15 @@ class Plugins:
                     raise TypeError(i18n.get(Message.STARTUP_PLUGIN_CLEANUP))
                 self._cleanups.append(cleanup)
 
+    def settings_for(self, name):
+        """Return this loaded package's typed options with defaults applied."""
+        from ish.plugin.options import resolved
+
+        info = self.manager.registry.get_info(name) if self.manager else None
+        if info is None:
+            raise KeyError(name)
+        return resolved(info.settings, self.owner.plugin_settings.get(name, {}))
+
     def get(self, name):
         """Read an already loaded dependency from the shared plugin registry."""
         return self.manager.get(name) if self.manager is not None else None

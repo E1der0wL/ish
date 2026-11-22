@@ -14,5 +14,7 @@ config.plugins = []  # noqa: F821
 # config.mouse = "auto"
 # config.clipboard = "write"
 # config.shell = "bash"
+# config.editor = "code --wait"
+# config.browser = "firefox --new-tab"
 # config.log_file = ".ish.log"
 # config.log_level = "DEBUG"

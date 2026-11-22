@@ -33,6 +33,7 @@ class ManagementTerminal(Terminal):
         environment=None,
         language="en",
         host=False,
+        parent_line=None,
         rows=28,
         cols=110,
     ):
@@ -85,20 +86,26 @@ class ManagementTerminal(Terminal):
             if slave > 2:
                 os.close(slave)
             os.chdir(self.root)
-            os.execve(
+            argv = [
                 sys.executable,
-                [
-                    sys.executable,
-                    "-B",
-                    "-m",
-                    "ish",
-                    option,
-                    "--home",
-                    str(self.home),
-                    *(["--lang", language] if language is not None else []),
-                ],
-                child_environment,
-            )
+                "-B",
+                "-m",
+                "ish",
+                option,
+                "--home",
+                str(self.home),
+                *(["--lang", language] if language is not None else []),
+            ]
+            if parent_line is not None:
+                argv = [
+                    "/bin/sh",
+                    "-c",
+                    '"$@" || exit $?; printf "CALLER_READY\\n"; '
+                    'IFS= read -r line && printf %s "$line" > "$0"',
+                    str(parent_line),
+                    *argv,
+                ]
+            os.execve(argv[0], argv, child_environment)
         os.close(slave)
         if host:
             tty.setraw(0)

@@ -65,7 +65,6 @@ FAMILY_LABELS = {
 }
 HOST_COLOR = "default"
 HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
-MIN_TEXT_CONTRAST = 4.5
 COLORS = {
     f"{family}-{shade}": f"#{rgb}"
     for family, row in FAMILIES.items()
@@ -76,8 +75,12 @@ DEFAULTS = {
     "background": HOST_COLOR,
     "text": HOST_COLOR,
     "accent": "lime-300",
+    "accent2": "cyan-300",
+    "accent3": "violet-300",
+    "accent4": "slate-500",
+    "warning": "amber-400",
     "muted": "slate-400",
-    "edge": "slate-600",
+    "muted2": "slate-500",
     "selection": "slate-800",
     "error": "rose-400",
 }
@@ -87,6 +90,7 @@ class PanelStyle(DynamicStyle):
     """Desaturate the finished foreground and background of the inactive pane."""
 
     INACTIVE = "class:panel.inactive"
+    HOVER = "class:pointer.hover"
 
     @staticmethod
     def _gray(color):
@@ -102,15 +106,28 @@ class PanelStyle(DynamicStyle):
     def get_attrs_for_style_str(self, style_str, default=DEFAULT_ATTRS):
         """Retain host defaults, font attributes and the luminance of each swatch."""
         attrs = super().get_attrs_for_style_str(style_str, default)
-        if self.INACTIVE in style_str.split():
-            return attrs._replace(
-                color=self._gray(attrs.color), bgcolor=self._gray(attrs.bgcolor)
-            )
-        return attrs
+        flags = style_str.split()
+        if self.INACTIVE not in flags:
+            return attrs
+        hovering = self.HOVER in flags
+        if hovering and "class:nav.current" not in flags:
+            return attrs
+        # A page label only highlights its ink, including on a custom pane background.
+        return attrs._replace(
+            color=attrs.color
+            if hovering or "class:edge" in flags or "class:edge.hover" in flags
+            else self._gray(attrs.color),
+            bgcolor=attrs.bgcolor
+            if "class:scrollbar.button" in flags
+            else self._gray(attrs.bgcolor),
+        )
 
 
 def validate_palette(value):
     """Validate all role overrides and retain only differences from the defaults."""
+    if isinstance(value, dict) and "edge" in value:
+        # A saved divider override no longer owns any color. Keep the other roles.
+        value = {role: color for role, color in value.items() if role != "edge"}
     if not isinstance(value, dict) or any(
         role not in DEFAULTS
         or not isinstance(token, str)
@@ -121,30 +138,6 @@ def validate_palette(value):
     return {
         role: token.lower() for role, token in value.items() if token != DEFAULTS[role]
     }
-
-
-def _luminance(rgb):
-    channels = (component / 255 for component in bytes.fromhex(rgb[1:]))
-    red, green, blue = [
-        value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
-        for value in channels
-    ]
-    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
-
-
-@lru_cache(maxsize=512)
-def contrast_ink(background, preferred=HOST_COLOR):
-    """Prefer the named ink at 4.5:1, then choose the more legible black or white."""
-    if background == HOST_COLOR:
-        return HOST_COLOR
-    level = _luminance(background)
-    if preferred != HOST_COLOR:
-        low, high = sorted((level, _luminance(preferred)))
-        if (high + 0.05) / (low + 0.05) >= MIN_TEXT_CONTRAST:
-            return preferred
-    black_contrast = (level + 0.05) / 0.05
-    white_contrast = 1.05 / (level + 0.05)
-    return "#000000" if black_contrast >= white_contrast else "#ffffff"
 
 
 def ui_style(overrides):
@@ -160,22 +153,30 @@ def _style(tokens):
         role: COLORS.get(token, token)
         for role, token in zip(DEFAULTS, tokens, strict=True)
     }
-    surface = f"fg:{colors['text']} bg:{colors['background']}"
+    text = f"fg:{colors['text']}"
+    surface = f"{text} bg:{colors['background']}"
     accent = f"fg:{colors['accent']}"
     muted = f"fg:{colors['muted']}"
-    edge = f"fg:{colors['edge']}"
+    edge = f"fg:{colors['muted2']}"
     bar = f"bg:{colors['selection']}"
     selected = f"{accent} {bar} bold noreverse"
-    chip = colors["muted"]
-    segment = f"fg:{colors['selection']} bg:{chip}"
+    chip = colors["accent4"]
+    secondary_accent = f"fg:{colors['accent2']}"
+    # Reverse a default bar background to use the host's actual background as ink.
+    chip_face = (
+        f"fg:{chip} {bar} reverse"
+        if colors["selection"] == HOST_COLOR
+        else f"fg:{colors['selection']} bg:{chip}"
+    )
     return Style.from_dict(
         {
             "": surface,
             "surface": surface,
-            "header": f"fg:{contrast_ink(colors['selection'], colors['text'])} {bar} bold",
+            "header": f"{text} {bar} bold",
             "section.title": f"{accent} bold",
             "muted": muted,
             "edge": edge,
+            "edge.hover": muted,
             "frame.border": edge,
             "dialog.body": surface,
             "dialog frame.label": f"{accent} bold",
@@ -186,10 +187,16 @@ def _style(tokens):
             "accent": accent,
             "status": muted,
             "status.busy": accent,
-            "status.dirty": f"{accent} bold",
+            "status.dirty": f"fg:{colors['warning']} bold",
             "error": f"fg:{colors['error']} bold",
             "nav.selected": selected,
-            "nav.current": f"{muted} bold",
+            "nav.current": f"{accent} bold",
+            "warning": f"fg:{colors['warning']} bold",
+            "profile": f"{text} {bar} bold",
+            "profile.name": secondary_accent,
+            "profile.focused": f"{accent} bold",
+            "profile.version": f"{muted} nobold",
+            "group": f"fg:{colors['accent3']} bold",
             "field": "",
             "field.focused": f"{accent} bold",
             "setting.title": "bold",
@@ -197,14 +204,15 @@ def _style(tokens):
             "setting.description": muted,
             "setting.edge": edge,
             "setting.edge.focused": accent,
-            "setting.value": f"fg:{contrast_ink(colors['selection'], colors['text'])} {bar}",
-            "shortcut.bar": f"{muted} {bar}",
-            "shortcut.leading": segment,
-            "shortcut.edge": f"{muted} {bar}",
-            "shortcut.key": f"fg:{contrast_ink(chip, colors['accent'])} bg:{chip} bold",
-            "shortcut.label": f"fg:{contrast_ink(chip, colors['selection'])} bg:{chip} bold",
+            "setting.value": f"{text} {bar}",
+            "shortcut.bar": f"fg:{chip} {bar}",
+            "shortcut.alt": f"fg:{colors['accent3']}",
+            "shortcut.leading": chip_face,
+            "shortcut.edge": f"fg:{chip} {bar}",
+            "shortcut.key": f"{secondary_accent} bg:{chip} bold",
+            "shortcut.label": f"{chip_face} bold",
             "toolbar": surface,
-            "button": f"fg:{contrast_ink(colors['selection'], colors['text'])} {bar} bold noreverse nounderline",
+            "button": f"{text} {bar} bold noreverse nounderline",
             "auxiliary": surface,
             "auxiliary.focused": f"{accent} bold noreverse",
             "button.disabled": f"{muted} {bar} noreverse",
@@ -215,12 +223,7 @@ def _style(tokens):
             "radio-checked": f"{accent} bold",
             "checkbox-selected": f"{accent} bold noreverse",
             "checkbox-checked": f"{accent} bold",
-            "scrollbar.arrow": muted,
-            "scrollbar.button": f"bg:{colors['accent']}"
-            if colors["accent"] not in (HOST_COLOR, colors["background"])
-            else "reverse",
-            "scrollbar.highlight": f"bg:{colors['muted']}"
-            if colors["muted"] not in (HOST_COLOR, colors["background"])
-            else "reverse",
+            "scrollbar.button": f"bg:{colors['muted2']}",
+            "scrollbar.highlight": f"bg:{colors['accent']}",
         }
     )

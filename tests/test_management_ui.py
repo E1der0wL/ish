@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import weakref
 from functools import partial
@@ -27,7 +28,7 @@ from wcwidth import wcswidth
 from ish.config import config
 from ish.lang import i18n
 from ish.manage.app import Screen, SettingsWindow
-from ish.manage.palette import PanelStyle
+from ish.manage.palette import PanelStyle, ui_style
 from ish.manage.store import SettingsStore
 from ish.plugin.manager import PluginManager
 from ish.terminal.settings import Settings, load
@@ -130,6 +131,17 @@ class PipeInputTests(ManagementFixture):
             style.get_attrs_for_style_str("class:panel.inactive").bgcolor,
             style.get_attrs_for_style_str("").bgcolor,
         )
+
+    def test_scrollbar_uses_the_chosen_background_even_when_it_matches_the_rail(self):
+        """A deliberately matching or host-default thumb must not reverse the cell."""
+        for token, rgb in (("#123456", "123456"), ("default", "default")):
+            with self.subTest(token=token):
+                style = ui_style(
+                    {"background": token, "accent": token, "muted2": token}
+                )
+                for part in ("button", "highlight"):
+                    cell = style.get_attrs_for_style_str(f"class:scrollbar.{part}")
+                    self.assertEqual((cell.bgcolor, cell.reverse), (rgb, False))
 
     def run_keys(self, screen, pipe, keys, *, until=None):
         """Send real input and, for non-closing actions, wait for their visible result."""
@@ -500,9 +512,8 @@ class PipeInputTests(ManagementFixture):
 
                 try:
                     await asyncio.wait_for(frame.wait(), 5)
-                    self.assertEqual(calls, [])
-                    pipe.send_bytes(b"\t\t\r")
                     await asyncio.wait_for(entered["slow"].wait(), 5)
+                    pipe.send_bytes(b"\t\t\r")
                     pipe.send_bytes(b"\r\x01\x0bskipped\r\r\x01\x0blatest\r")
                     await wait_for_frame(
                         lambda: window.inputs["plugin_dir"].text == "latest"
@@ -602,7 +613,7 @@ class PublicManagementTests(ManagementFixture):
         """Locate a rendered field's title and its independently clickable value box."""
         frame = terminal.screen.display
         for heading, row in enumerate(frame):
-            visible_title = row.partition("│")[2].rstrip(" △▽\ueb6e\ueb71").lstrip()
+            visible_title = row.partition("│")[2].rstrip(" △▽").lstrip()
             if visible_title not in (title, "✎ " + title, "\uf044 " + title):
                 continue
             for y, candidate in enumerate(frame[heading + 1 :], heading + 1):
@@ -662,7 +673,7 @@ class PublicManagementTests(ManagementFixture):
         """Send one press/release at a zero-based host cell."""
         terminal.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m")
 
-    def scrollbar_at_top(self, terminal, *, up="△", down="▽"):
+    def scrollbar_at_top(self, terminal):
         """Locate the right pane's arrows and inspect its blank cells and colors."""
 
         def bounds():
@@ -670,8 +681,8 @@ class PublicManagementTests(ManagementFixture):
                 column = [
                     terminal.screen.buffer[y][x].data for y in range(terminal.rows)
                 ]
-                if up in column and down in column:
-                    top, bottom = column.index(up), column.index(down)
+                if "△" in column and "▽" in column:
+                    top, bottom = column.index("△"), column.index("▽")
                     if bottom > top + 2:
                         return x, top, bottom
             return None
@@ -705,12 +716,15 @@ class PublicManagementTests(ManagementFixture):
             if "▸ Getting started" in row
         )
         x = row.index("▸")
-        selected = terminal.screen.buffer[y][x].bg
+        selected = terminal.screen.buffer[y][x].fg
+        self.assertEqual(terminal.screen.buffer[y][x].bg, "default")
         self.assertNotIn("C Close", terminal.screen.display[-1])
         terminal.send(b"\r")
-        terminal.require(lambda: terminal.screen.buffer[y][x].bg != selected)
+        terminal.require(lambda: terminal.screen.buffer[y][x].fg != selected)
+        self.assertEqual(terminal.screen.buffer[y][x].bg, "default")
         terminal.send(b"\x03" + terminal.escape_key)
-        terminal.require(lambda: terminal.screen.buffer[y][x].bg == selected)
+        terminal.require(lambda: terminal.screen.buffer[y][x].fg == selected)
+        self.assertEqual(terminal.screen.buffer[y][x].bg, "default")
         terminal.send(b"\x03\x1b[B\x1b[B")
         terminal.require(lambda: terminal.frame_has(".ishrc.py"))
         terminal.finish()
@@ -719,29 +733,1159 @@ class PublicManagementTests(ManagementFixture):
         self.assertFalse(plugin_marker.exists())
         self.assertFalse((self.home / ".ish.log").exists())
 
-    def test_help_title_bar_sidebar_and_close_button_layout(self):
-        """Open the Korean help and exercise both close controls in the rendered UI."""
-        for close_header in (False, True):
-            with self.subTest(close_header=close_header):
-                terminal = self.terminal("-h", language="ko")
-                terminal.require(partial(terminal.frame_has, "닫기"))
-                frame = terminal.screen.display
-                self.assertEqual(frame[0].split(), ["📖", "도움말", "×"])
-                sidebar = [row.partition("│")[0].strip() for row in frame[1:-1]]
-                self.assertEqual(next(label for label in sidebar if label), "사용 안내")
-                self.assertFalse(
-                    any("도움말" in label or "─" in label for label in sidebar)
+    def test_switching_management_views_keeps_the_alternate_screen(self):
+        """Observe the outer terminal protocol in both launch orders and on final exit."""
+        for first in ("-h", "-c"):
+            with self.subTest(first=first):
+                term = self.terminal(first, rows=38, cols=116)
+                help_active = first == "-h"
+                for _ in range(4):
+                    button = "Config" if help_active else "Help"
+                    self.click_label(term, button, same_line="Preset")
+                    help_active = not help_active
+                    title = "Help" if help_active else "Settings"
+                    term.require(
+                        lambda t=term, title=title: title in t.screen.display[0]
+                    )
+                    self.assertEqual(term.output.count(b"\x1b[?1049h"), 1)
+                    self.assertNotIn(b"\x1b[?1049l", term.output)
+                term.close_settings()
+                self.assertEqual(term.output.count(b"\x1b[?1049l"), 1)
+
+    def test_configured_editor_and_browser_receive_separate_arguments(self):
+        """Save both fields, open the editor, then open a link from both help paths."""
+        recorder = self.root / "record arguments.py"
+        recorder.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n"
+        )
+        env = {
+            "VISUAL": "/missing/editor",
+            "EDITOR": "/missing/editor",
+            "BROWSER": "/missing/browser",
+        }
+        term = self.terminal("-c", rows=38, cols=116, environment=env)
+        term.require(lambda: term.frame_has("Shell executable"))
+        term.send(b"\r\x1b[1;3F")
+        markers = {}
+        for field in ("Default editor", "Web browser"):
+            marker = self.root / field
+            markers[field] = marker
+            self.click_field(term, field)
+            term.require(lambda title=field: term.frame_has("✎ " + title))
+            command = shlex.join(
+                [sys.executable, str(recorder), str(marker), "two words", "semi;colon"]
+            )
+            term.send("\x1b[200~" + command + "\x1b[201~\r")
+            term.require(lambda title=field: not term.frame_has("✎ " + title))
+        self.apply_action(term, "Save")
+        term.send(b"\x05")
+        term.require(
+            lambda: (
+                term.frame_has("reloaded from disk")
+                and markers["Default editor"].exists()
+            )
+        )
+        self.assertEqual(
+            json.loads(markers["Default editor"].read_text()),
+            ["two words", "semi;colon", str(self.rc)],
+        )
+        self.click_label(term, "Help", same_line="Preset")
+
+        def open_link(ui):
+            marker = markers["Web browser"]
+            self.click_label(ui, "More details")
+            expected = ["two words", "semi;colon", "https://github.com/E1der0wL/ish"]
+            ui.require(
+                lambda: marker.is_file() and marker.read_text() == json.dumps(expected)
+            )
+            marker.unlink()
+            ui.close_settings()
+
+        open_link(term)
+        trap = self.root / "rc-evaluated"
+        self.rc.write_text(f"open({str(trap)!r}, 'w').close()\n" + self.rc.read_text())
+        open_link(self.terminal("-h", rows=38, cols=116, environment=env))
+        self.assertFalse(trap.exists())
+
+    def test_closing_help_leaves_the_opened_browser_running(self):
+        """The link handoff has no claim on the terminal after the user closes help."""
+        marker = self.root / "browser-started"
+        release = self.root / "browser-may-exit"
+        done = self.root / "browser-exited"
+        script = self.root / "browser.py"
+        script.write_text(
+            "import os, time\nfrom pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text(str(os.isatty(0)))\n"
+            "deadline = time.monotonic() + 20\n"
+            f"while not Path({str(release)!r}).exists() and time.monotonic() < deadline: time.sleep(0.02)\n"
+            f"Path({str(done)!r}).touch()\n"
+        )
+        self.rc.write_text(
+            f"config.browser = {shlex.join([sys.executable, str(script)])!r}\n"
+        )
+        term = self.terminal("-h")
+        try:
+            self.click_label(term, "More details")
+            term.require(marker.exists)
+            self.assertEqual(marker.read_text(), "False")
+            term.close_settings()
+            self.assertFalse(done.exists())
+        finally:
+            release.touch()
+        deadline = time.monotonic() + 5
+        while not done.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(done.exists())
+
+    def test_help_details_opens_project_and_preserves_help(self):
+        """Capture the browser handoff and leave the same help window usable."""
+        marker = self.root / "browser-url"
+        browser = self.root / "browser"
+        browser.write_text(
+            f"#!/bin/sh\nprintf '%s' \"$1\" > {shlex.quote(str(marker))}\n"
+        )
+        browser.chmod(0o700)
+        terminal = self.terminal(
+            "-h",
+            language="ko",
+            environment={"BROWSER": str(browser), "LOGNAME": "guest"},
+        )
+        self.click_label(terminal, "자세히")
+        terminal.require(
+            lambda: (
+                marker.is_file()
+                and marker.read_text() == "https://github.com/E1der0wL/ish"
+            )
+        )
+        frame = terminal.screen.display
+        self.assertEqual(frame[0].split(), ["📖", "도움말", "×"])
+        profile = next(row.partition("│")[0] for row in frame if "ish 2.0.0" in row)
+        self.assertEqual(profile.split(), ["☺", "guest", "ish", "2.0.0"])
+        self.assertTrue(
+            profile.startswith("  ☺  guest") and profile.endswith("2.0.0  ")
+        )
+        self.assertIn("<F>", frame[-1])
+        terminal.close_settings()
+        self.assertFalse(self.rc.exists())
+
+    def test_sidebar_rules_follow_titles_and_resize_with_the_panel(self):
+        """Read category rules from CLI output and click items under them."""
+        cases = (
+            ("-c", ("ish 설정", "설치된 확장"), "환경 설정", "UI 팔레트"),
+            ("-h", ("사용 안내", "참고 자료"), None, "진단·로그"),
+        )
+
+        def check(option, sections, subgroup, page):
+            terminal = self.terminal(option, rows=36, cols=110, language="ko")
+
+            def rule(title):
+                lines = [line.partition("│")[0] for line in terminal.screen.display]
+                return next(
+                    (
+                        lines[i + 1]
+                        for i, line in enumerate(lines[:-1])
+                        if line.strip() == title
+                    ),
+                    "",
                 )
-                self.assertNotIn("C 닫기", frame[-1])
-                button_row = next(
+
+            terminal.require(lambda: all(rule(h).strip() for h in sections))
+            for heading in sections:
+                self.assertEqual(rule(heading), " " + "─" * 26 + " ")
+            lines = [line.partition("│")[0].strip() for line in terminal.screen.display]
+            self.assertEqual(sum(set(line) == {"─"} for line in lines), len(sections))
+            if subgroup:
+                self.assertIn("언어·시작 설정", rule(subgroup))
+                self.assertTrue(
+                    any(
+                        row.startswith("    공개된 확장 설정 없음")
+                        for row in terminal.screen.display
+                    )
+                )
+            terminal.send(b"\x1b[1;5C")  # Ctrl+Right widens the sidebar by one cell.
+            terminal.require(lambda: rule(sections[0]) == " " + "─" * 27 + " ")
+            self.assertEqual(rule(sections[1]), rule(sections[0]))
+            self.click_label(terminal, page)
+            terminal.require(
+                lambda: page in terminal.screen.display[2].partition("│")[2]
+            )
+            terminal.close_settings()
+
+        for case in cases:
+            with self.subTest(option=case[0]):
+                check(*case)
+
+    def test_sidebar_height_drag_uses_comment_colors_and_keeps_focus(self):
+        """Drag both real category handles, including a resize before release."""
+        self.rc.write_text(
+            "config.ui_palette = {'text': '#22ff44', 'muted': '#ff0000', 'muted2': '#0000ff', 'edge': '#ffff00'}\n"
+        )
+
+        def check(option, title):
+            term = self.terminal(option, rows=36, cols=110)
+
+            def rule():
+                return next(
+                    (
+                        y + 1
+                        for y, line in enumerate(term.screen.display)
+                        if line.partition("│")[0].strip() == title
+                    ),
+                    None,
+                )
+
+            def point(code, y, suffix="M"):
+                term.send(f"\x1b[<{code};6;{y + 1}{suffix}")
+
+            term.require(
+                lambda: rule() and term.screen.buffer[rule()][5].fg == "0000ff"
+            )
+            y = rule()
+            point(35, y - 1)
+            term.require(lambda: term.screen.buffer[y][5].fg == "ff0000")
+            point(0, y - 1)
+            point(32, y + 3)
+            point(0, y + 3, "m")
+            term.require(lambda: rule() == y + 4)
+            # Capture a drag at the rule and resize before releasing over the close button.
+            point(0, rule())
+            term.resize(24, 80)
+            term.require(lambda: "×" in term.screen.display[0][70:])
+            term.send(b"\x1b[<0;79;1m\x1b[B")
+            expected = "UI palette" if option == "-c" else "Keys and navigation"
+            term.require(lambda: expected in term.screen.display[2].partition("│")[2])
+            self.assertIsNotNone(rule())
+            term.close_settings()
+
+        for option, title in (("-h", "Reference"), ("-c", "Installed extensions")):
+            with self.subTest(option=option):
+                check(option, title)
+
+    def test_color_role_columns_and_button_padding_on_screen(self):
+        """Measure Korean captions, both button margins and the rendered color strip."""
+        self.rc.write_text("config.ui_icons = 'nerdfont'\n")
+        term = self.terminal(
+            "-c", language="ko", environment={"LOGNAME": "dev"}, rows=38, cols=119
+        )
+        term.require(lambda: term.frame_has("\uedca  dev"))
+        self.click_label(term, "UI 팔레트")
+        term.send(b"\r")
+        term.require(lambda: term.frame_has("lime-300"))
+
+        def cell_x(label, same):
+            line = next(
+                row for row in term.screen.display if label in row and same in row
+            )
+            return wcswidth(line.partition(label)[0])
+
+        term.require(
+            lambda: any("100" in row and "900" in row for row in term.screen.display)
+        )
+        right = cell_x("900", "100") + 3
+        token = cell_x("lime-300", "강조색 1")
+        self.assertEqual(token, cell_x("cyan-300", "강조색 2"))
+        self.assertGreaterEqual(token + len("lime-300"), right - 5)
+        self.assertLessEqual(token + len("lime-300"), right + 1)
+        y = term.rows - 3
+        for caption in ("취소", "저장"):
+            x = cell_x(caption, "저장")
+            cells = term.screen.buffer[y]
+            bg = cells[x].bg
+            width = wcswidth(caption)
+            self.assertNotEqual(cells[x - 3].bg, bg)
+            self.assertNotEqual(cells[x + width + 2].bg, bg)
+            self.assertTrue(all(cells[i].bg == bg for i in range(x - 2, x + width + 2)))
+        term.close_settings()
+
+    def test_clicking_toolbar_returns_keyboard_to_the_original_field(self):
+        """Close a clicked filter and type into the field selected before the click."""
+        term = self.terminal("-c", rows=36, cols=110)
+        self.click_field(term, "Shell executable")
+        term.send(b"\r")
+        term.require(lambda: not term.frame_has("✎ Shell executable"))
+        self.click_label(term, "⚲", same_line="Language and startup")
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(b"\x1b")
+        term.require(lambda: not term.frame_has("Apply"))
+        self.assertNotIn("Filter options", term.screen.display[2])
+        term.send(b"\r")
+        term.require(lambda: term.frame_has("✎ Shell executable"))
+        term.send(b"\x01\x0bclicked-shell\r\x13")
+        term.require(
+            lambda: self.rc.exists() and load(self.rc).shell == "clicked-shell"
+        )
+        # A pointer click must also leave the toolbar if a different tool was
+        # selected deliberately using the keyboard before hovering over Filter.
+        term.send(b"\t\t\x1b[C")
+        term.require(lambda: "Reload settings" in term.screen.display[2])
+        x = wcswidth(term.screen.display[2].partition("⚲")[0])
+        term.send(f"\x1b[<35;{x + 1};3M")
+        term.require(lambda: "Filter options" in term.screen.display[2])
+        self.click_cell(term, x, 2)
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(b"\x1b")
+        term.require(lambda: not term.frame_has("Apply"))
+        self.assertNotIn("Reload settings", term.screen.display[2])
+        self.assertNotIn("Filter options", term.screen.display[2])
+        term.close_settings()
+
+    def test_profile_keeps_actions_and_focus_when_sidebar_narrows(self):
+        """Read the same account and activate the same preset control after a resize."""
+        terminal = self.terminal(
+            "-c", language="ko", rows=32, cols=110, environment={"LOGNAME": "ui-tester"}
+        )
+
+        def footer():
+            rows = [line.partition("│")[0].strip() for line in terminal.screen.display]
+            for y, row in enumerate(rows):
+                if row.split()[:2] == ["☺", "ui-tester"]:
+                    return rows[y : y + 4]
+            return []
+
+        terminal.require(lambda: len(footer()) == 4 and "프리셋 ▾" in footer()[2])
+        heading, gap, buttons, bottom = footer()
+        self.assertEqual(heading.split(), ["☺", "ui-tester", "ish", "2.0.0"])
+        self.assertEqual((gap, bottom), ("", ""))
+        self.assertEqual(buttons.split(), ["도움말", "프리셋", "▾"])
+        self.click_label(terminal, "ui-tester")
+        terminal.require(lambda: terminal.frame_has("로컬 사용자 계정"))
+        terminal.send(b"\x1b")
+        terminal.require(lambda: not terminal.frame_has("로컬 사용자 계정"))
+        terminal.resize(32, 52)
+        terminal.require(lambda: terminal.screen.display[4].index("│") == 4)
+        self.click_label(terminal, "▤")
+        terminal.require(
+            lambda: any(
+                row.strip() == "+" or "   +" in row
+                for row in terminal.screen.display[:-1]
+            )
+        )
+        terminal.send(b"\r")
+        terminal.require(lambda: terminal.frame_has("새 프리셋 이름"))
+        terminal.send(b"\x1b")
+        terminal.require(lambda: not terminal.frame_has("새 프리셋 이름"))
+        terminal.resize(32, 110)
+        terminal.require(lambda: len(footer()) == 4 and "도움말" in footer()[2])
+        self.click_label(terminal, "도움말", same_line="프리셋")
+        terminal.require(lambda: terminal.frame_has("자세히"))
+        terminal.close_settings()
+
+    def test_blank_clicks_focus_the_clicked_pane_and_preserve_the_page(self):
+        """Click margins, indentation, inter-item gaps and the space below the list."""
+        for option, field, selected in (
+            ("-c", "Language and startup", "UI palette"),
+            ("-h", "Getting started", "Keys and navigation"),
+        ):
+            with self.subTest(option=option):
+                term = self.terminal(option, rows=42, cols=112)
+                self.click_label(term, selected)
+                term.require(
+                    lambda t=term, title=selected: (
+                        title in t.screen.display[2].partition("│")[2]
+                    )
+                )
+                frame = term.screen.display
+                y = next(
+                    y for y, row in enumerate(frame) if field in row.partition("│")[0]
+                )
+                edge = frame[y].index("│")
+                empty = next(
+                    i
+                    for i, row in enumerate(frame[y + 1 :], y + 1)
+                    if "│" in row and not row.partition("│")[0].strip()
+                )
+                for x, row in ((0, y), (2, y), (edge - 2, y), (1, empty)):
+                    self.click_cell(term, x, row)
+                # A Ctrl+Right frame is an ordered acknowledgement of those clicks.
+                term.send(b"\x1b[1;5C")
+                term.require(
+                    lambda t=term, e=edge: t.screen.display[2].index("│") == e + 1
+                )
+                self.assertIn(selected, term.screen.display[2].partition("│")[2])
+                self.click_label(term, field)
+                term.require(
+                    lambda t=term, title=field: (
+                        title in t.screen.display[2].partition("│")[2]
+                    )
+                )
+                if option == "-c":
+                    self.click_field(term, "Shell executable")
+                    term.send(b"\x01\x0bdraft-shell")
+                    term.require(partial(term.frame_has, "draft-shell"))
+                else:
+                    term.send(b"\r")
+                self.click_cell(term, 0, y)
+                # Only sidebar navigation handles Ctrl+Right. The blank click also
+                # finishes a text edit without selecting another page or saving it.
+                term.send(b"\x1b[1;5C")
+                term.require(
+                    lambda t=term, e=edge: t.screen.display[2].index("│") == e + 2
+                )
+                self.assertIn(field, term.screen.display[2].partition("│")[2])
+                term.require(lambda t=term: not t.frame_has("✎ Shell executable"))
+                self.click_cell(term, term.cols - 1, y)
+                if option == "-c":
+                    term.send(b"\r")
+                    term.require(partial(term.frame_has, "✎ Shell executable"))
+                    self.assertTrue(term.frame_has("draft-shell"))
+                else:
+                    # The first Esc from the document goes back to navigation.
+                    term.send(b"\x1b")
+                    term.require(
+                        lambda t=term: (
+                            self.label_cell(t, "Getting started", "▸").fg
+                            != self.label_cell(
+                                t, "Keys and navigation", "Keys and navigation"
+                            ).fg
+                        )
+                    )
+                    self.assertIsNone(term.status)
+                term.close_settings()
+                self.assertFalse(self.rc.exists())
+
+    def test_blank_press_across_divider_routes_keys_before_mouse_release(self):
+        """A divider hover or a held motion cannot postpone the next key to a later click."""
+        term = self.terminal("-c", rows=38, cols=112)
+        self.click_field(term, "Shell executable")
+        term.send(b"\r")
+        term.require(lambda: not term.frame_has("✎ Shell executable"))
+        edge = term.screen.display[2].index("│")
+        y = 10
+
+        def mouse(code, x, end="M"):
+            return f"\x1b[<{code};{x + 1};{y}{end}"
+
+        def cross(x, direction):
+            return "".join(mouse(35, col) for col in (x - direction, x, x + direction))
+
+        # The first keyboard event follows the press in the same PTY write.
+        # Only navigation owns Ctrl+Right; it grows the sidebar by one cell.
+        term.send(cross(edge, -1) + mouse(0, edge - 1) + "\x1b[1;5C")
+        term.require(lambda: term.screen.display[2].index("│") == edge + 1)
+        term.send(mouse(0, edge - 1, "m"))
+        edge += 1
+        # Switch back. A move report while held, even in the same cell, used
+        # to cancel the click. Enter must reach the remembered body field.
+        term.send(
+            cross(edge, 1)
+            + mouse(0, edge + 1)
+            + mouse(32, edge + 1)
+            + mouse(0, edge + 1, "m")
+            + "\r"
+        )
+        term.require(lambda: term.frame_has("✎ Shell executable"))
+        term.close_settings()
+
+    def test_pane_background_focus_preserves_scroll_and_requires_a_left_click(self):
+        """Retain a manual scroll; a drag release and a modal cannot switch panes."""
+        self.rc.write_text("config.ui_palette = {'accent': '#eb1647'}\n")
+        term = self.terminal(
+            "-c",
+            rows=24,
+            cols=106,
+            environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+        )
+
+        def main_active():
+            cell = self.label_cell(term, "Language and startup", "⚲")
+            return cell is not None and cell.fg == "eb1647"
+
+        self.click_field(term, "Shell executable")
+        term.send(b"\r\x1b[1;3F")  # Finish the edit, then scroll the form to the end.
+        term.require(lambda: main_active() and self.field_bounds(term, "Log level"))
+        bounds = self.field_bounds(term, "Log level")
+        # Press in the main margin and release in the sidebar margin.
+        term.send(f"\x1b[<0;{term.cols};6M\x1b[<32;1;6M\x1b[<0;1;6m")
+        term.send(b"\x1b[<2;1;6M\x1b[<2;1;6m")  # Right-click the sidebar.
+        # Ctrl+Right would resize the rail if either gesture had taken focus.
+        width = term.screen.display[2].index("│")
+        term.send(b"\x1b[1;5C")
+        self.click_cell(term, 0, 5)
+        term.require(lambda: not main_active())
+        self.assertEqual(term.screen.display[2].index("│"), width)
+        self.click_cell(term, term.cols - 1, 5)
+        term.require(main_active)
+        self.assertEqual(self.field_bounds(term, "Log level"), bounds)
+
+        term.send(b"\x06")
+        term.require(
+            lambda: any(
+                "Apply" in row and "Cancel" in row for row in term.screen.display
+            )
+        )
+        self.click_cell(term, 0, 5)
+        term.send(b"escape_delay\r")
+        term.require(lambda: term.frame_has("Filter: escape_delay"))
+        term.close_settings()
+
+    def test_blank_space_below_installed_extension_does_not_open_it(self):
+        """Exercise PTK's last-line fallback in an oversized installed-extension list."""
+        root = self.home / "plugin/script/sample"
+        root.mkdir(parents=True)
+        (root / "__init__.py").write_text(
+            "PLUGIN_META = {'version': '1', 'category': 'module', 'settings': "
+            "{'caption': {'title': 'Caption', 'description': 'Visible text', 'default': 'abc'}}}"
+        )
+        term = self.terminal("-c", rows=45, cols=112)
+        term.require(lambda: term.frame_has("sample"))
+        self.click_label(term, "UI palette")
+        term.require(lambda: "UI palette" in term.screen.display[2])
+        frame = term.screen.display
+        y = next(i for i, row in enumerate(frame) if "sample" in row.partition("│")[0])
+        edge = frame[y].index("│")
+        self.assertFalse(frame[y + 3].partition("│")[0].strip())
+        self.click_cell(term, 5, y + 3)
+        self.click_cell(term, edge - 2, y)
+        term.send(b"\x1b[1;5C")
+        term.require(lambda: term.screen.display[2].index("│") == edge + 1)
+        self.assertIn("UI palette", term.screen.display[2])
+        self.click_label(term, "sample")
+        term.require(lambda: term.frame_has("Caption"))
+        term.close_settings()
+
+    def test_hover_in_other_pane_previews_only_the_pointed_widget(self):
+        """Assert actual cell colors and immediately send keys to the original pane."""
+        self.rc.write_text(
+            "config.ui_palette = {'accent': '#c62a71', 'selection': '#213145', 'background': '#102530'}\n"
+        )
+        term = self.terminal(
+            "-c",
+            rows=40,
+            cols=120,
+            environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+        )
+        term.require(lambda: self.field_bounds(term, "Language"))
+
+        def hover(x, y):
+            term.send(f"\x1b[<35;{x + 1};{y + 1}M")
+
+        def hover_label(label, same):
+            term.require(lambda: self.label_cell(term, label, same) is not None)
+            y, row = next(
+                (y, row)
+                for y, row in enumerate(term.screen.display)
+                if label in row and same in row
+            )
+            hover(wcswidth(row.partition(label)[0]), y)
+
+        def color(label, row):
+            cell = self.label_cell(term, label, row)
+            return cell.fg if cell is not None else None
+
+        edge = term.screen.display[2].index("│")
+        for label, same in (("Save", "Cancel"), ("⚲", "Language and startup")):
+            hover_label(label, same)
+            term.require(lambda label=label, same=same: color(label, same) == "c62a71")
+            self.assertNotEqual(color("Language and startup", "⚲"), "c62a71")
+        left, _, title, editor = self.field_bounds(term, "Language")
+        hover(left + 3, editor)
+        term.require(lambda: term.screen.buffer[title][left].fg == "c62a71")
+        term.send(b"\x1b[1;5C")
+        term.require(lambda: term.screen.display[2].index("│") == edge + 1)
+        self.click_field(term, "Shell executable")
+        hover_label("UI palette", "UI palette")
+        term.require(lambda: color("UI palette", "UI palette") == "c62a71")
+        term.send(b"\x01\x0bhover-kept-the-editor")
+        term.require(lambda: term.frame_has("hover-kept-the-editor"))
+        self.assertTrue(term.frame_has("✎ Shell executable"))
+        label = self.label_cell(term, "UI palette", "UI palette")
+        row = next(
+            i
+            for i, line in enumerate(term.screen.display)
+            if "UI palette" in line.partition("│")[0]
+        )
+        self.assertEqual(label.bg, term.screen.buffer[row][0].bg)
+        hover(0, 3)
+        term.require(lambda: color("UI palette", "UI palette") != "c62a71")
+        term.close_settings()
+
+    def test_footer_accent_edits_independently_and_reopens_in_help(self):
+        """Persist a chip color without modifying a previously configured comment color."""
+        self.rc.write_text("config.ui_palette = {'muted2': '#7094ab'}\n")
+        options = {
+            "environment": {"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+            "rows": 42,
+            "cols": 120,
+        }
+        term = self.terminal("-c", **options)
+        self.click_label(term, "UI palette")
+        term.require(lambda: self.label_cell(term, "Comment 2", "#7094ab") is not None)
+        self.click_label(term, "Accent 4", same_line="slate-500")
+        term.require(
+            lambda: term.frame_has("› Accent 4") and term.frame_has("◂ Slate ▸")
+        )
+        self.click_label(term, "Teal")
+        term.require(lambda: term.frame_has("teal-500") and term.frame_has("◂ Teal ▸"))
+        self.click_label(term, "200", same_line="900")
+        term.require(
+            lambda: (
+                (cell := self.label_cell(term, "Save", "<S>")) and cell.bg == "99f6e4"
+            )
+        )
+        self.apply_action(term, "Save")
+        term.close_settings()
+        self.assertEqual(
+            load(self.rc).ui_palette, {"muted2": "#7094ab", "accent4": "teal-200"}
+        )
+        help_ui = self.terminal("-h", **options)
+        help_ui.require(
+            lambda: (
+                (cell := self.label_cell(help_ui, "Find", "<F>"))
+                and cell.bg == "99f6e4"
+            )
+        )
+        help_ui.close_settings()
+
+    def test_toolbar_hover_and_activation_leave_keyboard_on_the_field(self):
+        """A tooltip can follow the pointer without redirecting Enter to the toolbar."""
+        term = self.terminal("-c", rows=38, cols=112)
+        self.click_field(term, "Shell executable")
+        term.send(b"\r")
+        term.require(lambda: not term.frame_has("✎ Shell executable"))
+        x = wcswidth(term.screen.display[2].partition("⚲")[0])
+        self.click_cell(term, x - 1, 2)
+        self.click_cell(term, x + 1, 2)
+        term.send(f"\x1b[<35;{x + 1};3M")
+        term.require(lambda: "Filter options" in term.screen.display[2])
+        term.send(b"\r")
+        term.require(lambda: term.frame_has("✎ Shell executable"))
+        term.send(b"\r\t\t\r")
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(b"\x1b")
+        term.require(lambda: not term.frame_has("Apply"))
+        self.assertNotIn("Filter options", term.screen.display[2])
+        term.send(b"\r")
+        term.require(lambda: term.frame_has("✎ Shell executable"))
+        term.close_settings()
+
+    def test_cross_button_releases_do_not_save_reload_or_close(self):
+        """Press on the field, another button, or another cell of the Save button."""
+        original = "config.shell = 'initial-shell'\n"
+        self.rc.write_text(original)
+        term = self.terminal("-c", rows=38, cols=116)
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0bdraft-shell\r")
+        term.require(
+            lambda: (
+                term.frame_has("draft-shell")
+                and not term.frame_has("✎ Shell executable")
+            )
+        )
+        left, _, _, field_y = self.field_bounds(term, "Shell executable")
+
+        def point(label, row):
+            return wcswidth(term.screen.display[row].rpartition(label)[0]), row
+
+        def gesture(start, end):
+            x, y = start
+            a, b = end
+            term.send(
+                f"\x1b[<0;{x + 1};{y + 1}M\x1b[<32;{a + 1};{b + 1}M\x1b[<0;{a + 1};{b + 1}m"
+            )
+
+        field = (left + 2, field_y)
+        save = point("Save", term.rows - 3)
+        cancel = point("Cancel", term.rows - 3)
+        for end in (save, point("↻", 2), point("×", 0)):
+            gesture(field, end)
+        gesture(cancel, save)
+        gesture(save, cancel)
+        # Wait for a subsequent action before checking that earlier releases had no effect.
+        term.send(b"\x06")
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(term.escape_key)
+        term.require(
+            lambda: not term.frame_has("Apply") and term.frame_has("draft-shell")
+        )
+        self.assertEqual(self.rc.read_text(), original)
+        gesture(save, (save[0] + 1, save[1]))
+        term.require(lambda: term.frame_has("Changes saved"))
+        self.assertEqual(load(self.rc).shell, "draft-shell")
+        term.close_settings()
+
+    def test_tool_keys_and_footer_cancel_the_same_edit_as_the_toolbar(self):
+        """Filter, edit and reload each use one action for all three activation paths."""
+        log = self.root / "editor-calls"
+        script = self.root / "editor.py"
+        script.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            f"log = Path({str(log)!r})\n"
+            "with log.open('a') as f: print(sys.argv[1], file=f)\n"
+            "n = len(log.read_text().splitlines())\n"
+            "with Path(sys.argv[1]).open('a') as rc: print(f\"config.shell = 'editor-{n}'\", file=rc)\n"
+        )
+        editor = shlex.join([sys.executable, str(script)])
+        disk = "disk-shell"
+        self.rc.write_text(f"config.editor = {editor!r}\nconfig.shell = {disk!r}\n")
+        term = self.terminal("-c", rows=38, cols=118)
+        calls = 0
+        for route in ("toolbar", "key", "footer"):
+            for key, glyph, code in (
+                ("F", "⚲", b"\x06"),
+                ("E", "✎", b"\x05"),
+                ("R", "↻", b"\x12"),
+            ):
+                with self.subTest(route=route, key=key):
+                    self.click_field(term, "Shell executable")
+                    term.require(lambda: term.frame_has("✎ Shell executable"))
+                    term.send(b"\x01\x0bdiscard-me")
+                    term.require(lambda: term.frame_has("discard-me"))
+                    if key == "R":
+                        disk = f"reload-{route}"
+                        self.rc.write_text(
+                            f"config.editor = {editor!r}\nconfig.shell = {disk!r}\n"
+                        )
+                    if route == "key":
+                        term.send(code)
+                    elif route == "toolbar":
+                        self.click_label(term, glyph, same_line="Language and startup")
+                    else:
+                        self.click_label(term, f"<{key}>", same_line="<S>")
+                    if key == "F":
+                        term.require(lambda: term.frame_has("Apply"))
+                        term.send(term.escape_key)
+                    elif key == "E":
+                        calls += 1
+                        disk = f"editor-{calls}"
+                    term.require(
+                        lambda disk=disk: (
+                            term.frame_has(disk)
+                            and not term.frame_has("discard-me")
+                            and not term.frame_has("Apply")
+                            and not term.frame_has("✎ Shell executable")
+                        )
+                    )
+        self.assertEqual(log.read_text().splitlines(), [str(self.rc)] * calls)
+        term.close_settings()
+
+    def test_extension_integers_have_the_numeric_field_controls(self):
+        """Step a negative integer and a large exact integer and persist both operations."""
+        source = self.home / "plugin/script/sample/__init__.py"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "PLUGIN_META = {'version':'1','category':'module','settings':"
+            "{'count':{'title':'Quantity','description':'Item count','default':-7}}}\n"
+        )
+        term = self.terminal("-c", rows=38, cols=118)
+        self.click_label(term, "sample")
+        self.click_field(term, "Quantity")
+        _, right, _, y = self.field_bounds(term, "Quantity")
+        term.require(lambda: term.screen.buffer[y][right - 2].data == "↕")
+        term.send(b"\x1b[B\r\x13")
+        term.require(
+            lambda: (
+                self.rc.exists()
+                and load(self.rc).plugin_settings.get("sample", {}).get("count") == -8
+            )
+        )
+        self.click_field(term, "Quantity")
+        term.send(b"\x01\x0b99999999999999999999999999999\x1b[A\r\x13")
+        term.require(
+            lambda: (
+                load(self.rc).plugin_settings["sample"]["count"]
+                == 100000000000000000000000000000
+            )
+        )
+        term.close_settings()
+
+    @staticmethod
+    def at_reference_end(term):
+        """Read the final CLI example even when its argument wraps across rows."""
+        body = "".join(
+            row.partition("│")[2].strip(" ▽△") for row in term.screen.display[4:-4]
+        )
+        return "--shell-arg=ARG." in body and not term.frame_has("usage: ish")
+
+    def test_first_config_visit_translates_the_open_help_page_in_place(self):
+        """Loading the rc language for settings preserves the position in translated help."""
+        self.rc.write_text("config.lang = 'ko'\n")
+        term = self.terminal("-h", language=None, rows=28, cols=116)
+        term.require(lambda: "Help" in term.screen.display[0])
+        term.send(b"\x06Command-line options\r")
+        term.require(lambda: term.frame_has("usage: ish"))
+        term.send(b"\x1b[1;3F")
+        term.require(lambda: self.at_reference_end(term))
+        self.click_label(term, "Config", same_line="Preset")
+        term.require(lambda: "설정" in term.screen.display[0])
+        self.click_label(term, "도움말", same_line="프리셋")
+        term.require(
+            lambda: (
+                "명령줄 옵션" in term.screen.display[2]
+                and "도움말" in term.screen.display[0]
+            )
+        )
+        self.assertFalse(term.frame_has("사용법: ish"))
+        self.click_label(term, "×")
+        term.finish(key=b"")
+
+    def test_help_retains_the_selected_page_and_reading_position(self):
+        """Resume the CLI reference at its final example after visiting settings."""
+        term = self.terminal("-h", rows=28, cols=116)
+        term.require(lambda: term.frame_has("Getting started"))
+        term.send(b"\x06Command-line options\r")
+        term.require(lambda: term.frame_has("usage: ish"))
+        term.send(b"\x1b[1;3F")
+
+        term.require(lambda: self.at_reference_end(term))
+        self.click_label(term, "Config", same_line="Preset")
+        term.require(lambda: "Settings" in term.screen.display[0])
+        self.click_label(term, "Help", same_line="Preset")
+        term.require(
+            lambda: (
+                "Command-line options" in term.screen.display[2]
+                and self.at_reference_end(term)
+            )
+        )
+        term.close_settings()
+
+    def test_toolbar_cancels_only_the_open_field_before_filtering(self):
+        """Keep the earlier draft and discard only the current value on a tool click."""
+        self.rc.write_text("config.shell = 'disk-shell'\n")
+        term = self.terminal("-c", rows=38, cols=116)
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0baccepted-shell\r")
+        term.require(
+            lambda: (
+                term.frame_has("accepted-shell")
+                and not term.frame_has("✎ Shell executable")
+            )
+        )
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0bdiscard-this-edit")
+        term.require(lambda: term.frame_has("discard-this-edit"))
+        self.click_label(term, "⚲", same_line="Language and startup")
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(b"\x1b")
+        term.require(
+            lambda: (
+                term.frame_has("accepted-shell")
+                and not term.frame_has("discard-this-edit")
+            )
+        )
+
+        self.click_field(term, "Language")
+        term.require(lambda: term.frame_has("○ English"))
+        x = wcswidth(term.screen.display[2].partition("⚲")[0])
+        term.send(f"\x1b[<35;{x + 1};3M")
+        term.require(lambda: "Filter options" in term.screen.display[2])
+        term.send(b"\x1b[B")
+        term.require(lambda: self.label_cell(term, "○ English", "○ English").bold)
+        self.click_cell(term, x, 2)
+        term.require(lambda: term.frame_has("Apply"))
+        term.send(b"\x1b")
+        term.require(
+            lambda: not term.frame_has("Apply") and not term.frame_has("○ English")
+        )
+        self.apply_action(term, "Save")
+        self.assertEqual(load(self.rc).shell, "accepted-shell")
+        self.assertIsNone(load(self.rc).lang)
+        term.close_settings()
+
+    def test_toolbar_cancels_before_opening_file_and_reloading(self):
+        """Open the configured editor on one click, then reload both disk and form."""
+        recorder = self.root / "editor.py"
+        log = self.root / "opened"
+        recorder.write_text(
+            "from pathlib import Path\nimport sys\n"
+            f"with Path({str(log)!r}).open('a') as log: log.write(sys.argv[1] + '\\n')\n"
+        )
+        command = shlex.join([sys.executable, str(recorder)])
+        self.rc.write_text(
+            f"config.editor = {command!r}\nconfig.shell = 'original-shell'\n"
+        )
+        term = self.terminal("-c", rows=38, cols=116)
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0btemporary-shell")
+        term.require(lambda: term.frame_has("temporary-shell"))
+        self.click_label(term, "✎", same_line="Language and startup")
+        term.require(lambda: log.exists() and term.frame_has("reloaded from disk"))
+        self.assertEqual(log.read_text().splitlines(), [str(self.rc)])
+        self.assertTrue(term.frame_has("original-shell"))
+
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0bearlier-draft\r")
+        term.require(
+            lambda: (
+                term.frame_has("earlier-draft")
+                and not term.frame_has("✎ Shell executable")
+            )
+        )
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0bsecond-edit")
+        term.require(lambda: term.frame_has("second-edit"))
+        self.rc.write_text("config.shell = 'reloaded-shell'\n")
+        self.click_label(term, "↻", same_line="Language and startup")
+        term.require(
+            lambda: (
+                term.frame_has("reloaded-shell")
+                and term.frame_has("reloaded from disk")
+            )
+        )
+        term.close_settings()
+
+    def test_icon_sidebar_hover_card_and_keyboard_expansion(self):
+        """Collapse past the profile width, read a different icon and reopen the panel."""
+        term = self.terminal("-c", rows=34, cols=105)
+        term.require(lambda: term.frame_has("Language and startup"))
+        term.send(b"\x1b[1;5D" * 10)
+        term.require(
+            lambda: (
+                term.screen.display[4].index("│") == 4
+                and any(
+                    row.partition("│")[0].strip() == "▤" for row in term.screen.display
+                )
+            )
+        )
+        y = next(
+            i
+            for i, line in enumerate(term.screen.display)
+            if "◐" in line.partition("│")[0]
+        )
+        sidebar = [line.partition("│")[0].strip() for line in term.screen.display[1:-1]]
+        items = [i for i, glyph in enumerate(sidebar) if glyph and set(glyph) != {"─"}]
+        self.assertTrue(all(not sidebar[i + 1] for i in items[:-1]))
+        self.assertEqual([sidebar[i] for i in items[-3:]], ["☺", "📖", "▤"])
+        self.click_cell(term, 1, y - 1)
+        self.assertIn("Language and startup", term.screen.display[2])
+        term.send(f"\x1b[<35;2;{y + 1}M")
+        term.require(lambda: "UI palette" in term.screen.display[y])
+        self.assertIn("Language and startup", term.screen.display[2])
+        self.click_cell(term, 1, y)
+        term.require(
+            lambda: (
+                "UI palette" in term.screen.display[2]
+                and "UI palette" not in term.screen.display[y]
+            )
+        )
+        first = next(
+            i
+            for i, row in enumerate(term.screen.display)
+            if "⚙" in row.partition("│")[0] and i > 0
+        )
+        self.assertEqual(term.screen.buffer[y][1].fg, term.screen.buffer[first][1].fg)
+        self.click_cell(term, 2, first)  # Blank cell beside a one-cell icon.
+        self.click_cell(term, 1, y - 1)  # Vertical padding between the two icons.
+        term.send(b"\x1b[1;5C")
+        term.require(
+            lambda: (
+                term.screen.display[4].index("│") > 20
+                and any(
+                    "Help" in line and "Preset" in line for line in term.screen.display
+                )
+            )
+        )
+        self.assertIn("UI palette", term.screen.display[2])
+        term.close_settings()
+
+    def test_preset_menu_centers_creation_and_consumes_one_outside_click(self):
+        """Observe both icon sets, dismiss over another button, then invoke creation."""
+        for mode, glyph in (("unicode", "+"), ("nerdfont", "")):
+            with self.subTest(mode=mode):
+                original = (
+                    f"config.ui_icons = {mode!r}\nconfig.presets = {{'saved': {{}}}}\n"
+                )
+                self.rc.write_text(original)
+                term = self.terminal("-c", rows=34, cols=108)
+                self.click_label(term, "Preset")
+                term.require(partial(term.frame_has, "○ saved"))
+                row = next(
+                    y for y, s in enumerate(term.screen.display) if "○ saved" in s
+                )
+                # The ordinary row and the creation row occupy the same painted width.
+                line = term.screen.buffer[row]
+                marker = term.screen.display[row].index("○ saved")
+                start = marker - 1
+                end = start
+                while end < term.cols and line[end].bg == line[marker].bg:
+                    end += 1
+                center = start + (end - start - wcswidth(glyph)) // 2
+                self.assertEqual(term.screen.buffer[row + 1][center].data, glyph)
+                # Release over the profile's Help button after the menu has repainted.
+                profile = next(
                     y
-                    for y, row in enumerate(frame)
-                    if row.partition("│")[2].strip() == "닫기"
+                    for y, s in enumerate(term.screen.display)
+                    if "Preset" in s and "Help" in s
                 )
-                rule = frame[button_row - 1].partition("│")[2].strip()
-                self.assertEqual(set(rule), {"─"})
-                self.click_label(terminal, "×" if close_header else "닫기")
-                terminal.finish(key=b"")
+                x = term.screen.display[profile].index("Help")
+                term.send(f"\x1b[<0;{x + 1};{profile + 1}M")
+                term.require(lambda term=term: not term.frame_has("○ saved"))
+                term.send(
+                    f"\x1b[<32;{x + 2};{profile + 1}M\x1b[<0;{x + 2};{profile + 1}m"
+                )
+                self.click_label(term, "Preset")
+                term.require(partial(term.frame_has, "○ saved"))
+                self.assertTrue(term.frame_has("Language and startup"))
+                self.click_cell(term, center, row + 1)
+                term.require(partial(term.frame_has, "New preset name"))
+                self.assertNotIn("<S>", term.screen.display[-1])
+                term.send(b"\x13")
+                term.send(b"\x1b")
+                term.require(
+                    lambda term=term: (
+                        not term.frame_has("New preset name")
+                        and "<S>" in term.screen.display[-1]
+                    )
+                )
+                self.assertEqual(self.rc.read_text(), original)
+                term.close_settings()
+
+    def test_scrollbar_matches_divider_until_hover_or_drag(self):
+        """Observe exact idle and active colors while keyboard focus is in the sidebar."""
+        self.rc.write_text(
+            "config.ui_palette = {'accent': '#a312df', 'muted2': '#174e75'}\n"
+        )
+        term = self.terminal(
+            "-c",
+            rows=24,
+            cols=106,
+            environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+        )
+        x, top, bottom = self.scrollbar_at_top(term)
+
+        def bar(color):
+            buf = term.screen.buffer
+            return buf[top][x].fg == buf[bottom][x].fg == color and any(
+                buf[y][x].bg == color for y in range(top + 1, bottom)
+            )
+
+        term.require(lambda: bar("174e75"))
+        term.send(f"\x1b[<35;{x + 1};{top + 2}M")
+        term.require(lambda: bar("a312df"))
+        term.send(f"\x1b[<0;{x + 1};{top + 2}M\x1b[<32;2;{bottom}M")
+        term.require(
+            lambda: bar("a312df") and term.screen.buffer[bottom - 1][x].bg == "a312df"
+        )
+        term.send(f"\x1b[<0;2;{bottom}m\x1b[<35;1;2M")
+        term.require(lambda: bar("174e75"))
+        term.close_settings()
+
+    def test_extension_draft_and_profile_presets_survive_navigation(self):
+        """Read literals, edit without activating code and restore a saved draft."""
+        source = self.home / "plugin/script/sample/__init__.py"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "PLUGIN_META = {'version':'1','category':'module','settings':"
+            "{'caption':{'title':'Caption','description':'Footer text','default':'first'}}}\n"
+            "raise RuntimeError('metadata lookup imported extension')\n"
+        )
+        terminal = self.terminal("-c", rows=38, cols=118)
+        self.click_label(terminal, "sample")
+        self.click_field(terminal, "Caption")
+        terminal.send(b"\x01\x0bnext\r")
+        self.click_label(terminal, "Preset")
+        terminal.require(
+            lambda: any("   +" in row for row in terminal.screen.display[:-1])
+        )
+        terminal.send(b"\r")
+        terminal.require(lambda: terminal.frame_has("New preset name"))
+        terminal.send(b"work")
+        self.click_label(terminal, "Create preset", same_line="Close")
+        terminal.require(
+            lambda: any(
+                "Help" in row and "work ▾" in row for row in terminal.screen.display
+            )
+        )
+        self.assertFalse(self.rc.exists())
+        self.click_label(terminal, "Help")
+        terminal.require(lambda: terminal.frame_has("More details"))
+        self.click_label(terminal, "Config", same_line="▾")
+        terminal.require(
+            lambda: any(
+                "Help" in row and "work ▾" in row for row in terminal.screen.display
+            )
+        )
+        self.click_field(terminal, "Caption")
+        terminal.send(b"\x01\x0bchanged\r")
+        self.click_label(terminal, "work ▾", same_line="Help")
+        self.click_label(terminal, "● work")
+        terminal.require(
+            lambda: (
+                terminal.frame_has("next") and not terminal.frame_has("Create preset")
+            )
+        )
+        self.apply_action(terminal, "Save")
+        terminal.close_settings()
+        saved = load(self.rc)
+        self.assertEqual(saved.active_preset, "work")
+        self.assertEqual(saved.plugin_settings, {"sample": {"caption": "next"}})
+        self.assertEqual(
+            saved.presets["work"]["plugin_settings"], saved.plugin_settings
+        )
+        self.assertEqual(saved.plugins, [])
+
+    def test_pointer_targets_match_painted_packages_palette_and_choices(self):
+        """Ignore blank cells, highlight hovered choices and keep checked state until click."""
+        for name in ("alpha", "beta"):
+            package = self.home / "plugin/script" / name
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("PLUGIN_META = {'category': 'module'}")
+        terminal = self.terminal("-c", rows=38, cols=118)
+        self.click_label(terminal, "Modules")
+
+        def locate(label, same=""):
+            for y, row in enumerate(terminal.screen.display):
+                if label in row and same in row:
+                    return wcswidth(row.partition(label)[0]), y
+
+        def move(label):
+            x, y = locate(label)
+            terminal.send(f"\x1b[<35;{x + 1};{y + 1}M")
+
+        terminal.require(lambda: locate("[ ] beta"))
+        x, y = locate("[ ] beta")
+        before = terminal.screen.buffer[y][x].fg
+        move("[ ] beta")
+        terminal.require(lambda: terminal.screen.buffer[y][x].fg != before)
+        # The sidebar still owns Enter. On entry the checkbox list still points to alpha.
+        terminal.send(b"\r ")
+        terminal.require(lambda: terminal.frame_has("[*] alpha"))
+        self.assertTrue(terminal.frame_has("[ ] beta"))
+        terminal.send(b" ")
+        terminal.require(lambda: terminal.frame_has("[ ] alpha"))
+        alpha = self.label_cell(terminal, "[ ] alpha", "0.0.0").fg
+        move("[ ] beta")
+        terminal.require(
+            lambda: self.label_cell(terminal, "[ ] beta", "0.0.0").fg == alpha
+        )
+        self.click_cell(terminal, x + 46, y)
+        self.click_label(terminal, "[ ] alpha")
+        terminal.require(lambda: terminal.frame_has("[*] alpha"))
+        self.assertTrue(terminal.frame_has("[ ] beta"))
+        self.click_label(terminal, "UI palette")
+        terminal.send(b"\r")
+        terminal.require(lambda: locate("900", "100"))
+        x, y = locate("900", "100")
+        self.click_cell(terminal, x + 10, y)
+        self.assertFalse(terminal.frame_has("lime-900"))
+        self.click_label(terminal, "Language and startup")
+        self.click_field(terminal, "Language")
+        terminal.require(lambda: locate("○ Korean"))
+        x, y = locate("○ Korean")
+        old = terminal.screen.buffer[y][x].fg
+        move("○ Korean")
+        terminal.require(lambda: terminal.screen.buffer[y][x].fg != old)
+        self.assertTrue(terminal.frame_has("● Automatic"))
+        terminal.send(b"\r\x13")
+        terminal.require(lambda: terminal.frame_has("Changes saved"))
+        terminal.close_settings()
+        saved = load(self.rc)
+        self.assertEqual(saved.plugins, ["alpha"])
+        self.assertEqual(saved.lang, "ko")
+        self.assertEqual(saved.ui_palette, {})
+
+    def test_field_navigation_reveals_heading_and_description(self):
+        """Scroll to the bottom and return to the first setting using only field keys."""
+        terminal = self.terminal("-c", rows=20)
+        terminal.require(lambda: self.field_bounds(terminal, "Language"))
+        terminal.send(b"\r" + b"\x1b[B" * 8)
+        terminal.require(lambda: self.field_bounds(terminal, "Log level"))
+        terminal.send(b"\x1b[A" * 8)
+        terminal.require(lambda: self.field_bounds(terminal, "Language"))
+        _, _, heading, editor = self.field_bounds(terminal, "Language")
+        self.assertIn("LANG", terminal.screen.display[heading + 1])
+        self.assertGreater(editor, heading + 1)
+        terminal.close_settings()
 
     def test_help_page_header_offers_the_same_find_by_mouse_and_keyboard(self):
         """Preview categories in the heading; Enter opens a match and Esc cancels."""
@@ -791,18 +1935,18 @@ class PublicManagementTests(ManagementFixture):
         terminal.require(
             lambda: (
                 terminal.frame_has("Unsaved changes")
-                and "F Filter options " in terminal.screen.display[-1]
+                and "<F> Filter options " in terminal.screen.display[-1]
             )
         )
         footer = terminal.screen.display[-1]
         self.assertTrue(footer.startswith(" Ctrl +"))
-        self.assertTrue(footer.endswith("│ "))
+        self.assertTrue(footer.endswith("▸ "))
         body = terminal.screen.display[1:-4]
         for x in (0, terminal.cols - 1):
             self.click_cell(terminal, x, terminal.rows - 1)
         # Last cell of the filter segment, immediately before the next shortcut.
-        prefix, label, rest = footer.partition("F Filter options ")
-        self.assertTrue(rest.startswith("│"))
+        prefix, label, rest = footer.partition("<F> Filter options ")
+        self.assertTrue(rest.startswith("▸"))
         self.click_cell(terminal, wcswidth(prefix + label), terminal.rows - 1)
         terminal.require(lambda: terminal.frame_has("Apply"))
         self.assertEqual(self.rc.read_bytes(), saved)
@@ -1214,7 +2358,7 @@ class PublicManagementTests(ManagementFixture):
         """Overlay every candidate cell without moving the form and restore what it covered."""
         self.rc.write_text("config.ui_palette = {'selection': 'blue-800'}\n")
         terminal = self.terminal("-c", rows=36, cols=110)
-        terminal.require(lambda: self.field_bounds(terminal, "Language"))
+        terminal.require(lambda: self.field_bounds(terminal, "Starting directory"))
         left, right, _, first = self.field_bounds(terminal, "Language")
         directory = self.field_bounds(terminal, "Starting directory")
         covered = tuple(
@@ -1317,7 +2461,12 @@ class PublicManagementTests(ManagementFixture):
 
     def test_button_groups_release_focus_to_the_clicked_content(self):
         """Hover and group arrows select actions; a background click restores the field."""
-        terminal = self.terminal("-c", rows=38, cols=115)
+        terminal = self.terminal(
+            "-c",
+            rows=38,
+            cols=115,
+            environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+        )
         self.click_field(terminal, "Shell executable")
         terminal.send(b"\r")
         terminal.require(lambda: not terminal.frame_has("✎ Shell executable"))
@@ -1346,11 +2495,15 @@ class PublicManagementTests(ManagementFixture):
         self.click_cell(terminal, terminal.cols - 6, heading)
         terminal.send(b"\r")
         terminal.require(lambda: terminal.frame_has("✎ Shell executable"))
-        # Moving across a toolbar button cannot take an in-progress text edit.
+        # Hover highlights the tool while the text field keeps the keyboard.
         terminal.send(f"\x1b[<35;{x + 1};{toolbar_y + 1}M")
+        terminal.require(lambda: "Filter options" in terminal.screen.display[toolbar_y])
+        self.assertEqual(
+            terminal.screen.buffer[toolbar_y][x].fg,
+            self.label_cell(terminal, "✎ Shell executable", "Shell executable").fg,
+        )
         terminal.send(b"\x01\x0bdraft-shell\r")
         terminal.require(lambda: terminal.frame_has("draft-shell"))
-        self.assertNotIn("Filter options", terminal.screen.display[toolbar_y])
         self.click_label(terminal, "Modules")
         terminal.require(lambda: terminal.frame_has("No modules are declared"))
         terminal.send(b"\r\t\t")
@@ -1358,7 +2511,7 @@ class PublicManagementTests(ManagementFixture):
         self.click_label(terminal, "No modules are declared")
         terminal.send(b"\x1b")
         terminal.require(
-            lambda: self.label_cell(terminal, "Modules", "▸").bg != "default"
+            lambda: self.label_cell(terminal, "Modules", "▸").fg == "bef264"
         )
         terminal.send(b"\x1b[A")
         terminal.require(
@@ -1398,8 +2551,10 @@ class PublicManagementTests(ManagementFixture):
             title = self.label_cell(terminal, "Language and startup", "⚲")
             return button and title and button.fg == title.fg
 
+        ink = terminal.screen.buffer[heading][left].fg
         hover("Save", "Cancel")
         terminal.require(lambda: active("Save"))
+        self.assertEqual(terminal.screen.buffer[heading][left].fg, ink)
         hover("⚲", "Language and startup")
         terminal.require(
             lambda: any(
@@ -1414,7 +2569,13 @@ class PublicManagementTests(ManagementFixture):
         terminal.require(lambda: terminal.frame_has("✎ Shell executable"))
 
         # Clicking the hovered action keeps its result when the pointer leaves.
-        terminal.send(b"\x01\x0bmouse-save-shell\r")
+        terminal.send(b"\x01\x0bmouse-save-")
+        hover("Save", "Cancel")
+        terminal.require(
+            lambda: active("Save") and terminal.frame_has("✎ Shell executable")
+        )
+        terminal.send(b"shell")
+        terminal.require(lambda: terminal.frame_has("mouse-save-shell"))
         hover("Save", "Cancel")
         terminal.require(lambda: active("Save"))
         self.click_action(terminal, "Save")
@@ -1461,7 +2622,13 @@ class PublicManagementTests(ManagementFixture):
                 "",
             )
 
-        terminal.require(lambda: toolbar() and terminal.frame_has("Ctrl +"))
+        terminal.require(
+            lambda: (
+                toolbar()
+                and terminal.frame_has("Ctrl +")
+                and self.status_rows(terminal) == [""]
+            )
+        )
         line = toolbar()
         self.assertIn("Language and startup", line.rsplit("│", 1)[-1])
         self.assertGreater(line.index("⚲"), terminal.cols * 3 // 4)
@@ -1476,9 +2643,8 @@ class PublicManagementTests(ManagementFixture):
             set(terminal.screen.display[-4].partition("│")[2].strip()), {"─"}
         )
         footer = next(row for row in terminal.screen.display if "Ctrl +" in row)
-        self.assertRegex(footer, r"\bS\s+Save\b")
-        for row in (actions, footer):
-            self.assertNotRegex(row, r"[<>]")
+        self.assertIn("<S> Save", footer)
+        self.assertNotRegex(actions, r"[<>]")
 
         for key, label, other in (
             (b"\r\t", "Cancel", "Save"),
@@ -1548,7 +2714,7 @@ class PublicManagementTests(ManagementFixture):
         self.assert_actions_at_right(terminal, "취소", "저장")
         self.assertEqual(self.status_rows(terminal, "취소", "저장"), [""])
         self.assertTrue(terminal.screen.display[-1].startswith(" Ctrl +"))
-        self.assertTrue(terminal.screen.display[-1].endswith("│ "))
+        self.assertTrue(terminal.screen.display[-1].endswith("▸ "))
         terminal.send(b"\r\x1b[Z\x1b[D\r")
         terminal.require(
             lambda: "파일에서" in "".join(self.status_rows(terminal, "취소", "저장"))
@@ -1566,6 +2732,58 @@ class PublicManagementTests(ManagementFixture):
         self.click_action(terminal, "취소", cancel="취소", save="저장")
         terminal.close_settings()
         self.assertFalse(self.rc.exists())
+
+    def test_tiny_view_restores_the_same_editor_and_insertion_point(self):
+        """Shrink without submitting; keep the edit buffer and its mid-line cursor."""
+        self.rc.write_text("config.ui_palette = {'warning': '#bd642a'}\n")
+        term = self.terminal(
+            "-c", rows=38, environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"}
+        )
+        self.click_field(term, "Shell executable")
+        term.send(b"\x01\x0bABCD\x1b[D\x1b[D")
+        term.require(lambda: term.frame_has("ABCD"))
+        for rows, cols in ((3, 20), (2, 100), (30, 19)):
+            term.resize(rows, cols)
+            term.require(lambda: term.frame_has("Enlarge the window"))
+            self.assertEqual(
+                self.label_cell(term, "Enlarge the window", "").fg, "bd642a"
+            )
+            self.assertFalse(term.frame_has("ABCD"))
+        term.resize(38, 110)
+        term.require(lambda: term.frame_has("✎ Shell executable"))
+        term.send(b"X")
+        term.require(lambda: term.frame_has("ABXCD"))
+        self.assertNotIn("ABXCD", self.rc.read_text())
+        term.send(b"\r\x13")
+        term.require(lambda: "ABXCD" in self.rc.read_text())
+        term.close_settings()
+
+    def test_standalone_and_visited_help_use_the_available_palette(self):
+        """Resolve a named literal in standalone help or reuse the open settings draft."""
+        marker = self.root / "loads"
+        direct = (
+            f"with open({str(marker)!r}, 'a') as f: f.write('x')\n"
+            "theme = {'text': '#357d64'}\nconfig.ui_palette = theme\n"
+        )
+        self.rc.write_text(direct)
+        env = {"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"}
+
+        def header_is(ui, title, color):
+            cell = self.label_cell(ui, title, "×")
+            return cell is not None and cell.fg == color
+
+        help_ui = self.terminal("-h", environment=env)
+        help_ui.require(partial(header_is, help_ui, "Help", "357d64"))
+        help_ui.close_settings()
+        self.assertFalse(marker.exists())
+
+        self.rc.write_text(direct.replace("= theme\n", "= dict(theme)\n"))
+        ui = self.terminal("-c", rows=38, environment=env)
+        ui.require(partial(header_is, ui, "Settings", "357d64"))
+        self.click_label(ui, "Help", same_line="Preset")
+        ui.require(partial(header_is, ui, "Help", "357d64"))
+        self.assertEqual(marker.read_text(), "x")
+        ui.close_settings()
 
     def test_icon_style_previews_and_help_reads_only_the_saved_selection(self):
         """Preview an icon set, discard it, then save it for read-only interactive help."""
@@ -1589,6 +2807,9 @@ class PublicManagementTests(ManagementFixture):
                 terminal.require(
                     lambda terminal=terminal: not terminal.frame_has("\uf0d8")
                 )
+                self.assertTrue(terminal.frame_has("△"))
+                self.assertTrue(terminal.frame_has("▽"))
+                self.assertIn("←↓↑→", terminal.screen.display[-1])
                 self.assertEqual(self.rc.read_text(), original)
                 self.apply_action(terminal, "Save" if save else "Cancel")
                 if not save:
@@ -1606,7 +2827,7 @@ class PublicManagementTests(ManagementFixture):
         help_ui.resize(22, 100)
         help_ui.send(b"\x06Command-line options\r")
         help_ui.require(lambda: help_ui.frame_has("usage: ish"))
-        down, up, right = "\ueb6e\ueb71\ueb70"
+        right = "\ueb70"
         help_ui.require(
             lambda: "\u2190\u2193\u2191\u2192" in help_ui.screen.display[-1]
         )
@@ -1617,7 +2838,7 @@ class PublicManagementTests(ManagementFixture):
                 for row in help_ui.screen.display
             )
         )
-        x, top, bottom = self.scrollbar_at_top(help_ui, up=up, down=down)
+        x, top, bottom = self.scrollbar_at_top(help_ui)
         start = next(
             row.index("usage: ish")
             for row in help_ui.screen.display
@@ -1663,17 +2884,27 @@ class PublicManagementTests(ManagementFixture):
             # The last CLI example can wrap across two physical terminal rows.
             return "--shell-arg=ARG." in "".join(row.strip() for row in viewport())
 
+        def option_rows():
+            # Use two visible options so a partial PTY read cannot become the baseline.
+            rows = viewport()
+            return tuple(
+                next((i for i, row in enumerate(rows) if option in row), -1)
+                for option in ("--escape-delay", "--clipboard")
+            )
+
+        terminal.require(lambda: all(i > 0 for i in option_rows()))
+        initial_rows = option_rows()
         terminal.send(b"\x1b[1;3F")  # Alt+End, xterm modified-key encoding.
         terminal.require(at_end)
         self.assertFalse(terminal.frame_has("usage: ish"))
         terminal.send(b"\x1b\x1b[H")  # Alt+Home, ESC-prefixed Home encoding.
-        terminal.require(lambda: terminal.frame_has("usage: ish"))
-        before = viewport()
-        self.assertNotEqual(before[:-1], before[1:])
+        terminal.require(lambda: option_rows() == initial_rows)
+        # Releasing a scrollbar arrow over a different cell must not take a step.
+        terminal.send(f"\x1b[<0;{x + 1};{bottom + 1}M\x1b[<0;{x};{bottom + 1}m")
         self.click_cell(terminal, x, bottom)
-        terminal.require(lambda: viewport()[:-1] == before[1:])
+        terminal.require(lambda: option_rows() == tuple(i - 1 for i in initial_rows))
         self.click_cell(terminal, x, top)
-        terminal.require(lambda: viewport() == before)
+        terminal.require(lambda: option_rows() == initial_rows)
 
         # The first painted cell beneath the upper arrow is the draggable thumb.
         terminal.send(
@@ -1742,10 +2973,10 @@ class PublicManagementTests(ManagementFixture):
         terminal.require(
             lambda: terminal.frame_has("Background") and terminal.frame_has("Accent")
         )
-        self.assertFalse(terminal.frame_has("Filter: ui_icons"))
+        terminal.require(lambda: not terminal.frame_has("Filter: ui_icons"))
         open_dialog()
         apply("Accent")
-        terminal.require(lambda: not terminal.frame_has("Muted text"))
+        terminal.require(lambda: not terminal.frame_has("Comment 1"))
         terminal.send(b"\x1b[A")
         require_page("Language and startup")
         terminal.require(lambda: terminal.frame_has("Filter: ui_icons"))
@@ -1760,7 +2991,7 @@ class PublicManagementTests(ManagementFixture):
         terminal.require(lambda: terminal.frame_has("○ Nerd Font"))
         self.click_label(terminal, "UI palette")
         terminal.require(lambda: terminal.frame_has("Filter: Accent"))
-        self.assertFalse(terminal.frame_has("Muted text"))
+        terminal.require(lambda: not terminal.frame_has("Comment 1"))
         self.click_label(terminal, "Input and display")
         terminal.require(
             lambda: (
@@ -1782,7 +3013,10 @@ class PublicManagementTests(ManagementFixture):
         self.click_label(terminal, "Host features")
         terminal.require(lambda: terminal.frame_has("(OSC 8)"))
         self.click_label(terminal, "Language and startup")
-        self.click_field(terminal, "Shell executable")
+        # Wait for the field's own value: the old page can still occupy lower
+        # rows when the first part of the new page arrives through the PTY.
+        self.click_label(terminal, "initial-shell")
+        terminal.require(lambda: terminal.frame_has("✎ Shell executable"))
         terminal.send(b"\x01\x0bfilter-draft-shell\r")
         terminal.require(lambda: terminal.frame_has("filter-draft-shell"))
 
@@ -1866,7 +3100,15 @@ class PublicManagementTests(ManagementFixture):
                 self.click_label(terminal, "Teal")
                 terminal.require(partial(terminal.frame_has, "teal-400"))
                 self.click_label(terminal, "700", same_line="900")
-                terminal.require(partial(terminal.frame_has, "teal-700"))
+                terminal.require(
+                    lambda terminal=terminal: (
+                        terminal.frame_has("teal-700")
+                        and not (
+                            terminal.frame_has("✎ Accent")
+                            or terminal.frame_has("\uf044 Accent")
+                        )
+                    )
+                )
                 selected = partial(self.label_cell, terminal, "700", "900")
                 terminal.require(
                     lambda selected=selected: (
@@ -1886,6 +3128,113 @@ class PublicManagementTests(ManagementFixture):
                     self.assertEqual(self.rc.read_bytes(), original)
                     self.assertTrue(terminal.frame_has("orange-400"))
                 terminal.close_settings()
+
+    def test_text_and_muted_roles_survive_dark_light_and_default_surfaces(self):
+        """Compare the actual ink and background of chrome, fields and buttons."""
+
+        def check(term, label, row, fg, bg):
+            expected = fg.removeprefix("#"), bg.removeprefix("#"), False
+            term.require(
+                lambda: (
+                    (cell := self.label_cell(term, label, row)) is not None
+                    and (cell.fg, cell.bg, cell.reverse) == expected
+                )
+            )
+
+        def focused(term, label, row):
+            cell = self.label_cell(term, label, row)
+            return cell is not None and cell.fg == "bef264"
+
+        for fill, text, muted in (
+            ("#253043", "#293448", "#334056"),
+            ("#ebe4d7", "#e1dccc", "#d5cfc4"),
+            ("default", "#776688", "#667788"),
+        ):
+            with self.subTest(fill=fill):
+                palette = {
+                    "selection": fill,
+                    "text": text,
+                    "muted": muted,
+                    "accent4": "#b7c4dc",
+                    "muted2": "#394151",
+                }
+                self.rc.write_text(
+                    f"config.ui_palette = {palette!r}\nconfig.shell = '/bin/sh'\n"
+                )
+                term = self.terminal(
+                    "-c",
+                    rows=38,
+                    cols=120,
+                    environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+                )
+                check(term, "Settings", "×", text, fill)
+                term.require(
+                    lambda t=term: self.label_cell(t, "Save", "<S>") is not None
+                )
+                label = self.label_cell(term, "Save", "<S>")
+                bar = self.label_cell(term, "Ctrl +", "<S>")
+                if label.reverse:
+                    ink, chip = label.bg, label.fg
+                else:
+                    ink, chip = label.fg, label.bg
+                self.assertEqual(
+                    (ink, chip, bar.bg), (fill.removeprefix("#"), "b7c4dc", ink)
+                )
+                check(term, "Ctrl +", "<S>", "#b7c4dc", fill)
+                check(term, "S>", "<S>", "#67e8f9", "#b7c4dc")
+                check(term, "ish 2.0.0", "ish 2.0.0", muted, fill)
+                term.send(b"\r")
+                term.require(partial(focused, term, "Language and startup", "⚲"))
+                check(term, "/bin/sh", "/bin/sh", text, fill)
+                term.send(b"\t")
+                term.require(partial(focused, term, "Cancel", "Save"))
+                check(term, "Save", "Cancel", text, fill)
+                term.close_settings()
+
+    def test_secondary_accent_reaches_shortcuts_and_account_without_recoloring(self):
+        """Read the requested ink from actual cells during editing and after restart."""
+        self.rc.write_text("config.ui_palette = {'accent': 'lime-500'}\n")
+        environment = {
+            "LOGNAME": "ish-tester",
+            "PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT",
+        }
+        term = self.terminal("-c", rows=45, cols=120, environment=environment)
+
+        def ink(ui, label, row):
+            cell = self.label_cell(ui, label, row)
+            return cell.fg if cell else None
+
+        term.require(lambda: ink(term, "S>", "<S>") == "67e8f9")
+        self.click_label(term, "UI palette")
+        self.click_label(term, "Accent 2", same_line="cyan-300")
+        term.require(
+            lambda: term.frame_has("› Accent 2") and term.frame_has("◂ Cyan ▸")
+        )
+        self.click_label(term, "Rose")
+        term.require(lambda: term.frame_has("rose-300"))
+        self.click_label(term, "700", same_line="900")
+        term.require(
+            lambda: term.frame_has("rose-700") and ink(term, "S>", "<S>") == "be123c"
+        )
+        self.apply_action(term, "Save")
+        self.assertEqual(
+            load(self.rc).ui_palette, {"accent": "lime-500", "accent2": "rose-700"}
+        )
+
+        self.click_label(term, "Language and startup")
+        term.require(lambda: "Language and startup" in term.screen.display[2])
+        term.send(b"\r\t")
+        term.require(lambda: ink(term, "Cancel", "Save") == "84cc16")
+        term.close_settings()
+
+        help_ui = self.terminal("-h", environment=environment)
+        help_ui.require(
+            lambda: (
+                ink(help_ui, "F>", "<F>") == "be123c"
+                and ink(help_ui, "ish-tester", "ish 2.0.0") == "be123c"
+            )
+        )
+        help_ui.close_settings()
 
     def test_palette_default_custom_hex_and_keyboard_editing(self):
         """Preview and commit named, host and direct colors on the real PTY."""
@@ -1938,6 +3287,17 @@ class PublicManagementTests(ManagementFixture):
             )
         )
         self.assertEqual(load(self.rc).ui_palette, {"accent": "#1a2b3c"})
+        self.click_label(terminal, "HEX #c0ffee")
+        terminal.send(b"\x01\x0b123456")
+        terminal.require(lambda: terminal.frame_has("HEX #123456"))
+        self.click_label(terminal, "⚲", same_line="UI palette")
+        terminal.require(lambda: terminal.frame_has("Apply"))
+        terminal.send(b"\x1b")
+        terminal.require(
+            lambda: (
+                terminal.frame_has("HEX #c0ffee") and not terminal.frame_has("Apply")
+            )
+        )
         self.click_label(terminal, "HEX #c0ffee")
         terminal.send(b"\x01\x0b12Q")
         terminal.require(lambda: terminal.frame_has("HEX #12Q"))
@@ -2049,7 +3409,13 @@ class PublicManagementTests(ManagementFixture):
 
     def test_korean_palette_keeps_its_title_in_each_filter_state(self):
         """Find the color editor by its own title, narrow its roles, clear and restore it."""
-        terminal = self.terminal("-c", language="ko", rows=24, cols=64)
+        terminal = self.terminal(
+            "-c",
+            language="ko",
+            rows=24,
+            cols=64,
+            environment={"PROMPT_TOOLKIT_COLOR_DEPTH": "DEPTH_24_BIT"},
+        )
 
         def body():
             return "\n".join(
@@ -2104,7 +3470,7 @@ class PublicManagementTests(ManagementFixture):
         assert_narrow_entry()
         terminal.send(b"\x1b")
         terminal.require(
-            lambda: self.label_cell(terminal, "UI 팔레트", "▸").bg != "default"
+            lambda: self.label_cell(terminal, "UI 팔레트", "▸").fg == "bef264"
         )
         terminal.send(b"\x1b[A")
         terminal.require(
@@ -2115,7 +3481,7 @@ class PublicManagementTests(ManagementFixture):
         terminal.send(b"\r")
         assert_narrow_entry()
         terminal.send(b"\x1b[B")
-        terminal.require(lambda: "› 보조 글자" in body())
+        terminal.require(lambda: "› 강조색 2" in body())
         terminal.send(b"\x1b[A")
         terminal.require(lambda: "› 강조" in body())
         terminal.resize(39, 110)
@@ -2235,6 +3601,113 @@ class PublicManagementTests(ManagementFixture):
         self.apply_action(terminal, "Save")
         terminal.close_settings()
         self.assertEqual(load(self.rc).features["scheme_notifications"], "off")
+
+    def test_long_choice_expands_and_wrapped_rows_select_the_original_value(self):
+        """Select by clicking the second physical row of a long translated option."""
+        first = "FIRST_" + "가" * 40 + "_ONE"
+        second = "SECOND_" + "나" * 40 + "_TWO"
+        root = self.home / "plugin/script/long_options"
+        root.mkdir(parents=True)
+        meta = {
+            "version": "1",
+            "category": "plugin",
+            "settings": {
+                "path": {
+                    "title": "Which path",
+                    "description": "Choose a path",
+                    "default": first,
+                    "choices": [first, second],
+                }
+            },
+        }
+        (root / "__init__.py").write_text("PLUGIN_META = " + repr(meta))
+        terminal = self.terminal("-c", rows=36, cols=84)
+        self.click_label(terminal, "long_options")
+        terminal.require(
+            lambda: any(
+                "FIRST_" in row and "…" in row for row in terminal.screen.display
+            )
+        )
+        self.click_field(terminal, "Which path")
+        terminal.require(
+            lambda: terminal.frame_has("_ONE") and terminal.frame_has("_TWO")
+        )
+        self.click_label(terminal, "_TWO")
+        terminal.require(
+            lambda: any(
+                "SECOND_" in row and "…" in row for row in terminal.screen.display
+            )
+        )
+        self.apply_action(terminal, "Save")
+        self.assertEqual(load(self.rc).plugin_settings["long_options"]["path"], second)
+        terminal.close_settings()
+
+    def test_late_mouse_burst_does_not_reach_the_calling_shell(self):
+        """Delay the final mouse fragments until shutdown and read the next real shell line."""
+        off = b"\x1b[?1003l"
+        query = b"\x1b[?1003$p"
+        reply = b"\x1b[?1003;2$y"
+        literal = b"35;60;62M stays literal"
+        for option in ("-c", "-h"):
+            with self.subTest(option=option):
+                result = self.root / option
+                term = self.terminal(option, parent_line=result)
+                term.require(lambda term=term: query in term.output)
+                if not term.host:
+                    term.send(reply)
+                term.require(lambda term=term: "×" in term.screen.display[0])
+                col = wcswidth(term.screen.display[0].partition("×")[0]) + 1
+                start = len(term.output)
+                term.send(f"\x1b[<0;{col};1M\x1b[<0;{col};1m\x1b[<35;60;")
+                term.require(lambda term=term, start=start: off in term.output[start:])
+                term.send(b"62M" + b"\x1b[<35;60;61M" * 20)
+                if term.host:
+                    term.require(lambda term=term: b"CALLER_READY" in term.output)
+                    term.send(literal + b"\n")
+                else:
+                    term.require(
+                        lambda term=term, start=start: query in term.output[start:]
+                    )
+                    # One write includes both the host acknowledgement and the caller's line.
+                    term.send(reply + literal + b"\n")
+                term.finish(key=b"")
+                self.assertEqual(result.read_bytes(), literal)
+                self.assertIn(query, term.output[start:])
+
+    def test_focus_reports_in_close_batch_do_not_echo_before_terminal_release(self):
+        """Actual PTYs deliver focus events on either side of the close keystroke."""
+        for option in ("-c", "-h"):
+            with self.subTest(option=option):
+                terminal = self.terminal(option)
+                terminal.require(lambda term=terminal: "×" in term.screen.display[0])
+                column = wcswidth(terminal.screen.display[0].partition("×")[0]) + 1
+                click = f"\x1b[<0;{column};1M\x1b[<0;{column};1m".encode()
+                terminal.finish(key=b"\x1b[I\x1b[O" + click + b"\x1b[O")
+                self.assertNotIn(b"^[[O", terminal.output)
+                self.assertNotIn(b"\x1b[?1004h", terminal.output)
+
+    def test_long_field_preview_wraps_only_while_editing(self):
+        """Read the entire CJK value and keep its bytes after clicking Save."""
+        value = "HEAD" + "가나" * 24 + "TAIL"
+        self.rc.write_text(f"config.shell = {value!r}\n")
+        terminal = self.terminal("-c", rows=40, cols=115)
+        terminal.require(
+            lambda: any("HEAD" in r and "…" in r for r in terminal.screen.display)
+        )
+        self.click_field(terminal, "Shell executable")
+        terminal.require(
+            lambda: terminal.frame_has("HEAD") and terminal.frame_has("TAIL")
+        )
+        self.click_action(terminal, "Save")
+        terminal.require(lambda: not terminal.frame_has("TAIL"))
+        self.assertEqual(load(self.rc).shell, value)
+        terminal.send(b"\r")
+        terminal.require(
+            lambda: (
+                terminal.frame_has("✎ Shell executable") and terminal.frame_has("TAIL")
+            )
+        )
+        terminal.close_settings()
 
     def test_horizontal_pan_preserves_the_edit_cursor_in_a_long_field(self):
         """Read the end of the shell field, then insert at the original beginning."""
@@ -2395,6 +3868,32 @@ class PublicManagementTests(ManagementFixture):
         )
         terminal.close_settings()
 
+    def test_outside_click_with_motion_finishes_the_field_on_first_release(self):
+        """A held motion in blank space is one blur; the next key cannot edit the old field."""
+        self.rc.write_text("config.shell = 'old-shell'\nconfig.escape_delay = 0.02\n")
+        term = self.terminal("-c", rows=40, cols=115)
+        for title, typed, shift in (
+            ("Shell executable", "accepted-shell", 0),
+            ("Esc / Alt wait (s)", "9.1", 1),
+        ):
+            self.click_field(term, title)
+            term.send("\x01\x0b" + typed)
+            term.require(lambda typed=typed: term.frame_has(typed))
+            _, right, _, row = self.field_bounds(term, title)
+            x, y = right + 4, row + 1
+            term.send(
+                f"\x1b[<0;{x};{y}M\x1b[<32;{x + shift};{y}M\x1b[<0;{x + shift};{y}m"
+            )
+            term.send(b"POISON")
+            term.require(lambda title=title: not term.frame_has("✎ " + title))
+            self.assertFalse(term.frame_has("POISON"))
+        term.require(lambda: self.status_contains(term, "must be between"))
+        self.apply_action(term, "Save")
+        self.assertEqual(
+            (load(self.rc).shell, load(self.rc).escape_delay), ("accepted-shell", 0.02)
+        )
+        term.close_settings()
+
     def test_click_outside_ends_text_edits_and_runs_the_clicked_target(self):
         """Keep the field draft on blur and deliver the same click to the next target."""
         original = "config.shell = 'abcd'\nconfig.escape_delay = 0.075\n"
@@ -2520,15 +4019,15 @@ class PublicManagementTests(ManagementFixture):
             lambda: (
                 terminal.frame_has("0.125")
                 and not terminal.frame_has("✎ " + delay)
-                and self.status_contains(terminal, "must be between")
                 and self.status_contains(terminal, "before opening the file")
+                and not self.status_contains(terminal, "must be between")
             )
         )
         self.assertEqual(self.rc.read_text(), original)
         self.click_field(terminal, delay)
         terminal.send(b"\x01\x0b9.9")
         terminal.require(lambda: terminal.frame_has("9.9"))
-        self.click_label(terminal, "S Save", same_line="Ctrl +")
+        self.click_label(terminal, "<S> Save", same_line="Ctrl +")
         terminal.require(
             lambda: (
                 terminal.frame_has("✎ " + delay)
@@ -2562,7 +4061,7 @@ class PublicManagementTests(ManagementFixture):
         """Use each setting's own empty-value policy on a direct click into the next field."""
         original = "config.cwd = 'saved-start'\nconfig.log_file = 'old.log'\n"
         self.rc.write_text(original)
-        terminal = self.terminal("-c", rows=46, cols=120)
+        terminal = self.terminal("-c", rows=56, cols=120)
         cwd, log = "Starting directory", "Log file"
         self.click_field(terminal, "Shell executable")
         terminal.send(b"\x01\x0b~:no-ish-home:/bin/sh\r")

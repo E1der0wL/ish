@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import runpy
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,21 @@ class RcError(ValueError):
         if not isinstance(self.error, SettingsError):
             error = f"{type(self.error).__name__}: {error}"
         return i18n.get(Message.STARTUP_RC_ERROR, path=self.path, error=error)
+
+
+def validate_command(value):
+    """Accept a blank default or a quoted executable and its fixed arguments."""
+    if not isinstance(value, str) or (value and not value.isprintable()):
+        raise SettingsError(Message.MANAGE_COMMAND_INVALID)
+    value = value.strip()
+    if value:
+        try:
+            executable, *_ = shlex.split(value)
+        except ValueError as error:
+            raise SettingsError(Message.MANAGE_COMMAND_INVALID) from error
+        if not executable:
+            raise SettingsError(Message.MANAGE_COMMAND_INVALID)
+    return value
 
 
 def validate_escape_delay(value):

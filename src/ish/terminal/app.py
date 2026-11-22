@@ -279,6 +279,7 @@ class TerminalApp:
         dump_state: Path | None = None,
         plugins=(),
         plugin_dir=None,
+        plugin_settings=None,
         library_dir=None,
         clipboard=DEFAULT_CLIPBOARD,
         mouse=DEFAULT_MOUSE,
@@ -328,6 +329,7 @@ class TerminalApp:
         self.presentation_ready = False
         self.suspend_task = None
         self.plugin_names = tuple(plugins)
+        self.plugin_settings = plugin_settings or {}
         self.plugin_dir, self.library_dir = plugin_dir, library_dir
         self.host = HostBroker(
             features=features,

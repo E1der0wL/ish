@@ -6,7 +6,6 @@ from threading import Event, Thread
 
 from prompt_toolkit.application import get_app
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.layout import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.screen import WritePosition
 from prompt_toolkit.mouse_events import MouseEventType
@@ -15,7 +14,7 @@ from prompt_toolkit.widgets import CheckboxList
 from ish.plugin.manager import PluginManager
 from ish.runtime.settings import setting_path
 
-from .scroll import FormPane
+from .scroll import FormPane, HitWindow, hover_style
 
 
 class CatalogReader:
@@ -130,8 +129,10 @@ class PackageRows(UIControl):
         def line(index):
             name, title = owner.values[index]
             style = owner.checked_style if name in checked else ""
-            if index == selected:
-                style += " " + owner.selected_style
+            emphasized = style + " " + owner.selected_style
+            style = hover_style(
+                (self, index), emphasized if index == selected else style, emphasized
+            )
             mark = owner.select_character if name in checked else " "
             box = owner.open_character + mark + owner.close_character
             return [(style, box), (style + " " + owner.default_style, " " + title)]
@@ -156,7 +157,7 @@ class PackageRows(UIControl):
         return NotImplemented
 
 
-class PackageWindow(Window):
+class PackageWindow(HitWindow):
     """Expose full list geometry to the form while drawing a single viewport."""
 
     def __init__(self, control, style):

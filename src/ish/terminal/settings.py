@@ -7,11 +7,11 @@ from pathlib import Path
 
 from prompt_toolkit.output import ColorDepth
 
-from ish.lang import Message
+from ish.lang import Message, i18n
 from ish.manage.icons import DEFAULT_ICONS, validate_icons
 from ish.manage.palette import validate_palette
 from ish.runtime.settings import Settings as BaseSettings
-from ish.runtime.settings import SettingsError
+from ish.runtime.settings import SettingsError, validate_command
 from ish.runtime.settings import load as load_common
 
 from .features import validate as validate_features
@@ -61,14 +61,50 @@ class Settings(BaseSettings):
     color_depth: str = DEFAULT_COLOR_DEPTH
     ui_palette: dict[str, str] = field(default_factory=dict)
     ui_icons: str = DEFAULT_ICONS
+    editor: str = ""
+    browser: str = ""
+    plugin_settings: dict = field(default_factory=dict)
+    presets: dict = field(default_factory=dict)
+    active_preset: str = ""
     features: dict[str, str] = field(default_factory=dict)
 
     def validate(self, base: Path):
         """Reject invalid policies before acquiring a terminal or native library."""
         BaseSettings.validate(self, base)
+        if not isinstance(self.plugin_settings, dict) or any(
+            not isinstance(name, str)
+            or not isinstance(items, dict)
+            or any(
+                not isinstance(key, str) or type(value) not in (bool, str, int)
+                for key, value in items.items()
+            )
+            for name, items in self.plugin_settings.items()
+        ):
+            raise ValueError(i18n.get(Message.MANAGE_SCHEMA_INVALID))
+        if (
+            not isinstance(self.presets, dict)
+            or not isinstance(self.active_preset, str)
+            or self.active_preset
+            and self.active_preset not in self.presets
+            or any(
+                not isinstance(name, str)
+                or not name.strip()
+                or not name.isprintable()
+                or not isinstance(values, dict)
+                or any(
+                    key not in self.__dataclass_fields__
+                    or key in ("presets", "active_preset")
+                    for key in values
+                )
+                for name, values in self.presets.items()
+            )
+        ):
+            raise ValueError(i18n.get(Message.MANAGE_PRESET_INVALID))
         self.color_depth = validate_color_depth(self.color_depth)
         self.ui_palette = validate_palette(self.ui_palette)
         self.ui_icons = validate_icons(self.ui_icons)
+        self.editor = validate_command(self.editor)
+        self.browser = validate_command(self.browser)
         if not isinstance(self.features, dict):
             raise SettingsError(Message.VT_FEATURES_MAPPING)
         self.features = validate_features(self.features)

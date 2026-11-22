@@ -15,7 +15,8 @@ from ish.terminal.session import Session
 
 DEADLINE = 5
 OVERSIZED_INPUT = 5 * 1024 * 1024
-FINAL_OUTPUT = b"x" * 10000 + b"FINAL_MARKER"
+FINAL_MARKER = b"FINAL_MARKER"
+FINAL_OUTPUT = b"x" * 10000 + FINAL_MARKER
 HOST_PIPE_BYTES = 4096
 HOST_QUEUE_BYTES = 32768
 
@@ -398,11 +399,13 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_paused_exit_with_open_slave_drains_without_waiting_for_eof(self):
         """A retained slave cannot prolong completion after final bytes are delivered."""
+        # Reads are paused before the child writes. Its exit must not depend on
+        # the kernel having space for a bulk write in the unread PTY.
         self.start(
             "import os,sys\n"
             "print('SLAVE='+os.ttyname(0),flush=True)\n"
             "sys.stdin.readline()\n"
-            "os.write(1," + repr(FINAL_OUTPUT) + ")\n"
+            "os.write(1," + repr(FINAL_MARKER) + ")\n"
         )
         await self.require_output(b"\r\n")
         line = bytes(self.output).split(b"\r\n", 1)[0]
@@ -413,10 +416,11 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.session.send(b"finish\n")
         await self.require_child_exit()
         self.assertFalse(self.completed.is_set())
+        self.assertNotIn(FINAL_MARKER, self.output)
         self.session.set_output_enabled(True)
         await asyncio.wait_for(self.completed.wait(), DEADLINE)
-        self.assertTrue(self.output.endswith(FINAL_OUTPUT))
-        self.assertEqual(bytes(self.output).count(FINAL_OUTPUT), 1)
+        self.assertTrue(self.output.endswith(FINAL_MARKER))
+        self.assertEqual(self.output.count(FINAL_MARKER), 1)
         self.assertEqual(self.exits, [0])
         self.assertEqual(self.errors, [])
         os.fstat(self.slave)
@@ -442,7 +446,7 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
             "tty.setraw(0)\n"
             "print('SLAVE='+os.ttyname(0),flush=True)\n"
             "sys.stdin.readline()\n"
-            "os.write(1," + repr(FINAL_OUTPUT) + ")\n"
+            "os.write(1," + repr(FINAL_MARKER) + ")\n"
         )
         await self.require_output(b"\n")
         line = bytes(self.output).split(b"\n", 1)[0]
@@ -466,7 +470,7 @@ class TerminalSessionTests(unittest.IsolatedAsyncioTestCase):
             os.read(self.slave, 65536)
         self.session.set_output_enabled(True)
         await asyncio.wait_for(self.completed.wait(), DEADLINE)
-        self.assertTrue(self.output.endswith(FINAL_OUTPUT))
+        self.assertTrue(self.output.endswith(FINAL_MARKER))
         self.assertEqual(self.exits, [0])
 
     async def test_child_exit_callback_failure_releases_completion_wait(self):

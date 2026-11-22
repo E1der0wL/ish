@@ -51,6 +51,7 @@ class WireHost(io.StringIO):
         self.queried = False
         self.writes = []
         self.sync_mode = None
+        self.release_reply = b"\x1b[?1003;2$y"
 
     def write(self, value):
         """Interleave ordinary keys with replies on the same real PTY input."""
@@ -69,6 +70,8 @@ class WireHost(io.StringIO):
                 )
                 parts.extend(["b" if self.keys else "", "\x1bP1$r0;1;3;31;44m\x1b\\"])
                 os.write(self.master, "".join(parts).encode())
+        elif value == "\x1b[?1003$p" and self.reply and self.release_reply:
+            os.write(self.master, self.release_reply)
         return result
 
 
@@ -179,6 +182,9 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
         screen, host, source, _, _ = self.fixture()
         move = b"\x1b[<35;8;2M"
         paste = b"35;8;2M literal " + move
+        host.release_reply = (
+            b"C" + move + b"\x1b[200~" + paste + b"\x1b[201~" + host.release_reply
+        )
         await self.finish(
             screen,
             host,
@@ -210,7 +216,10 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(received, ["A", paste.decode(), "B", move.decode(), "\x1b"])
+        self.assertEqual(
+            received,
+            ["A", paste.decode(), "B", "C", paste.decode(), move.decode(), "\x1b"],
+        )
 
     async def test_split_reports_keys_and_paste_survive_management_handoff(self):
         """Continue only the old partial control on the next caller-owned PTK reader."""
@@ -229,6 +238,8 @@ class ManagementRestoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(prefix=prefix):
                 screen, host, source, original, _ = self.fixture()
+                # A disconnected/nonresponding host can leave a split control at handoff.
+                host.release_reply = None
                 await self.finish(screen, host, key=b"\x04" + prefix)
                 # No reader has touched the suffix. The caller owns this read.
                 with source.raw_mode():

@@ -15,6 +15,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from ish.lang import Message, i18n
+from ish.runtime.settings import validate_command
 
 from .icons import validate_icons
 from .palette import validate_palette
@@ -34,7 +35,14 @@ class SettingsStore:
     STAGE_PREFIX = ".ish-settings-"
     BACKUP_PREFIX = ".ishrc-backup-"
     OBJECT = "config"
-    APPEARANCE = {"ui_palette": validate_palette, "ui_icons": validate_icons}
+    HELP_OPTIONS = {
+        "browser": validate_command,
+        "ui_palette": validate_palette,
+        "ui_icons": validate_icons,
+        "active_preset": lambda value: (
+            value if isinstance(value, str) and value.isprintable() else ""
+        ),
+    }
     DEFAULT_NEWLINE = "\n"
     NEW_FILE_MODE = 0o600
 
@@ -87,8 +95,57 @@ class SettingsStore:
             return target.attr
         return None
 
+    @staticmethod
+    def _assignment(node):
+        """Return the target of one plain top-level assignment, if present."""
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            return node.targets[0]
+        if isinstance(node, ast.AnnAssign) and node.value is not None:
+            return node.target
+        return None
+
+    @staticmethod
+    def _mentions_binding(node, name):
+        """Include bindings that Python's AST stores as strings rather than Name nodes."""
+        for item in ast.walk(node):
+            if isinstance(item, ast.alias):
+                if (item.asname or item.name.split(".")[0]) in (name, "*"):
+                    return True
+            elif isinstance(item, ast.Name):
+                if item.id == name:
+                    return True
+            elif name in (getattr(item, "name", None), getattr(item, "rest", None)):
+                # Definitions, exception handlers and structural pattern captures.
+                return True
+        return False
+
     @classmethod
-    def read_appearance(cls, path):
+    def _palette_literal(cls, statements, position, name):
+        """Follow one literal dictionary while its binding and uses are unambiguous."""
+        value = None
+        for index, node in enumerate(statements):
+            if index == position:
+                continue
+            target = cls._assignment(node)
+            if isinstance(target, ast.Name) and target.id == name:
+                if index < position:
+                    value = node.value
+                    continue
+                # A fresh binding leaves the already assigned dictionary intact.
+                if not any(
+                    isinstance(n, ast.Name) and n.id == name
+                    for n in ast.walk(node.value)
+                ):
+                    break
+            if cls._mentions_binding(node, name):
+                # An alias, mutation, or conditional binding is not a literal.
+                value = None
+        if not isinstance(value, ast.Dict):
+            raise ValueError("Unresolved palette variable")
+        return ast.literal_eval(value)
+
+    @classmethod
+    def read_help_options(cls, path):
         """Read literal UI overrides for interactive help without evaluating the rc."""
         try:
             # A special file at the rc path must not block a read-only query.
@@ -104,21 +161,19 @@ class SettingsStore:
                 statements = ast.parse(source.read(), filename=os.fspath(path)).body
         except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
             return {}
-        pending = set(cls.APPEARANCE)
+        pending = set(cls.HELP_OPTIONS)
         overrides = {}
-        for node in reversed(statements):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target = node.targets[0]
-            elif isinstance(node, ast.AnnAssign):
-                target = node.target
-            else:
-                target = None
-            field = cls._field(target)
+        for index in reversed(range(len(statements))):
+            node = statements[index]
+            field = cls._field(cls._assignment(node))
             if field in pending:
                 try:
-                    overrides[field] = cls.APPEARANCE[field](
-                        ast.literal_eval(node.value)
+                    value = (
+                        cls._palette_literal(statements, index, node.value.id)
+                        if field == "ui_palette" and isinstance(node.value, ast.Name)
+                        else ast.literal_eval(node.value)
                     )
+                    overrides[field] = cls.HELP_OPTIONS[field](value)
                 except (ValueError, TypeError, RecursionError):
                     pass
             # A later conditional or in-place edit makes an earlier literal

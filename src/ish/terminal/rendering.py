@@ -487,15 +487,21 @@ class ScreenApplication(Application):
         if not self.renderer._screen_owned:
             return
         queue = self.key_processor.input_queue
+        retire = getattr(self.input, "retire_mouse", None)
+        if retire is not None:
+            retire()
+        if (
+            not self.renderer.mouse_support()
+            and self.renderer.release_mouse()
+            and self.is_done
+        ):
+            finish = getattr(self.input, "finish_mouse_release", None)
+            if finish is not None:
+                queue.extend(finish(self.renderer.output))
         if queue:
             kept = [key for key in queue if key.key != Keys.Vt100MouseEvent]
             queue.clear()
             queue.extend(kept)
-        retire = getattr(self.input, "retire_mouse", None)
-        if retire is not None:
-            retire()
-        if not self.renderer.mouse_support():
-            self.renderer.release_mouse()
 
     def exit(self, *args, **kwargs):
         """Switch off capture at the close decision, before PTK's final repaint."""
@@ -671,6 +677,8 @@ class RestoringRenderer(Renderer):
             self._mouse_support_enabled = False
             self.output.write_raw(self.owner.host.mouse_mode(False))
             self.output.flush()
+            return True
+        return False
 
     def repaint_viewport(self):
         """Anchor PTK's relative diff after a host shrink, clamp or reflow."""

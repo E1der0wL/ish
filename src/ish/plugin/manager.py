@@ -25,6 +25,7 @@ from ish.log import get_logger
 
 from . import PACKAGE_ENTRY, PYTHON_SOURCE_SUFFIX
 from .metadata import DependencySpec, split_requirement
+from .options import declarations
 
 if TYPE_CHECKING:
     from packaging.requirements import Requirement
@@ -87,6 +88,8 @@ class PluginInfo:
     category: PluginCategory = field(
         default=PluginCategory.PLUGIN, metadata={NORMALIZER: PluginCategory.declared}
     )
+
+    settings: dict = field(default_factory=dict, metadata={NORMALIZER: declarations})
 
     @classmethod
     def from_mapping(cls, name: str, meta: object) -> PluginInfo | None:

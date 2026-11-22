@@ -22,6 +22,12 @@ class IconSet:
 
     label: Message
     book: str
+    presets: str
+    new_preset: str
+    extension: str
+    settings_pages: tuple[str, ...]
+    help_pages: tuple[str, ...]
+    account: str
     gear: str
     title_gap: str
     find: str
@@ -44,12 +50,18 @@ ICON_SETS = {
         label=Message.MANAGE_ICONS_UNICODE,
         book="📖",
         gear="⚙",
+        account="☺",
+        presets="▤",
+        new_preset="+",
+        extension="◇",
+        settings_pages=("⚙", "◐", "▣", "⚑", "♧", "◇"),
+        help_pages=("⌂", "⌨", "⚙", "♧", "⚑", "↵", "⊙", "△", "≡"),
         title_gap="  ",
         find="⌕",
         filter="⚲",
         refresh="↻",
         open_file="✎",
-        separator="│",
+        separator="▸",
         edit="✎",
         number="↕",
         large=Arrows(left="◂", down="▽", up="△", right="▸"),
@@ -60,6 +72,12 @@ ICON_SETS = {
         label=Message.MANAGE_ICONS_NERD,
         book="\U000f02d7",
         gear="\uf013",
+        account="\uedca",
+        presets="󰆓",
+        new_preset="",
+        extension="",
+        settings_pages=("", "󰏘", "", "", "", ""),
+        help_pages=("", "", "", "", "", "", "", "", ""),
         title_gap=" ",
         find="\uf002",
         filter="\uf0b0",

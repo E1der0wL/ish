@@ -10,10 +10,13 @@ Internal generations cannot identify arbitrary delayed duplicates on the wire.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
+import select
 import socket
 import termios
+import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -734,7 +737,8 @@ class HostBroker:
         2004,
         2026,
     )
-    MOUSE_MODES = (1000, 1002, 1003, 1005, 1006, 1015, 1016)
+    MOTION_MODE = 1003
+    MOUSE_MODES = (1000, 1002, MOTION_MODE, 1005, 1006, 1015, 1016)
     SCREEN_MODES = tuple(mode for mode in RESTORE_MODES if mode not in (1004, 2026))
     COLOR_NAMES = {10: "foreground", 11: "background", 12: "cursor"}
     SCHEMES = {1: "dark", 2: "light"}
@@ -804,6 +808,7 @@ class HostBroker:
         self._initial_attributes = None
         self._attributes_changed = False
         self._mode_values = {}
+        self.mouse_release_pending = False
         self._changed_modes = set()
         self._adapter = UNKNOWN
         self._appearance = HostAppearance()
@@ -1012,6 +1017,13 @@ class HostBroker:
             for mode in self.RESTORE_MODES
             if mode in modes and self._mode_values.get(mode) == value
         )
+
+    def begin_mouse_release(self) -> str:
+        """Order a single shutdown acknowledgement after tracking has been disabled."""
+        if self._closed and self._mode_values.get(self.MOTION_MODE) in (1, 2):
+            self.mouse_release_pending = True
+            return f"{ESC}[?{self.MOTION_MODE}$p"
+        return ""
 
     def enter_modes(self) -> str:
         """Normalize inherited input capture and origin for the owned screen."""
@@ -1664,6 +1676,12 @@ class HostBroker:
         mode = self.MODE_REPORT.fullmatch(sequence)
         if mode and int(mode[1]) in self.RESTORE_MODES:
             number, value = map(int, mode.groups())
+            if (
+                self.mouse_release_pending
+                and number == self.MOTION_MODE
+                and value in (2, 4)
+            ):
+                self.mouse_release_pending = False
             if self._started and not self._closed and number not in self._mode_values:
                 self._mode_values[number] = value
                 self._changed()
@@ -2159,6 +2177,8 @@ class HostInput(Input):
     Native Windows input has a different contract and is not supported here.
     """
 
+    RELEASE_TIMEOUT = 0.5
+
     def __init__(self, source: Input, broker: HostBroker):
         """Attach to the version-pinned VT parser without creating an input source."""
         parser = getattr(source, "vt100_parser", None)
@@ -2174,6 +2194,7 @@ class HostInput(Input):
         self.source = source
         source.vt100_parser = self.parser
         self._initial_termios = None
+        self._released = False
 
     def fileno(self):
         """Retain the existing descriptor."""
@@ -2185,7 +2206,7 @@ class HostInput(Input):
 
     def read_keys(self):
         """Read through the sole existing PTK reader."""
-        return self.source.read_keys()
+        return [] if self._released else self.source.read_keys()
 
     def flush_keys(self):
         """Use the framed parser for PTK's Escape flush."""
@@ -2194,6 +2215,40 @@ class HostInput(Input):
     def retire_mouse(self):
         """Keep a split report with its old surface until the final byte arrives."""
         self.parser.retire_mouse()
+
+    def finish_mouse_release(self, output):
+        """Read through the host's ordered reply without reading the next owner's bytes."""
+        broker = self.parser.broker
+        reader = getattr(self.source, "stdin_reader", None)
+        if reader is None or self.closed or not os.isatty(self.fileno()):
+            return []
+        query = broker.begin_mouse_release()
+        if not query:
+            return []
+        keys = []
+        decoder = self.parser.parser
+        receive_key = decoder.feed_key_callback
+        try:
+            # Preserve completed keys as PTK typeahead and leave partial keys or paste
+            # with the same parser. An Escape flush here would split their next read.
+            decoder.feed_key_callback = keys.append
+            output.write_raw(query)
+            output.flush()
+            deadline = time.monotonic() + self.RELEASE_TIMEOUT
+            # This is the final synchronous read of the existing PTK reader, while
+            # its TTY is still raw. A single OS write can contain the reply and the
+            # next shell command. Leave everything after the reply in the kernel.
+            fd = self.fileno()
+            while broker.mouse_release_pending and not self.closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    break
+                self.parser.feed(reader.read(count=1))
+            self._released = not broker.mouse_release_pending
+            return keys
+        finally:
+            decoder.feed_key_callback = receive_key
+            broker.mouse_release_pending = False
 
     def flush(self):
         """Delegate the input lifecycle operation."""
@@ -2212,6 +2267,7 @@ class HostInput(Input):
                 self._initial_termios = termios.tcgetattr(self.fileno())
             except (OSError, termios.error):
                 pass  # Non-TTY inputs retain PTK's original no-op behavior.
+        self._released = False
         with self.source.raw_mode():
             yield
 

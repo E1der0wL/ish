@@ -280,12 +280,12 @@ def parse(argv=None, *, startup):
                 and value is not False
             ):
                 parser.error(i18n.get(Message.MANAGE_OPTION_CONFLICT))
-        from ish.manage.app import settings_window
+        from ish.manage.app import management_window
 
         with session_logging() as log:
             report_logs(tuple(records.buffer), log.logger)
             records.close()
-            settings_window(startup, no_rc=args.no_rc, language=first.lang)
+            management_window(startup, parser, no_rc=args.no_rc, language=first.lang)
         return parser, args, True
     information = args.help or args.version or args.diagnose
     try:
@@ -338,9 +338,11 @@ def parse(argv=None, *, startup):
         with session_logging(level=args.log_level) as log:
             report_logs(args.log_records, log.logger)
     if args.help:
-        from ish.manage.app import help_window
+        from ish.manage.app import management_window
 
-        help_window(parser, no_rc=args.no_rc)
+        management_window(
+            startup, parser, no_rc=args.no_rc, language=first.lang, help_first=True
+        )
         return parser, args, True
     if args.version:
         print(i18n.get(startup.version, version=__version__))

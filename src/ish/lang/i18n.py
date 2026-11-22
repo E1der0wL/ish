@@ -47,7 +47,9 @@ class Message(StrEnum):
         auto(),
         "--config can be combined only with --home, --lang and --no-rc.",
     )
+    MANAGE_ENLARGE = auto(), "Enlarge the window"
     MANAGE_HELP_TITLE = auto(), "Help"
+    MANAGE_CONFIG_SWITCH = auto(), "Config"
     MANAGE_CONFIG_TITLE = auto(), "Settings"
     MANAGE_UI_ICONS = auto(), "Icon style"
     MANAGE_ICONS_UNICODE = auto(), "Unicode"
@@ -79,9 +81,30 @@ class Message(StrEnum):
     )
     MANAGE_PALETTE_BACKGROUND = auto(), "Background"
     MANAGE_PALETTE_TEXT = auto(), "Text"
-    MANAGE_PALETTE_ACCENT = auto(), "Accent"
-    MANAGE_PALETTE_MUTED = auto(), "Secondary text"
-    MANAGE_PALETTE_EDGE = auto(), "Divider"
+    MANAGE_PALETTE_ACCENT = auto(), "Accent 1"
+    MANAGE_PALETTE_ACCENT2 = auto(), "Accent 2"
+    MANAGE_PALETTE_ACCENT3 = auto(), "Accent 3"
+    MANAGE_PALETTE_ACCENT4 = auto(), "Accent 4"
+    MANAGE_PALETTE_WARNING = auto(), "Warning"
+    MANAGE_INSTALLED = auto(), "Installed extensions"
+    MANAGE_EMPTY_INSTALLED = auto(), "No extension settings"
+    MANAGE_ACCOUNT = auto(), "Account details"
+    MANAGE_LOCAL_ACCOUNT = auto(), "Local OS account"
+    MANAGE_PRESET = auto(), "Preset"
+    MANAGE_NEW_PRESET = auto(), "Create preset"
+    MANAGE_PRESET_NAME = auto(), "New preset name"
+    MANAGE_PRESET_INVALID = (
+        auto(),
+        "Enter a unique, printable preset name or check its settings.",
+    )
+    MANAGE_DETAILS = auto(), "More details"
+    MANAGE_BROWSER_FAILED = auto(), "Open this URL in your browser: {url}"
+    MANAGE_SCHEMA_INVALID = auto(), "Invalid extension settings declaration or values."
+    MANAGE_OPTION_INVALID = auto(), "Invalid value for {name}."
+    MANAGE_ISH_SETTINGS = auto(), "ish settings"
+    MANAGE_PRESET_HINT = auto(), "Enter a name to capture the current settings draft."
+    MANAGE_PALETTE_MUTED = auto(), "Comment 1"
+    MANAGE_PALETTE_MUTED2 = auto(), "Comment 2"
     MANAGE_PALETTE_SELECTION = auto(), "Selection background"
     MANAGE_PALETTE_ERROR = auto(), "Error"
     MANAGE_PALETTE_FAMILY = auto(), "Color family"
@@ -150,9 +173,23 @@ class Message(StrEnum):
         "There are unsaved changes. Save or cancel before opening the file.",
     )
     MANAGE_RELOADED = auto(), "Settings reloaded from disk."
+    MANAGE_EDITOR = auto(), "Default editor"
+    MANAGE_BROWSER = auto(), "Web browser"
+    MANAGE_DESC_EDITOR = (
+        auto(),
+        "Command for editing .ishrc.py. Leave blank to use VISUAL, EDITOR, or vi.",
+    )
+    MANAGE_DESC_BROWSER = (
+        auto(),
+        "Command for opening links from help. Leave blank to use the system browser.",
+    )
+    MANAGE_COMMAND_INVALID = (
+        auto(),
+        "Enter an executable with optional arguments. Quote paths containing spaces.",
+    )
     MANAGE_EDITOR_MISSING = (
         auto(),
-        "No editor found. Set VISUAL or EDITOR, or install vi.",
+        "Editor not found. Check the default editor setting, VISUAL, or EDITOR.",
     )
     MANAGE_EDITOR_STATUS = auto(), "The editor exited with status {status}."
     MANAGE_LANG = auto(), "Language"
@@ -304,11 +341,11 @@ class Message(StrEnum):
     )
     MANAGE_HELP_KEYS_BODY = (
         auto(),
-        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. When a key starts with a lone ESC byte, the default wait is {escape_delay} seconds for a possible suffix. Increase escape_delay if Alt or arrow keys split on a slow connection. A complete enhanced Escape key report skips this wait.\n\nShift+PageUp / Shift+PageDown go to the program by default. Enable the terminal_history plugin to scroll primary-screen history with these keys. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn the sidebar, Up/Down moves within a group, Tab/Shift+Tab changes groups, and Enter/Space/Right opens the page. Drag the divider or use Ctrl+Left/Right in the sidebar to change its width. In settings, Ctrl+F opens the option filter for the current page from either pane. Each page keeps its own filter while the window is open. In help, click Find beside the page title or press Ctrl+F to search category names. Press Enter to open a match or Esc to return to the previous page. Click a category to open its page. The shortcut bar lists Ctrl and Alt combinations for the current pane. Scroll the focused pane with Alt+Up/Down, Alt+PgUp/PgDn or Alt+Home/End. Alt+Left/Right scrolls long single-line fields without moving the cursor. Use the wheel or drag the scrollbar thumb to scroll the pane under the pointer.\n\nIn settings, click inside a value field to edit it, or use Up/Down to choose a field and Enter to edit it. Click outside a text, number or HEX field to accept a valid value. An invalid value reverts to the value at the start of the edit, with the reason in the status bar. Enter and Save keep invalid input open for correction. Esc cancels just the current edit. While editing a number, Up/Down adjusts it by one step. Tab and Shift+Tab cycle between the form, the lower-right buttons, and the tools to the right of the page title. Tab from the form selects Cancel. Press Right to select Save. Status and progress appear on the lower left. Long warnings wrap within that space. Outside an edit, hovering over a button in the active pane focuses it until the pointer leaves. Keyboard navigation keeps its selection. Click to run it or use Left/Right within the group and press Enter or Space. Click the form background or press Esc to return from a button to the form. Ctrl+S saves your changes and keeps settings open. Ctrl+E opens .ishrc.py and Ctrl+R reloads it. In help and settings, press Esc in the page body to return to the sidebar. Press Esc in the sidebar or click × in the title bar to close the window.",
+        "Shell and program keys normally go to their PTY. Enter, Ctrl+C and Ctrl+D keep native shell meaning. When a key starts with a lone ESC byte, the default wait is {escape_delay} seconds for a possible suffix. Increase escape_delay if Alt or arrow keys split on a slow connection. A complete enhanced Escape key report skips this wait.\n\nShift+PageUp / Shift+PageDown go to the program by default. Enable the terminal_history plugin to scroll primary-screen history with these keys. Mouse off leaves dragging to the host. Automatic captures only when a program or explicitly selected UI requests it.\n\nA selected popup plugin can reserve a key globally, including inside Vim. Closing a popup restores input focus; it does not undo input already sent to a program.\n\nIn the sidebar, Up/Down moves within a group, Tab/Shift+Tab changes groups, and Enter/Space/Right opens the page. Drag the divider or use Ctrl+Left/Right in the sidebar to change its width. Drag the lower category heading or its rule vertically to resize the two lists. In settings, Ctrl+F opens the option filter for the current page from either pane. Each page keeps its own filter while the window is open. In help, click Find beside the page title or press Ctrl+F to search category names. Press Enter to open a match or Esc to return to the previous page. Click a category to open its page. The shortcut bar lists Ctrl and Alt combinations for the current pane. Scroll the focused pane with Alt+Up/Down, Alt+PgUp/PgDn or Alt+Home/End. Alt+Left/Right scrolls long single-line fields without moving the cursor. Use the wheel or drag the scrollbar thumb to scroll the pane under the pointer.\n\nIn settings, click inside a value field to edit it, or use Up/Down to choose a field and Enter to edit it. Click elsewhere in the form to finish editing a text, number or HEX field and accept a valid value. An invalid value reverts to the value at the start of the edit, with the reason in the status bar. Enter and Save keep invalid input open for correction. Esc cancels just the current edit. While editing a number, Up/Down adjusts it by one step. Tab and Shift+Tab cycle between the form, the lower-right buttons, and the tools to the right of the page title. Tab from the form selects Cancel. Press Right to select Save. Status and progress appear on the lower left. Long warnings wrap within that space. Hover over a page tool to highlight it and see its name. Typing and arrow keys stay with the current field or open dropdown. The toolbar, Ctrl+F/E/R and their footer shortcuts cancel the current edit like Esc before running the tool. Click to run it or use Left/Right within the group and press Enter or Space. Click the form background or press Esc to return from a button to the form. Ctrl+S saves your changes and keeps settings open. Ctrl+E opens .ishrc.py and Ctrl+R reloads it. In help and settings, press Esc in the page body to return to the sidebar. Press Esc in the sidebar or click × in the title bar to close the window.",
     )
     MANAGE_HELP_SETTINGS_BODY = (
         auto(),
-        "Use ish --config to edit language, UI colors, plugins and session settings. Press Ctrl+S or click Save to write your changes. Cancel restores the last saved or loaded values. You can continue editing after either action. Closing discards the remaining unsaved edits. Changes apply at the next startup.\n\nThe one settings file is ~/ish/.ishrc.py, or DIR/.ishrc.py with --home DIR. It is Python code evaluated once when starting a session or loading the settings window. Interactive help reads a literal config.ui_palette dictionary and a literal config.ui_icons string without executing the file. Computed values use their individual defaults in help. Version and diagnostics also skip rc execution.\n\nExample:\n  config.lang = 'ko'\n  config.plugins = []\n  config.mouse = 'auto'\n  config.ui_palette = {'accent': 'blue-300'}\n  config.features = {'hyperlinks': 'on'}\n\nIn UI palette, click a role, a color family and a swatch to preview a color. There are 22 families with nine shades each, from 100 (light) to 900 (dark). Choose a role with Up/Down and press Enter or Space to edit. Up/Down changes the family and Left/Right changes the shade. The selected shade is underlined. Default uses the host color. For Custom, type six digits such as 1A2B3C after the fixed HEX # prefix. Enter applies the color and Esc cancels the edit. The palette styles help and settings. Under Language and startup, Icon style lets you preview Unicode or Nerd Font symbols. Unicode is the default. For Nerd Font icons, select a Nerd Font in your host terminal and save the setting (config.ui_icons = 'nerdfont'). For shell output, use config.color_depth.\n\nExplicit CLI choices override this file. Language order is explicit setting (CLI first), LANG, then English. --no-rc skips the file. The settings window preserves your Python code and appends one managed block, backs up the prior file and rejects conflicting edits.\n\nEdit .ishrc.py uses VISUAL, EDITOR, or vi without invoking a shell. Save or cancel draft changes before editing the file.",
+        "Use ish --config to edit language, UI colors, plugins and session settings. Press Ctrl+S or click Save to write your changes. Cancel restores the last saved or loaded values. You can continue editing after either action. Closing discards the remaining unsaved edits. Changes apply at the next startup.\n\nInstalled extensions lists packages that publish options. Use Profile to switch between help and settings or create and apply a named preset. Save writes the current draft and its presets.\n\nThe one settings file is ~/ish/.ishrc.py, or DIR/.ishrc.py with --home DIR. It is Python code evaluated once when starting a session or loading the settings window. Interactive help reads a literal config.ui_palette dictionary and literal config.ui_icons and config.browser strings without executing the file. Computed values use their individual defaults in help. Version and diagnostics also skip rc execution.\n\nExample:\n  config.lang = 'ko'\n  config.plugins = []\n  config.mouse = 'auto'\n  config.ui_palette = {'accent': 'blue-300'}\n  config.features = {'hyperlinks': 'on'}\n\nIn UI palette, choose a role and click a swatch to apply the color to the draft and finish the edit. There are 22 families with nine shades each, from 100 (light) to 900 (dark). Choose a role with Up/Down and press Enter or Space to edit. Up/Down changes the family and Left/Right changes the shade. The selected shade is underlined. Default uses the host color. For Custom, type six digits such as 1A2B3C after the fixed HEX # prefix. Enter applies the color and Esc cancels the edit. The palette styles help and settings. Under Language and startup, Icon style lets you preview Unicode or Nerd Font symbols. Unicode is the default. For Nerd Font icons, select a Nerd Font in your host terminal and save the setting (config.ui_icons = 'nerdfont'). For shell output, use config.color_depth.\n\nExplicit CLI choices override this file. Language order is explicit setting (CLI first), LANG, then English. --no-rc skips the file. The settings window preserves your Python code and appends one managed block, backs up the prior file and rejects conflicting edits.\n\nUnder Language and startup, set Default editor for .ishrc.py and Web browser for More details. Each command takes an optional list of arguments followed by the file path or URL. Leave the command blank to use VISUAL, EDITOR, or vi for editing and the system browser for links. Save or cancel draft changes before editing the file.",
     )
     MANAGE_HELP_PLUGINS_BODY = (
         auto(),

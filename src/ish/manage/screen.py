@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import getpass
+import os
 from enum import Enum, auto
 from functools import partial
 from time import monotonic
 
 from prompt_toolkit.application.current import get_app
-from prompt_toolkit.filters import Condition
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import Always, Condition
+from prompt_toolkit.key_binding import ConditionalKeyBindings, KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
@@ -32,13 +34,23 @@ from prompt_toolkit.styles import DynamicStyle
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Button, CheckboxList, Dialog, TextArea
 
+from ish import __version__
 from ish.lang import Message, i18n
 from ish.runtime.settings import ESCAPE_DELAY
 
 from .host import ManagementApplication
 from .icons import DEFAULT_ICONS, ICON_SETS
 from .palette import PanelStyle, ui_style
-from .scroll import FormPane, PanelDivider, ScrollSurface
+from .scroll import (
+    CategorySplit,
+    FormPane,
+    HitWindow,
+    PanelDivider,
+    ScrollSurface,
+    fit_caption,
+    hover_style,
+    on_hover,
+)
 
 
 def reset_clicks(field):
@@ -47,17 +59,17 @@ def reset_clicks(field):
     field.control._last_click_timestamp = None
 
 
-def on_click(action):
-    """Run a management action on left release, leaving wheel events to PTK."""
+def on_click(action, *, target=None):
+    """Activate only when a left press and release belong to this visible action."""
+    target = action if target is None else target
 
     def handle(event):
         if event.button != MouseButton.LEFT:
             return NotImplemented
-        if event.event_type == MouseEventType.MOUSE_UP:
-            if not getattr(get_app(), "busy", False):
-                action()
-        elif event.event_type != MouseEventType.MOUSE_DOWN:
+        if event.event_type not in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
             return NotImplemented
+        if get_app().layout.container.clicked(target, event):
+            action()
         return None
 
     return handle
@@ -75,11 +87,10 @@ class EditAction(Enum):
 class FocusPane(VSplit):
     """Keep the inactive pane readable and let a background click activate it."""
 
-    def __init__(self, content, active, focus, *, width, button_focus=None):
+    def __init__(self, content, active, focus, *, width):
         """Use the layout's actual focus as the source of both color and clicks."""
         self.active = active
         self.focus = focus
-        self.button_focus = button_focus
         super().__init__(
             [Window(width=1), content, Window(width=1)],
             width=width,
@@ -87,37 +98,51 @@ class FocusPane(VSplit):
             style=lambda: "" if active() else PanelStyle.INACTIVE,
         )
 
-    def write_to_screen(self, screen, mouse_handlers, write_position, *args, **kwargs):
-        """Give widgets the first chance to handle a click in the inactive pane."""
-        if self.active() and not (self.button_focus and self.button_focus()):
-            return super().write_to_screen(
-                screen, mouse_handlers, write_position, *args, **kwargs
-            )
-        targets = MouseHandlers()
-        super().write_to_screen(screen, targets, write_position, *args, **kwargs)
-
-        def handle(event):
-            app = get_app()
-            before = app.layout.current_control
-            x, y = event.position
-            result = targets.mouse_handlers[y][x](event)
-            if (
-                event.button == MouseButton.LEFT
-                and event.event_type == MouseEventType.MOUSE_UP
-                and app.layout.current_control is before
-                and result is NotImplemented
-                and not app.busy
-                and self in app.layout.walk_through_modal_area()
-                and not app.is_done
-            ):
-                self.focus()
-                return None
-            return result
-
-        pos = write_position
-        mouse_handlers.set_mouse_handler_for_range(
-            pos.xpos, pos.xpos + pos.width, pos.ypos, pos.ypos + pos.height, handle
+    def contains(self, frame, point):
+        """Hit-test the pane, including margins, against the cells in this frame."""
+        boxes = frame.visible_windows_to_write_positions
+        left, right = boxes.get(self.children[0]), boxes.get(self.children[-1])
+        return (
+            left is not None
+            and right is not None
+            and left.xpos <= point.x < right.xpos + right.width
+            and left.ypos <= point.y < left.ypos + left.height
         )
+
+
+class ActionButton(Button):
+    """Run a settings action on keyboard activation or a primary mouse click."""
+
+    PADDING = 2
+
+    @classmethod
+    def caption_width(cls, title):
+        """Measure two margins around the translated caption in terminal cells."""
+        return get_cwidth(title) + 2 * cls.PADDING
+
+    def __init__(self, message, action):
+        """Keep the focus and action colors independent of the shell palette."""
+        title = i18n.get(message)
+        super().__init__(
+            title,
+            handler=action,
+            width=self.caption_width(title),
+            left_symbol="",
+            right_symbol="",
+        )
+        self.control.mouse_handler = on_hover(self.control, on_click(action))
+        self.window.always_hide_cursor = Always()
+
+        def button_style():
+            app = get_app()
+            if getattr(app, "busy", False):
+                return "class:button.disabled"
+            normal = (
+                "class:button.focused" if app.layout.has_focus(self) else "class:button"
+            )
+            return hover_style(self.control, normal, "class:button.focused")
+
+        self.window.style = button_style
 
 
 class AuxiliaryButton:
@@ -125,44 +150,295 @@ class AuxiliaryButton:
 
     WIDTH = 3
 
-    def __init__(self, glyph, label, action):
+    def __init__(self, glyph, label, key, action, screen):
         """Keep the same hit target and focus when the displayed icon set changes."""
         self.label = label
+        self.key = key
         self.handler = action
         keys = KeyBindings()
 
         enabled = Condition(lambda: not get_app().busy)
-        keys.add("enter", filter=enabled)(lambda _: action())
-        keys.add(" ", filter=enabled)(lambda _: action())
+        keys.add("enter", filter=enabled)(lambda _: screen.activate_button(self))
+        keys.add(" ", filter=enabled)(lambda _: screen.activate_button(self))
         self.control = FormattedTextControl(
             glyph,
             focusable=True,
             show_cursor=False,
             key_bindings=keys,
         )
-        self.window = Window(
+        self.window = HitWindow(
             self.control,
             height=1,
             width=self.WIDTH,
             align=WindowAlign.CENTER,
             always_hide_cursor=True,
-            style=lambda: (
-                "class:auxiliary.focused"
-                if get_app().layout.has_focus(self.control) and not get_app().busy
-                else "class:auxiliary"
+            style=lambda: hover_style(
+                self.control, self.style(screen.active_tool() is self), self.style(True)
             ),
         )
+
+    @staticmethod
+    def style(highlighted):
+        """Give icon actions a transparent background and a transient accent."""
+        return "class:auxiliary.focused" if highlighted else "class:auxiliary"
 
     def __pt_container__(self):
         """Expose the labelled control to PTK's focus and layout code."""
         return self.window
 
 
+class SidebarFloat(Float):
+    """Anchor a profile menu or a passive rail label to its rendered window."""
+
+    def __init__(self, content, anchor, *, card=False):
+        """Resolve the anchor lazily so a resized sidebar keeps the same overlay."""
+        super().__init__(content=content)
+        self.anchor = anchor
+        self.card = card
+
+
+class SidebarOverlays(FloatContainer):
+    """Place sidebar floats using this frame's actual cells, including after resize."""
+
+    def _draw_float(self, fl, screen, handlers, pos, style, erase, z_index):
+        if isinstance(fl, SidebarFloat):
+            anchor = fl.anchor()
+            positions = screen.visible_windows_to_write_positions
+            if anchor is not None and not isinstance(anchor, Window):
+                anchor = next(
+                    (window for window in positions if window.content is anchor), None
+                )
+            target = positions.get(anchor)
+            if not target:
+                return
+            width = min(pos.width, fl.content.preferred_width(pos.width).preferred)
+            if not width:
+                return
+            height = min(
+                pos.height, fl.content.preferred_height(width, pos.height).preferred
+            )
+            if fl.card:
+                surface = get_app().layout.container
+                y = (
+                    surface.rail_tip[1]
+                    if surface.rail_tip
+                    else screen.get_cursor_position(anchor).y
+                )
+                x = target.xpos + target.width + 2
+                handlers = MouseHandlers()  # A passive label never takes a click.
+            else:
+                x = target.xpos
+                above = target.ypos - pos.ypos
+                below = pos.height - above - target.height
+                on_top = below < height and above > below
+                height = min(height, max(1, above if on_top else below))
+                y = target.ypos - height if on_top else target.ypos + target.height
+            fl.width, fl.height = width, height
+            fl.left = max(0, min(pos.width - width, x - pos.xpos))
+            fl.top = max(0, min(pos.height - height, y - pos.ypos))
+        return super()._draw_float(fl, screen, handlers, pos, style, erase, z_index)
+
+
+class ProfileBar(HSplit):
+    """Hub-style sidebar footer with an identity strip and centered actions."""
+
+    PRESET_WIDTH = 14
+    GAP = 1
+
+    def __init__(self, screen, page_title, preset_name, open_presets):
+        """Keep the same actions and focus when the sidebar changes width."""
+        self.screen = screen
+        self.version = "ish " + __version__
+        self.preset_name = preset_name
+        self.page_title = page_title
+        self.page_width = ActionButton.caption_width(page_title)
+        self.heading = self._control(self._identity, screen.account)
+        self.page = self._control(
+            lambda: self.page_icon() if screen.compact() else page_title,
+            lambda: screen.switch(screen.SWITCH),
+        )
+        self.preset = self._control(self._preset_caption, open_presets)
+        self.controls = (self.heading, self.page, self.preset)
+
+        version = Window(
+            FormattedTextControl(self.version),
+            height=1,
+            width=get_cwidth(self.version),
+            style="class:profile.version",
+        )
+        identity = VSplit(
+            [
+                HitWindow(self.heading, always_hide_cursor=True, height=1),
+                ConditionalContainer(version, Condition(self._version_fits)),
+                ConditionalContainer(
+                    Window(width=1), Condition(lambda: not screen.compact())
+                ),
+            ],
+            style=lambda: (
+                AuxiliaryButton.style(False) if screen.compact() else "class:profile"
+            ),
+        )
+        page = self._button(self.page, self.page_width)
+        preset = self.preset_window = self._button(self.preset, self.PRESET_WIDTH)
+        inline = VSplit([page, preset], padding=self.GAP, align=HorizontalAlign.CENTER)
+        stacked = HSplit(
+            [VSplit([item], align=HorizontalAlign.CENTER) for item in (page, preset)],
+            padding=self.GAP,
+        )
+        version_below = Window(
+            FormattedTextControl(
+                lambda: (
+                    ""
+                    if screen.compact() or self._version_fits()
+                    else self.version + " "
+                )
+            ),
+            align=WindowAlign.RIGHT,
+            style="class:muted",
+            height=1,
+        )
+        actions = DynamicContainer(lambda: stacked if screen.compact() else inline)
+        super().__init__(
+            [
+                ConditionalContainer(
+                    Window(height=self.GAP), Condition(screen.compact)
+                ),
+                identity,
+                Window(height=self.GAP),
+                actions,
+                version_below,
+            ]
+        )
+
+    def page_icon(self):
+        """Identify the destination of the screen switch in the current icon set."""
+        icons = self.screen.icons()
+        return icons.book if self.screen.filter_options is not None else icons.gear
+
+    @property
+    def inline_width(self):
+        """Two pane insets plus both translated actions on one line."""
+        return 2 + self.page_width + self.GAP + self.PRESET_WIDTH
+
+    def _width(self):
+        # FocusPane supplies one inset on each side.
+        return max(1, self.screen.sidebar_width() - 2)
+
+    def _version_fits(self):
+        identity_width = (
+            get_cwidth(self._account_prefix()) + get_cwidth(self.screen.username) + 1
+        )
+        return identity_width + self.GAP + get_cwidth(self.version) <= self._width()
+
+    def _account_prefix(self):
+        return " " + self.screen.icons().account + "  "
+
+    def _identity(self):
+        style = (
+            "class:profile.focused"
+            if get_app().layout.has_focus(self.heading)
+            else "class:profile.name"
+        )
+        if self.screen.compact():
+            return [(self._icon_style(self.heading), self.screen.icons().account)]
+        prefix = self._account_prefix()
+        width = self._width() - get_cwidth(prefix) - 1
+        return [
+            (
+                hover_style(self.heading, style, "class:profile.focused"),
+                prefix + fit_caption(self.screen.username, width),
+            )
+        ]
+
+    def _preset_caption(self):
+        if self.screen.compact():
+            return self.screen.icons().presets
+        title = self.preset_name() or i18n.get(Message.MANAGE_PRESET)
+        arrow = self.screen.icons().small.down
+        width = min(self._width(), self.PRESET_WIDTH) - get_cwidth(arrow) - 2
+        return fit_caption(title, width) + " " + arrow
+
+    def _control(self, caption, action):
+        keys = KeyBindings()
+        control = FormattedTextControl(
+            caption, focusable=True, show_cursor=False, key_bindings=keys
+        )
+
+        def activate(pointer=False):
+            if not self.screen.busy:
+                self.screen.leave_edit()
+                if self.screen.in_sidebar():
+                    self.screen.focus_navigation(pointer=pointer)
+                action()
+
+        click = on_click(lambda: activate(pointer=True))
+
+        def pointer(event):
+            if event.event_type == MouseEventType.MOUSE_MOVE and self.screen.compact():
+                self.screen.hover_label(control, self.label(control))
+            return click(event)
+
+        control.mouse_handler = on_hover(control, pointer)
+        keys.add("enter")(lambda _: activate())
+        keys.add(" ")(lambda _: activate())
+        return control
+
+    def label(self, control):
+        """Return the unabridged profile action or account caption."""
+        if control is self.heading:
+            return self.screen.username + " · " + self.version
+        if control is self.page:
+            return self.page_title
+        return self.preset_name() or i18n.get(Message.MANAGE_PRESET)
+
+    def _icon_style(self, control):
+        layout = self.screen.app.layout
+        return hover_style(
+            control,
+            AuxiliaryButton.style(layout.has_focus(control)),
+            AuxiliaryButton.style(True),
+        )
+
+    def _button(self, control, width):
+        return HitWindow(
+            control,
+            width=lambda: min(width, self._width()),
+            text_only=self.screen.compact,
+            height=1,
+            align=WindowAlign.CENTER,
+            always_hide_cursor=True,
+            style=lambda: (
+                self._icon_style(control)
+                if self.screen.compact()
+                else hover_style(
+                    control,
+                    "class:button.focused"
+                    if get_app().layout.has_focus(control)
+                    else "class:button",
+                    "class:button.focused",
+                )
+            ),
+        )
+
+    def move(self, key):
+        """Use horizontal keys between actions; vertical keys also reach the account."""
+        layout = self.screen.app.layout
+        controls = self.controls if key in ("up", "down") else (self.page, self.preset)
+        current = layout.current_control
+        if current in controls:
+            step = -1 if key in ("up", "left") else 1
+            layout.focus(
+                controls[max(0, min(len(controls) - 1, controls.index(current) + step))]
+            )
+
+
 class Screen:
     """Own focus, panel size and keyboard navigation for one standalone TUI."""
 
-    NAV_WIDTH = 26
-    MIN_NAV_WIDTH = 12
+    SWITCH = "switch"
+    PRESETS = "presets"
+    NAV_ITEM_INDENT = "   "
+    NAV_WIDTH = 28
     MIN_BODY_WIDTH = 34
     BUTTON_GAP = 1
     HEADER_CLOSE = "×"
@@ -200,6 +476,8 @@ class Screen:
         auxiliary=(),
         filter_options=None,
         filter_query=lambda: "",
+        presets=None,
+        preset_name=lambda: "",
         field_finished=None,
         page_selected=None,
         overlay=None,
@@ -210,6 +488,8 @@ class Screen:
         editor=lambda: None,
         dirty=None,
         fields=None,
+        app=None,
+        on_switch=None,
         input=None,
         output=None,
     ):
@@ -222,6 +502,24 @@ class Screen:
         self.dirty = dirty
         self.groups = dict(groups)
         self.buttons = buttons
+        self.core_pages = len(self.pages)
+        self.extra_nav = None
+        try:
+            self.username = getpass.getuser()
+        except (KeyError, OSError):
+            self.username = str(os.getuid())
+        self.modal = None
+        self.profile = ProfileBar(
+            self,
+            i18n.get(
+                Message.MANAGE_HELP_TITLE
+                if filter_options is not None
+                else Message.MANAGE_CONFIG_SWITCH
+            ),
+            preset_name,
+            presets or (lambda: self.switch(self.PRESETS)),
+        )
+
         self.icons = icons
         self.filter_options = filter_options
         if filter_options is None:
@@ -230,12 +528,14 @@ class Screen:
             find_icon, self.find_label = "filter", Message.MANAGE_FILTER
         self.auxiliary = [
             AuxiliaryButton(
-                lambda key=key: getattr(self.icons(), key),
+                lambda glyph=glyph: getattr(self.icons(), glyph),
                 label,
+                key,
                 action,
+                self,
             )
-            for key, label, action in (
-                (find_icon, i18n.get(self.find_label), self.open_find),
+            for glyph, label, key, action in (
+                (find_icon, i18n.get(self.find_label), "F", self.open_find),
                 *auxiliary,
             )
         ]
@@ -244,7 +544,8 @@ class Screen:
             for group in (self.buttons, self.auxiliary)
             for button in group
         }
-        self.hover_origin = None
+        self.pointer_navigation = False
+        self.on_press = on_press
         for button in (*self.buttons, *self.auxiliary):
             button.control.mouse_handler = self.button_mouse(button)
         self.field_finished = field_finished
@@ -264,65 +565,112 @@ class Screen:
             self.navigation, focusable=True, show_cursor=False
         )
         self.sidebar_scroll = FormPane(
-            Window(self.nav, always_hide_cursor=True), icons=self.icons
+            HitWindow(self.nav, always_hide_cursor=True, wrap_lines=False)
         )
         self.search = None
-        if filter_options is None:
+        categories = []
+        self.nav_split = self.core_pages
+        if filter_options is not None:
+            titles = (
+                i18n.get(Message.MANAGE_ISH_SETTINGS),
+                i18n.get(Message.MANAGE_INSTALLED),
+            )
+        else:
             self.search = TextArea(
                 multiline=False, prompt=" / ", style="class:field.focused"
             )
             self.search.buffer.on_text_changed += self.find
+            categories.append(
+                ConditionalContainer(
+                    self.search,
+                    Condition(lambda: self.searching and not self.compact()),
+                )
+            )
+            titles = tuple(self.groups.values())
+            if len(titles) == 2:
+                self.nav_split = max(self.groups)
+        if len(titles) == 2:
+            self.extra_nav = FormattedTextControl(
+                lambda: self.navigation(lower=True),
+                focusable=True,
+                show_cursor=False,
+            )
+            self.extra_scroll = FormPane(
+                HitWindow(self.extra_nav, always_hide_cursor=True, wrap_lines=False)
+            )
+            categories.append(
+                CategorySplit(
+                    titles, self.sidebar_scroll, self.extra_scroll, compact=self.compact
+                )
+            )
+        else:
+            categories.append(self.sidebar_scroll)
         self.bindings = KeyBindings()
         self._bind()
-
-        sidebar = HSplit(
+        resize_notice = HSplit(
             [
-                Window(height=1),
-                *(
-                    [
-                        ConditionalContainer(
-                            self.search, Condition(lambda: self.searching)
-                        )
-                    ]
-                    if self.search is not None
-                    else []
-                ),
-                self.sidebar_scroll,
-                Window(height=1),
+                Window(
+                    FormattedTextControl(i18n.get(Message.MANAGE_ENLARGE)),
+                    align=WindowAlign.CENTER,
+                    height=1,
+                    always_hide_cursor=True,
+                )
             ],
-            height=Dimension(weight=1),
+            align=VerticalAlign.CENTER,
+            style="class:surface class:warning",
         )
-        content = HSplit(
+        sidebar = HSplit(
+            [Window(height=1), *categories, self.profile],
+            height=Dimension(weight=1),
+            window_too_small=resize_notice,
+        )
+        heading = HSplit(
             [
                 Window(height=1),
                 self.page_header(),
                 Window(height=1, char="─", style="class:edge"),
-                DynamicContainer(lambda: self.pages[self.index][1]),
-                *([self.action_row()] if buttons else []),
-            ],
+            ]
+        )
+        actions = [self.action_row()] if buttons else []
+        content = HSplit(
+            [heading, DynamicContainer(lambda: self.pages[self.index][1]), *actions],
             width=Dimension(weight=1),
             height=Dimension(weight=1),
+            window_too_small=resize_notice,
         )
+
+        # Leave one title cell next to the toolbar and room for a stacked action.
+        tool_width = len(self.auxiliary) * (AuxiliaryButton.WIDTH + self.BUTTON_GAP)
+        minimum_width = max([tool_width + 1, *(button.width for button in buttons)])
+
+        def fits(width, height):
+            body_width = width - self.sidebar_width() - 3
+            if body_width < minimum_width:
+                return False
+            chrome = sum(
+                part.preferred_height(body_width, height).min
+                for part in (heading, *actions)
+            )
+            return height >= chrome + 3  # Window title, one body row and key hints.
+
+        nav_pane = FocusPane(
+            sidebar,
+            self.in_sidebar,
+            lambda: self.select_page(self.index, pointer=True),
+            width=self.sidebar_width,
+        )
+        body_pane = FocusPane(
+            content,
+            lambda: not self.in_sidebar(),
+            self.focus_body,
+            width=Dimension(weight=1),
+        )
+        self.panes = nav_pane, body_pane
         base = HSplit(
             [
                 self.header(title, title_icon),
                 VSplit(
-                    [
-                        FocusPane(
-                            sidebar,
-                            self.in_sidebar,
-                            lambda: self.select_page(self.index),
-                            width=self.sidebar_width,
-                        ),
-                        PanelDivider(self.resize_sidebar),
-                        FocusPane(
-                            content,
-                            lambda: not self.in_sidebar(),
-                            self.focus_body,
-                            width=Dimension(weight=1),
-                            button_focus=self.focused_buttons,
-                        ),
-                    ],
+                    [nav_pane, PanelDivider(self.resize_sidebar), body_pane],
                     height=Dimension(weight=1),
                 ),
                 Window(
@@ -339,12 +687,7 @@ class Screen:
                 title=i18n.get(Message.MANAGE_FILTER),
                 body=self.filter_input,
                 buttons=[
-                    Button(
-                        i18n.get(message),
-                        handler=action,
-                        left_symbol="",
-                        right_symbol="",
-                    )
+                    ActionButton(message, action)
                     for message, action in (
                         (Message.MANAGE_FILTER_APPLY, self.apply_filter),
                         (Message.MANAGE_CANCEL, self.cancel_filter),
@@ -359,19 +702,58 @@ class Screen:
             base = FloatContainer(base, [Float(content=filter_dialog)])
         if overlay is not None:
             base = overlay(base)
-        self.app = ManagementApplication(
-            layout=Layout(
-                ScrollSurface(base, self.button_hover, on_press),
-                focused_element=self.nav,
+        card = Window(
+            FormattedTextControl(lambda: " " + self.rail_label() + " "),
+            wrap_lines=True,
+            style="class:nav.selected",
+        )
+        self.dialogs = SidebarOverlays(
+            base,
+            [
+                SidebarFloat(card, self.rail_anchor, card=True),
+            ],
+        )
+        if self.search is not None:
+            self.dialogs.floats.append(
+                Float(
+                    content=ConditionalContainer(
+                        self.search,
+                        Condition(lambda: self.searching and self.compact()),
+                    ),
+                    top=2,
+                    left=self.rail_width() + 1,
+                    right=AuxiliaryButton.WIDTH + 2,
+                    height=1,
+                )
+            )
+        self.on_switch = on_switch
+        self.layout = Layout(
+            ScrollSurface(
+                self.dialogs,
+                self.pointer_press,
+                self.dismiss_outside,
+                self.focus_background,
+                fits,
+                resize_notice,
             ),
-            key_bindings=self.bindings,
-            style=DynamicStyle(lambda: ui_style(palette())),
+            focused_element=self.nav,
+        )
+        self.keys = ConditionalKeyBindings(
+            self.bindings, Condition(lambda: self.modal is None)
+        )
+        self.style = DynamicStyle(lambda: ui_style(palette()))
+        self.app = app or ManagementApplication(
+            layout=self.layout,
+            key_bindings=self.keys,
+            style=self.style,
             include_default_pygments_style=False,
             full_screen=True,
             mouse_support=True,
             input=input,
             output=output,
         )
+        if app is not None:
+            self.show()
         self.app.ttimeoutlen = ESCAPE_DELAY
         self.busy = False
 
@@ -406,10 +788,196 @@ class Screen:
                 self.PROGRESS_INTERVAL, self._refresh_progress
             )
 
+    def page_nav(self):
+        """Return the navigation surface containing the selected page."""
+        return (
+            self.extra_nav
+            if self.index >= self.nav_split and self.extra_nav
+            else self.nav
+        )
+
+    def show(self):
+        """Change the active PTK view while the renderer keeps owning the host screen."""
+        self.app.layout = self.layout
+        self.app.key_bindings = self.keys
+        self.app.style = self.style
+        # An input batch can contain another click before the next frame is painted.
+        self.app.renderer.mouse_handlers = MouseHandlers()
+        self.layout.container.hovered = self.layout.container.rail_tip = None
+        self.layout.container.pressed = None
+        self.app.invalidate()
+
+    def switch(self, action):
+        """Open the companion view without ending the application."""
+        if not self.busy and self.on_switch is not None:
+            self.on_switch(action)
+
+    def pointer_press(self, frame, point):
+        """Prepare an edit that needs a matching release."""
+        return self.on_press(frame, point) if self.on_press and not self.modal else None
+
+    def dismiss_outside(self, frame, point):
+        """Let the open preset menu consume a left press outside its painted bounds."""
+        if not self.modal or not isinstance(self.modal[0], SidebarFloat):
+            return False
+        box = frame.visible_windows_to_write_positions.get(self.layout.current_window)
+        if box and (
+            box.xpos <= point.x < box.xpos + box.width
+            and box.ypos <= point.y < box.ypos + box.height
+        ):
+            return False
+        self.dismiss()
+        return True
+
+    def focus_background(self, frame, point):
+        """Give an unclaimed left press to its pane before the next key is dispatched."""
+        if self.busy or self.modal or self.filtering or self.app.is_done:
+            return False
+        for pane in self.panes:
+            if (
+                pane.contains(frame, point)
+                and (not pane.active() or self.focused_buttons())
+                and pane in self.app.layout.walk_through_modal_area()
+            ):
+                pane.focus()
+                return True
+        return False
+
+    def preset_menu(self, names, current, select):
+        """Show saved presets and the final creation action next to the profile."""
+        entries = [*names, None]
+        position = entries.index(current) if current in names else 0
+        keys = KeyBindings()
+
+        def move(index):
+            nonlocal position
+            position = max(0, min(len(entries) - 1, index))
+
+        def choose(index):
+            self.dismiss()
+            select(entries[index])
+
+        def mouse(index, event):
+            if (
+                event.event_type == MouseEventType.MOUSE_MOVE
+                and event.button == MouseButton.NONE
+            ):
+                if position != index:
+                    move(index)
+                    self.app.invalidate()
+                return None
+            if event.event_type in (
+                MouseEventType.SCROLL_UP,
+                MouseEventType.SCROLL_DOWN,
+            ):
+                move(
+                    position
+                    + (1 if event.event_type == MouseEventType.SCROLL_DOWN else -1)
+                )
+                return None
+            return on_click(lambda: choose(index), target=(menu, index))(event)
+
+        def options():
+            rows = []
+            width = max(
+                self.profile.PRESET_WIDTH, 3 + max(map(get_cwidth, names), default=0)
+            )
+            width = min(width, self.app.output.get_size().columns)
+            for i, key in enumerate(entries):
+                if i:
+                    rows.append(("", "\n"))
+                if i == position:
+                    rows.append(("[SetCursorPosition]", ""))
+                if key is None:
+                    glyph = self.icons().new_preset
+                    label = " " * ((width - get_cwidth(glyph)) // 2) + glyph
+                else:
+                    label = (" ● " if key == current else " ○ ") + key
+                rows.append(
+                    (
+                        "class:nav.selected" if i == position else "",
+                        label + " " * max(0, width - get_cwidth(label)),
+                        partial(mouse, i),
+                    )
+                )
+            return rows
+
+        keys.add("down")(lambda _: move(position + 1))
+        keys.add("up")(lambda _: move(position - 1))
+        keys.add("end")(lambda _: move(len(entries) - 1))
+        keys.add("home")(lambda _: move(0))
+        keys.add("enter")(lambda _: choose(position))
+        keys.add(" ")(lambda _: choose(position))
+        keys.add("escape", eager=True)(lambda _: self.dismiss())
+        menu = Window(
+            FormattedTextControl(options, focusable=True, show_cursor=False),
+            wrap_lines=True,
+            style="class:setting.value",
+        )
+        floating = SidebarFloat(
+            HSplit([menu], modal=True, key_bindings=keys),
+            lambda: self.profile.preset_window,
+        )
+        self.show_modal(floating, menu)
+
+    def show_modal(self, floating, focus):
+        """Remember the caller and direct subsequent input to the overlay."""
+        self.layout.container.pressed = None
+        self.modal = floating, self.app.layout.current_window
+        self.dialogs.floats.append(floating)
+        self.app.layout.update_parents_relations()
+        self.app.layout.focus(focus)
+        self.app.invalidate()
+
+    def dialog(self, title, body, actions):
+        """Contain keys, focus and mouse input inside a single profile dialog."""
+        buttons = [
+            ActionButton(message, handler)
+            for message, handler in [*actions, (Message.MANAGE_CLOSE_KEY, self.dismiss)]
+        ]
+        box = Dialog(
+            title=i18n.get(title),
+            body=body,
+            buttons=buttons,
+            modal=False,
+            with_background=False,
+            width=Dimension(max=58, preferred=58),
+        )
+
+        escape = KeyBindings()
+        escape.add("escape", eager=True)(lambda _: self.dismiss())
+        floating = Float(content=HSplit([box], key_bindings=escape, modal=True))
+        self.show_modal(floating, box)
+
+    def dismiss(self):
+        """Restore focus to the control that opened the modal."""
+        if self.modal:
+            floating, origin = self.modal
+            self.layout.container.pressed = None
+            self.modal = None
+            self.dialogs.floats.remove(floating)
+            self.app.layout.update_parents_relations()
+            self.app.layout.focus(origin)
+            self.release_focus([floating.content])
+            self.app.invalidate()
+
+    def account(self):
+        """Show the local identity used by this terminal session."""
+        self.dialog(
+            Message.MANAGE_ACCOUNT,
+            Window(
+                FormattedTextControl(
+                    i18n.get(Message.MANAGE_LOCAL_ACCOUNT) + " · " + self.username
+                ),
+                height=1,
+            ),
+            [],
+        )
+
     def in_sidebar(self):
         """Use the actual category or search focus to decide which pane keeps color."""
         control = get_app().layout.current_control
-        return control is self.nav or (
+        return control in (self.nav, self.extra_nav, *self.profile.controls) or (
             self.search is not None and control is self.search.control
         )
 
@@ -417,61 +985,34 @@ class Screen:
         """Return the active button group from PTK's current focus."""
         return self.button_groups.get(get_app().layout.current_control, ())
 
+    def activate_button(self, button):
+        """Cancel the unfinished field before invoking a page tool."""
+        if isinstance(button, AuxiliaryButton):
+            self.leave_edit(EditAction.CANCEL)
+        layout = self.app.layout
+        if self.focused_buttons():
+            self.focus_body()
+            if self.focused_buttons():
+                self.focus_navigation(pointer=True)
+        layout.container.release_button(button.control)
+        button.handler()
+
     def button_mouse(self, button):
-        """Report eligible hover targets and execute a left click once."""
-
-        def activate():
-            self.app.layout.focus(button)
-            button.handler()
-
-        click = on_click(activate)
+        """Show hover without borrowing keyboard focus from a pane or an editor."""
+        click = on_click(partial(self.activate_button, button))
+        pointer = on_hover(button.control, click)
 
         def handle(event):
-            if (
-                event.event_type != MouseEventType.MOUSE_MOVE
-                or event.button != MouseButton.NONE
-            ):
-                if (
-                    event.button == MouseButton.LEFT
-                    and event.event_type
-                    in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP)
-                    and not self.busy
-                ):
-                    self.app.layout.container.hovered = button.control
+            if self.busy or self.filtering or self.modal:
                 return click(event)
-            editor = self.editor()
-            if (
-                self.busy
-                or self.filtering
-                or self.in_sidebar()
-                or self.editing is not None
-                or (editor and editor.picking)
-            ):
-                return NotImplemented
-            self.app.layout.container.hovered = button.control
-            return NotImplemented
+            return pointer(event)
 
         return handle
-
-    def button_hover(self, previous, target):
-        """Borrow focus across adjacent buttons and return it when the pointer leaves."""
-        layout = self.app.layout
-        origin = self.hover_origin if layout.current_control is previous else None
-        self.hover_origin = None
-        if target in self.button_groups:
-            if layout.current_control is not target:
-                self.hover_origin = origin or layout.current_window
-                layout.focus(target)
-        elif origin is not None:
-            if origin in walk(layout.container, skip_hidden=True):
-                layout.focus(origin)
-            else:
-                self.focus_body()
 
     def header(self, title, icon):
         """Display the window title and close target across both panes."""
         close = FormattedTextControl(self.HEADER_CLOSE, show_cursor=False)
-        close.mouse_handler = on_click(self.close)
+        close.mouse_handler = on_hover(close, on_click(self.close))
 
         def heading():
             icons = self.icons()
@@ -481,7 +1022,12 @@ class Screen:
             [
                 Window(width=1),
                 Window(FormattedTextControl(heading)),
-                Window(close, width=AuxiliaryButton.WIDTH, align=WindowAlign.CENTER),
+                HitWindow(
+                    close,
+                    width=AuxiliaryButton.WIDTH,
+                    align=WindowAlign.CENTER,
+                    style=lambda: hover_style(close, "", "class:auxiliary.focused"),
+                ),
                 Window(width=1),
             ],
             height=1,
@@ -536,8 +1082,19 @@ class Screen:
                     get_app().output.get_size().rows >= self.HELP_PADDING_MIN_ROWS
                 )
 
-            close = VSplit(self.buttons, height=1, align=HorizontalAlign.RIGHT)
-            return HSplit([rule, close, Window(height=padding)])
+            actions = VSplit(
+                [
+                    Window(
+                        FormattedTextControl(lambda: self.status),
+                        style=lambda: (
+                            "class:error" if self.status_error else "class:status"
+                        ),
+                    ),
+                    *self.buttons,
+                ],
+                height=1,
+            )
+            return HSplit([rule, actions, Window(height=padding)])
 
         inline_width = sum(
             button.width for button in self.buttons
@@ -593,10 +1150,20 @@ class Screen:
         """Measure the main pane between the divider and its two margins."""
         return max(1, get_app().output.get_size().columns - self.sidebar_width() - 3)
 
+    def active_tool(self):
+        """Use one icon for hover feedback or explicit keyboard navigation."""
+        if self.busy or self.modal or self.filtering:
+            return None
+        layout = self.app.layout
+        for control in (layout.container.hovered, layout.current_control):
+            if self.button_groups.get(control) is self.auxiliary:
+                return next(b for b in self.auxiliary if b.control is control)
+        return None
+
     def tool_label(self):
-        """Identify the focused icon alongside its toolbar controls."""
-        control = self.app.layout.current_control
-        return next((b.label for b in self.auxiliary if b.control is control), "")
+        """Label the same toolbar icon that is visibly highlighted."""
+        tool = self.active_tool()
+        return tool.label if tool else ""
 
     def status_line(self, width):
         """Leave the strip empty until there is progress, a result or a warning."""
@@ -645,21 +1212,15 @@ class Screen:
 
     def shortcuts(self):
         """Use the two ends of the footer for active Ctrl and Alt combinations."""
-        if self.busy:
+        if self.busy or self.modal or self.searching or self.filtering:
             return []
         settings = self.dirty is not None
-        entering_query = self.searching or self.filtering
-        actions = []
-        if not entering_query:
-            if settings:
-                actions.append(("S", Message.MANAGE_APPLY_KEY))
-            actions.append(("F", self.find_label))
-        if settings and not entering_query:
+        actions = [("S", Message.MANAGE_APPLY_KEY)] if settings else []
+        actions.append(("F", self.find_label))
+        if settings:
             actions.extend(
                 [("E", Message.MANAGE_EDIT_KEY), ("R", Message.MANAGE_RELOAD_KEY)]
             )
-        if not actions:
-            return []
 
         control = [
             self.shortcut_segment([(key, self.CTRL_KEYS[key])], message)
@@ -669,7 +1230,7 @@ class Screen:
         if width <= 0:
             return []
         alt, alt_width = [], 0
-        if not entering_query and self.scroll_target() is not None:
+        if self.scroll_target() is not None:
             scroll = self.shortcut_segment(
                 self.SCROLL_ARROWS.items(), Message.MANAGE_SCROLL, alt=True
             )
@@ -695,7 +1256,7 @@ class Screen:
             sequence = (
                 [KeyPress(Keys.Escape), KeyPress(key)] if alt else [KeyPress(key)]
             )
-            click = on_click(partial(invoke, sequence))
+            click = on_click(partial(invoke, sequence), target=(self, key, alt))
             keys.append(("class:shortcut.key", glyph, click))
 
         # A Ctrl segment has one action. Each Alt arrow has an independent hit target.
@@ -704,7 +1265,9 @@ class Screen:
         fragments = [
             ("class:shortcut.leading", separator, *target),
             ("class:shortcut.label", " ", *target),
+            ("class:shortcut.label", "<", *target),
             *keys,
+            ("class:shortcut.label", ">", *target),
             ("class:shortcut.label", " " + i18n.get(message) + " ", *target),
             ("class:shortcut.edge", separator, *target),
         ]
@@ -714,7 +1277,11 @@ class Screen:
         """Fit complete key/label segments; a final ellipsis marks omitted items."""
         if not items:
             return [], 0
-        fragments = [("", prefix)] if prefix else []
+        fragments = (
+            [("class:shortcut.alt" if prefix == self.SHORTCUT_ALT else "", prefix)]
+            if prefix
+            else []
+        )
         used = get_cwidth(prefix)
         ellipsis = get_cwidth(self.SHORTCUT_ELLIPSIS)
         for index, (cells, segment) in enumerate(items):
@@ -734,20 +1301,73 @@ class Screen:
             return None
         if get_app().layout.current_control is self.nav:
             return self.sidebar_scroll
+        if self.extra_nav and get_app().layout.current_control is self.extra_nav:
+            return self.extra_scroll
         page = self.pages[self.index][1]
         return page if isinstance(page, FormPane) else None
 
     def sidebar_width(self, requested=None):
         """Leave room for the main pane when the terminal shrinks."""
         available = get_app().output.get_size().columns
-        return max(
-            6,
-            min(
-                max(self.MIN_NAV_WIDTH, self.width if requested is None else requested),
-                available // 2,
-                max(self.MIN_NAV_WIDTH, available - self.MIN_BODY_WIDTH),
-            ),
+        width = min(
+            self.width if requested is None else requested,
+            available // 2,
+            max(1, available - self.MIN_BODY_WIDTH),
         )
+        if width >= self.profile.inline_width:
+            return width
+        return self.rail_width()
+
+    def rail_width(self):
+        """Fit the widest sidebar glyph with one cell of padding on either side."""
+        return 2 + max(
+            get_cwidth(icon)
+            for icon in (
+                self.profile.page_icon(),
+                self.icons().account,
+                self.icons().presets,
+                *self.nav_icons(),
+            )
+        )
+
+    def nav_icons(self):
+        """Use the icon sequence for the active management screen."""
+        icons = self.icons()
+        return (
+            icons.settings_pages
+            if self.filter_options is not None
+            else icons.help_pages
+        )
+
+    def compact(self):
+        """Collapse labels once the two profile actions no longer fit together."""
+        return self.sidebar_width() < self.profile.inline_width
+
+    def rail_anchor(self):
+        """Find the visible window that owns the current rail caption."""
+        if not self.compact() or self.modal or self.searching or not self.rail_label():
+            return None
+        layout = self.app.layout
+        if layout.container.rail_tip:
+            return layout.container.rail_tip[0]
+        return layout.current_window if self.in_sidebar() else None
+
+    def hover_label(self, control, label):
+        """Associate a compact hit target with the physical pointer row."""
+        surface = self.app.layout.container
+        surface.rail_tip = control, surface.pointer_row, label
+
+    def rail_label(self):
+        """Describe the hovered icon or the item reached with the keyboard."""
+        layout = self.app.layout
+        if layout.container.rail_tip:
+            return layout.container.rail_tip[2]
+        control = layout.current_control
+        if control in self.profile.controls:
+            return self.profile.label(control)
+        if control is self.page_nav() and not self.pointer_navigation:
+            return self.pages[self.index][0]
+        return ""
 
     def resize_sidebar(self, width):
         """Apply the same visible bounds to pointer and keyboard resizing."""
@@ -756,41 +1376,87 @@ class Screen:
             return NotImplemented
         self.width = width
 
-    def navigation(self):
+    def navigation(self, lower=False):
         """Render category groups and mark the active category even in the main pane."""
+        compact = self.compact()
         fragments = []
-        focused = get_app().layout.current_control is self.nav
-        for n, (title, _) in enumerate(self.pages):
-            if n in self.groups:
-                if n:
-                    fragments.append(("", "\n"))
-                fragments.append(("class:muted", self.groups[n] + "\n"))
+        focused = get_app().layout.current_control is (
+            self.extra_nav if lower else self.nav
+        )
+        if lower and len(self.pages) == self.nav_split:
+            return [
+                (
+                    "class:muted",
+                    ""
+                    if compact
+                    else self.NAV_ITEM_INDENT
+                    + i18n.get(Message.MANAGE_EMPTY_INSTALLED),
+                )
+            ]
+        start, stop = (
+            (self.nav_split, len(self.pages)) if lower else (0, self.nav_split)
+        )
+        width = self.sidebar_width() - 2
+        for n in range(start, stop):
+            title = self.pages[n][0]
+            if n != start:
+                fragments.append(("", "\n\n" if compact or n in self.groups else "\n"))
+            if (
+                not compact
+                and n in self.groups
+                and (self.filter_options is not None or self.extra_nav is None)
+            ):
+                fragments.append(("class:muted", " " + self.groups[n] + "\n"))
             active = self.index == n
             if active:
                 fragments.append(("[SetCursorPosition]", ""))
-            style = (
-                ("class:nav.selected" if focused else "class:nav.current")
-                if active
-                else ""
+            target = (self.extra_nav if lower else self.nav, n)
+            handler = on_hover(target, partial(self._click_page, n))
+            emphasize = active and (
+                not compact or focused and not self.pointer_navigation
             )
-            marker = self.icons().large.right if active else " "
-            row = marker + " " + title
-            row += " " * max(0, self.sidebar_width() - 2 - get_cwidth(row))
-            fragments.append((style, row, partial(self._click_page, n)))
-            fragments.append(("", "\n"))
+            style = hover_style(
+                target, "class:nav.current" if emphasize else "", "class:nav.current"
+            )
+            if compact:
+                icons = self.nav_icons()
+                icon = icons[n] if n < len(icons) else self.icons().extension
+                fragments.append((style, icon, handler))
+            else:
+                if active:
+                    fragments.extend(
+                        [("", " "), (style, self.icons().large.right + " ", handler)]
+                    )
+                else:
+                    fragments.append(("", self.NAV_ITEM_INDENT))
+                fragments.append(
+                    (
+                        style,
+                        fit_caption(title, width - len(self.NAV_ITEM_INDENT)),
+                        handler,
+                    )
+                )
         return fragments
 
     def _click_page(self, index, event):
-        if index == self.index and self.app.layout.current_control is self.nav:
-            return NotImplemented
-        return on_click(partial(self.select_page, index))(event)
+        if event.event_type == MouseEventType.MOUSE_MOVE and self.compact():
+            control = self.extra_nav if index >= self.nav_split else self.nav
+            self.hover_label(control, self.pages[index][0])
+        return on_click(
+            partial(self.select_page, index, pointer=True), target=self.pages[index][1]
+        )(event)
 
-    def select_page(self, index):
+    def focus_navigation(self, *, pointer=False):
+        """Keep arrow navigation available after a click without latching its highlight."""
+        self.pointer_navigation = pointer
+        self.app.layout.focus(self.page_nav())
+
+    def select_page(self, index, *, pointer=False):
         """Switch pages on a single click and keep keyboard navigation in the sidebar."""
         self.leave_edit()
         self.searching = False
         self.index = index
-        self.app.layout.focus(self.nav)
+        self.focus_navigation(pointer=pointer)
 
     @property
     def index(self):
@@ -835,7 +1501,6 @@ class Screen:
                 self.editing = None
                 message = Message.MANAGE_EDIT_RESTORED
             else:
-                self.hover_origin = None
                 self.app.layout.container.hovered = None
                 reset_clicks(field)
                 self.app.layout.focus(field)
@@ -875,7 +1540,6 @@ class Screen:
             self.open_filter()
             return
         if not self.searching:
-            self.leave_edit()
             self.return_index = self.index
             self.searching = True
             self.search.text = ""
@@ -898,7 +1562,6 @@ class Screen:
         if self.busy or self.filter_options is None or self.filtering:
             return
         self.filter_origin = self.app.layout.current_window
-        self.leave_edit()
         self.filter_input.text = self.filter_query()
         self.filter_input.buffer.cursor_position = len(self.filter_input.text)
         self.filtering = True
@@ -923,10 +1586,27 @@ class Screen:
 
     def _bind(self):
         bind = self.bindings.add
-        nav = Condition(lambda: self.app.layout.current_control is self.nav)
+        nav = Condition(
+            lambda: self.app.layout.current_control in (self.nav, self.extra_nav)
+        )
+        profile = Condition(lambda: self.app.layout.has_focus(self.profile))
         searching = Condition(lambda: self.searching)
         filtering = Condition(lambda: self.filtering)
-        body = ~nav & ~searching & ~filtering
+        body = ~nav & ~searching & ~filtering & ~profile
+
+        @bind("left", filter=profile)
+        @bind("right", filter=profile)
+        @bind("up", filter=profile)
+        @bind("down", filter=profile)
+        def profile_move(event):
+            self.profile.move(event.key_sequence[0].key)
+
+        @bind("tab", filter=profile)
+        @bind("s-tab", filter=profile)
+        def profile_leave(event):
+            self.select_page(
+                0 if event.key_sequence[0].key == "tab" else max(self.groups)
+            )
 
         def scroll(event):
             target = self.scroll_target()
@@ -956,6 +1636,8 @@ class Screen:
         @bind("up", filter=nav)
         @bind("down", filter=nav)
         def category(event):
+            was_pointer = self.pointer_navigation
+            self.pointer_navigation = False
             step = -1 if event.key_sequence[0].key == "up" else 1
             first = self.group_start()
             last = (
@@ -964,13 +1646,16 @@ class Screen:
             )
             index = max(first, min(last, self.index + step))
             if index == self.index:
-                return NotImplemented
+                return None if was_pointer else NotImplemented
             self.index = index
 
         @bind("c-left", filter=nav)
         @bind("c-right", filter=nav)
         def resize(event):
+            self.pointer_navigation = False
             step = -1 if event.key_sequence[0].key == "c-left" else 1
+            if step > 0 and self.compact():
+                return self.resize_sidebar(self.profile.inline_width)
             return self.resize_sidebar(self.sidebar_width() + step)
 
         @bind("enter", filter=nav)
@@ -988,9 +1673,11 @@ class Screen:
         def apply_query(event):
             self.apply_filter()
 
-        @bind("c-f", filter=~filtering)
-        def search(event):
-            self.open_find()
+        tools_available = ~filtering & Condition(lambda: not self.busy)
+        for button in self.auxiliary:
+            bind(self.CTRL_KEYS[button.key], filter=tools_available, eager=True)(
+                lambda event, button=button: self.activate_button(button)
+            )
 
         @bind("enter", filter=searching, eager=True)
         def accept_search(event):
@@ -1006,7 +1693,11 @@ class Screen:
                 return
             current = self.group_start()
             step = -1 if event.key_sequence[0].key == "s-tab" else 1
-            self.index = groups[(groups.index(current) + step) % len(groups)]
+            pos = groups.index(current) + step
+            if not 0 <= pos < len(groups):
+                self.app.layout.focus(self.profile.page)
+            else:
+                self.select_page(groups[pos])
 
         def palette_focus():
             widget = self.editor()
@@ -1026,7 +1717,7 @@ class Screen:
 
         @bind("left", filter=idle)
         def sidebar(event):
-            event.app.layout.focus(self.nav)
+            self.focus_navigation()
 
         @bind(
             "tab",
@@ -1037,7 +1728,6 @@ class Screen:
             filter=body & ~Condition(lambda: palette_focus() and self.editor().picking),
         )
         def zone(event):
-            self.hover_origin = None
             self.leave_edit()
             layout = event.app.layout
             groups = [
@@ -1082,7 +1772,6 @@ class Screen:
         @bind("left", filter=actions)
         @bind("right", filter=actions)
         def action(event):
-            self.hover_origin = None
             layout = event.app.layout
             buttons = self.focused_buttons()
             pos = next(i for i, b in enumerate(buttons) if layout.has_focus(b))
@@ -1111,15 +1800,15 @@ class Screen:
                 self.cancel_filter()
             elif self.searching:
                 self.searching, self.index = False, self.return_index
-                event.app.layout.focus(self.nav)
+                self.focus_navigation()
             elif self.editing is not None or (
                 palette_focus() and self.editor().picking
             ):
                 self.leave_edit(EditAction.CANCEL)
             elif self.focused_buttons():
                 self.focus_body()
-            elif event.app.layout.current_control is not self.nav:
-                event.app.layout.focus(self.nav)
+            elif not self.in_sidebar():
+                self.focus_navigation()
             else:
                 self.close()
 

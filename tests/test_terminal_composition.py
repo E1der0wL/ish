@@ -578,6 +578,15 @@ class TerminalCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bytes(self.owner.session.pending_input).endswith(b"NATIVE"))
         self.assertNotIn(b"POPUP", self.owner.session.pending_input)
 
+    async def test_installed_bar_renders_its_configured_text(self):
+        """An external package reads a typed setting and paints it in the public UI."""
+        self.owner.plugin_settings = {"terminal_bar": {"label": "MY BAR"}}
+        self.owner.plugins.load(
+            ("terminal_bar",), directory=ROOT / "examples/terminal_plugins"
+        )
+        self.render()
+        self.assertEqual(self.screen().display[-1].strip(), "MY BAR")
+
     async def test_opt_in_bar_changes_actual_pty_size_and_restores_full_grid(self):
         """The kernel's PTY dimensions match the opt-in bar's actual allocation."""
         import termios

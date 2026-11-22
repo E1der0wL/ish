@@ -1,13 +1,13 @@
 """Edit management color roles with a token picker and live swatches."""
 
-from functools import partial
+from functools import lru_cache, partial
 
 from prompt_toolkit.application import get_app
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Label, TextArea
@@ -22,10 +22,10 @@ from .palette import (
     HEX_COLOR,
     HOST_COLOR,
     SHADES,
-    contrast_ink,
     validate_palette,
 )
 from .screen import on_click, reset_clicks
+from .scroll import HitWindow, hover_style, on_hover
 
 
 class PaletteEditor:
@@ -36,8 +36,12 @@ class PaletteEditor:
         "background": Message.MANAGE_PALETTE_BACKGROUND,
         "text": Message.MANAGE_PALETTE_TEXT,
         "accent": Message.MANAGE_PALETTE_ACCENT,
+        "accent2": Message.MANAGE_PALETTE_ACCENT2,
+        "accent3": Message.MANAGE_PALETTE_ACCENT3,
+        "accent4": Message.MANAGE_PALETTE_ACCENT4,
+        "warning": Message.MANAGE_PALETTE_WARNING,
         "muted": Message.MANAGE_PALETTE_MUTED,
-        "edge": Message.MANAGE_PALETTE_EDGE,
+        "muted2": Message.MANAGE_PALETTE_MUTED2,
         "selection": Message.MANAGE_PALETTE_SELECTION,
         "error": Message.MANAGE_PALETTE_ERROR,
     }
@@ -48,7 +52,7 @@ class PaletteEditor:
     HEX_PROMPT = " HEX #"
     MIN_SWATCH_WIDTH = 3
     MAX_SWATCH_WIDTH = 5
-    LABEL_WIDTH = 16
+    COLOR_COLUMN_WIDTH = 3 + max(map(len, COLORS))  # Swatch, space and color token.
     MAX_FAMILY_COLUMNS = 6
 
     def __init__(self, overrides, *, focus, confirm, width, icons):
@@ -87,7 +91,7 @@ class PaletteEditor:
         self.hex_field.buffer.on_text_changed += self._hex_changed
         self.container = HSplit(
             [
-                Window(self.control, dont_extend_height=True, wrap_lines=False),
+                HitWindow(self.control, dont_extend_height=True, wrap_lines=False),
                 ConditionalContainer(
                     self.hex_field, Condition(lambda: self.candidate == self.CUSTOM)
                 ),
@@ -97,7 +101,7 @@ class PaletteEditor:
                     ),
                     Condition(lambda: self.hex_error),
                 ),
-                Window(
+                HitWindow(
                     FormattedTextControl(self.family_grid),
                     dont_extend_height=True,
                     wrap_lines=False,
@@ -276,15 +280,14 @@ class PaletteEditor:
         self.candidate = None
         self.hex_error = False
 
-    def accept(self, *, keep_editing=False):
+    def accept(self):
         """Apply a valid candidate to the draft or leave its input open for correction."""
         token = self._candidate_token()
         if token is None:
             self.hex_error = True
             raise ValueError(i18n.get(Message.MANAGE_PALETTE_HEX_ERROR))
         self._values = validate_palette({**self._values, self.role: token})
-        if not keep_editing:
-            self.cancel()
+        self.cancel()
 
     def _select_role(self, role):
         self.focus()
@@ -293,13 +296,13 @@ class PaletteEditor:
     def _set_token(self, token):
         self.focus()
         self.candidate = token
-        self.accept(keep_editing=True)
+        self.accept()
 
     def _select_family(self, family, shade):
         self.focus()
         self._activate(family, shade)
         if family != self.CUSTOM:
-            self.accept(keep_editing=True)
+            self.accept()
 
     def values(self):
         """Return a copy of the overrides accepted into the draft."""
@@ -321,10 +324,10 @@ class PaletteEditor:
         return Point(x=0, y=self.visible_roles.index(self.role))
 
     def _roles(self):
-        focused = get_app().layout.has_focus(self.container)
         icons = self.icons()
         marker = icons.edit if self.picking else icons.current_role
         rows = []
+        color_column = self.shade_row_width() - self.COLOR_COLUMN_WIDTH
         for role in self.visible_roles:
             current = self.role == role
             token = (
@@ -332,29 +335,53 @@ class PaletteEditor:
                 if current and self.picking
                 else self._values.get(role, DEFAULTS[role])
             )
-            style = "class:field.focused" if current and focused else ""
+            style = "class:field.focused" if current else ""
             title = i18n.get(self.LABELS[role])
-            padding = " " * max(1, self.LABEL_WIDTH - get_cwidth(title))
-            select = on_click(partial(self._select_role, role))
-            rows.append(
-                (style, f"{marker if current else ' '} {title}{padding}", select)
+            heading = (marker if current else " ") + " " + title
+            padding = " " * max(1, color_column - get_cwidth(heading))
+            target = (self.control, role)
+            select = on_hover(
+                target, on_click(partial(self._select_role, role), target=target)
             )
+            token_style = hover_style(
+                target, style or "class:muted", "class:field.focused"
+            )
+            style = hover_style(target, style, "class:field.focused")
+            rows.append((style, heading + padding, select))
             if token == HOST_COLOR:
-                rows.append(("fg:default bg:default", "◇  ", select))
-            else:
-                rows.extend(
-                    [
-                        (f"bg:{COLORS.get(token, token)}", "  ", select),
-                        ("", " ", select),
-                    ]
+                rows.append(
+                    (hover_style(target, "fg:default bg:default"), "◇  ", select)
                 )
-            rows.append((style or "class:muted", token, select))
+            else:
+                rows.append(
+                    (
+                        hover_style(target, f"bg:{COLORS.get(token, token)}"),
+                        "  ",
+                        select,
+                    )
+                )
+                rows.append(("", " ", select))
+            rows.append((token_style, token, select))
             rows.append(("", "\n"))
         return rows
 
     def custom_digits(self):
         """Read only the editable part of the selected role's saved HEX token."""
         return self.token[1:] if self.token.startswith("#") else ""
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _swatch_ink(rgb):
+        """Choose ink for the shade number. The swatch itself keeps its exact RGB."""
+        channels = (component / 255 for component in bytes.fromhex(rgb[1:]))
+        red, green, blue = [
+            level / 12.92 if level <= 0.04045 else ((level + 0.055) / 1.055) ** 2.4
+            for level in channels
+        ]
+        luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        black_contrast = (luminance + 0.05) / 0.05
+        white_contrast = 1.05 / (luminance + 0.05)
+        return "#000000" if black_contrast >= white_contrast else "#ffffff"
 
     def swatch_layout(self):
         """Return the width per shade and the number that fit on one row."""
@@ -375,27 +402,50 @@ class PaletteEditor:
             return [("class:muted", i18n.get(Message.MANAGE_FILTER_EMPTY))]
         rows = self._roles()
         family, shade = self.family_shade()
-        previous = on_click(partial(self._select_family, *self._neighbor(-1)))
-        following = on_click(partial(self._select_family, *self._neighbor(1)))
+
+        def arrow(step, glyph):
+            target = (self.control, step)
+            return (
+                hover_style(target, "class:accent bold", "class:nav.selected"),
+                glyph,
+                on_hover(
+                    target,
+                    on_click(
+                        partial(self._select_family, *self._neighbor(step)),
+                        target=target,
+                    ),
+                ),
+            )
+
         arrows = self.icons().small
         rows.extend(
             [
                 ("class:muted", "\n" + i18n.get(Message.MANAGE_PALETTE_FAMILY) + "   "),
-                ("class:accent bold", arrows.left + " ", previous),
+                arrow(-1, arrows.left + " "),
                 ("class:accent bold", self.family_names[family]),
-                ("class:accent bold", " " + arrows.right, following),
+                arrow(1, " " + arrows.right),
             ]
         )
         if family == self.CUSTOM:
             if not self.picking:
                 rows.append(
                     (
-                        "class:setting.value",
+                        hover_style(
+                            (self.control, "hex"),
+                            "class:setting.value",
+                            "class:nav.selected",
+                        ),
                         "\n"
                         + (self.HEX_PROMPT + self.custom_digits()).ljust(
                             self.shade_row_width()
                         ),
-                        on_click(partial(self._select_family, family, shade)),
+                        on_hover(
+                            (self.control, "hex"),
+                            on_click(
+                                partial(self._select_family, family, shade),
+                                target=(self.control, "hex"),
+                            ),
+                        ),
                     )
                 )
             return rows
@@ -411,14 +461,20 @@ class PaletteEditor:
                 rows.append(("", "\n"))
             sample = f"{family}-{level}"
             rgb = COLORS[sample]
-            style = f"fg:{contrast_ink(rgb)} bg:{rgb}"
+            style = f"fg:{self._swatch_ink(rgb)} bg:{rgb}"
             if sample == token:
                 style += " bold underline"
             rows.append(
                 (
-                    style,
+                    hover_style((self.control, sample), style, style + " bold"),
                     f"{level:^{swatch_width}}",
-                    on_click(partial(self._set_token, sample)),
+                    on_hover(
+                        (self.control, sample),
+                        on_click(
+                            partial(self._set_token, sample),
+                            target=(self.control, sample),
+                        ),
+                    ),
                 )
             )
         return rows
@@ -439,16 +495,23 @@ class PaletteEditor:
             title = self.family_names[name]
             if number and number % columns == 0:
                 rows.append(("", "\n"))
-            select = on_click(partial(self._select_family, name, shade))
+            target = (self.control, name)
+            select = on_hover(
+                target,
+                on_click(partial(self._select_family, name, shade), target=target),
+            )
             swatch = COLORS.get(f"{name}-500")
             rows.append(
                 (
-                    f"fg:{swatch}" if swatch else "class:muted",
+                    hover_style(target, f"fg:{swatch}" if swatch else "class:muted"),
                     "■ " if swatch else "◇ ",
                     select,
                 )
             )
             padding = " " * (column_width - 2 - get_cwidth(title))
             style = "class:field.focused" if name == family else ""
-            rows.append((style, title + padding, select))
+            rows.append(
+                (hover_style(target, style, "class:field.focused"), title, select)
+            )
+            rows.append(("", padding))
         return rows

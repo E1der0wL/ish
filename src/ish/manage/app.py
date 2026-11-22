@@ -7,14 +7,18 @@ import copy
 import os
 import shlex
 import shutil
+import subprocess
 import sys
+import webbrowser
+from concurrent.futures import Future
 from dataclasses import dataclass
 from decimal import Decimal
+from threading import Thread
 
 from prompt_toolkit.application import get_app, in_terminal
 from prompt_toolkit.cache import SimpleCache
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Always, Condition
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
     Dimension,
@@ -31,7 +35,7 @@ from prompt_toolkit.layout.processors import BeforeInput, ConditionalProcessor
 from prompt_toolkit.layout.screen import WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import Button, Label, TextArea
+from prompt_toolkit.widgets import Label, TextArea
 
 from ish.config import config
 from ish.lang import Message, i18n
@@ -51,9 +55,11 @@ from .content import help_pages, help_text
 from .icons import DEFAULT_ICONS, ICON_SETS
 from .packages import CatalogReader, PackageList
 from .palette_editor import PaletteEditor
-from .screen import EditAction, Screen, on_click, reset_clicks
-from .scroll import FieldWindow, FormPane
+from .screen import ActionButton, EditAction, Screen, on_click, reset_clicks
+from .scroll import FieldWindow, FormPane, hover_style, on_hover, preview_value
 from .store import SettingsStore
+
+PROJECT_URL = "https://github.com/E1der0wL/ish"
 
 
 def text(value):
@@ -78,40 +84,14 @@ def label(message, *, focusable=False, **values):
     )
 
 
-class ActionButton(Button):
-    """Run a settings action on keyboard activation or a primary mouse click."""
-
-    def __init__(self, message, action):
-        """Keep the focus and action colors independent of the shell palette."""
-        title = i18n.get(message)
-        super().__init__(
-            title,
-            handler=action,
-            width=get_cwidth(title) + 4,
-            left_symbol="",
-            right_symbol="",
-        )
-        self.window.always_hide_cursor = Always()
-
-        def button_style():
-            app = get_app()
-            if getattr(app, "busy", False):
-                return "class:button.disabled"
-            return (
-                "class:button.focused" if app.layout.has_focus(self) else "class:button"
-            )
-
-        self.window.style = button_style
-
-
 @dataclass(frozen=True, slots=True)
 class NumberSpec:
     """Parse a numeric draft and step it in the unit shown by the form."""
 
     parse: type[int] | type[float]
     step: int | Decimal
-    minimum: int | float
-    maximum: int | float
+    minimum: int | float = float("-inf")
+    maximum: int | float = float("inf")
 
     def bind(self, field):
         """Step a field's draft only while its editor has input focus."""
@@ -128,15 +108,23 @@ class NumberSpec:
             if not self.minimum <= value <= self.maximum:
                 return NotImplemented
 
-            current = Decimal(str(value))
+            current = value if self.parse is int else Decimal(buffer.text)
             step = self.step if event.key_sequence[-1].key == "up" else -self.step
-            result = min(
-                Decimal(str(self.maximum)),
-                max(Decimal(str(self.minimum)), current + step),
-            )
+            result = current + step
+            if result < self.minimum:
+                result = self.minimum
+            elif result > self.maximum:
+                result = self.maximum
             if result == current:
                 return NotImplemented
-            updated = format(result.normalize(), "f")
+            try:
+                updated = (
+                    str(result)
+                    if self.parse is int
+                    else format(Decimal(str(result)).normalize(), "f")
+                )
+            except ValueError:
+                return NotImplemented
             cursor = buffer.cursor_position
             position = (
                 len(updated)
@@ -159,6 +147,7 @@ class TextField(TextArea):
     def begin(self):
         """Keep PTK double-click selection within one edit of this field."""
         self.original = self.text
+        self.window.reset_pan()
         self.buffer.exit_selection()
         reset_clicks(self)
 
@@ -189,8 +178,9 @@ class Choice:
             show_cursor=False,
             key_bindings=keys,
         )
+        preview_value(self.control, self.control.text, lambda: False)
         self.window = Window(self.control, height=1, wrap_lines=False)
-        self.control.mouse_handler = on_click(self.toggle)
+        self.control.mouse_handler = on_click(self.toggle, target=self.control)
 
         @keys.add("up", filter=Condition(self.editing))
         @keys.add("down", filter=Condition(self.editing))
@@ -260,10 +250,11 @@ class ChoiceMenu(FloatContainer):
             lambda: self.active().options(), show_cursor=False
         )
         control.mouse_handler = self.choose
+        self.list_window = Window(control, char=" ", wrap_lines=True)
         menu = VSplit(
             [
                 Window(width=1, char="│", style="class:setting.edge.focused"),
-                Window(control, char=" ", wrap_lines=False),
+                self.list_window,
                 Window(width=1, char="│", style="class:setting.edge.focused"),
             ],
             style="class:setting.value",
@@ -282,9 +273,19 @@ class ChoiceMenu(FloatContainer):
             return choice.move(
                 1 if event.event_type == MouseEventType.SCROLL_DOWN else -1
             )
+        if not 0 <= event.position.y < len(choice.values):
+            return NotImplemented
+        if (
+            event.event_type == MouseEventType.MOUSE_MOVE
+            and event.button == MouseButton.NONE
+        ):
+            if choice.position != event.position.y:
+                choice.position = event.position.y
+                choice.screen().app.invalidate()
+            return None
         if event.button != MouseButton.LEFT:
             return NotImplemented
-        if event.event_type == MouseEventType.MOUSE_UP:
+        if get_app().layout.container.clicked((choice, event.position.y), event):
             choice.position = event.position.y
             choice.accept()
             choice.screen().leave_edit()
@@ -336,8 +337,17 @@ class ChoiceMenu(FloatContainer):
         if choice.editing():
             menu.attach_to_window = choice.window
             menu.left = left.xpos - pos.xpos
-            menu.width = right.xpos + right.width - left.xpos
-            menu.height = len(choice.values)
+            width = min(
+                pos.width - menu.left,
+                max(
+                    right.xpos + right.width - left.xpos,
+                    5 + max(get_cwidth(label) for _, label in choice.values),
+                ),
+            )
+            menu.width = width
+            menu.height = self.list_window.preferred_height(
+                max(1, width - 2), len(rows)
+            ).preferred
             # PTK fits the list below or above the anchor and clips long menus.
             viewport = WritePosition(pos.xpos, rows.start, pos.width, len(rows))
             self._draw_float(
@@ -377,6 +387,8 @@ class OptionRow(HSplit):
     def preferred_height(self, width, max_available_height):
         """Measure again when the geometry or the title's edit glyph changes."""
         measure = super().preferred_height
+        if isinstance(self.widget, TextField) and self.editing():
+            return measure(width, max_available_height)
         return self._heights.get(
             (width, max_available_height, self.editing()),
             lambda: measure(width, max_available_height),
@@ -393,6 +405,11 @@ class OptionRow(HSplit):
             or self.widget.control is get_app().layout.current_control
         ):
             # PTK follows the geometric position and cursor of a focused control.
+            if (
+                pane is not None
+                and self.widget.control is get_app().layout.current_control
+            ):
+                pane.focus_item(position)
             draw(*args)
             return
 
@@ -437,6 +454,7 @@ class SettingsWindow:
     VALUE_WIDTH = 48
     MIN_VALUE_WIDTH = 6
     OPTION_GAP = 2
+    EXTENSION_INTEGER = NumberSpec(int, 1)
     NUMBERS = {
         "escape_delay": NumberSpec(
             float, Decimal("0.001"), MIN_ESCAPE_DELAY, MAX_ESCAPE_DELAY
@@ -472,11 +490,13 @@ class SettingsWindow:
         **{mode: glyphs.label for mode, glyphs in ICON_SETS.items()},
     }
 
-    def __init__(self, store, *, input=None, output=None):
+    def __init__(self, store, *, app=None, on_switch=None, input=None, output=None):
         """Build editable fields from the one validated settings object."""
         self.store = store
         self.option_queries = {}
         self._catalog = None
+        self._catalog_source = self._cached_source = None
+        self.catalog_visited = False
         self.reader = CatalogReader(self._catalog_ready)
         self.inputs, self.choices, self.feature_choices = {}, {}, {}
         self.fields = {}
@@ -496,10 +516,11 @@ class SettingsWindow:
                 ActionButton(Message.MANAGE_APPLY_KEY, self.save),
             ],
             auxiliary=[
-                ("refresh", i18n.get(Message.MANAGE_RELOAD), self.reload),
+                ("refresh", i18n.get(Message.MANAGE_RELOAD), "R", self.reload),
                 (
                     "open_file",
                     f"{i18n.get(Message.MANAGE_EDIT_KEY)} ({self.store.path.name})",
+                    "E",
                     self.edit,
                 ),
             ],
@@ -512,60 +533,89 @@ class SettingsWindow:
             field_finished=self.field_finished,
             page_selected=self.visit_page,
             loading=lambda: self.reader.request is not None,
+            presets=self.open_presets,
+            preset_name=lambda: self.active_preset,
             dirty=self.dirty,
             palette=lambda: self.palette.preview(),
             icons=self.icons,
             editor=lambda: self.palette,
             fields=self.fields,
+            app=app,
+            on_switch=on_switch,
             input=input,
             output=output,
         )
+        if self.screen.app.is_running:
+            self.refresh_plugins(reuse=True)
+        else:
+            self.screen.app.pre_run_callables.append(
+                lambda: self.refresh_plugins(reuse=True)
+            )
         available = Condition(lambda: not self.screen.filtering)
         self.screen.bindings.add("c-s", filter=available, eager=True)(
             lambda event: self.save()
-        )
-        self.screen.bindings.add("c-e", filter=available, eager=True)(
-            lambda event: self.edit()
-        )
-        self.screen.bindings.add("c-r", filter=available, eager=True)(
-            lambda event: self.reload()
         )
         if store.error:
             self.screen.set_status(
                 i18n.get(Message.MANAGE_READ_ERROR, error=store.error), error=True
             )
 
-    def row(self, name, title, widget, content, *, detail=None):
+    def row(
+        self,
+        name,
+        title,
+        widget,
+        content,
+        *,
+        detail=None,
+        description=None,
+        number=None,
+    ):
         """Group a setting's title, explanation and editable value as one search result."""
         self.fields[widget.control] = widget
-        description = i18n.get(Message[f"MANAGE_DESC_{name.upper()}"])
+        description = description or i18n.get(Message[f"MANAGE_DESC_{name.upper()}"])
         if detail:
             description = f"{description}  {detail}"
         click = on_click(
             widget.toggle
             if isinstance(widget, Choice)
-            else lambda: self.screen.start_edit(widget.control)
+            else lambda: self.screen.start_edit(widget.control),
+            target=widget.control,
         )
         editing = (
             widget.editing if isinstance(widget, Choice) else ~widget.buffer.read_only
         )
 
         def focus_style(part):
-            suffix = ".focused" if get_app().layout.has_focus(widget.control) else ""
-            return f"class:setting.{part}{suffix}"
+            base = f"class:setting.{part}"
+            focused = base + ".focused"
+            return hover_style(
+                widget.control,
+                focused if get_app().layout.has_focus(widget.control) else base,
+                focused,
+            )
 
         def heading():
             prefix = f"{self.icons().edit} " if editing() else ""
             return [(focus_style("title"), prefix + title)]
 
+        def value_style():
+            return hover_style(widget.control, "class:setting.value")
+
         def side(symbol, handler):
             side_control = FormattedTextControl(symbol)
-            side_control.mouse_handler = handler
-            return Window(side_control, width=1, char=" ")
+            side_control.mouse_handler = on_hover(widget.control, handler)
+            return Window(side_control, width=1, char=" ", style=value_style)
 
         def edge():
-            return Window(char="│", width=1, style=lambda: focus_style("edge"))
+            line = FormattedTextControl()
+            line.mouse_handler = on_hover(widget.control, line.mouse_handler)
+            return Window(line, char="│", width=1, style=lambda: focus_style("edge"))
 
+        widget.control.mouse_handler = on_hover(
+            widget.control, widget.control.mouse_handler
+        )
+        widget.window.style = value_style
         widget.window.char = " "
         controls = [edge(), side(" ", click), content]
         if isinstance(widget, Choice):
@@ -577,7 +627,7 @@ class SettingsWindow:
                     click,
                 )
             )
-        elif name in self.NUMBERS:
+        elif number is not None:
             controls.append(side(lambda: self.icons().number, click))
         controls.extend([side(" ", click), edge()])
         if isinstance(widget, Choice):
@@ -646,11 +696,11 @@ class SettingsWindow:
 
     def current_query(self):
         """Return the active page's applied filter for the dialog and status line."""
-        return self.option_queries.get(self.PAGE_TITLES[self.screen.index], "")
+        return self.option_queries.get(self.page_key(), "")
 
     def filter_options(self, query):
         """Apply the dialog's query to just the page on which it was opened."""
-        title = self.PAGE_TITLES[self.screen.index]
+        title = self.page_key()
         if query:
             self.option_queries[title] = query
         else:
@@ -674,7 +724,7 @@ class SettingsWindow:
         else:
             body.children = list(rows)
 
-    def field(self, name, message, value, placeholder=None):
+    def field(self, name, message, value, placeholder=None, *, spec=None):
         """Keep each text field in the draft with its translated label."""
 
         def editing():
@@ -685,8 +735,10 @@ class SettingsWindow:
             )
 
         control = TextField(
-            validate=lambda raw: self.store.validated(
-                {name: self.input_value(name, raw)}
+            validate=lambda raw: (
+                spec.value(self.option_value(spec, raw))
+                if spec
+                else self.store.validated({name: self.input_value(name, raw)})
             ),
             text="" if value is None else str(value),
             multiline=False,
@@ -694,16 +746,28 @@ class SettingsWindow:
             height=1,
             wrap_lines=False,
         )
-        control.window = FieldWindow(control.control)
-        if name in self.NUMBERS:
-            self.NUMBERS[name].bind(control)
+        control.window = FieldWindow(control.control, editing)
+        preview_value(
+            control.control,
+            lambda: control.text,
+            lambda: editing() or control.window.preview_expanded(),
+        )
+        number = (
+            self.EXTENSION_INTEGER
+            if spec and type(spec.default) is int
+            else self.NUMBERS.get(name)
+        )
+        if number is not None:
+            number.bind(control)
         mouse_handler = control.control.mouse_handler
 
         def edit_at(event):
             if event.button != MouseButton.LEFT or self.screen.busy:
                 return NotImplemented
-            if event.event_type in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
+            if event.event_type == MouseEventType.MOUSE_DOWN:
                 self.screen.start_edit(control.control)
+            elif self.screen.editing is not control.control:
+                return NotImplemented
             return mouse_handler(event)
 
         control.control.mouse_handler = edit_at
@@ -715,7 +779,14 @@ class SettingsWindow:
                 )
             )
         self.inputs[name] = control
-        return self.row(name, i18n.get(message), control, control)
+        return self.row(
+            name,
+            spec.label(spec.title) if spec else i18n.get(message),
+            control,
+            control,
+            number=number,
+            description=spec.label(spec.description) if spec else None,
+        )
 
     def outside_input(self, frame, point):
         """Identify an open text edit when the pointer is outside its visible box."""
@@ -729,7 +800,7 @@ class SettingsWindow:
         if (
             left
             and right
-            and point.y == left.ypos
+            and left.ypos <= point.y < left.ypos + left.height
             and point.y in viewport
             and left.xpos <= point.x < right.xpos + right.width
         ):
@@ -743,7 +814,7 @@ class SettingsWindow:
             return None
 
         def release(frame, released_at):
-            if released_at == point and self.outside_input(frame, released_at) is field:
+            if self.outside_input(frame, released_at) is field:
                 self.screen.leave_edit()
                 return True
             return False
@@ -791,15 +862,20 @@ class SettingsWindow:
     def visit_page(self, index):
         """Read extension metadata on its first visit, outside PTK's render path."""
         if (
-            index >= self.EXTENSIONS_START
-            and self.plugin_rows is None
-            and self.reader.request is None
+            self.EXTENSIONS_START <= index < len(self.PAGE_TITLES)
+            and not self.catalog_visited
         ):
+            self.catalog_visited = True
             self.refresh_plugins()
 
-    def pages(self):
+    def pages(self, settings=None):
         """Create category forms while reusing field validation and feature policies."""
-        settings = self.store.settings
+        settings = settings or self.store.settings
+        self.extension_keys = []
+        self.extension_values = copy.deepcopy(settings.plugin_settings)
+        self.specs = {}
+        self.presets = copy.deepcopy(settings.presets)
+        self.active_preset = settings.active_preset
         self.option_pages, self.option_matches = {}, {}
         languages = {
             "en": i18n.get(Message.MANAGE_LANG_EN),
@@ -832,6 +908,8 @@ class SettingsWindow:
                 self.choice(
                     "ui_icons", Message.MANAGE_UI_ICONS, ICON_SETS, settings.ui_icons
                 ),
+                self.field("editor", Message.MANAGE_EDITOR, settings.editor),
+                self.field("browser", Message.MANAGE_BROWSER, settings.browser),
                 self.field(
                     "log_file",
                     Message.MANAGE_LOG_FILE,
@@ -935,14 +1013,13 @@ class SettingsWindow:
         self.form(Message.MANAGE_PALETTE, [colors])
         if Message.MANAGE_PALETTE in self.option_queries:
             self.palette.apply_filter(self.option_queries[Message.MANAGE_PALETTE])
-        for title in self.option_queries:
+        for title in self.option_queries.keys() & self.option_pages.keys():
             self.filter_form(title)
         pages = [
             (
                 i18n.get(title),
                 FormPane(
                     HSplit([Window(height=1), self.option_pages[title][0], Window()]),
-                    icons=self.icons,
                     # The palette is one tall control. Follow its selected role or shade.
                     keep_focused_window_visible=title != Message.MANAGE_PALETTE,
                 ),
@@ -982,6 +1059,7 @@ class SettingsWindow:
         """Install complete metadata for the latest directory on the PTK thread."""
         self.plugin_error = error
         self._catalog = (directory, candidates) if error is None else None
+        self._cached_source = self._catalog_source
         rows = {category: [] for category in self.CATALOGS}
         known, invalid = set(), {}
         for candidate in candidates:
@@ -1015,6 +1093,7 @@ class SettingsWindow:
         self.invalid_plugins = invalid
         # CheckboxList maps the clicked logical line to a plugin index.
         self.plugin_rows = rows
+        self.extension_pages(candidates)
         self.show_plugins()
         screen = self.screen
         layout = screen.app.layout
@@ -1023,6 +1102,151 @@ class SettingsWindow:
             screen.focus_body()
         screen.update_progress()
         screen.app.invalidate()
+
+    def page_key(self):
+        """Use catalog identity for an extension and the existing title for a built-in."""
+        index = self.screen.index
+        return (
+            self.PAGE_TITLES[index]
+            if index < len(self.PAGE_TITLES)
+            else self.extension_keys[index - len(self.PAGE_TITLES)]
+        )
+
+    @staticmethod
+    def option_value(spec, raw):
+        """Parse integer editors before passing values to the schema owner."""
+        if type(spec.default) is int:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        return raw
+
+    def extension_draft(self):
+        """Preserve overrides for packages that are offline or no longer installed."""
+        values = copy.deepcopy(self.extension_values)
+        for pair, spec in self.specs.items():
+            name, key = pair
+            if pair in self.inputs:
+                value = spec.value(self.option_value(spec, self.inputs[pair].text))
+            elif pair in self.choices:
+                value = self.choices[pair].current_value
+            else:
+                continue
+            if value != spec.default:
+                values.setdefault(name, {})[key] = value
+            elif name in values:
+                values[name].pop(key, None)
+                if not values[name]:
+                    del values[name]
+        return values
+
+    def extension_pages(self, candidates):
+        """Use the metadata scan for both extension management and settings pages."""
+        screen = self.screen
+        old = self.extension_keys
+        selected = (
+            old[screen.index - screen.core_pages]
+            if screen.index >= screen.core_pages and old
+            else None
+        )
+        retired = [page for _, page in screen.pages[screen.core_pages :]]
+        if screen.editing is not None and any(
+            screen.fields.get(screen.editing)
+            is (self.inputs.get(key) or self.choices.get(key))
+            for key in self.specs
+        ):
+            screen.leave_edit()
+        self.extension_values = self.extension_draft()
+        for key in self.specs:
+            widget = self.inputs.pop(key, None) or self.choices.pop(key, None)
+            if widget:
+                self.fields.pop(widget.control, None)
+        for name in old:
+            if name in self.option_pages:
+                _, rows, _ = self.option_pages.pop(name)
+                for row in rows:
+                    self.option_matches.pop(row, None)
+        self.specs.clear()
+        self.extension_keys = []
+        del screen.pages[screen.core_pages :]
+        screen.groups = {
+            i: label for i, label in screen.groups.items() if i < screen.core_pages
+        }
+        records = sorted(
+            (c for c in candidates if c.info and c.info.settings),
+            key=lambda c: (c.info.category == PluginCategory.MODULE, c.name),
+        )
+        for candidate in records:
+            name, info = candidate.name, candidate.info
+            index = len(screen.pages)
+            module = info.category == PluginCategory.MODULE
+            group = i18n.get(
+                Message.MANAGE_MODULE_PAGE if module else Message.MANAGE_PLUGIN_PAGE
+            )
+            if index == screen.core_pages or screen.groups[max(screen.groups)] != group:
+                screen.groups[index] = group
+            self.extension_keys.append(name)
+            rows = []
+            for key, spec in info.settings.items():
+                pair = name, key
+                self.specs[pair] = spec
+                saved = self.extension_values.get(name, {}).get(key, spec.default)
+                try:
+                    saved = spec.value(saved)
+                except ValueError:
+                    screen.set_status(
+                        i18n.get(Message.MANAGE_OPTION_INVALID, name=key), error=True
+                    )
+                    saved = spec.default
+                if spec.choices or type(saved) is bool:
+                    options = spec.choices or (False, True)
+                    control = Choice(
+                        [
+                            (
+                                v,
+                                i18n.get(Message.MANAGE_ON if v else Message.MANAGE_OFF)
+                                if type(v) is bool
+                                else str(v),
+                            )
+                            for v in options
+                        ],
+                        saved,
+                        lambda: screen,
+                    )
+                    self.choices[pair] = control
+                    rows.append(
+                        self.row(
+                            pair,
+                            spec.label(spec.title),
+                            control,
+                            control.window,
+                            description=spec.label(spec.description),
+                        )
+                    )
+                else:
+                    rows.append(self.field(pair, None, saved, spec=spec))
+            self.form(name, rows)
+            self.filter_form(name)
+            screen.pages.append(
+                (
+                    name,
+                    FormPane(
+                        HSplit(
+                            [Window(height=1), self.option_pages[name][0], Window()]
+                        ),
+                    ),
+                )
+            )
+        if selected or screen.index >= len(screen.pages):
+            screen.index = (
+                screen.core_pages + self.extension_keys.index(selected)
+                if selected in self.extension_keys
+                else 0
+            )
+
+        if retired:
+            screen.release_focus(retired)
 
     def show_plugins(self, categories=None):
         """Filter cached metadata while keeping the full, ordered plugin selection."""
@@ -1080,15 +1304,35 @@ class SettingsWindow:
         mouse_handler = checkbox.control.mouse_handler
 
         def toggle(event):
-            if self.screen.busy or event.button != MouseButton.LEFT:
+            if self.screen.busy:
                 return NotImplemented
-            if event.event_type == MouseEventType.MOUSE_UP:
+            if (
+                event.event_type == MouseEventType.MOUSE_MOVE
+                and event.button == MouseButton.NONE
+            ):
+                self.screen.app.layout.container.hovered = (
+                    checkbox.control,
+                    event.position.y,
+                )
+                if (
+                    self.screen.app.layout.has_focus(checkbox.control)
+                    and checkbox._selected_index != event.position.y
+                ):
+                    checkbox._selected_index = event.position.y
+                    self.screen.app.invalidate()
+                return None
+            if event.button != MouseButton.LEFT:
+                return NotImplemented
+            if self.screen.layout.container.clicked(
+                (checkbox.control, event.position.y), event
+            ):
                 self.screen.leave_edit()
                 # Finishing a directory edit can replace the list under this click.
                 if checkbox is not self.fields.get(checkbox.control):
                     return None
                 self.screen.app.layout.focus(checkbox.control)
-            return mouse_handler(event)
+                return mouse_handler(event)
+            return None
 
         checkbox.control.mouse_handler = toggle
         return checkbox
@@ -1155,11 +1399,19 @@ class SettingsWindow:
         values = {
             name: self.input_value(name, field.text)
             for name, field in self.inputs.items()
+            if isinstance(name, str)
         }
         values.update(
-            {name: control.current_value for name, control in self.choices.items()}
+            {
+                name: control.current_value
+                for name, control in self.choices.items()
+                if isinstance(name, str)
+            }
         )
         values.update(
+            plugin_settings=self.extension_draft(),
+            presets=copy.deepcopy(self.presets),
+            active_preset=self.active_preset,
             ui_palette=self.palette.values(),
             lang=self.language.current_value,
             plugins=list(self.selection),
@@ -1230,6 +1482,67 @@ class SettingsWindow:
 
         self._file_work(write)
 
+    def open_presets(self):
+        """Create and apply named snapshots in the current draft until Save."""
+        screen = self.screen
+        if not screen.leave_edit(EditAction.SAVE):
+            return
+        screen.preset_menu(list(self.presets), self.active_preset, self.choose_preset)
+
+    def choose_preset(self, key):
+        """Apply a preset to the draft or ask for the name of a new snapshot."""
+        screen = self.screen
+        if key is not None:
+            try:
+                selected = self.store.validated(
+                    {**self.presets[key], "presets": self.presets, "active_preset": key}
+                )
+            except (ValueError, TypeError) as error:
+                self.failure(error)
+                return
+            self._restore_form(reuse_catalog=True, settings=selected)
+            return
+        name = TextArea(multiline=False, height=1)
+        notice = Label("", style="class:error")
+        body = HSplit(
+            [
+                Label(i18n.get(Message.MANAGE_PRESET_HINT)),
+                Label(i18n.get(Message.MANAGE_PRESET_NAME)),
+                name,
+                notice,
+            ],
+            padding=1,
+        )
+
+        def create():
+            key = name.text.strip()
+            if not key or not key.isprintable() or key in self.presets:
+                notice.text = i18n.get(Message.MANAGE_PRESET_INVALID)
+                screen.app.layout.focus(name)
+                return
+            try:
+                values = self.values()
+                self.store.validated(values)
+            except (ValueError, TypeError) as error:
+                notice.text = str(error)
+                return
+            self.presets[key] = {
+                k: v for k, v in values.items() if k not in ("presets", "active_preset")
+            }
+            self.active_preset = key
+            screen.dismiss()
+
+        def accept_name(_):
+            create()
+            return True
+
+        name.buffer.accept_handler = accept_name
+        screen.dialog(
+            Message.MANAGE_NEW_PRESET,
+            body,
+            [(Message.MANAGE_NEW_PRESET, create)],
+        )
+
     def cancel(self):
         """Restore the last good settings without writing or executing the rc."""
         if self.screen.busy:
@@ -1248,7 +1561,7 @@ class SettingsWindow:
         self.screen.app.layout.focus(self.screen.nav)
         self._status(Message.MANAGE_RELOADED)
 
-    def _restore_form(self, *, reuse_catalog=False):
+    def _restore_form(self, *, reuse_catalog=False, settings=None):
         layout = self.screen.app.layout
         in_form = layout.has_focus(self.screen.pages[self.screen.index][1])
         self.screen.leave_edit(EditAction.CANCEL)
@@ -1256,10 +1569,27 @@ class SettingsWindow:
         self.fields.clear()
         catalog_opened = self.plugin_rows is not None or self.reader.request is not None
         self.reader.cancel()
-        self.screen.pages = self.pages()
-        if catalog_opened or not reuse_catalog:
+        previous = (
+            self.page_key() if self.screen.index >= self.screen.core_pages else None
+        )
+        if previous is not None:
+            self.screen._index = 0
+        self.screen.pages = self.pages(settings)
+        if (
+            reuse_catalog
+            and self._catalog
+            and self.inputs["plugin_dir"].text == self._cached_source
+        ):
+            self._catalog_source = self._cached_source
+            self._catalog_ready(*self._catalog, None)
+        elif catalog_opened or not reuse_catalog:
             self.refresh_plugins(reuse=reuse_catalog)
-        self.initial = copy.deepcopy(self.values())
+        if previous in self.extension_keys:
+            self.screen.select_page(
+                self.screen.core_pages + self.extension_keys.index(previous)
+            )
+        if settings is None:
+            self.initial = copy.deepcopy(self.values())
         layout.update_parents_relations()
         if in_form:
             self.screen.focus_body()
@@ -1277,16 +1607,11 @@ class SettingsWindow:
         """Open the user's editor outside PTK; do not pass arguments through a shell."""
         if self.screen.busy:
             return
-        rollback = "" if self.screen.leave_edit() else self.screen.status
-
-        def show_result():
-            if rollback and self.screen.status != rollback:
-                self.screen.set_status(f"{rollback} {self.screen.status}", error=True)
 
         try:
             if self.changes():
                 raise ValueError(i18n.get(Message.MANAGE_UNSAVED))
-            selected = next(
+            selected = self.store.settings.editor or next(
                 (
                     os.environ[name]
                     for name in self.EDITOR_VARIABLES
@@ -1299,7 +1624,6 @@ class SettingsWindow:
                 raise ValueError(i18n.get(Message.MANAGE_EDITOR_MISSING))
         except (OSError, ValueError) as error:
             self.failure(error)
-            show_result()
             return
 
         self.screen.busy = True
@@ -1329,30 +1653,16 @@ class SettingsWindow:
                 self.failure(error)
             finally:
                 self.screen.busy = False
-                show_result()
                 self.screen.app.invalidate()
 
         self.screen.app.create_background_task(open_file())
 
-    def run(self):
-        """Return whether this visit actually replaced the file, regardless of exit key."""
-        writes = self.store.writes
-        try:
-            self.screen.run()
-        finally:
-            self.reader.cancel()
-        return self.store.writes != writes
 
-
-def help_window(parser, *, no_rc=False):
-    """Select a category TUI only for a real terminal; keep redirected help readable."""
-    if not os.isatty(0) or not os.isatty(1) or os.environ.get("TERM") == "dumb":
-        print(help_text(parser), end="")
-        return
-    appearance = {} if no_rc else SettingsStore.read_appearance(config.RC_FILE)
+def help_screen(parser, options, app, on_switch):
+    """Build the help layout using read-only options or the open settings draft."""
 
     def icons():
-        return ICON_SETS[appearance.get("ui_icons", DEFAULT_ICONS)]
+        return ICON_SETS[options.get("ui_icons", DEFAULT_ICONS)]
 
     pages = [
         (
@@ -1370,33 +1680,141 @@ def help_window(parser, *, no_rc=False):
                         ),
                     ]
                 ),
-                icons=icons,
             ),
         )
         for title, body in help_pages(parser)
     ]
-    Screen(
+
+    def details():
+        result = Future()
+
+        def open_site():
+            # The browser may outlive ish. Its waiter must not hold the UI loop open.
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                browser = options.get("browser")
+                if browser:
+                    arguments = shlex.split(browser)
+                elif webbrowser.open(PROJECT_URL):
+                    result.set_result(True)
+                    return
+                elif os.environ.get("WSL_DISTRO_NAME") and shutil.which("explorer.exe"):
+                    arguments = ["explorer.exe"]
+                else:
+                    result.set_result(False)
+                    return
+                process = subprocess.run(
+                    [*arguments, PROJECT_URL],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    check=False,
+                )
+                # Explorer can return nonzero after successfully handing off a URL.
+                result.set_result(process.returncode == 0 or not browser)
+            except (webbrowser.Error, OSError, ValueError):
+                result.set_result(False)
+
+        async def report():
+            if not await asyncio.wrap_future(result):
+                screen.set_status(
+                    i18n.get(Message.MANAGE_BROWSER_FAILED, url=PROJECT_URL), error=True
+                )
+
+        Thread(target=open_site, daemon=True).start()
+        screen.app.create_background_task(report())
+
+    screen = Screen(
         i18n.get(Message.MANAGE_HELP_TITLE),
         pages,
         groups=[
             (0, i18n.get(Message.MANAGE_GUIDE)),
             (6, i18n.get(Message.MANAGE_REFERENCE)),
         ],
-        buttons=[
-            ActionButton(Message.MANAGE_CLOSE_KEY, lambda: get_app().exit(result=False))
-        ],
-        palette=lambda: appearance.get("ui_palette", {}),
+        buttons=[ActionButton(Message.MANAGE_DETAILS, details)],
+        palette=lambda: options.get("ui_palette", {}),
         icons=icons,
-    ).run()
-
-
-def settings_window(startup, *, no_rc=False, language=None):
-    """Reuse the one settings evaluator and never launch plugins, a shell or engine."""
-    store = SettingsStore(
-        config.RC_FILE, settings_type=startup.settings, loader=startup.load, no_rc=no_rc
+        preset_name=lambda: options.get("active_preset", ""),
+        app=app,
+        on_switch=on_switch,
     )
-    selected = store.settings.lang
-    if isinstance(store.error, RcError) and valid_language(store.error.settings.lang):
-        selected = store.error.settings.lang
-    i18n.load(language if language is not None else selected)
-    return SettingsWindow(store).run()
+    return screen
+
+
+def management_window(startup, parser, *, no_rc=False, language=None, help_first=False):
+    """Own one terminal session and evaluate the rc only when settings is first opened."""
+    if help_first and (
+        not os.isatty(0) or not os.isatty(1) or os.environ.get("TERM") == "dumb"
+    ):
+        print(help_text(parser), end="")
+        return
+    settings = None
+    guide = None
+    guide_language = None
+    options = {}
+    app = None
+
+    def show_help(_action=None):
+        nonlocal app, guide, guide_language
+        if settings is None:
+            if not no_rc:
+                options.update(SettingsStore.read_help_options(config.RC_FILE))
+        else:
+            settings.reader.cancel()
+            settings.screen.update_progress()
+            options.update(
+                {
+                    "ui_palette": settings.palette.values(),
+                    "ui_icons": settings.choices["ui_icons"].current_value,
+                    "active_preset": settings.active_preset,
+                    "browser": settings.store.settings.browser,
+                }
+            )
+        if guide is None or guide_language != i18n.current_lang:
+            previous = guide
+            guide = help_screen(parser, options, app, show_settings)
+            guide_language = i18n.current_lang
+            app = guide.app
+            if previous is not None:
+                guide.select_page(previous.index)
+                for (_, pane), (_, old) in zip(
+                    guide.pages, previous.pages, strict=True
+                ):
+                    pane.restore_scroll(old.vertical_scroll)
+        else:
+            guide.show()
+        return guide
+
+    def show_settings(action=None):
+        nonlocal settings, app
+        if settings is None:
+            store = SettingsStore(
+                config.RC_FILE,
+                settings_type=startup.settings,
+                loader=startup.load,
+                no_rc=no_rc,
+            )
+            selected = store.settings.lang
+            if isinstance(store.error, RcError) and valid_language(
+                store.error.settings.lang
+            ):
+                selected = store.error.settings.lang
+            i18n.load(language if language is not None else selected)
+            settings = SettingsWindow(store, app=app, on_switch=show_help)
+            app = settings.screen.app
+        else:
+            settings.screen.show()
+            if settings.plugin_rows is None:
+                settings.refresh_plugins(reuse=True)
+        if action == Screen.PRESETS:
+            settings.open_presets()
+        return settings.screen
+
+    try:
+        screen = show_help() if help_first else show_settings()
+        screen.run()
+    finally:
+        if settings is not None:
+            settings.reader.cancel()

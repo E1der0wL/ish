@@ -648,12 +648,11 @@ class StartupTests(StartupFixture, unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
 
+        from ish.config import Config
         from ish.lang.i18n import I18N
         from ish.terminal.__main__ import main
 
         language = I18N()
-        language.base_path = self.root / "languages"
-        language.load("ko")
         state = []
 
         async def fail():
@@ -665,23 +664,6 @@ class StartupTests(StartupFixture, unittest.TestCase):
         application = SimpleNamespace(
             run=fail, stop=lambda _: None, suspend=lambda: None
         )
-        options = SimpleNamespace(
-            log_level="WARNING",
-            log_file=None,
-            log_records=(),
-            plugin=(),
-            cwd=self.root,
-            dump_state=None,
-            plugin_dir=None,
-            plugin_lib_dir=None,
-            clipboard="write",
-            mouse="auto",
-            color_depth="inherit",
-            features={},
-            escape_delay=0.05,
-            scrollback_lines=10000,
-            scrollback_bytes=32 * 1024 * 1024,
-        )
         output = io.StringIO()
 
         def report(application, logger):
@@ -690,14 +672,24 @@ class StartupTests(StartupFixture, unittest.TestCase):
             state.append("reported")
 
         with (
-            patch("ish.terminal.__main__.parse", return_value=(None, options, False)),
-            patch("ish.terminal.__main__.command", return_value=("/bin/sh",)),
+            patch("ish.runtime.cli.terminal"),
+            patch("ish.runtime.cli.config", Config()),
+            patch("ish.runtime.cli.i18n", language),
             patch("ish.terminal.__main__.i18n", language),
             patch("ish.terminal.app.TerminalApp", return_value=application),
             patch("ish.terminal.diagnostics.report_session", side_effect=report),
             redirect_stderr(output),
         ):
-            self.assertEqual(main([]), 1)
+            argv = [
+                "--home",
+                str(self.home),
+                "--no-rc",
+                "--lang",
+                "ko",
+                "--shell",
+                "/bin/sh",
+            ]
+            self.assertEqual(main(argv), 1)
         self.assertEqual(state, ["restored", "reported"])
         self.assertIn("ish 세션 오류: QUEUE_LIMIT", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
