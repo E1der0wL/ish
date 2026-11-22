@@ -2431,6 +2431,7 @@ class PublicManagementTests(ManagementFixture):
                 len(terminal.screen.display[0]) == 78
                 and "×" in terminal.screen.display[0]
                 and terminal.frame_has("○ CRITICAL")
+                and "Cancel" in terminal.screen.display[-3]
             )
         )
         assert_above()

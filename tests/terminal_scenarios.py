@@ -204,6 +204,10 @@ def prepare(root: Path, shell: str, plugins: bool) -> list[str]:
     if shutil.which("vim") is None:
         raise RuntimeError("Required native Vim is missing")
     root.mkdir(parents=True, exist_ok=True)
+    if shell == "zsh":
+        # Ubuntu starts compinit before the user's .zshrc. Its prompt depends
+        # on site-wide completion directory permissions outside the fixture.
+        (root / ".zshenv").write_text("skip_global_compinit=1\n", encoding="utf-8")
     (root / RC_NAMES[shell]).write_text(STARTUP[shell], encoding="utf-8")
     (root / "raw-reader.py").write_text(RAW_READER, encoding="utf-8")
     (root / "job-reader.py").write_text(JOB_READER, encoding="utf-8")
